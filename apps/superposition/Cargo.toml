@@ -1,0 +1,24 @@
+[package]
+name = "superposition"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+eframe = { version = "0.31.1", default-features = true, features = ["default_fonts", "accesskit"] }
+egui = "0.31.1"
+sp-audio-io = { path = "../../crates/sp-audio-io" }
+sp-engine = { path = "../../crates/sp-engine" }
+sp-midi = { path = "../../crates/sp-midi" }
+sp-model = { path = "../../crates/sp-model" }
+sp-session = { path = "../../crates/sp-session" }
+sp-supervisor = { path = "../../crates/sp-supervisor" }
+sp-ui = { path = "../../crates/sp-ui" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sp-audio-io-macos = { path = "../../crates/sp-audio-io-macos" }
+
+[lints]
+workspace = true

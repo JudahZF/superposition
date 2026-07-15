@@ -1,0 +1,26 @@
+[package]
+name = "sp-audio-io-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sp-audio-io = { path = "../sp-audio-io" }
+sp-engine = { path = "../sp-engine" }
+sp-shared-memory = { path = "../sp-shared-memory" }
+sp-shared-memory-macos = { path = "../sp-shared-memory-macos" }
+
+[build-dependencies]
+cc = "1.2.57"
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"

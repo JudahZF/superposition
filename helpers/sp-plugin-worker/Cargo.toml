@@ -1,0 +1,24 @@
+[package]
+name = "sp-plugin-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["sdk"]
+sdk = ["sp-vst3/sdk"]
+feasibility-fault-injection = ["sp-shared-memory/test-hooks"]
+
+[dependencies]
+sp-shared-memory = { path = "../../crates/sp-shared-memory" }
+sp-shared-memory-macos = { path = "../../crates/sp-shared-memory-macos" }
+sp-test-support = { path = "../../crates/sp-test-support" }
+sp-vst3 = { path = "../../crates/sp-vst3" }
+
+[dev-dependencies]
+sp-shared-memory = { path = "../../crates/sp-shared-memory", features = ["test-hooks"] }
+
+[lints]
+workspace = true

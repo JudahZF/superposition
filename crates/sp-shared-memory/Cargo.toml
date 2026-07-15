@@ -1,0 +1,18 @@
+[package]
+name = "sp-shared-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+test-hooks = ["sp-protocol/test-hooks"]
+
+[dependencies]
+sp-protocol = { path = "../sp-protocol" }
+
+[lints]
+workspace = true

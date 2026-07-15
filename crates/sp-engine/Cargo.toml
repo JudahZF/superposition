@@ -1,0 +1,16 @@
+[package]
+name = "sp-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sp-model = { path = "../sp-model" }
+sp-protocol = { path = "../sp-protocol" }
+thiserror.workspace = true

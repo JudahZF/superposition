@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Rust quality (macOS)
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+          targets: aarch64-apple-darwin
+
+      - name: Confirm macOS runner
+        run: test "$(uname -s)" = Darwin
+
+      - name: Install dependency policy tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit
+
+      - name: Verify workspace bootstrap
+        run: |
+          cargo metadata --no-deps --format-version 1
+
+      - name: Run workspace doctor
+        run: cargo xtask doctor
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check Apple Silicon target
+        run: cargo check --workspace --all-targets --all-features --target aarch64-apple-darwin
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets --all-features
+
+      - name: Smoke synthetic IPC preflight
+        run: cargo xtask ipc-feasibility --racks 2 --frames 128 --duration-seconds 2
+
+      - name: Smoke fault matrix
+        run: cargo xtask fault-matrix --racks 2 --frames 128 --output-dir target/ci-fault-matrix
+
+      - name: Smoke compatibility and bundle scaffolds
+        run: |
+          cargo xtask compatibility
+          cargo xtask bundle --profile debug
+
+      - name: Enforce dependency policy
+        run: cargo deny check
+
+      - name: Audit dependencies
+        run: cargo audit

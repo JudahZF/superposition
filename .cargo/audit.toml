@@ -1,0 +1,9 @@
+[advisories]
+# quick-xml is present only through Linux-specific xcb/Wayland dependency edges in
+# eframe and vst3-host. Superposition ships only aarch64 macOS binaries, where the
+# vulnerable crate is not compiled. Remove these exceptions if Linux becomes a target.
+ignore = ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]
+
+[target]
+arch = ["aarch64"]
+os = ["macos"]

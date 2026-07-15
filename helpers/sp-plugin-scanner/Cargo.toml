@@ -1,0 +1,19 @@
+[package]
+name = "sp-plugin-scanner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["sdk"]
+sdk = ["sp-vst3/sdk"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sp-vst3 = { path = "../../crates/sp-vst3" }
+
+[lints]
+workspace = true
