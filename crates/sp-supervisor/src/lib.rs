@@ -1,10 +1,20 @@
 //! Process supervision for isolated helper binaries.
 
+mod catalog;
+mod quarantine;
 mod scanner;
+mod worker_control;
 
+pub use catalog::{CATALOG_SCHEMA_VERSION, PluginCatalog};
+pub use quarantine::{
+    PersistentQuarantine, PluginFailureKind, QuarantineRecord, QuarantineTable, QuarantinedPlugin,
+};
 pub use scanner::{
     BundleFingerprint, CachedScan, ScanCache, ScanDescriptor, ScanStatus, Scanner,
     discover_vst3_bundles, fingerprint_bundle,
+};
+pub use worker_control::{
+    WorkerControlClient, WorkerControlError, WorkerControlLaunch, WorkerControlSession,
 };
 
 use std::{
@@ -16,6 +26,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Maximum stdout or stderr retained from a disposable helper process.
+const MAX_CAPTURED_HELPER_OUTPUT_BYTES: usize = 1024 * 1024;
+
 /// The helper executable role managed by the application.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HelperKind {
@@ -23,6 +36,17 @@ pub enum HelperKind {
     PluginWorker,
     /// Inspects plug-in bundles outside the application process.
     PluginScanner,
+}
+
+impl HelperKind {
+    /// Returns the deployment filename allowed for this helper role.
+    #[must_use]
+    pub const fn executable_name(self) -> &'static str {
+        match self {
+            Self::PluginWorker => "sp-plugin-worker",
+            Self::PluginScanner => "sp-plugin-scanner",
+        }
+    }
 }
 
 /// Declarative request to start a helper process.
@@ -34,6 +58,40 @@ pub struct HelperLaunch {
     pub executable: PathBuf,
     /// Arguments passed without shell expansion.
     pub arguments: Vec<String>,
+}
+
+impl HelperLaunch {
+    /// Validates that a control-plane launch targets its dedicated deployed helper.
+    ///
+    /// The generic process supervisor also serves Phase 1 tooling, so this check is deliberately
+    /// opt-in for product worker lifecycle code rather than imposed on every helper invocation.
+    /// It rejects PATH lookup and role/executable mismatches before the supervisor can create a
+    /// process capable of loading third-party plug-in code.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` unless `executable` is an absolute path whose filename exactly
+    /// matches the selected helper role.
+    pub fn validate_helper_only(&self) -> std::io::Result<()> {
+        if !self.executable.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "helper executable must be an absolute deployment path",
+            ));
+        }
+        let actual_name = self.executable.file_name().and_then(|name| name.to_str());
+        if actual_name != Some(self.kind.executable_name()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "helper role requires executable `{}`, not `{}`",
+                    self.kind.executable_name(),
+                    self.executable.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Observable lifecycle state of a helper process.
@@ -188,80 +246,10 @@ impl RackWorkerTable {
     }
 }
 
-/// Fingerprint quarantine used after restart exhaustion or repeated scan/worker faults.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QuarantineTable {
-    failures: HashMap<String, u32>,
-    quarantined: HashMap<String, u32>,
-    threshold: u32,
-}
-
-impl QuarantineTable {
-    /// Creates a table that quarantines after `threshold` recorded failures.
-    #[must_use]
-    pub fn with_threshold(threshold: u32) -> Self {
-        Self {
-            failures: HashMap::new(),
-            quarantined: HashMap::new(),
-            threshold: threshold.max(1),
-        }
-    }
-
-    /// Creates a table with the default threshold of three failures.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::with_threshold(3)
-    }
-
-    /// Records one failure against `fingerprint` and returns whether it is now quarantined.
-    pub fn record_failure(&mut self, fingerprint: impl Into<String>) -> bool {
-        let fingerprint = fingerprint.into();
-        let count = self.failures.entry(fingerprint.clone()).or_insert(0);
-        *count = count.saturating_add(1);
-        if *count >= self.threshold {
-            self.quarantined.insert(fingerprint, *count);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Returns whether `fingerprint` is quarantined.
-    #[must_use]
-    pub fn is_quarantined(&self, fingerprint: &str) -> bool {
-        self.quarantined.contains_key(fingerprint)
-    }
-
-    /// Clears quarantine and failure counts for one fingerprint.
-    pub fn clear(&mut self, fingerprint: &str) {
-        self.failures.remove(fingerprint);
-        self.quarantined.remove(fingerprint);
-    }
-
-    /// Clears all quarantine state.
-    pub fn clear_all(&mut self) {
-        self.failures.clear();
-        self.quarantined.clear();
-    }
-
-    /// Returns the configured failure threshold.
-    #[must_use]
-    pub const fn threshold(&self) -> u32 {
-        self.threshold
-    }
-}
-
-impl Default for QuarantineTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Product control-plane loop over [`ProcessSupervisor`] and [`RackWorkerTable`].
 #[derive(Debug, Default)]
 pub struct RackSupervisor {
     table: RackWorkerTable,
-    quarantine: QuarantineTable,
 }
 
 impl RackSupervisor {
@@ -277,18 +265,11 @@ impl RackSupervisor {
         &self.table
     }
 
-    /// Returns the quarantine table.
-    #[must_use]
-    pub const fn quarantine(&self) -> &QuarantineTable {
-        &self.quarantine
-    }
-
-    /// Returns a mutable quarantine table.
-    pub fn quarantine_mut(&mut self) -> &mut QuarantineTable {
-        &mut self.quarantine
-    }
-
     /// Launches a worker for `rack_index`, replacing any previous assignment.
+    ///
+    /// This low-level operation exists for Phase 1 feasibility helpers. Production VST3 worker
+    /// launches must use [`Self::create_or_replace_plugin_worker`] so a quarantined bundle is
+    /// refused before a plug-in-loading process can be spawned.
     ///
     /// # Errors
     ///
@@ -317,10 +298,73 @@ impl RackSupervisor {
         Ok(handle)
     }
 
+    /// Refuses a quarantined plug-in before it can spawn a plug-in-loading worker helper.
+    ///
+    /// This is the production worker-launch API. It validates the deployed helper role and the
+    /// atomically persisted quarantine record before it stops a previous worker or invokes
+    /// `Command::spawn`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PermissionDenied` when the fingerprint is quarantined, or an error when helper
+    /// validation, process launch, or worker replacement fails.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launch contract names every safety input explicitly at the call site"
+    )]
+    pub fn create_or_replace_plugin_worker(
+        &mut self,
+        processes: &mut ProcessSupervisor,
+        rack_index: usize,
+        bank_name: impl Into<String>,
+        launch: &HelperLaunch,
+        suspected_slot: Option<usize>,
+        fingerprint: &BundleFingerprint,
+        quarantine: &PersistentQuarantine,
+    ) -> std::io::Result<RackWorkerHandle> {
+        quarantine
+            .ensure_launch_permitted(fingerprint)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
+        if launch.kind != HelperKind::PluginWorker {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "plug-in launches must use the plug-in worker helper",
+            ));
+        }
+        launch.validate_helper_only()?;
+        self.create_or_replace_worker(processes, rack_index, bank_name, launch, suspected_slot)
+    }
+
+    /// Records one worker crash, timeout, or hang and atomically persists the failure counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` for scanner failure kinds or an error when state cannot persist.
+    pub fn record_worker_failure(
+        &self,
+        quarantine: &mut PersistentQuarantine,
+        fingerprint: BundleFingerprint,
+        kind: PluginFailureKind,
+    ) -> std::io::Result<bool> {
+        if !matches!(
+            kind,
+            PluginFailureKind::WorkerCrash
+                | PluginFailureKind::WorkerTimeout
+                | PluginFailureKind::WorkerHang
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "record_worker_failure requires a worker failure kind",
+            ));
+        }
+        quarantine.record_failure(fingerprint, kind)
+    }
+
     /// Dual-bank recovery: stop the live worker, launch on the alternate bank, bypass a slot.
     ///
-    /// When `fingerprint` is provided and process restarts are exhausted, the fingerprint is
-    /// quarantined.
+    /// This legacy control-plane operation does not persist a plug-in failure because it has no
+    /// canonical fingerprint. Product worker recovery must call [`Self::record_worker_failure`]
+    /// with the exact fingerprint observed by the worker.
     ///
     /// # Errors
     ///
@@ -331,7 +375,7 @@ impl RackSupervisor {
         rack_index: usize,
         mut launch: HelperLaunch,
         suspected_slot: Option<usize>,
-        fingerprint: Option<&str>,
+        _fingerprint: Option<&str>,
     ) -> std::io::Result<RackWorkerHandle> {
         let previous = self.table.get(rack_index).cloned();
         let bank_name = previous.as_ref().map_or_else(
@@ -356,14 +400,7 @@ impl RackSupervisor {
             &launch,
             suspected_slot,
         )?;
-        let events = processes.reap();
-        if events
-            .iter()
-            .any(|event| matches!(event, SupervisorEvent::RestartExhausted))
-            && let Some(fingerprint) = fingerprint
-        {
-            self.quarantine.record_failure(fingerprint);
-        }
+        let _ = processes.reap();
         Ok(handle)
     }
 
@@ -593,20 +630,10 @@ impl ProcessSupervisor {
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let stdout_thread = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut stdout) = stdout {
-                let _ = stdout.read_to_end(&mut bytes);
-            }
-            bytes
-        });
-        let stderr_thread = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut stderr) = stderr {
-                let _ = stderr.read_to_end(&mut bytes);
-            }
-            bytes
-        });
+        let stdout_thread =
+            thread::spawn(move || stdout.map_or_else(Vec::new, read_bounded_helper_output));
+        let stderr_thread =
+            thread::spawn(move || stderr.map_or_else(Vec::new, read_bounded_helper_output));
 
         let deadline = Instant::now() + timeout;
         let result = loop {
@@ -710,6 +737,19 @@ impl ProcessSupervisor {
     }
 }
 
+fn read_bounded_helper_output(mut reader: impl Read) -> Vec<u8> {
+    let mut retained = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    while let Ok(read) = reader.read(&mut buffer) {
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_CAPTURED_HELPER_OUTPUT_BYTES.saturating_sub(retained.len());
+        retained.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+    retained
+}
+
 impl Default for ProcessSupervisor {
     fn default() -> Self {
         Self::new()
@@ -735,11 +775,17 @@ impl HelperSupervisor for ProcessSupervisor {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, thread, time::Duration};
+    use std::{
+        fs,
+        path::PathBuf,
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     use super::{
-        HelperKind, HelperLaunch, HelperStatus, ProcessSupervisor, QuarantineTable, RackSupervisor,
-        RackWorkerHandle, RackWorkerTable, RestartPolicy, SupervisorEvent, TimedHelperResult,
+        BundleFingerprint, HelperKind, HelperLaunch, HelperStatus, PersistentQuarantine,
+        PluginFailureKind, ProcessSupervisor, QuarantineTable, RackSupervisor, RackWorkerHandle,
+        RackWorkerTable, RestartPolicy, SupervisorEvent, TimedHelperResult,
     };
 
     fn launch(executable: &str, arguments: &[&str]) -> HelperLaunch {
@@ -748,6 +794,70 @@ mod tests {
             executable: PathBuf::from(executable),
             arguments: arguments.iter().map(ToString::to_string).collect(),
         }
+    }
+
+    #[test]
+    fn helper_only_validation_requires_the_deployed_role_binary() {
+        let worker = HelperLaunch {
+            kind: HelperKind::PluginWorker,
+            executable: PathBuf::from(
+                "/Applications/Superposition.app/Contents/Helpers/sp-plugin-worker",
+            ),
+            arguments: Vec::new(),
+        };
+        assert!(worker.validate_helper_only().is_ok());
+
+        let relative = HelperLaunch {
+            executable: PathBuf::from("sp-plugin-worker"),
+            ..worker.clone()
+        };
+        assert!(relative.validate_helper_only().is_err());
+
+        let mismatched = HelperLaunch {
+            kind: HelperKind::PluginScanner,
+            ..worker
+        };
+        assert!(mismatched.validate_helper_only().is_err());
+    }
+
+    #[test]
+    fn plugin_worker_launch_is_rejected_before_spawn_when_fingerprint_is_quarantined() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let state_path = std::env::temp_dir().join(format!("sp-launch-quarantine-{unique}.json"));
+        let fingerprint = BundleFingerprint {
+            algorithm: "sha256".to_owned(),
+            digest: "quarantined".to_owned(),
+        };
+        let mut quarantine = PersistentQuarantine::open(&state_path, 1).expect("open quarantine");
+        quarantine
+            .record_failure(fingerprint.clone(), PluginFailureKind::WorkerCrash)
+            .expect("persist failure");
+
+        let mut processes = ProcessSupervisor::new();
+        let mut racks = RackSupervisor::new();
+        let error = racks
+            .create_or_replace_plugin_worker(
+                &mut processes,
+                0,
+                "rack-0-a",
+                &HelperLaunch {
+                    kind: HelperKind::PluginWorker,
+                    executable: PathBuf::from(
+                        "/Applications/Superposition.app/Contents/Helpers/sp-plugin-worker",
+                    ),
+                    arguments: Vec::new(),
+                },
+                None,
+                &fingerprint,
+                &quarantine,
+            )
+            .expect_err("quarantined worker must not launch");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(racks.table().is_empty());
+        fs::remove_file(state_path).expect("remove quarantine state");
     }
 
     fn reap_until_exit(supervisor: &mut ProcessSupervisor) -> Vec<SupervisorEvent> {
@@ -850,12 +960,16 @@ mod tests {
 
     #[test]
     fn quarantine_trips_at_threshold() {
+        let fingerprint = BundleFingerprint {
+            algorithm: "sha256".to_owned(),
+            digest: "fp".to_owned(),
+        };
         let mut quarantine = QuarantineTable::with_threshold(2);
-        assert!(!quarantine.record_failure("fp"));
-        assert!(quarantine.record_failure("fp"));
-        assert!(quarantine.is_quarantined("fp"));
-        quarantine.clear("fp");
-        assert!(!quarantine.is_quarantined("fp"));
+        assert!(!quarantine.record_failure(fingerprint.clone(), PluginFailureKind::WorkerCrash));
+        assert!(quarantine.record_failure(fingerprint.clone(), PluginFailureKind::WorkerCrash));
+        assert!(quarantine.is_quarantined(&fingerprint));
+        quarantine.clear(&fingerprint);
+        assert!(!quarantine.is_quarantined(&fingerprint));
     }
 
     #[test]

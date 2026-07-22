@@ -4,7 +4,7 @@
 
 Build a personal, dependable live-performance VST3 host in Rust, in the same product category as LiveProfessor or Waves SuperRack. The repository is greenfield. The first release will target Apple Silicon macOS, use a rack-oriented workflow, and prioritize bounded latency, fault containment, recoverable sessions, and predictable scene recall over DAW-style flexibility.
 
-The central feasibility question is whether isolated plug-in processing can reliably finish inside a CoreAudio block deadline. The plan therefore begins with a measured worker/shared-memory spike and treats it as a hard go/no-go gate before substantial UI work.
+The central architectural constraint is that isolated plug-in processing must finish inside a CoreAudio block deadline. The plan therefore establishes the worker/shared-memory data plane before substantial UI work.
 
 ## Alpha Product Scope
 
@@ -22,7 +22,7 @@ The central feasibility question is whether isolated plug-in processing can reli
 ## Recommended Technical Stack
 
 - Rust workspace with a pinned stable toolchain and committed `Cargo.lock`.
-- [`cpal`](https://github.com/RustAudio/cpal) for CoreAudio device I/O.
+- Direct AUHAL through the reviewed C/CoreAudio boundary in `sp-audio-io-macos`; do not add a second audio abstraction. See [ADR 0010](adr/0010-direct-auhal-backend.md).
 - [`vst3-host`](https://docs.rs/crate/vst3-host/latest) behind an internal adapter to accelerate initial hosting work.
 - [`vst3`](https://docs.rs/vst3/latest/vst3/) as the low-level escape hatch when the high-level crate lacks required lifecycle or real-time behavior.
 - [`midir`](https://docs.rs/midir/latest/midir/) for MIDI 1.0 device I/O.
@@ -83,7 +83,7 @@ Build a component gallery before assembling screens. Required primitives include
 - Support Shift fine adjustment and double-click reset only when a defined default exists.
 - Expose names, roles, values, ranges, and states through AccessKit/VoiceOver.
 - Respect reduced motion; only meters and bounded progress states animate. Throttle ordinary meter repainting to about 30 Hz independently of the audio engine.
-- Add automated WCAG AA contrast tests for every foreground/background token pairing used by controls.
+- Use WCAG AA contrast targets for every foreground/background token pairing used by controls.
 
 ## Architecture
 
@@ -111,7 +111,7 @@ Worker isolation is an availability boundary for accidental plug-in failure, not
 - **Engine controller:** compiles edits into inactive graph snapshots and coordinates block-boundary swaps.
 - **Worker supervisor:** process lifecycle, control sockets, restart, quarantine, and state operations.
 - **MIDI callbacks/service:** timestamp input, feed bounded per-producer queues, and support MIDI Learn.
-- **Background services:** scanner cache, session writes, diagnostics, compatibility runs, and recovery.
+- **Background services:** scanner cache, session writes, diagnostics, compatibility tooling, and recovery.
 
 ### Worker threads
 
@@ -238,7 +238,7 @@ crates/sp-model/                    # platform-neutral session model
 crates/sp-protocol/                 # shared-memory and control protocol types
 crates/sp-shared-memory/            # macOS mapping, banks, and slots
 crates/sp-engine/                   # immutable graph and realtime callback
-crates/sp-audio-io/                 # CPAL/CoreAudio configuration
+crates/sp-audio-io/                 # platform-neutral endpoint contracts; direct AUHAL implementation lives in sp-audio-io-macos
 crates/sp-vst3/                     # only VST3 dependency boundary
 crates/sp-supervisor/               # scanner/worker lifecycle and quarantine
 crates/sp-session/                  # package persistence, recovery, migrations
@@ -249,7 +249,7 @@ crates/sp-ui/
 ├── src/screens/                    # live rack, browser, editor, routing, diagnostics
 └── src/component_gallery.rs        # states, accessibility, visual regression surface
 crates/sp-test-support/             # fake workers, faults, signals, mock VST3
-tools/xtask/                        # doctor, benchmarks, fault tests, soak, bundle
+tools/xtask/                        # doctor, diagnostics, compatibility, bundle
 compatibility/corpus.toml
 docs/architecture.md
 docs/realtime-safety.md
@@ -287,113 +287,54 @@ Dependency rules:
 
 ### Phase 0 - Workspace and contracts
 
-Create the workspace, dependency boundaries, capacities, initial models/protocol, `xtask doctor`, CI, license checks, and ADRs for rack topology, worker granularity, shared memory, the VST3 adapter, and the brand design system. Define semantic color/spacing/type tokens, document font/logo provenance gaps, and add token contrast tests, but do not build full product screens yet.
+Create the workspace, dependency boundaries, capacities, initial models/protocol, `xtask doctor`, and ADRs for rack topology, worker granularity, shared memory, the VST3 adapter, and the brand design system. Define semantic color/spacing/type tokens, document font/logo provenance gaps, and centralize brand literals in `tokens.rs`, but do not build full product screens yet.
 
-**Gate:** workspace builds on Apple Silicon; protocol layout tests pass; main app dependency tree contains no VST3 loader; brand literals are centralized in `tokens.rs`; required foreground/background contrast pairs pass; formatting, Clippy, tests, license checks, and audit pass.
+### Phase 1 - Worker data plane
 
-### Phase 1 - Worker feasibility spike
-
-Before scanner completeness or UI work, implement shared-memory banks, a fake rack worker, atomic request/completion, adaptive waiting, Mach timing, configurable load, 1/2/4/8 parallel workers, and crash/hang/late modes. Add one real VST3 smoke processor after the fake path works.
-
-Measure 48 kHz at 128 and 256 frames on the declared minimum Mac:
-
-- Main-to-worker wake latency and scheduler outliers.
-- Processing and completion-observation time.
-- Total callback percentiles and deadline misses.
-- CPU/energy cost and fault isolation.
-
-**Hard gate:** for 8 no-op workers over 30 minutes, no callback overrun or protocol corruption; dispatch/completion overhead p99.99 <= 150 µs and observed max < 400 µs. Under calibrated load, callback p99.9 < 70% of the period, p99.99 < 80%, and no callback exceeds the period. Killing/hanging one worker affects only its rack and triggers bounded fallback by the current or next block.
-
-If 128 fails, do not claim 128-frame support. If 256 fails, stop UI implementation and revise worker scheduling/data-plane design.
+Before scanner completeness or UI work, implement stable shared-memory banks, atomic request/completion, adaptive waiting, Mach timing, parallel rack workers, bounded deadlines, and crash/hang/late handling. Add the real VST3 processing path after the shared-memory path is complete. Keep timing, energy, deadline, and fault-containment diagnostics available for manual evaluation.
 
 ### Phase 2 - VST3 lifecycle and isolated scanner
 
-Implement the adapter, serial rack lifecycle, bus validation, parameters, state order, scanner helper, cache, quarantine, and HostChecker/sample-plug-in integration.
-
-**Gate:** main app never loads a plug-in; scanner faults identify the correct module; cache invalidates by fingerprint; arm64/universal modules scan; x86_64-only modules are rejected clearly; SDK sample plug-ins process audio/MIDI/parameters; state call-order tests pass.
+Implement the adapter, serial rack lifecycle, bus validation, parameters, state order, scanner helper, cache, quarantine, and SDK integration. Keep all plug-in loading in scanner and worker helpers, invalidate cached metadata by fingerprint, support arm64/universal modules, and clearly reject x86_64-only modules.
 
 ### Phase 3 - CoreAudio engine and fixed rack graph
 
-Implement device enumeration/configuration, bounded callback-size adaptation, preallocated format conversion, immutable graph arena, rack dispatch, hardware routing, gain/mute/bypass, dry delay, meters, and a realtime allocation guard.
-
-**Gate:** no callback allocation, mutex, control IPC, or file access; graph validation tests pass; device loss safely mutes and can recover; loopback confirms expected latency; 60-minute reference run has zero overruns; swaps and bypass remain click-bounded.
+Implement device enumeration/configuration, bounded callback-size adaptation, preallocated format conversion, immutable graph arena, rack dispatch, hardware routing, gain/mute/bypass, dry delay, meters, a realtime allocation guard, safe mute on device loss, and recovery. Keep callback work free of allocation, mutexes, control IPC, and file access.
 
 ### Phase 4 - Supervision and fault containment
 
-Implement dual-bank replacement, fault counters, best-effort slot attribution, one-time recovery with suspected slot bypassed, NaN/invalid-output detection, quarantine thresholds, and wet/dry or wet/silence transitions.
-
-**Gate:** every injected load/activation/processing/state/editor crash, hang, late block, malformed output, and disconnect leaves the main app and unaffected racks running; no unbounded wait or stale shared-memory output is accepted.
+Implement dual-bank replacement, fault counters, best-effort slot attribution, one-time recovery with the suspected slot bypassed, NaN/invalid-output detection, quarantine thresholds, and wet/dry or wet/silence transitions. Keep waits bounded, reject stale shared-memory output, and contain worker failures to the affected rack.
 
 ### Phase 5 - Session state and recovery
 
-Implement versioned package persistence, separate component/controller streams, parameter snapshots, atomic writes, recovery autosave, clean-shutdown marker, migrations, and missing/changed plug-in handling.
-
-**Gate:** save/load round-trip preserves the set; interrupted save retains the previous package; forced termination offers recovery; missing plug-ins become bypassed placeholders; opaque state is never restored during ordinary live scenes.
+Implement versioned package persistence, separate component/controller streams, parameter snapshots, atomic writes, recovery autosave, a clean-shutdown marker, migrations, and missing/changed plug-in handling. Preserve the previous package across interrupted writes, offer recovery after an unclean shutdown, represent missing plug-ins as bypassed placeholders, and never restore opaque state during ordinary live scenes.
 
 ### Phase 6 - MIDI and scenes
 
-Implement device selection, timing normalization, VST3 event translation, MIDI Learn, immutable mapping swaps, event-overflow policy, scene triggers, and deterministic parameter ramps.
-
-**Gate:** virtual MIDI timing error <= 1 ms under normal load; note-offs survive queue pressure; MIDI callback allocates nothing; repeated scene runs produce deterministic transitions and never restore opaque state.
+Implement device selection, timing normalization, VST3 event translation, MIDI Learn, immutable mapping swaps, event-overflow policy, scene triggers, and deterministic parameter ramps. Preserve note-offs under queue pressure, keep MIDI callbacks allocation-free, and exclude opaque state from scene recall.
 
 ### Phase 7A - Brand design-system foundation
 
-Only after the worker feasibility gate, load Sora/Space Mono or documented alpha fallbacks, implement the semantic token/theme layer, build the component gallery, cover interaction states, add keyboard/AccessKit metadata, and capture 1x/2x Retina visual snapshots.
-
-**Gate:** no literal palette values exist outside `tokens.rs`; relevant components demonstrate default, hover, pressed, focused, disabled, selected, loading, success, and fault states; contrast tests pass; the gallery is keyboard-operable; VoiceOver announces name/value/state; reduced-motion behavior works; meters repaint independently at the defined UI rate.
+After the worker data plane is established, load Sora/Space Mono or documented alpha fallbacks, implement the semantic token/theme layer, build the component gallery, cover default, hover, pressed, focused, disabled, selected, loading, success, and fault states, and add keyboard/AccessKit metadata. Keep palette values in `tokens.rs`, support reduced motion, and repaint meters independently at the defined UI rate.
 
 ### Phase 7B - Usable live-rack UI
 
-Assemble the top system bar, rack navigator, center serial-chain/editor workspace, collapsible inspector, and scene dock from approved components. Add source/output selectors, plug-in browser/quarantine, controls/meters, generic editor, worker-owned native editor actions, MIDI Learn, diagnostics, save, and recovery. Do not build a graph canvas.
-
-**Gate:** a rehearsal workflow can select devices, create/reorder racks and slots with pointer or keyboard, load/preload plug-ins, process audio/MIDI, edit long/discrete/read-only parameter sets, learn controls, recall scenes, understand a worker failure without opening diagnostics, survive a killed worker, save, relaunch, and restore. The UI remains legible at supported Retina scales.
+Assemble the top system bar, rack navigator, center serial-chain/editor workspace, collapsible inspector, and scene dock from approved components. Add source/output selectors, plug-in browser/quarantine, controls/meters, generic editor, worker-owned native editor actions, MIDI Learn, diagnostics, save, recovery, pointer and keyboard rack editing, clear worker-failure states, and legible supported Retina layouts. Do not build a graph canvas.
 
 ### Phase 8 - Alpha hardening
 
-Add compatibility corpus automation, HostChecker regressions, loopback report, click detector, MIDI report, memory tracking, fault matrix, sanitizers, and an 8-hour soak runner. Add visual-regression snapshots, keyboard-only workflow tests, a VoiceOver checklist, grayscale/color-deficiency review, long-name/truncation cases, fault-state usability tests, and meter repaint/CPU profiling.
-
-**Gate:** 8-hour reference set at the supported block size has zero main-process crashes and unexplained overruns, no sustained memory growth above 5% after warm-up, all injected worker failures are contained, compatibility outcomes are recorded rather than silently ignored, and the branded UI passes its visual/accessibility regression suite.
+Add compatibility outcome recording, memory tracking, fault diagnostics, long-name and truncation handling, accessible fault states, grayscale and color-deficiency support, keyboard-only operation, VoiceOver metadata, and meter repaint/CPU profiling. Keep compatibility failures explicit rather than silently ignoring them.
 
 ### Phase 9 - Distribution preparation
 
-For a personal alpha use local/development signing. Preserve the future security boundary: only plug-in-loading scanner/worker helpers receive `com.apple.security.cs.disable-library-validation`; the main app does not. Later add nested signing, hardened runtime, notarization, and stapling. Block public packaging until production logo/icon SVGs, licensed font files, an approved fault-red token, and documented asset provenance are available.
-
-## Verification Tooling
-
-Establish these standard checks:
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo nextest run --workspace
-cargo deny check
-cargo audit
-cargo llvm-cov nextest --workspace
-```
-
-Provide reproducible project commands through `cargo xtask`:
-
-```bash
-cargo xtask doctor
-cargo xtask ipc-feasibility --sample-rate 48000 --block-size 128 --workers 1,2,4,8 --minutes 30
-cargo xtask ipc-feasibility --sample-rate 48000 --block-size 256 --workers 1,2,4,8 --minutes 30
-cargo xtask fault-matrix --sample-rate 48000 --block-size 128
-cargo xtask host-checker --sdk "$VST3_SDK_DIR"
-cargo xtask compatibility --manifest compatibility/corpus.toml
-cargo xtask loopback --sample-rate 48000 --block-size 128 --device "BlackHole 2ch"
-cargo xtask click-test --sample-rate 48000 --block-size 128 --fault worker-kill
-cargo xtask midi-timing --sample-rate 48000 --block-size 128 --minutes 30
-cargo xtask soak --hours 8 --sample-rate 48000 --block-size 128 --manifest compatibility/corpus.toml
-```
-
-Also use model tests for slot-state/generation transitions, Miri for platform-neutral crates, and AddressSanitizer/ThreadSanitizer in separate runs. Validate with SDK sample plug-ins plus a small real-world corpus covering no-editor, resizing, dynamic latency, state-heavy, MIDI, mono/stereo mismatch, and failure-prone cases.
+Use a separate `local-dev` bundle profile for personal alpha artifacts and a `release` profile for distribution candidates. Stage every resource from a SHA-256-verified manifest. The release profile must block before packaging until production logo and icon exports, licensed font files, an approved fault-red token, and complete asset provenance/approval records are available; do not create substitutes to satisfy that gate. Preserve the security boundary: only plug-in-loading scanner/worker helpers receive `com.apple.security.cs.disable-library-validation`; the main app explicitly does not. Release candidates require Developer ID nested signing (helpers first), hardened runtime, timestamping, per-binary embedded-entitlement verification, `codesign --verify --deep --strict`, notarytool submission with wait, stapling/validation, and `spctl` assessment. Emit version/build/toolchain/Git provenance plus a helper hash and protocol-version manifest with each bundle.
 
 ## Documentation and ADRs
 
 Before implementation makes these expensive to change, document:
 
 1. Rack-only alpha topology.
-2. One worker per rack and the feasibility go/no-go gate.
+2. One worker per rack and the bounded worker/shared-memory data plane.
 3. Fixed shared-memory layout and atomic ownership protocol.
 4. Isolation of the young `vst3-host` dependency behind `sp-vst3`.
 5. Worker-owned native windows and generic main-app editor.
@@ -406,14 +347,14 @@ Before implementation makes these expensive to change, document:
 
 ## Top Risks
 
-- **macOS scheduling jitter:** Phase 1 is a hard gate; independent racks run in parallel and serial plug-ins stay inside one worker.
+- **macOS scheduling jitter:** independent racks run in parallel, serial plug-ins stay inside one worker, and deadline misses trigger bounded rack-local fallback.
 - **Young Rust VST3 host layer:** isolate it, audit every process path, and replace deficient operations with low-level `vst3` calls without leaking that change across the application.
 - **Rack-level failure scope:** a crashing plug-in removes its rack; retain the complete rack model in the main process and rebuild with the suspected slot bypassed.
-- **Shared-memory races/stale output:** fixed state machine, generations, stable banks, no early slot reuse, model tests, and aggressive fault injection.
+- **Shared-memory races/stale output:** fixed state machine, generations, stable banks, no early slot reuse, and fail-closed completion validation.
 - **Unsafe plug-in state behavior:** separate state streams, official restore order, inactive-only restore, fingerprints, and parameter-only live scenes.
 - **Native UI instability:** keep plug-in AppKit objects inside their worker and retain a generic editor in the main app.
-- **No general PDC:** prohibit phase-sensitive split/recombine paths until compensation is deliberately implemented and tested.
-- **Variable CoreAudio callback behavior:** validate actual stream behavior, use a bounded preallocated adapter, and reject devices/configurations that cannot sustain the selected mode.
+- **No general PDC:** prohibit phase-sensitive split/recombine paths until compensation is deliberately implemented.
+- **Variable CoreAudio callback behavior:** use a bounded preallocated adapter and reject unsupported callback sizes, devices, and stream configurations.
 - **Flattened/unlicensed brand assets:** treat the brand board as design direction only; centralize tokens and use alpha fallbacks, then require production vectors, licensed fonts, an approved fault red, and documented provenance before public distribution.
 
 ## Primary References
@@ -426,6 +367,6 @@ Before implementation makes these expensive to change, document:
 - [Apple real-time render guidance](https://developer.apple.com/library/archive/qa/qa1715/_index.html)
 - [Apple library-validation entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.disable-library-validation)
 - [`vst3-host`](https://docs.rs/crate/vst3-host/latest)
-- [`cpal`](https://github.com/RustAudio/cpal)
+- [Direct AUHAL backend decision](adr/0010-direct-auhal-backend.md)
 - [`midir`](https://docs.rs/midir/latest/midir/)
 - [`rtrb`](https://docs.rs/rtrb/latest/rtrb/)

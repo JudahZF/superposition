@@ -7,8 +7,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+rtrb.workspace = true
 sp-audio-io = { path = "../sp-audio-io" }
 sp-engine = { path = "../sp-engine" }
+sp-midi = { path = "../sp-midi" }
+sp-model = { path = "../sp-model" }
 sp-shared-memory = { path = "../sp-shared-memory" }
 sp-shared-memory-macos = { path = "../sp-shared-memory-macos" }
 

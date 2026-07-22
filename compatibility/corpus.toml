@@ -1,9 +1,9 @@
 # Compatibility corpus schema.
 #
-# Each `case` names a redistributable fixture beneath `fixture_root`. `expected`
-# records the outcome expected from the relevant compatibility phase; fixtures are
-# deliberately not executed merely by declaring them in this manifest.
-schema_version = 1
+# Every declared case names a fixture beneath `fixture_root` and is structurally
+# parsed before it is executed. A missing or failed mandatory case is a failed
+# qualification; placeholders and expected failures are not accepted.
+schema_version = 2
 
 [corpus]
 # Stable corpus identifier for reports and CI output.
@@ -12,7 +12,8 @@ name = "superposition-compatibility"
 fixture_root = "fixtures"
 
 [[case]]
-# Documented placeholder: no fixture is bundled and this case must not run yet.
-id = "not-run-placeholder"
-fixture = "not-run-placeholder.vst3"
-expected = "not-run"
+# Licensed installed fixture; keep the bundle out of source control unless it is redistributable.
+id = "mandatory-installed-vst3"
+fixture = "mandatory-installed-vst3.vst3"
+expected = "pass"
+mandatory = true

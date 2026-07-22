@@ -5,9 +5,11 @@ use std::collections::BTreeMap;
 use sp_model::{
     ChannelLayout, Endpoint, EndpointId, GainDb, MAX_RACKS, MidiController, MidiMapping,
     MidiMappingId, NormalizedParameters, NormalizedValue, ParameterAddress, ParameterId,
-    PluginDescriptor, PluginFingerprint, PluginIdentity, PluginInstanceId, PluginSlot, Rack,
-    RackGain, RackId, RackMute, RackTopology, Scene, SceneId, SceneParameterValue, Session,
-    SlotBypass, Source, SourceId, ValidationError,
+    PluginArchitecture, PluginBusConfiguration, PluginBusMetadata, PluginClassScanMetadata,
+    PluginDescriptor, PluginFingerprint, PluginIdentity, PluginInstanceId, PluginParameterMetadata,
+    PluginScanMetadata, PluginScanOutcome, PluginSlot, Rack, RackGain, RackId, RackMute,
+    RackTopology, Scene, SceneId, SceneParameterValue, Session, SlotBypass, Source, SourceId,
+    ValidationError,
 };
 
 fn valid_session() -> Session {
@@ -34,6 +36,9 @@ fn valid_session() -> Session {
             source_id: SourceId("input-a".into()),
             endpoint_id: EndpointId("output-a".into()),
             topology: RackTopology::default(),
+            gain_db: sp_model::GainDb::default(),
+            muted: false,
+            bypassed: false,
             slots: vec![PluginSlot {
                 id: PluginInstanceId("slot-a".into()),
                 plugin: PluginDescriptor {
@@ -48,6 +53,7 @@ fn valid_session() -> Session {
                         plugin_version: "1.0.0".into(),
                     },
                 },
+                bypassed: false,
                 parameters: NormalizedParameters { values: parameters },
             }],
         }],
@@ -115,6 +121,9 @@ fn rejects_capacity_before_following_invalid_references() {
             source_id: SourceId("missing".into()),
             endpoint_id: EndpointId("missing".into()),
             topology: RackTopology::default(),
+            gain_db: sp_model::GainDb::default(),
+            muted: false,
+            bypassed: false,
             slots: Vec::new(),
         })
         .collect();
@@ -125,6 +134,22 @@ fn rejects_capacity_before_following_invalid_references() {
             collection: sp_model::Collection::Racks,
             capacity: MAX_RACKS,
             found: MAX_RACKS + 1,
+        })
+    );
+}
+
+#[test]
+fn rejects_rack_slot_capacity_before_duplicate_slot_ids() {
+    let mut session = valid_session();
+    session.racks[0].slots =
+        vec![session.racks[0].slots[0].clone(); sp_model::MAX_SLOTS_PER_RACK + 1];
+
+    assert_eq!(
+        session.validate(),
+        Err(ValidationError::CapacityExceeded {
+            collection: sp_model::Collection::RackSlots,
+            capacity: sp_model::MAX_SLOTS_PER_RACK,
+            found: sp_model::MAX_SLOTS_PER_RACK + 1,
         })
     );
 }
@@ -141,4 +166,110 @@ fn rejects_scene_parameter_that_is_not_declared_by_its_slot() {
             ..
         })
     ));
+}
+
+#[test]
+fn persisted_sessions_require_an_explicit_supported_version() {
+    let encoded = serde_json::json!({
+        "sources": [],
+        "endpoints": [],
+        "racks": [],
+        "scenes": [],
+        "midi_mappings": []
+    });
+
+    assert!(serde_json::from_value::<Session>(encoded).is_err());
+
+    let mut unsupported = valid_session();
+    unsupported.version = 2;
+    assert!(matches!(
+        unsupported.validate(),
+        Err(ValidationError::UnsupportedVersion {
+            found: 2,
+            supported: 1
+        })
+    ));
+}
+
+#[test]
+fn alpha_validation_rejects_persisted_parallel_and_discrete_topologies() {
+    let mut parallel = valid_session();
+    parallel.racks[0].topology = RackTopology::Parallel;
+    assert!(matches!(
+        parallel.validate_for_alpha(),
+        Err(ValidationError::UnsupportedRackTopology {
+            topology: RackTopology::Parallel
+        })
+    ));
+
+    let mut discrete = valid_session();
+    discrete.sources[0].layout = ChannelLayout::Discrete { channels: 2 };
+    assert!(matches!(
+        discrete.validate_for_alpha(),
+        Err(ValidationError::UnsupportedChannelLayout {
+            layout: ChannelLayout::Discrete { channels: 2 }
+        })
+    ));
+}
+
+#[test]
+fn alpha_validation_rejects_unsupported_channel_conversion() {
+    let mut session = valid_session();
+    session.endpoints[0].layout = ChannelLayout::Mono;
+
+    assert!(matches!(
+        session.validate_for_alpha(),
+        Err(ValidationError::MismatchedRackLayouts {
+            source_layout: ChannelLayout::Stereo,
+            endpoint_layout: ChannelLayout::Mono,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn scan_metadata_round_trips_without_vst3_sdk_types() {
+    let metadata = PluginScanMetadata {
+        version: sp_model::PLUGIN_SCAN_METADATA_VERSION,
+        architecture: PluginArchitecture::Universal,
+        outcome: PluginScanOutcome::Supported,
+        classes: vec![PluginClassScanMetadata {
+            identity: PluginIdentity {
+                vendor: "Acme".into(),
+                name: "Filter".into(),
+                unique_id: "acme.filter".into(),
+            },
+            version: "1.2.3".into(),
+            buses: PluginBusConfiguration {
+                inputs: vec![PluginBusMetadata {
+                    index: 0,
+                    channels: 2,
+                    main: true,
+                    event: false,
+                }],
+                outputs: vec![PluginBusMetadata {
+                    index: 0,
+                    channels: 2,
+                    main: true,
+                    event: false,
+                }],
+            },
+            parameters: vec![PluginParameterMetadata {
+                id: 74,
+                name: "Cutoff".into(),
+                short_name: "Cut".into(),
+                unit: "Hz".into(),
+                default_normalized: Some(0.5),
+                automatable: true,
+                read_only: false,
+                bypass: false,
+            }],
+            editor_supported: true,
+        }],
+        detail: None,
+    };
+
+    let encoded = serde_json::to_string(&metadata).expect("serialize scan metadata");
+    let decoded: PluginScanMetadata = serde_json::from_str(&encoded).expect("deserialize metadata");
+    assert_eq!(decoded, metadata);
 }

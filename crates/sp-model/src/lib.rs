@@ -25,13 +25,12 @@ pub const MAX_MIDI_MAPPINGS: usize = 1_024;
 /// Maximum number of normalized parameters stored for one plug-in instance.
 pub const MAX_PARAMETERS_PER_PLUGIN: usize = 4_096;
 /// Maximum number of parameter overrides in one scene.
-pub const MAX_SCENE_PARAMETER_VALUES: usize = 4_096;
+pub const MAX_SCENE_PARAMETER_VALUES: usize = 256;
 
 /// A persisted Superposition session.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     /// The serialized schema version.
-    #[serde(default = "current_session_version")]
     pub version: u32,
     /// Available input sources.
     #[serde(default)]
@@ -70,12 +69,12 @@ impl Session {
         Self::default()
     }
 
-    /// Validates all schema, capacity, value, and reference invariants.
+    /// Validates schema, capacity, value, and reference invariants shared by all models.
     ///
     /// # Errors
     ///
     /// Returns [`ValidationError`] when a field, capacity, or cross-reference
-    /// violates the Phase 0 session contract.
+    /// is invalid.
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.version != CURRENT_SESSION_VERSION {
             return Err(ValidationError::UnsupportedVersion {
@@ -142,6 +141,7 @@ impl Session {
                 });
             }
             validate_capacity(Collection::RackSlots, rack.slots.len(), MAX_SLOTS_PER_RACK)?;
+            rack.gain_db.validate()?;
 
             let mut slot_ids = BTreeSet::new();
             for slot in &rack.slots {
@@ -183,10 +183,61 @@ impl Session {
 
         Ok(())
     }
-}
 
-const fn current_session_version() -> u32 {
-    CURRENT_SESSION_VERSION
+    /// Validates the subset of the model that the personal alpha can persist or activate.
+    ///
+    /// The generic model remains able to describe future topologies, while session-package
+    /// persistence must reject them before they can reach a live renderer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] when the model is invalid or requests parallel routing,
+    /// a non-mono/stereo layout, or an unsupported source-to-endpoint conversion.
+    pub fn validate_for_alpha(&self) -> Result<(), ValidationError> {
+        self.validate()?;
+
+        for source in &self.sources {
+            source.layout.validate_for_alpha()?;
+        }
+        for endpoint in &self.endpoints {
+            endpoint.layout.validate_for_alpha()?;
+        }
+        for rack in &self.racks {
+            if rack.topology != RackTopology::Serial {
+                return Err(ValidationError::UnsupportedRackTopology {
+                    topology: rack.topology,
+                });
+            }
+
+            let source = self
+                .sources
+                .iter()
+                .find(|source| source.id == rack.source_id)
+                .ok_or_else(|| ValidationError::UnknownReference {
+                    owner: EntityKind::Rack,
+                    reference: EntityKind::Source,
+                    id: rack.source_id.0.clone(),
+                })?;
+            let endpoint = self
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.id == rack.endpoint_id)
+                .ok_or_else(|| ValidationError::UnknownReference {
+                    owner: EntityKind::Rack,
+                    reference: EntityKind::Endpoint,
+                    id: rack.endpoint_id.0.clone(),
+                })?;
+            if source.layout != endpoint.layout {
+                return Err(ValidationError::MismatchedRackLayouts {
+                    rack_id: rack.id.0.clone(),
+                    source_layout: source.layout.clone(),
+                    endpoint_layout: endpoint.layout.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// An input source declaration.
@@ -225,6 +276,15 @@ pub struct Rack {
     /// Requested processing topology.
     #[serde(default)]
     pub topology: RackTopology,
+    /// Persisted rack output gain.
+    #[serde(default)]
+    pub gain_db: GainDb,
+    /// Persisted rack mute state.
+    #[serde(default)]
+    pub muted: bool,
+    /// Persisted latency-matched rack bypass state.
+    #[serde(default)]
+    pub bypassed: bool,
     /// Ordered plug-in instances.
     #[serde(default)]
     pub slots: Vec<PluginSlot>,
@@ -248,6 +308,9 @@ pub struct PluginSlot {
     pub id: PluginInstanceId,
     /// Immutable identity used to find the plug-in.
     pub plugin: PluginDescriptor,
+    /// Persisted plug-in bypass state.
+    #[serde(default)]
+    pub bypassed: bool,
     /// Persisted normalized parameter values.
     #[serde(default)]
     pub parameters: NormalizedParameters,
@@ -277,7 +340,7 @@ impl PluginDescriptor {
 }
 
 /// Platform-neutral metadata that identifies a plug-in.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginIdentity {
     /// Plug-in publisher.
     pub vendor: String,
@@ -296,6 +359,154 @@ pub struct PluginFingerprint {
     pub digest: String,
     /// Plug-in's reported version string.
     pub plugin_version: String,
+}
+
+/// Schema version for helper-produced plug-in scan metadata.
+pub const PLUGIN_SCAN_METADATA_VERSION: u32 = 1;
+
+/// CPU architecture advertised by a scanned plug-in bundle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginArchitecture {
+    /// Native Apple Silicon code is present.
+    Arm64,
+    /// Intel 64-bit code only.
+    X86_64,
+    /// Both Apple Silicon and Intel 64-bit code are present.
+    Universal,
+    /// The executable did not provide a recognized supported architecture.
+    #[default]
+    Unknown,
+}
+
+/// Outcome of an isolated plug-in scan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginScanOutcome {
+    /// The bundle and all reported classes were inspected successfully.
+    Supported,
+    /// The bundle has no native Apple Silicon code.
+    UnsupportedArchitecture,
+    /// The bundle layout is invalid.
+    InvalidBundle,
+    /// The scanner helper exceeded its deadline.
+    TimedOut,
+    /// The scanner helper exited without a valid report.
+    Crashed,
+    /// The helper loaded the SDK but could not enumerate the bundle.
+    SdkError,
+    /// The helper reported malformed or incompatible metadata.
+    #[default]
+    InvalidReport,
+}
+
+/// Platform-neutral scan metadata for one canonical bundle fingerprint.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PluginScanMetadata {
+    /// Version of this metadata schema.
+    #[serde(default = "plugin_scan_metadata_version")]
+    pub version: u32,
+    /// Architecture discovered before any plug-in code was loaded.
+    #[serde(default)]
+    pub architecture: PluginArchitecture,
+    /// Isolated-helper outcome.
+    #[serde(default)]
+    pub outcome: PluginScanOutcome,
+    /// Classes exposed by the bundle factory.
+    #[serde(default)]
+    pub classes: Vec<PluginClassScanMetadata>,
+    /// Optional bounded diagnostic text for the outcome.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+impl PluginScanMetadata {
+    /// Creates metadata using the current schema version.
+    #[must_use]
+    pub fn new(architecture: PluginArchitecture, outcome: PluginScanOutcome) -> Self {
+        Self {
+            version: PLUGIN_SCAN_METADATA_VERSION,
+            architecture,
+            outcome,
+            classes: Vec::new(),
+            detail: None,
+        }
+    }
+}
+
+const fn plugin_scan_metadata_version() -> u32 {
+    PLUGIN_SCAN_METADATA_VERSION
+}
+
+/// Factory metadata for a single VST3 class, free of VST3 SDK types.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PluginClassScanMetadata {
+    /// Vendor, display name, and stable class identity.
+    pub identity: PluginIdentity,
+    /// Version reported for this class or its bundle.
+    #[serde(default)]
+    pub version: String,
+    /// Supported input and output buses.
+    #[serde(default)]
+    pub buses: PluginBusConfiguration,
+    /// Parameters visible to the generic host editor.
+    #[serde(default)]
+    pub parameters: Vec<PluginParameterMetadata>,
+    /// Whether the class advertises a native editor view.
+    #[serde(default)]
+    pub editor_supported: bool,
+}
+
+/// Input and output buses supported by one plug-in class.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginBusConfiguration {
+    /// Input audio/event buses.
+    #[serde(default)]
+    pub inputs: Vec<PluginBusMetadata>,
+    /// Output audio/event buses.
+    #[serde(default)]
+    pub outputs: Vec<PluginBusMetadata>,
+}
+
+/// A plug-in bus available for host negotiation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginBusMetadata {
+    /// Zero-based bus index within its direction.
+    pub index: u32,
+    /// Number of discrete audio channels; zero denotes a non-audio/event bus.
+    pub channels: u8,
+    /// Whether this is the class's main bus for its direction.
+    #[serde(default)]
+    pub main: bool,
+    /// Whether this bus carries VST events rather than audio.
+    #[serde(default)]
+    pub event: bool,
+}
+
+/// Metadata for one generic-editor parameter.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PluginParameterMetadata {
+    /// Stable VST3 parameter identifier.
+    pub id: u32,
+    /// User-visible parameter title.
+    pub name: String,
+    /// Compact parameter title when the plug-in supplies one.
+    #[serde(default)]
+    pub short_name: String,
+    /// Unit displayed with formatted values.
+    #[serde(default)]
+    pub unit: String,
+    /// Plug-in default normalized value when available.
+    pub default_normalized: Option<f64>,
+    /// Whether the host may expose automation/MIDI binding for this parameter.
+    #[serde(default)]
+    pub automatable: bool,
+    /// Whether the parameter is read-only.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Whether the parameter controls the plug-in bypass state.
+    #[serde(default)]
+    pub bypass: bool,
 }
 
 /// Canonically ordered normalized values for a plug-in's parameters.
@@ -475,6 +686,12 @@ pub struct RackGain {
 #[serde(transparent)]
 pub struct GainDb(pub f32);
 
+impl Default for GainDb {
+    fn default() -> Self {
+        Self(0.0)
+    }
+}
+
 impl GainDb {
     /// Creates a valid scene gain.
     ///
@@ -647,6 +864,16 @@ impl ChannelLayout {
         }
         Ok(())
     }
+
+    fn validate_for_alpha(&self) -> Result<(), ValidationError> {
+        self.validate()?;
+        if matches!(self, Self::Discrete { .. }) {
+            return Err(ValidationError::UnsupportedChannelLayout {
+                layout: self.clone(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Stable source identifier.
@@ -738,6 +965,30 @@ pub enum ValidationError {
         found: u32,
         /// Version supported by this crate.
         supported: u32,
+    },
+    /// A persisted rack requests a topology that the personal alpha does not implement.
+    #[error("rack topology {topology:?} is not supported by the personal alpha")]
+    UnsupportedRackTopology {
+        /// Topology requested by the rack.
+        topology: RackTopology,
+    },
+    /// A persisted source or endpoint requests a layout that the personal alpha does not implement.
+    #[error("channel layout {layout:?} is not supported by the personal alpha")]
+    UnsupportedChannelLayout {
+        /// Layout requested by the model.
+        layout: ChannelLayout,
+    },
+    /// A persisted rack would require a channel conversion the personal alpha does not implement.
+    #[error(
+        "rack {rack_id:?} connects {source_layout:?} source channels to {endpoint_layout:?} endpoint channels"
+    )]
+    MismatchedRackLayouts {
+        /// Stable rack identifier.
+        rack_id: String,
+        /// Layout supplied by the selected source.
+        source_layout: ChannelLayout,
+        /// Layout required by the selected endpoint.
+        endpoint_layout: ChannelLayout,
     },
     /// A bounded collection is too large.
     #[error("{collection:?} has {found} entries; maximum is {capacity}")]

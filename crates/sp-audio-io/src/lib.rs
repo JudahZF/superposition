@@ -40,6 +40,47 @@ pub struct AudioDeviceInfo {
     pub max_output_channels: u16,
 }
 
+/// Directional capabilities for a device returned by a backend-specific enumeration API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioDeviceCapabilities {
+    /// Maximum capture channels advertised by the device.
+    pub max_input_channels: u16,
+    /// Maximum playback channels advertised by the device.
+    pub max_output_channels: u16,
+    /// Whether this is the system's current default input device.
+    pub is_default_input: bool,
+    /// Whether this is the system's current default output device.
+    pub is_default_output: bool,
+}
+
+/// A selected hardware route. Backends must reject unsupported cross-device duplex routes before
+/// they create a real-time stream; no callback-rate adaptation is implied by this type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioRouteConfig {
+    /// Device supplying capture samples. `None` requests an output-only route.
+    pub input: Option<AudioDeviceId>,
+    /// Device receiving the fixed product stereo output.
+    pub output: AudioDeviceId,
+    /// Fixed stream format requested from the backend.
+    pub format: AudioFormat,
+}
+
+/// A control-plane notification from an endpoint. Events are deliberately polled rather than
+/// delivered from a platform listener, so application recovery never executes on an audio thread.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AudioEndpointEvent {
+    /// A selected device ceased to be usable. The endpoint has muted its callback.
+    DeviceLost {
+        /// Stable identifier of the device that became unavailable.
+        device: AudioDeviceId,
+    },
+    /// A selected device changed format or topology. The endpoint has muted its callback.
+    DeviceConfigurationChanged {
+        /// Stable identifier of the device whose configuration changed.
+        device: AudioDeviceId,
+    },
+}
+
 /// The stream parameters negotiated with an audio endpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AudioFormat {
@@ -139,6 +180,35 @@ pub trait AudioEndpoint {
     fn enumerate_outputs(
         &self,
     ) -> Result<Vec<AudioDeviceInfo>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Lists capture-capable devices. The default implementation preserves output-only backends.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform cannot enumerate capture devices.
+    fn enumerate_inputs(
+        &self,
+    ) -> Result<Vec<AudioDeviceInfo>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Vec::new())
+    }
+
+    /// Starts a selected route. Backends that only support the legacy default-output path may
+    /// reject this request; this default deliberately does not silently discard the selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the route is unsupported or cannot be started.
+    fn start_route(
+        &mut self,
+        _route: AudioRouteConfig,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err("selected audio routes are not supported by this endpoint".into())
+    }
+
+    /// Returns a pending device event, if any. This must be non-blocking.
+    fn poll_event(&mut self) -> Option<AudioEndpointEvent> {
+        None
+    }
 
     /// Starts the endpoint with a validated format.
     ///

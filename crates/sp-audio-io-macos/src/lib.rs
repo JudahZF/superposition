@@ -6,10 +6,25 @@
 mod product;
 mod rack_dispatcher;
 
-pub use product::{MacOsAudioEndpoint, ProductRenderer};
-pub use rack_dispatcher::{RackDispatchTelemetry, RackSharedMemoryDispatcher};
+pub use product::{
+    MacOsAudioEndpoint, PreparedProductScene, ProductControl, ProductControlReceiver,
+    ProductRackDiagnostics, ProductRenderer, ProductTelemetry, current_product_parameters,
+    prepare_product_scenes, product_midi_mappings,
+};
+pub use rack_dispatcher::{
+    RackAutomationEvents, RackDispatchTelemetry, RackSharedMemoryDispatcher,
+};
 
-use std::{error::Error, ffi::c_void, fmt, mem, ptr::NonNull};
+use std::{
+    error::Error,
+    ffi::{CStr, c_char, c_void},
+    fmt, mem,
+    ptr::NonNull,
+};
+
+use sp_audio_io::{
+    AudioDeviceCapabilities, AudioDeviceId, AudioDeviceInfo, AudioEndpointEvent, AudioRouteConfig,
+};
 
 #[cfg(test)]
 use std::sync::{
@@ -185,12 +200,267 @@ pub trait PhaseOneRenderer: Send + 'static {
     fn render(&mut self, output: InterleavedStereoF32<'_>) -> RenderDisposition;
 }
 
+/// A fixed borrowed duplex callback block. The AUHAL shim owns the preallocated capture
+/// scratch buffer and converts the selected device format to interleaved product stereo before
+/// this value is constructed.
+pub struct DuplexStereoF32<'a> {
+    input: &'a [f32],
+    output: InterleavedStereoF32<'a>,
+}
+
+impl DuplexStereoF32<'_> {
+    /// Captured interleaved product-stereo input for this exact block.
+    #[must_use]
+    pub fn input(&self) -> &[f32] {
+        self.input
+    }
+
+    /// Mutable interleaved product-stereo output for this exact block.
+    pub fn output_mut(&mut self) -> &mut [f32] {
+        self.output.samples_mut()
+    }
+
+    /// Fixed frame count shared by input and output.
+    #[must_use]
+    pub const fn frames(&self) -> PhaseOneFrames {
+        self.output.frames()
+    }
+}
+
+/// Product renderer contract for the duplex AUHAL path.
+///
+/// This method is called by the `CoreAudio` thread. It receives only borrowed preallocated
+/// buffers, and therefore must not allocate, lock, wait, or make control-plane calls.
+pub trait DuplexRenderer: Send + 'static {
+    /// Processes one fixed-size captured block and writes its playback block.
+    fn render(&mut self, block: DuplexStereoF32<'_>) -> RenderDisposition;
+}
+
+/// `CoreAudio` device metadata with the stable identifier and directional capabilities needed to
+/// select a route. A device ID is `coreaudio:<AudioDeviceID>` and remains stable for the life of
+/// the `CoreAudio` device object; callers must handle a later `DeviceLost` event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MacOsAudioDevice {
+    /// Platform-neutral visible metadata.
+    pub info: AudioDeviceInfo,
+    /// Directional channels and default-device flags.
+    pub capabilities: AudioDeviceCapabilities,
+    /// Fixed product callback sizes supported by this device at 48 kHz.
+    pub supported_buffer_frames: Vec<u32>,
+}
+
+fn clamp_channels(channels: u32) -> u16 {
+    u16::try_from(channels.min(u32::from(u16::MAX))).expect("clamped to u16 range")
+}
+
+/// Lists hardware devices directly from `CoreAudio`. No audio unit is opened by enumeration.
+///
+/// # Errors
+/// Returns [`CoreAudioError`] when the system device query fails.
+pub fn enumerate_devices() -> Result<Vec<MacOsAudioDevice>, CoreAudioError> {
+    let count = unsafe { sp_audio_device_count() };
+    let mut devices = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+    for index in 0..count {
+        let mut raw = RawEnumeratedDevice::default();
+        let status = unsafe { sp_audio_device_at(index, &raw mut raw) };
+        if status != 0 {
+            return Err(CoreAudioError::System {
+                operation: CoreAudioOperation::EnumerateDevices,
+                status,
+            });
+        }
+        let name = unsafe { CStr::from_ptr(raw.name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        let id = AudioDeviceId::new(format!("coreaudio:{}", raw.device_id));
+        devices.push(MacOsAudioDevice {
+            info: AudioDeviceInfo {
+                id,
+                name,
+                max_output_channels: clamp_channels(raw.output_channels),
+            },
+            capabilities: AudioDeviceCapabilities {
+                max_input_channels: clamp_channels(raw.input_channels),
+                max_output_channels: clamp_channels(raw.output_channels),
+                is_default_input: raw.is_default_input != 0,
+                is_default_output: raw.is_default_output != 0,
+            },
+            supported_buffer_frames: supported_buffer_frames(&raw),
+        });
+    }
+    Ok(devices)
+}
+
+fn supported_buffer_frames(raw: &RawEnumeratedDevice) -> Vec<u32> {
+    [
+        (raw.supports_128_frames != 0).then_some(128),
+        (raw.supports_256_frames != 0).then_some(256),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// A started same-device AUHAL capture/playback stream. It mutes immediately after `CoreAudio`
+/// signals device loss or a relevant format/topology change; recovery is control-plane work.
+pub struct ActiveDuplex<R: DuplexRenderer> {
+    output: Option<NonNull<RawAudioOutput>>,
+    renderer: Option<Box<R>>,
+    route: AudioRouteConfig,
+    last_telemetry: CallbackTelemetry,
+}
+
+impl<R: DuplexRenderer> ActiveDuplex<R> {
+    /// Starts a selected same-device route after validating the fixed 48 kHz/128-or-256 contract.
+    ///
+    /// # Errors
+    /// Returns [`CoreAudioError`] when the route is unsupported or the unit cannot start.
+    pub fn start(
+        route: AudioRouteConfig,
+        renderer: R,
+        allow_device_reconfiguration: bool,
+    ) -> Result<Self, CoreAudioError> {
+        let format = route.format;
+        if !format.is_product_format() {
+            return Err(CoreAudioError::UnsupportedRoute);
+        }
+        let input = route.input.as_ref().ok_or(CoreAudioError::InputRequired)?;
+        let input_id = parse_core_audio_device_id(input)?;
+        let output_id = parse_core_audio_device_id(&route.output)?;
+        if input_id != output_id {
+            return Err(CoreAudioError::SeparateDuplexDevicesUnsupported);
+        }
+        let mut renderer = Box::new(renderer);
+        let mut output = std::ptr::null_mut();
+        let result = unsafe {
+            sp_audio_duplex_create(
+                &raw mut output,
+                input_id,
+                format.max_frames_per_callback,
+                u8::from(allow_device_reconfiguration),
+                std::ptr::from_mut(renderer.as_mut()).cast::<c_void>(),
+                duplex_render_trampoline::<R>,
+            )
+        };
+        let output = NonNull::new(output);
+        if result.status != 0 {
+            if let Some(native) = output {
+                if result.renderer_retired != 0 && result.native_releasable != 0 {
+                    unsafe { sp_audio_output_release(native.as_ptr()) };
+                } else {
+                    mem::forget(renderer);
+                }
+            }
+            return Err(core_audio_error(result));
+        }
+        let Some(output) = output else {
+            return Err(CoreAudioError::NativeInvariant);
+        };
+        Ok(Self {
+            output: Some(output),
+            renderer: Some(renderer),
+            route,
+            last_telemetry: CallbackTelemetry::default(),
+        })
+    }
+
+    /// The selected route.
+    #[must_use]
+    pub fn route(&self) -> &AudioRouteConfig {
+        &self.route
+    }
+
+    /// Non-blocking device-loss/change notification. Once an event is observed, the native
+    /// callback stays muted until this stream is stopped and a newly validated stream is started.
+    pub fn poll_event(&mut self) -> Option<AudioEndpointEvent> {
+        let output = self.output?;
+        let event = unsafe { sp_audio_output_take_device_event(output.as_ptr()) };
+        match event {
+            1 => Some(AudioEndpointEvent::DeviceLost {
+                device: self.route.output.clone(),
+            }),
+            2 => Some(AudioEndpointEvent::DeviceConfigurationChanged {
+                device: self.route.output.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// A coherent callback telemetry snapshot.
+    #[must_use]
+    pub fn telemetry(&self) -> CallbackTelemetry {
+        self.output.map_or(self.last_telemetry, |o| unsafe {
+            sp_audio_output_telemetry(o.as_ptr()).into()
+        })
+    }
+
+    /// Retires the callback and native unit before dropping the renderer.
+    ///
+    /// # Errors
+    /// Returns [`CoreAudioError`] when the native unit cannot be destroyed cleanly.
+    pub fn stop(&mut self) -> Result<(), CoreAudioError> {
+        let Some(output) = self.output else {
+            return Ok(());
+        };
+        let result = unsafe { sp_audio_output_destroy(output.as_ptr()) };
+        if result.status != 0 || result.renderer_retired == 0 || result.native_releasable == 0 {
+            return Err(core_audio_error(result));
+        }
+        self.last_telemetry = unsafe { sp_audio_output_telemetry(output.as_ptr()).into() };
+        self.output = None;
+        unsafe { sp_audio_output_release(output.as_ptr()) };
+        drop(self.renderer.take());
+        Ok(())
+    }
+}
+
+impl<R: DuplexRenderer> Drop for ActiveDuplex<R> {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+fn parse_core_audio_device_id(id: &AudioDeviceId) -> Result<u32, CoreAudioError> {
+    id.as_str()
+        .strip_prefix("coreaudio:")
+        .and_then(|raw| raw.parse().ok())
+        .ok_or(CoreAudioError::InvalidDeviceId)
+}
+
+unsafe extern "C" fn duplex_render_trampoline<R: DuplexRenderer>(
+    renderer: *mut c_void,
+    input: *const f32,
+    output: *mut f32,
+    frames: u32,
+) -> u32 {
+    let Some(frames) = PhaseOneFrames::from_u32(frames) else {
+        return 0;
+    };
+    if renderer.is_null() || input.is_null() || output.is_null() {
+        return 0;
+    }
+    let samples = frames.interleaved_sample_count();
+    let input = unsafe { std::slice::from_raw_parts(input, samples) };
+    let output = unsafe { std::slice::from_raw_parts_mut(output, samples) };
+    let Ok(output) = InterleavedStereoF32::new(output, frames) else {
+        return 0;
+    };
+    let renderer = unsafe { &mut *renderer.cast::<R>() };
+    match renderer.render(DuplexStereoF32 { input, output }) {
+        RenderDisposition::Rendered => RENDERED,
+        RenderDisposition::Silence => 0,
+    }
+}
+
 /// A strictly observed device and audio-unit format report.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeviceFormatReport {
     /// Exact nominal device sample rate in hertz.
     pub sample_rate_hz: f64,
-    /// Total output channels from the device stream configuration.
+    /// Total physical output channels from the device stream configuration.
+    ///
+    /// The AUHAL client stream remains fixed stereo and is explicitly mapped to physical
+    /// channels 1–2, so a device with more than two physical outputs remains eligible.
     pub channel_count: u32,
     /// Current device buffer frame count.
     pub current_frames_per_slice: u32,
@@ -210,11 +480,11 @@ pub struct DeviceFormatReport {
 }
 
 impl DeviceFormatReport {
-    /// Returns whether this report strictly matches the selected fixed Phase 1 format.
+    /// Returns whether this report supports the selected fixed stereo Phase 1 client format.
     #[must_use]
     pub const fn matches_phase_one(self, frames: PhaseOneFrames) -> bool {
         self.sample_rate_hz.to_bits() == 48_000.0_f64.to_bits()
-            && self.channel_count == 2
+            && self.channel_count >= 2
             && self.current_frames_per_slice == frames.as_u32()
             && self.supported_minimum_frames_per_slice <= frames.as_u32()
             && frames.as_u32() <= self.supported_maximum_frames_per_slice
@@ -231,6 +501,8 @@ pub enum CoreAudioOperation {
     ResolveDefaultDevice,
     /// Reading the device format.
     ReadDeviceFormat,
+    /// Enumerating hardware devices.
+    EnumerateDevices,
     /// Requesting a 48 kHz device sample rate.
     RequestSampleRate,
     /// Requesting the selected device buffer frame count.
@@ -304,6 +576,7 @@ impl CoreAudioOperation {
         match operation {
             1 => Self::ResolveDefaultDevice,
             2 => Self::ReadDeviceFormat,
+            41 => Self::EnumerateDevices,
             3 => Self::RequestSampleRate,
             4 => Self::RequestFrameCount,
             5 => Self::VerifyDeviceFormat,
@@ -345,6 +618,7 @@ impl CoreAudioOperation {
         match self {
             Self::ResolveDefaultDevice => 1,
             Self::ReadDeviceFormat => 2,
+            Self::EnumerateDevices => 41,
             Self::RequestSampleRate => 3,
             Self::RequestFrameCount => 4,
             Self::VerifyDeviceFormat => 5,
@@ -432,6 +706,14 @@ pub enum CoreAudioError {
     },
     /// The C shim reported success without returning valid native ownership.
     NativeInvariant,
+    /// The route did not use the fixed product format.
+    UnsupportedRoute,
+    /// Duplex capture requires an explicit input device.
+    InputRequired,
+    /// A persisted ID was not issued by this `CoreAudio` backend.
+    InvalidDeviceId,
+    /// This direct AUHAL backend intentionally does not clock two separate devices.
+    SeparateDuplexDevicesUnsupported,
 }
 
 impl fmt::Display for CoreAudioError {
@@ -439,8 +721,8 @@ impl fmt::Display for CoreAudioError {
         match self {
             Self::UnsupportedDeviceFormat { report } => write!(
                 formatter,
-                "Phase 1 requires exact 48 kHz fixed-size stereo callbacks; device reported \
-                 {} Hz, {} channels, current/supported/callback-max {}/{}/{}/{} frames, variable={}",
+                "Phase 1 requires exact 48 kHz fixed-size stereo client callbacks; device reported \
+                 {} Hz, {} physical output channels, current/supported/callback-max {}/{}/{}/{} frames, variable={}",
                 report.sample_rate_hz,
                 report.channel_count,
                 report.current_frames_per_slice,
@@ -477,6 +759,13 @@ impl fmt::Display for CoreAudioError {
             Self::NativeInvariant => {
                 formatter.write_str("C shim returned invalid native ownership")
             }
+            Self::UnsupportedRoute => {
+                formatter.write_str("route must use fixed 48 kHz stereo with 128 or 256 frames")
+            }
+            Self::InputRequired => formatter.write_str("duplex route requires an input device"),
+            Self::InvalidDeviceId => formatter.write_str("invalid CoreAudio device identifier"),
+            Self::SeparateDuplexDevicesUnsupported => formatter
+                .write_str("separate input/output devices are not supported by direct AUHAL"),
         }
     }
 }
@@ -958,6 +1247,34 @@ impl From<RawDeviceFormatReport> for DeviceFormatReport {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct RawEnumeratedDevice {
+    device_id: u32,
+    input_channels: u32,
+    output_channels: u32,
+    is_default_input: u32,
+    is_default_output: u32,
+    supports_128_frames: u32,
+    supports_256_frames: u32,
+    name: [c_char; 256],
+}
+
+impl Default for RawEnumeratedDevice {
+    fn default() -> Self {
+        Self {
+            device_id: 0,
+            input_channels: 0,
+            output_channels: 0,
+            is_default_input: 0,
+            is_default_output: 0,
+            supports_128_frames: 0,
+            supports_256_frames: 0,
+            name: [0; 256],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct RawCallbackTelemetry {
     callbacks: u64,
     rendered: u64,
@@ -1037,6 +1354,17 @@ unsafe extern "C" {
     fn sp_audio_output_destroy(output: *mut RawAudioOutput) -> RawAudioResult;
     fn sp_audio_output_release(output: *mut RawAudioOutput);
     fn sp_audio_output_telemetry(output: *const RawAudioOutput) -> RawCallbackTelemetry;
+    fn sp_audio_device_count() -> u32;
+    fn sp_audio_device_at(index: u32, device: *mut RawEnumeratedDevice) -> i32;
+    fn sp_audio_output_take_device_event(output: *mut RawAudioOutput) -> u32;
+    fn sp_audio_duplex_create(
+        output: *mut *mut RawAudioOutput,
+        device: u32,
+        frames: u32,
+        allow_reconfiguration: u8,
+        renderer: *mut c_void,
+        render: unsafe extern "C" fn(*mut c_void, *const f32, *mut f32, u32) -> u32,
+    ) -> RawAudioResult;
 
     #[cfg(test)]
     fn sp_audio_test_invoke(
@@ -1184,9 +1512,11 @@ enum TestInvokeError {
 mod tests {
     use super::{
         ActiveOutput, CallbackTelemetry, CoreAudioError, CoreAudioFailure, CoreAudioOperation,
-        InterleavedStereoF32, PhaseOneConfig, PhaseOneFrames, PhaseOneRenderer, RenderDisposition,
-        TestFakeConfig, TestHook, TestInvokeError,
+        InterleavedStereoF32, PhaseOneConfig, PhaseOneFrames, PhaseOneRenderer,
+        RawEnumeratedDevice, RenderDisposition, TestFakeConfig, TestHook, TestInvokeError,
+        supported_buffer_frames,
     };
+
     use std::{
         ffi::c_void,
         fs::File,
@@ -1200,6 +1530,16 @@ mod tests {
         },
         thread,
     };
+
+    #[test]
+    fn exposes_only_supported_product_buffer_sizes() {
+        let raw = RawEnumeratedDevice {
+            supports_128_frames: 0,
+            supports_256_frames: 1,
+            ..RawEnumeratedDevice::default()
+        };
+        assert_eq!(supported_buffer_frames(&raw), [256]);
+    }
 
     unsafe extern "C" {
         fn pipe(file_descriptors: *mut i32) -> i32;
@@ -1279,6 +1619,26 @@ mod tests {
         )
         .expect("fake backend starts");
         (output, hook)
+    }
+
+    #[test]
+    fn fixed_stereo_client_accepts_a_multichannel_output_device() {
+        let mut fake = TestFakeConfig::new(PhaseOneFrames::Frames128);
+        fake.raw.channel_count = 64;
+        let (mut output, _) = start_test(PhaseOneFrames::Frames128, renderer(), fake);
+        assert_eq!(output.device_format().channel_count, 64);
+        assert!(
+            output
+                .device_format()
+                .matches_phase_one(PhaseOneFrames::Frames128)
+        );
+
+        let mut samples = vec![0.0; 256];
+        output
+            .invoke_test_callback(128, 1, 2, 1_024, &mut samples)
+            .expect("fixed stereo client callback");
+        assert_eq!(output.telemetry().invalid_channels, 0);
+        output.stop().expect("fake output stops");
     }
 
     #[test]

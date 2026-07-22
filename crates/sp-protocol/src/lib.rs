@@ -7,6 +7,11 @@
 //! Phase 0 keeps these structures in process-owned memory; a later phase can map the
 //! exact same layout into an OS-backed shared-memory region.
 
+/// Bounded request/response control-plane transport contract.
+pub mod control;
+/// Bounded typed payload codecs for control-plane operations.
+pub mod payload;
+
 use std::fmt;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -14,9 +19,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 pub const PROTOCOL_MAGIC: u32 = u32::from_le_bytes(*b"SP00");
 /// Version of the Phase 1 binary layout.
 ///
-/// Version 2 adds shared monotonic timing and worker-heartbeat fields to the bank
-/// header and slot metadata. Older mappings must therefore be rejected.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Version 3 adds calibrated worker busy-time counters to the shared header. Version 2 added
+/// shared monotonic timing and worker-heartbeat fields. Older mappings must therefore be rejected.
+pub const PROTOCOL_VERSION: u32 = 3;
 /// Number of racks available in an Alpha topology.
 pub const MAX_RACKS: usize = 8;
 /// Number of plugins available in each Alpha rack.
@@ -31,6 +36,10 @@ pub const BLOCK_SLOT_COUNT: usize = 4;
 pub const MAX_MIDI_EVENTS: usize = 256;
 /// Maximum automation or transport events carried by one block.
 pub const MAX_EVENTS: usize = 256;
+/// Block-event discriminator for a normalized plug-in parameter change.
+pub const BLOCK_EVENT_PARAMETER: u32 = 1;
+/// Block-event discriminator for a plug-in slot bypass change.
+pub const BLOCK_EVENT_SLOT_BYPASS: u32 = 2;
 /// Length of the fixed, UTF-8-by-convention plugin identifier buffer.
 pub const PLUGIN_IDENTIFIER_BYTES: usize = 64;
 
@@ -163,13 +172,20 @@ pub struct BlockRequest {
 }
 
 impl BlockRequest {
-    /// Checks that every bounded count fits the Phase 0 fixed layout.
+    /// Checks that every bounded count fits the Phase 0 fixed audio layout.
+    ///
+    /// An Alpha request always carries at least one frame and one output channel. Input
+    /// remains allowed to be zero so an instrument rack can produce audio without an
+    /// upstream audio bus.
     pub const fn is_valid(self) -> bool {
-        self.frame_count <= MAX_FRAMES_U32
+        self.frame_count != 0
+            && self.frame_count <= MAX_FRAMES_U32
             && self.input_channel_count <= MAX_CHANNELS_U32
+            && self.output_channel_count != 0
             && self.output_channel_count <= MAX_CHANNELS_U32
             && self.midi_event_count <= MAX_MIDI_EVENTS_U32
             && self.event_count <= MAX_EVENTS_U32
+            && self.flags == 0
     }
 }
 
@@ -198,6 +214,41 @@ impl PluginDescriptor {
         output_channel_count: 0,
         reserved: 0,
     };
+
+    /// Returns whether this descriptor is the all-zero unused entry.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        if self.enabled != 0
+            || self.input_channel_count != 0
+            || self.output_channel_count != 0
+            || self.reserved != 0
+        {
+            return false;
+        }
+        let mut index = 0;
+        while index < PLUGIN_IDENTIFIER_BYTES {
+            if self.identifier[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+
+    /// Returns whether this raw descriptor uses an Alpha-supported main-bus layout.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        let is_disabled = self.enabled == 0
+            && self.input_channel_count == 0
+            && self.output_channel_count == 0
+            && self.reserved == 0;
+        let is_enabled = self.enabled == 1
+            && self.input_channel_count <= MAX_CHANNELS_U32
+            && self.output_channel_count >= 1
+            && self.output_channel_count <= MAX_CHANNELS_U32
+            && self.reserved == 0;
+        is_disabled || is_enabled
+    }
 }
 
 /// Fixed plugin list for a single Alpha rack.
@@ -220,10 +271,23 @@ impl RackDescriptor {
         plugins: [PluginDescriptor::EMPTY; MAX_PLUGINS_PER_RACK],
     };
 
-    /// Returns whether the declared plugin count fits the fixed array.
+    /// Returns whether the descriptor uses only fixed Alpha capacities and layouts.
     #[must_use]
     pub const fn is_valid(self) -> bool {
-        self.plugin_count <= MAX_PLUGINS_PER_RACK_U32
+        if self.plugin_count > MAX_PLUGINS_PER_RACK_U32 {
+            return false;
+        }
+
+        let mut index = 0;
+        while index < MAX_PLUGINS_PER_RACK {
+            let plugin = self.plugins[index];
+            let is_declared = index < self.plugin_count as usize;
+            if !plugin.is_valid() || (!is_declared && !plugin.is_empty()) {
+                return false;
+            }
+            index += 1;
+        }
+        true
     }
 }
 
@@ -271,7 +335,7 @@ impl BlockEvent {
     /// Checks the event's frame offset against a block length.
     #[must_use]
     pub const fn is_valid(self, frame_count: u32) -> bool {
-        self.frame_offset < frame_count
+        self.frame_offset < frame_count && self.value.is_finite()
     }
 }
 
@@ -428,6 +492,89 @@ impl BlockSlot {
         }
     }
 
+    fn validate_request_payload(&self, request: BlockRequest) -> Result<(), ProtocolError> {
+        if !request.is_valid() {
+            return Err(ProtocolError::InvalidRequest);
+        }
+
+        let midi_event_count =
+            usize::try_from(request.midi_event_count).map_err(|_| ProtocolError::InvalidRequest)?;
+        let event_count =
+            usize::try_from(request.event_count).map_err(|_| ProtocolError::InvalidRequest)?;
+        if self.midi_events[..midi_event_count]
+            .iter()
+            .any(|event| !event.is_valid(request.frame_count))
+            || self.events[..event_count]
+                .iter()
+                .any(|event| !event.is_valid(request.frame_count))
+        {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        Ok(())
+    }
+
+    /// Validates a mapped slot's state-appropriate metadata without changing ownership.
+    ///
+    /// A free slot may retain payload bytes and tickets from its previous use. Every other
+    /// state must have a live request with bounded payload metadata. Request, processing,
+    /// completion, and abandoned states additionally require the tickets, owner, and partial
+    /// timestamp sequence that their published state permits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol error when memory contains an unknown state, malformed active
+    /// request, invalid ticket or owner, inconsistent completion, or invalid timing record.
+    pub fn validate_mapped_contents(&self) -> Result<(), ProtocolError> {
+        let state = self.metadata.state()?;
+        let owner = self.metadata.owner.load(Ordering::Acquire);
+        if state == SlotState::Free {
+            return (owner == OWNER_NONE)
+                .then_some(())
+                .ok_or(ProtocolError::InvalidOwner);
+        }
+
+        let request = self.metadata.request();
+        let ticket = self.metadata.ticket();
+        if !ticket.is_valid() {
+            return Err(ProtocolError::InvalidTicket);
+        }
+        self.validate_request_payload(request)?;
+        if self.metadata.reserved != [0; 2] {
+            return Err(ProtocolError::InvalidRequest);
+        }
+
+        let completion = self.metadata.completion_ticket();
+        let timing = self.metadata.timing();
+        match state {
+            SlotState::Requested => {
+                require_no_slot_owner(owner)?;
+                require_empty_completion(completion)?;
+                validate_requested_timing(timing)
+            }
+            SlotState::Processing => {
+                require_worker_slot_owner(owner)?;
+                require_empty_completion(completion)?;
+                validate_processing_timing(timing)
+            }
+            SlotState::Complete => {
+                require_no_slot_owner(owner)?;
+                if completion != ticket || !completion.is_valid() {
+                    return Err(ProtocolError::MalformedCompletion);
+                }
+                timing
+                    .is_valid()
+                    .then_some(())
+                    .ok_or(ProtocolError::InvalidTimestamp)
+            }
+            SlotState::Abandoned => {
+                require_no_slot_owner(owner)?;
+                require_empty_completion(completion)?;
+                validate_abandoned_timing(timing)
+            }
+            SlotState::Free => unreachable!("free slots return before active validation"),
+        }
+    }
+
     /// Publishes a producer request from a free slot.
     ///
     /// The caller must have exclusively written the input payload before calling this
@@ -473,11 +620,19 @@ impl BlockSlot {
         if !ticket.is_valid() {
             return Err(ProtocolError::InvalidTicket);
         }
-        if !request.is_valid() {
+        self.validate_request_payload(request)?;
+        if self.metadata.reserved != [0; 2] {
             return Err(ProtocolError::InvalidRequest);
         }
         self.acquire_owner(OWNER_REQUESTING)?;
-        if self.metadata.state()? != SlotState::Free {
+        let state = match self.metadata.state() {
+            Ok(state) => state,
+            Err(error) => {
+                self.release_owner(OWNER_REQUESTING);
+                return Err(error);
+            }
+        };
+        if state != SlotState::Free {
             self.release_owner(OWNER_REQUESTING);
             return Err(ProtocolError::UnexpectedState);
         }
@@ -587,6 +742,10 @@ impl BlockSlot {
                 return Err(ProtocolError::UnexpectedState);
             }
             let ticket = self.metadata.ticket();
+            if !ticket.is_valid() {
+                return Err(ProtocolError::InvalidTicket);
+            }
+            self.validate_request_payload(self.metadata.request())?;
             if expected_ticket.is_some_and(|expected| expected != ticket) {
                 return Err(ProtocolError::StaleTicket);
             }
@@ -769,6 +928,9 @@ impl BlockSlot {
         &self,
         ticket: BlockTicket,
     ) -> Result<BlockTiming, ProtocolError> {
+        if !ticket.is_valid() {
+            return Err(ProtocolError::InvalidTicket);
+        }
         self.acquire_owner(OWNER_COMPLETING)?;
         let result = (|| {
             let snapshot = self
@@ -815,7 +977,7 @@ impl BlockSlot {
             return Err(ProtocolError::MalformedCompletion);
         }
         let request = self.metadata.request();
-        if !request.is_valid() {
+        if self.metadata.reserved != [0; 2] || self.validate_request_payload(request).is_err() {
             return Err(ProtocolError::MalformedCompletion);
         }
         let timing = self.metadata.timing();
@@ -836,6 +998,9 @@ impl BlockSlot {
     /// Returns an error if a worker or another transition owns the slot, or if the
     /// slot is no longer the requested ticket.
     pub fn abandon_request(&self, ticket: BlockTicket) -> Result<(), ProtocolError> {
+        if !ticket.is_valid() {
+            return Err(ProtocolError::InvalidTicket);
+        }
         self.acquire_owner(OWNER_RECLAIMING)?;
         let result = (|| {
             if self.metadata.state()? != SlotState::Requested || self.metadata.ticket() != ticket {
@@ -882,17 +1047,21 @@ impl BlockSlot {
     /// Returns an error if another transition owns the slot or it is not abandoned.
     pub fn reclaim_abandoned(&self) -> Result<(), ProtocolError> {
         self.acquire_owner(OWNER_RECLAIMING)?;
-        let result = self
-            .metadata
-            .state
-            .compare_exchange(
-                SlotState::Abandoned.raw(),
-                SlotState::Free.raw(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map(|_| ())
-            .map_err(|_| ProtocolError::UnexpectedState);
+        let result = (|| {
+            if self.metadata.state()? != SlotState::Abandoned {
+                return Err(ProtocolError::UnexpectedState);
+            }
+            self.metadata
+                .state
+                .compare_exchange(
+                    SlotState::Abandoned.raw(),
+                    SlotState::Free.raw(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map(|_| ())
+                .map_err(|_| ProtocolError::UnexpectedState)
+        })();
         self.release_owner(OWNER_RECLAIMING);
         result
     }
@@ -915,6 +1084,9 @@ impl BlockSlot {
     }
 
     fn require_worker(&self, worker_id: u32, ticket: BlockTicket) -> Result<(), ProtocolError> {
+        if !ticket.is_valid() {
+            return Err(ProtocolError::InvalidTicket);
+        }
         if worker_id == OWNER_NONE || is_reserved_owner(worker_id) {
             return Err(ProtocolError::InvalidOwner);
         }
@@ -950,6 +1122,56 @@ impl Default for BlockSlot {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn require_no_slot_owner(owner: u32) -> Result<(), ProtocolError> {
+    (owner == OWNER_NONE)
+        .then_some(())
+        .ok_or(ProtocolError::InvalidOwner)
+}
+
+fn require_worker_slot_owner(owner: u32) -> Result<(), ProtocolError> {
+    (owner != OWNER_NONE && !is_reserved_owner(owner))
+        .then_some(())
+        .ok_or(ProtocolError::InvalidOwner)
+}
+
+fn require_empty_completion(completion: BlockTicket) -> Result<(), ProtocolError> {
+    (completion
+        == BlockTicket {
+            generation: 0,
+            sequence: 0,
+        })
+    .then_some(())
+    .ok_or(ProtocolError::MalformedCompletion)
+}
+
+fn validate_requested_timing(timing: BlockTiming) -> Result<(), ProtocolError> {
+    let untimed = timing == BlockTiming::default();
+    let timed = timing.request_published_tick != 0
+        && timing.worker_claimed_tick == 0
+        && timing.completion_published_tick == 0;
+    (untimed || timed)
+        .then_some(())
+        .ok_or(ProtocolError::InvalidTimestamp)
+}
+
+fn validate_processing_timing(timing: BlockTiming) -> Result<(), ProtocolError> {
+    let untimed = timing == BlockTiming::default();
+    let timed = timing.request_published_tick != 0
+        && timing.worker_claimed_tick >= timing.request_published_tick
+        && timing.completion_published_tick == 0;
+    (untimed || timed)
+        .then_some(())
+        .ok_or(ProtocolError::InvalidTimestamp)
+}
+
+fn validate_abandoned_timing(timing: BlockTiming) -> Result<(), ProtocolError> {
+    let unclaimed = validate_requested_timing(timing).is_ok();
+    let claimed = validate_processing_timing(timing).is_ok();
+    (unclaimed || claimed)
+        .then_some(())
+        .ok_or(ProtocolError::InvalidTimestamp)
 }
 
 /// Header at the beginning of each independently usable shared bank.
@@ -989,6 +1211,12 @@ pub struct ProtocolHeader {
     pub completion_owner: AtomicU32,
     /// Latest worker liveness tick published in the shared monotonic clock domain.
     pub worker_heartbeat_tick: AtomicU64,
+    /// Sum of calibrated busy-spin targets in the shared monotonic clock domain.
+    pub worker_busy_requested_ticks: AtomicU64,
+    /// Sum of observed calibrated busy-spin durations in the shared monotonic clock domain.
+    pub worker_busy_observed_ticks: AtomicU64,
+    /// Number of calibrated busy-spin operations included in the busy-time counters.
+    pub worker_busy_operations: AtomicU64,
     /// Reserved for compatible layout expansion.
     pub reserved: [u32; 2],
 }
@@ -1015,6 +1243,9 @@ impl ProtocolHeader {
             request_owner: AtomicU32::new(OWNER_NONE),
             completion_owner: AtomicU32::new(OWNER_NONE),
             worker_heartbeat_tick: AtomicU64::new(0),
+            worker_busy_requested_ticks: AtomicU64::new(0),
+            worker_busy_observed_ticks: AtomicU64::new(0),
+            worker_busy_operations: AtomicU64::new(0),
             reserved: [0; 2],
         }
     }
@@ -1033,15 +1264,49 @@ impl ProtocolHeader {
             && self.block_slot_count == BLOCK_SLOT_COUNT_U32
             && self.max_midi_events == MAX_MIDI_EVENTS_U32
             && self.max_events == MAX_EVENTS_U32
+            && self.flags == 0
+            && self.generation.load(Ordering::Acquire) != 0
+            && self.next_request_sequence.load(Ordering::Acquire) != 0
+            && self.reserved == [0; 2]
     }
 
     /// Allocates the next nonzero ticket for the current generation.
-    #[must_use]
-    pub fn allocate_ticket(&self) -> BlockTicket {
-        let sequence = self.next_request_sequence.fetch_add(1, Ordering::Relaxed);
-        BlockTicket {
-            generation: self.generation.load(Ordering::Acquire),
-            sequence,
+    ///
+    /// Sequence exhaustion is a hard boundary: the allocator never wraps into zero,
+    /// because zero is reserved as an invalid raw ticket component.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::InvalidTicket`] for a zero active generation, a
+    /// corrupted zero sequence, or an allocation that would roll over to zero.
+    pub fn allocate_ticket(&self) -> Result<BlockTicket, ProtocolError> {
+        let generation = self.generation.load(Ordering::Acquire);
+        if generation == 0 {
+            return Err(ProtocolError::InvalidTicket);
+        }
+
+        let mut sequence = self.next_request_sequence.load(Ordering::Acquire);
+        loop {
+            if sequence == 0 {
+                return Err(ProtocolError::InvalidTicket);
+            }
+            let Some(next_sequence) = sequence.checked_add(1) else {
+                return Err(ProtocolError::InvalidTicket);
+            };
+            match self.next_request_sequence.compare_exchange_weak(
+                sequence,
+                next_sequence,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(BlockTicket {
+                        generation,
+                        sequence,
+                    });
+                }
+                Err(observed) => sequence = observed,
+            }
         }
     }
 
@@ -1100,6 +1365,40 @@ impl ProtocolHeader {
     pub fn worker_heartbeat(&self) -> u64 {
         self.worker_heartbeat_tick.load(Ordering::Acquire)
     }
+
+    /// Adds one measured calibrated busy-spin interval to this worker's fixed shared counters.
+    ///
+    /// Both durations use the header's shared monotonic clock domain. Zero durations are rejected
+    /// so a completed calibrated operation cannot be confused with an unavailable measurement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::InvalidTimestamp`] when either duration is zero.
+    pub fn record_worker_busy_ticks(
+        &self,
+        requested_ticks: u64,
+        observed_ticks: u64,
+    ) -> Result<(), ProtocolError> {
+        if requested_ticks == 0 || observed_ticks == 0 {
+            return Err(ProtocolError::InvalidTimestamp);
+        }
+        self.worker_busy_requested_ticks
+            .fetch_add(requested_ticks, Ordering::Release);
+        self.worker_busy_observed_ticks
+            .fetch_add(observed_ticks, Ordering::Release);
+        self.worker_busy_operations.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    /// Returns cumulative requested, observed, and operation-count busy-spin evidence.
+    #[must_use]
+    pub fn worker_busy_ticks(&self) -> (u64, u64, u64) {
+        (
+            self.worker_busy_requested_ticks.load(Ordering::Acquire),
+            self.worker_busy_observed_ticks.load(Ordering::Acquire),
+            self.worker_busy_operations.load(Ordering::Acquire),
+        )
+    }
 }
 
 /// Errors from a validated state transition or ownership operation.
@@ -1107,7 +1406,7 @@ impl ProtocolHeader {
 pub enum ProtocolError {
     /// A slot's raw state integer is not a defined `SlotState` value.
     InvalidState,
-    /// A request's bounded counts do not fit the fixed contract.
+    /// A request's bounded counts, event offsets, or event payload do not fit the fixed contract.
     InvalidRequest,
     /// A ticket has a zero generation or sequence.
     InvalidTicket,
@@ -1133,7 +1432,7 @@ impl fmt::Display for ProtocolError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::InvalidState => "invalid raw slot state",
-            Self::InvalidRequest => "request exceeds fixed protocol capacities",
+            Self::InvalidRequest => "request violates fixed protocol bounds or event offsets",
             Self::InvalidTicket => "ticket generation and sequence must be nonzero",
             Self::InvalidTimestamp => "shared monotonic timestamp is zero or out of order",
             Self::MalformedCompletion => "completion metadata or ticket is malformed",
@@ -1194,7 +1493,7 @@ mod tests {
 
     #[test]
     fn fixed_capacities_are_part_of_the_contract() {
-        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(PROTOCOL_VERSION, 3);
         assert_eq!(MAX_RACKS, 8);
         assert_eq!(MAX_PLUGINS_PER_RACK, 8);
         assert_eq!(MAX_CHANNELS, 2);
@@ -1227,19 +1526,111 @@ mod tests {
         assert!(header.is_compatible(65_536));
         assert!(!header.is_compatible(0));
         assert_eq!(
-            header.allocate_ticket(),
+            header.allocate_ticket().unwrap(),
             BlockTicket {
                 generation: 7,
                 sequence: 1
             }
         );
         assert_eq!(
-            header.allocate_ticket(),
+            header.allocate_ticket().unwrap(),
             BlockTicket {
                 generation: 7,
                 sequence: 2
             }
         );
+    }
+
+    #[test]
+    fn header_rejects_zero_generations_and_sequence_rollover() {
+        let zero_generation = ProtocolHeader::new(1, 0);
+        assert!(!zero_generation.is_compatible(1));
+        assert_eq!(
+            zero_generation.allocate_ticket(),
+            Err(ProtocolError::InvalidTicket)
+        );
+
+        let header = ProtocolHeader::new(1, 1);
+        header.next_request_sequence.store(0, Ordering::Relaxed);
+        assert_eq!(header.allocate_ticket(), Err(ProtocolError::InvalidTicket));
+        header
+            .next_request_sequence
+            .store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(header.allocate_ticket(), Err(ProtocolError::InvalidTicket));
+        assert_eq!(
+            header.next_request_sequence.load(Ordering::Acquire),
+            u64::MAX,
+            "a rejected allocation must not wrap the raw sequence to zero"
+        );
+    }
+
+    #[test]
+    fn rejects_capacity_overflow_in_raw_request_and_topology() {
+        let mut slot = BlockSlot::new();
+        let ticket = BlockTicket {
+            generation: 1,
+            sequence: 1,
+        };
+        let oversized = BlockRequest {
+            frame_count: u32::try_from(MAX_FRAMES).unwrap() + 1,
+            ..REQUEST
+        };
+        assert_eq!(
+            slot.publish_request(ticket, oversized),
+            Err(ProtocolError::InvalidRequest)
+        );
+        assert_eq!(slot.metadata.state(), Ok(SlotState::Free));
+
+        let mut rack = RackDescriptor::EMPTY;
+        rack.plugin_count = u32::try_from(MAX_PLUGINS_PER_RACK).unwrap() + 1;
+        assert!(!rack.is_valid());
+    }
+
+    #[test]
+    fn raw_publish_and_claim_reject_zero_sized_audio_requests() {
+        let ticket = BlockTicket {
+            generation: 1,
+            sequence: 1,
+        };
+        let zero_frames = BlockRequest {
+            frame_count: 0,
+            ..REQUEST
+        };
+        let zero_outputs = BlockRequest {
+            output_channel_count: 0,
+            ..REQUEST
+        };
+
+        for request in [zero_frames, zero_outputs] {
+            let mut slot = BlockSlot::new();
+            assert_eq!(
+                slot.publish_request(ticket, request),
+                Err(ProtocolError::InvalidRequest)
+            );
+            assert_eq!(slot.metadata.state(), Ok(SlotState::Free));
+
+            slot.metadata.frame_count = request.frame_count;
+            slot.metadata.input_channel_count = request.input_channel_count;
+            slot.metadata.output_channel_count = request.output_channel_count;
+            slot.metadata.midi_event_count = request.midi_event_count;
+            slot.metadata.event_count = request.event_count;
+            slot.metadata.flags = request.flags;
+            slot.metadata
+                .request_generation
+                .store(ticket.generation, Ordering::Relaxed);
+            slot.metadata
+                .request_sequence
+                .store(ticket.sequence, Ordering::Relaxed);
+            slot.metadata
+                .state
+                .store(SlotState::Requested.raw(), Ordering::Release);
+
+            assert_eq!(
+                slot.claim_for_processing(7),
+                Err(ProtocolError::InvalidRequest)
+            );
+            assert_eq!(slot.metadata.state(), Ok(SlotState::Requested));
+        }
     }
 
     #[test]
@@ -1294,6 +1685,152 @@ mod tests {
         );
         slot.reclaim_abandoned().unwrap();
         assert_eq!(slot.metadata.state(), Ok(SlotState::Free));
+    }
+
+    #[test]
+    fn rejects_malformed_raw_slot_states_without_transitioning_them() {
+        let mut slot = BlockSlot::new();
+        slot.metadata.state.store(99, Ordering::Relaxed);
+        let ticket = BlockTicket {
+            generation: 1,
+            sequence: 1,
+        };
+
+        assert_eq!(slot.metadata.state(), Err(ProtocolError::InvalidState));
+        assert_eq!(
+            slot.publish_request(ticket, REQUEST),
+            Err(ProtocolError::InvalidState)
+        );
+        assert_eq!(
+            slot.claim_for_processing(1),
+            Err(ProtocolError::InvalidState)
+        );
+        assert_eq!(slot.reclaim_abandoned(), Err(ProtocolError::InvalidState));
+        assert_eq!(slot.metadata.state.load(Ordering::Acquire), 99);
+    }
+
+    #[test]
+    fn mapped_slot_validation_requires_state_appropriate_metadata() {
+        let ticket = BlockTicket {
+            generation: 1,
+            sequence: 1,
+        };
+
+        let mut requested = BlockSlot::new();
+        requested.publish_request_at(ticket, REQUEST, 10).unwrap();
+        assert_eq!(requested.validate_mapped_contents(), Ok(()));
+        requested
+            .metadata
+            .request_sequence
+            .store(0, Ordering::Release);
+        assert_eq!(
+            requested.validate_mapped_contents(),
+            Err(ProtocolError::InvalidTicket)
+        );
+
+        let mut processing = BlockSlot::new();
+        processing.publish_request_at(ticket, REQUEST, 10).unwrap();
+        processing.claim_for_processing_at(7, 11).unwrap();
+        assert_eq!(processing.validate_mapped_contents(), Ok(()));
+        processing
+            .metadata
+            .worker_claimed_tick
+            .store(9, Ordering::Release);
+        assert_eq!(
+            processing.validate_mapped_contents(),
+            Err(ProtocolError::InvalidTimestamp)
+        );
+
+        let mut completed = BlockSlot::new();
+        completed.publish_request(ticket, REQUEST).unwrap();
+        completed.claim_for_processing(7).unwrap();
+        completed.publish_completion(7, ticket).unwrap();
+        assert_eq!(completed.validate_mapped_contents(), Ok(()));
+        completed
+            .metadata
+            .completion_sequence
+            .store(2, Ordering::Release);
+        assert_eq!(
+            completed.validate_mapped_contents(),
+            Err(ProtocolError::MalformedCompletion)
+        );
+    }
+
+    #[test]
+    fn rejects_event_offsets_before_publish_and_after_raw_mutation() {
+        let mut slot = BlockSlot::new();
+        let ticket = BlockTicket {
+            generation: 1,
+            sequence: 1,
+        };
+        slot.midi_events[0] = MidiEvent {
+            frame_offset: REQUEST.frame_count,
+            port: 0,
+            data_length: 3,
+            data: [0x90, 60, 100],
+            flags: 0,
+        };
+        assert_eq!(
+            slot.publish_request(ticket, REQUEST),
+            Err(ProtocolError::InvalidRequest)
+        );
+        assert_eq!(slot.metadata.state(), Ok(SlotState::Free));
+
+        slot.midi_events[0].frame_offset = REQUEST.frame_count - 1;
+        slot.publish_request(ticket, REQUEST).unwrap();
+        slot.events[0] = BlockEvent {
+            frame_offset: REQUEST.frame_count,
+            event_type: 1,
+            key: 2,
+            value: 0.5,
+            flags: 0,
+        };
+        assert_eq!(
+            slot.claim_for_processing(7),
+            Err(ProtocolError::InvalidRequest)
+        );
+        assert_eq!(slot.metadata.state(), Ok(SlotState::Requested));
+    }
+
+    #[test]
+    fn rejects_nonfinite_events_in_a_raw_completion_snapshot() {
+        let mut slot = BlockSlot::new();
+        let ticket = BlockTicket {
+            generation: 1,
+            sequence: 1,
+        };
+        slot.publish_request(ticket, REQUEST).unwrap();
+        slot.claim_for_processing(7).unwrap();
+        slot.events[0].value = f32::NAN;
+        slot.publish_completion(7, ticket).unwrap();
+
+        assert_eq!(
+            slot.completion_snapshot(),
+            Err(ProtocolError::MalformedCompletion)
+        );
+        assert_eq!(slot.metadata.state(), Ok(SlotState::Complete));
+    }
+
+    #[test]
+    fn all_slot_operations_reject_zero_ticket_components() {
+        let mut slot = BlockSlot::new();
+        let zero = BlockTicket {
+            generation: 0,
+            sequence: 1,
+        };
+
+        assert_eq!(
+            slot.publish_request(zero, REQUEST),
+            Err(ProtocolError::InvalidTicket)
+        );
+        assert_eq!(
+            slot.consume_completion(zero),
+            Err(ProtocolError::InvalidTicket)
+        );
+        assert_eq!(
+            slot.abandon_request(zero),
+            Err(ProtocolError::InvalidTicket)
+        );
     }
 
     #[test]
@@ -1495,6 +2032,23 @@ mod tests {
         header.publish_worker_heartbeat(42).unwrap();
         header.publish_worker_heartbeat(7).unwrap();
         assert_eq!(header.worker_heartbeat(), 42);
+    }
+
+    #[test]
+    fn worker_busy_ticks_retain_requested_and_observed_calibration() {
+        let header = ProtocolHeader::new(1, 1);
+        assert_eq!(header.worker_busy_ticks(), (0, 0, 0));
+        assert_eq!(
+            header.record_worker_busy_ticks(0, 1),
+            Err(ProtocolError::InvalidTimestamp)
+        );
+        assert_eq!(
+            header.record_worker_busy_ticks(1, 0),
+            Err(ProtocolError::InvalidTimestamp)
+        );
+        header.record_worker_busy_ticks(10, 11).unwrap();
+        header.record_worker_busy_ticks(20, 22).unwrap();
+        assert_eq!(header.worker_busy_ticks(), (30, 33, 2));
     }
 
     #[test]

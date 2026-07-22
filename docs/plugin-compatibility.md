@@ -4,7 +4,7 @@
 
 The initial plug-in format is VST3, behind `sp-vst3` and executed only in scanner/worker helpers. The adapter translates declared audio buses, bounded event/MIDI data, parameter changes, processing calls, and state transfer into host-owned types. The engine and session layer do not depend on VST3 SDK types or lifetime rules.
 
-The disposable scanner validates bundle layout and Mach-O architecture before optional SDK enumeration. The parent computes a SHA-256 fingerprint over canonical path, entry metadata, and bundle file contents; unchanged results are reused from an atomically replaced JSON cache. Worker helpers can load one real VST3 bundle and process shared-memory blocks. Serial multi-slot lifecycle control and native editor windows remain alpha gaps. Passing the prototype does not certify all VST3 plug-ins.
+The disposable scanner validates bundle layout and Mach-O architecture before optional SDK enumeration. The parent computes a SHA-256 fingerprint over canonical path, entry metadata, and bundle file contents; unchanged results are reused from an atomically replaced JSON cache. Retained worker helpers rebuild and process fixed serial multi-slot racks, while editor lifecycle is isolated in worker-owned AppKit windows. Passing the alpha path does not certify all VST3 plug-ins.
 
 ## Compatibility tiers
 
@@ -16,7 +16,7 @@ Discovery data and compatibility results are facts with timestamps and environme
 
 ## Native editor ownership
 
-The worker owns the plug-in and any native editor window it creates. The host requests open, close, focus, geometry, and lifecycle changes over the control plane, but does not reparent or draw into the plug-in's native view hierarchy. This avoids crossing plug-in framework/lifetime boundaries in the host. If the worker exits, the host removes its proxy surface and reports the rack as unavailable.
+The worker owns the plug-in and any native editor window it creates. The host requests open, close, focus, geometry, and lifecycle changes over the control plane, but does not reparent or draw into the plug-in's native view hierarchy. This avoids crossing plug-in framework/lifetime boundaries in the host. If the worker exits, the host removes its proxy surface, keeps that rack dry during bounded recovery, and opens any later editor in the replacement worker.
 
 ## Non-goals
 

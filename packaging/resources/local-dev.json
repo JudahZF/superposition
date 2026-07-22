@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "profile": "local-dev",
+  "release_approvals": {
+    "logo": { "approved": false, "approval_owner": null, "approval_reference": null },
+    "icon": { "approved": false, "approval_owner": null, "approval_reference": null },
+    "fonts": { "approved": false, "approval_owner": null, "approval_reference": null },
+    "fault_red": { "approved": false, "value": null, "approval_owner": null, "approval_reference": null },
+    "provenance": { "approved": false, "approval_owner": null, "approval_reference": null }
+  },
+  "resources": []
+}

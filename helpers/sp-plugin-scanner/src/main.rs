@@ -1,19 +1,20 @@
-//! Isolated VST3 bundle scanner.
+//! Disposable VST3 bundle scanner.
 //!
-//! Default path probes bundle layout without loading code. With `--sdk-enumerate`
-//! (enabled by the default `sdk` feature) the helper also loads factory metadata
-//! inside this disposable process so the parent can attribute timeout/crash outcomes.
+//! Bundle layout and Mach-O architecture inspection always happen before any factory code is
+//! eligible to load. The parent launches this helper once per bundle and applies its deadline;
+//! all machine-readable data is serialized as the SDK-free scan-metadata schema.
+
+use std::{env, path::PathBuf, process};
 
 use serde::Serialize;
-use sp_vst3::{
-    ScanOutcome, Vst3Architecture, Vst3BundleInfo, Vst3BundlePath, inspect_bundle_layout,
-};
-use std::env;
-use std::path::PathBuf;
-use std::process;
+use sp_model::{PluginArchitecture, PluginScanMetadata, PluginScanOutcome};
+use sp_vst3::{Vst3Architecture, Vst3BundleInfo, Vst3BundlePath, inspect_bundle_layout};
 
 #[cfg(feature = "sdk")]
-use sp_vst3::sdk::{HostSdkFactory, SdkPluginFactory};
+use sp_vst3::{
+    adapter::{ProcessingFormat, Vst3ClassSelection},
+    sdk::{HostSdkRackFactory, SDK_MAX_FRAMES},
+};
 
 /// Request passed to the scanner before it inspects a VST3 bundle.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,24 +23,13 @@ pub struct ScanRequest {
     pub bundle: Vst3BundlePath,
 }
 
-/// Machine-readable result emitted by this scanner phase.
+/// Machine-readable result emitted by the disposable scanner helper.
 #[derive(Debug, Serialize)]
 pub struct ScanReport {
     bundle: PathBuf,
-    architectures: &'static str,
-    supported_on_apple_silicon: bool,
-    outcome: &'static str,
-    descriptors: Vec<DescriptorReport>,
+    #[serde(flatten)]
+    metadata: PluginScanMetadata,
     sdk_enumerate: bool,
-    detail: Option<String>,
-}
-
-/// Descriptor shape populated by the isolated SDK scan.
-#[derive(Debug, Serialize)]
-struct DescriptorReport {
-    class_id: String,
-    name: String,
-    vendor: String,
 }
 
 struct Args {
@@ -70,32 +60,19 @@ fn main() {
         );
     } else {
         println!("bundle: {}", report.bundle.display());
-        println!("architectures: {}", report.architectures);
         println!(
-            "supported_on_apple_silicon: {}",
-            report.supported_on_apple_silicon
+            "architecture: {}",
+            architecture_name(report.metadata.architecture)
         );
-        println!("outcome: {}", report.outcome);
-        println!("descriptors: {}", report.descriptors.len());
+        println!("outcome: {}", outcome_name(report.metadata.outcome));
+        println!("classes: {}", report.metadata.classes.len());
         println!("sdk_enumerate: {}", report.sdk_enumerate);
-        if let Some(detail) = &report.detail {
+        if let Some(detail) = &report.metadata.detail {
             println!("detail: {detail}");
         }
-        for descriptor in &report.descriptors {
-            println!(
-                "  - {} ({}) [{}]",
-                descriptor.name, descriptor.vendor, descriptor.class_id
-            );
-        }
     }
-    if matches!(
-        report.outcome,
-        "invalid_bundle" | "unsupported_architecture"
-    ) {
+    if report.metadata.outcome != PluginScanOutcome::Supported {
         process::exit(1);
-    }
-    if report.outcome == "sdk_error" {
-        process::exit(3);
     }
 }
 
@@ -122,97 +99,166 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<Args, &'static 
 }
 
 fn report_for_info(info: Vst3BundleInfo, sdk_enumerate: bool) -> ScanReport {
+    let architecture = architecture_from(info.architectures);
     if !info.supported_on_apple_silicon {
-        return ScanReport {
-            bundle: info.path,
-            architectures: info.architectures.as_str(),
-            supported_on_apple_silicon: false,
-            outcome: outcome_name(ScanOutcome::UnsupportedArchitecture),
-            descriptors: Vec::new(),
-            sdk_enumerate: false,
-            detail: Some("bundle has no native Apple Silicon code".to_owned()),
-        };
+        return report(
+            info.path,
+            metadata_with_detail(
+                architecture,
+                PluginScanOutcome::UnsupportedArchitecture,
+                "bundle has no native Apple Silicon code",
+            ),
+            false,
+        );
     }
 
     if !sdk_enumerate {
-        return ScanReport {
-            bundle: info.path,
-            architectures: info.architectures.as_str(),
-            supported_on_apple_silicon: true,
-            outcome: outcome_name(ScanOutcome::Supported),
-            descriptors: Vec::new(),
-            sdk_enumerate: false,
-            detail: Some("layout probe only; pass --sdk-enumerate for factory metadata".to_owned()),
-        };
+        return report(
+            info.path,
+            metadata_with_detail(
+                architecture,
+                PluginScanOutcome::InvalidReport,
+                "layout probe completed; full class metadata requires --sdk-enumerate",
+            ),
+            false,
+        );
     }
 
-    enumerate_with_sdk(info)
+    scan_with_sdk(info, architecture)
 }
 
+/// Enumerates every audio-module class, then obtains complete helper-safe metadata for each one.
+///
+/// The SDK adapter remains confined to this disposable process. It selects classes while inactive
+/// and never starts audio processing or opens a native editor during scan.
 #[cfg(feature = "sdk")]
-fn enumerate_with_sdk(info: Vst3BundleInfo) -> ScanReport {
+fn scan_with_sdk(info: Vst3BundleInfo, architecture: PluginArchitecture) -> ScanReport {
     let bundle = Vst3BundlePath::new(info.path.clone());
-    match HostSdkFactory.enumerate(&bundle) {
-        Ok(descriptors) => ScanReport {
-            bundle: info.path,
-            architectures: info.architectures.as_str(),
-            supported_on_apple_silicon: true,
-            outcome: outcome_name(ScanOutcome::Supported),
-            descriptors: descriptors
-                .into_iter()
-                .map(|descriptor| DescriptorReport {
-                    class_id: descriptor.class_id,
-                    name: descriptor.name,
-                    vendor: descriptor.vendor,
-                })
-                .collect(),
-            sdk_enumerate: true,
-            detail: None,
-        },
-        Err(error) => ScanReport {
-            bundle: info.path,
-            architectures: info.architectures.as_str(),
-            supported_on_apple_silicon: true,
-            outcome: "sdk_error",
-            descriptors: Vec::new(),
-            sdk_enumerate: true,
-            detail: Some(error.to_string()),
-        },
+    let factory = HostSdkRackFactory;
+    let format = match ProcessingFormat::new(48_000.0, SDK_MAX_FRAMES) {
+        Ok(format) => format,
+        Err(error) => {
+            return report(
+                info.path,
+                metadata_with_detail(architecture, PluginScanOutcome::SdkError, error.to_string()),
+                true,
+            );
+        }
+    };
+    let descriptors = match factory.enumerate_classes(&bundle) {
+        Ok(descriptors) => descriptors,
+        Err(error) => {
+            return report(
+                info.path,
+                metadata_with_detail(architecture, PluginScanOutcome::SdkError, error.to_string()),
+                true,
+            );
+        }
+    };
+    if descriptors.is_empty() {
+        return report(
+            info.path,
+            metadata_with_detail(
+                architecture,
+                PluginScanOutcome::InvalidReport,
+                "bundle exposes no audio-module classes",
+            ),
+            true,
+        );
     }
+
+    let mut metadata = PluginScanMetadata::new(architecture, PluginScanOutcome::Supported);
+    for descriptor in descriptors {
+        let class_id = descriptor.class_id;
+        let selection = Vst3ClassSelection::new(bundle.clone(), class_id.clone());
+        match factory.scan_class_metadata(&selection, format) {
+            Ok(class) => metadata.classes.push(class),
+            Err(error) => {
+                return report(
+                    info.path,
+                    metadata_with_detail(
+                        architecture,
+                        PluginScanOutcome::SdkError,
+                        format!("could not inspect VST3 class {class_id}: {error}"),
+                    ),
+                    true,
+                );
+            }
+        }
+    }
+    report(info.path, metadata, true)
 }
 
 #[cfg(not(feature = "sdk"))]
-fn enumerate_with_sdk(info: Vst3BundleInfo) -> ScanReport {
-    ScanReport {
-        bundle: info.path,
-        architectures: info.architectures.as_str(),
-        supported_on_apple_silicon: true,
-        outcome: "sdk_error",
-        descriptors: Vec::new(),
-        sdk_enumerate: true,
-        detail: Some("scanner built without the sdk feature".to_owned()),
-    }
+fn scan_with_sdk(info: Vst3BundleInfo, architecture: PluginArchitecture) -> ScanReport {
+    report(
+        info.path,
+        metadata_with_detail(
+            architecture,
+            PluginScanOutcome::SdkError,
+            "scanner helper was built without the sdk feature",
+        ),
+        true,
+    )
 }
 
 fn invalid_report(bundle: PathBuf) -> ScanReport {
+    report(
+        bundle,
+        metadata_with_detail(
+            PluginArchitecture::Unknown,
+            PluginScanOutcome::InvalidBundle,
+            "path is not an inspectable VST3 bundle",
+        ),
+        false,
+    )
+}
+
+fn report(bundle: PathBuf, metadata: PluginScanMetadata, sdk_enumerate: bool) -> ScanReport {
     ScanReport {
         bundle,
-        architectures: Vst3Architecture::Unknown.as_str(),
-        supported_on_apple_silicon: false,
-        outcome: outcome_name(ScanOutcome::InvalidBundle),
-        descriptors: Vec::new(),
-        sdk_enumerate: false,
-        detail: Some("path is not an inspectable VST3 bundle".to_owned()),
+        metadata,
+        sdk_enumerate,
     }
 }
 
-const fn outcome_name(outcome: ScanOutcome) -> &'static str {
+fn metadata_with_detail(
+    architecture: PluginArchitecture,
+    outcome: PluginScanOutcome,
+    detail: impl Into<String>,
+) -> PluginScanMetadata {
+    let mut metadata = PluginScanMetadata::new(architecture, outcome);
+    metadata.detail = Some(detail.into());
+    metadata
+}
+
+const fn architecture_from(architecture: Vst3Architecture) -> PluginArchitecture {
+    match architecture {
+        Vst3Architecture::Arm64 => PluginArchitecture::Arm64,
+        Vst3Architecture::X86_64 => PluginArchitecture::X86_64,
+        Vst3Architecture::Universal => PluginArchitecture::Universal,
+        Vst3Architecture::Unknown => PluginArchitecture::Unknown,
+    }
+}
+
+const fn architecture_name(architecture: PluginArchitecture) -> &'static str {
+    match architecture {
+        PluginArchitecture::Arm64 => "arm64",
+        PluginArchitecture::X86_64 => "x86_64",
+        PluginArchitecture::Universal => "universal",
+        PluginArchitecture::Unknown => "unknown",
+    }
+}
+
+const fn outcome_name(outcome: PluginScanOutcome) -> &'static str {
     match outcome {
-        ScanOutcome::Supported => "supported",
-        ScanOutcome::UnsupportedArchitecture => "unsupported_architecture",
-        ScanOutcome::InvalidBundle => "invalid_bundle",
-        ScanOutcome::TimedOut => "timed_out",
-        ScanOutcome::Crashed => "crashed",
+        PluginScanOutcome::Supported => "supported",
+        PluginScanOutcome::UnsupportedArchitecture => "unsupported_architecture",
+        PluginScanOutcome::InvalidBundle => "invalid_bundle",
+        PluginScanOutcome::TimedOut => "timed_out",
+        PluginScanOutcome::Crashed => "crashed",
+        PluginScanOutcome::SdkError => "sdk_error",
+        PluginScanOutcome::InvalidReport => "invalid_report",
     }
 }
 

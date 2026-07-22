@@ -9,6 +9,11 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// SDK-free fixed-capacity serial rack contracts and lifecycle orchestration.
+pub mod adapter;
+#[cfg(all(target_os = "macos", feature = "editor-window"))]
+pub mod editor_window;
+
 /// Filesystem location of a VST3 bundle selected for helper-side inspection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Vst3BundlePath(PathBuf);
@@ -202,13 +207,50 @@ pub fn probe_macho_architecture(bytes: &[u8]) -> Vst3Architecture {
 }
 
 fn fat_cpu_types(bytes: &[u8], little_endian: bool, entry_size: usize) -> Vec<u32> {
+    // Fat Mach-O headers are untrusted bundle metadata. Never use their declared architecture
+    // count as an iteration/allocation bound: a truncated header could otherwise make scanning
+    // spend arbitrary time walking offsets that cannot exist.
+    const MAX_FAT_ARCHITECTURES: usize = 64;
     let Some(count) = read_u32(bytes, 4, little_endian) else {
         return Vec::new();
     };
-    (0..usize::try_from(count).unwrap_or(0))
-        .filter_map(|index| 8usize.checked_add(index.checked_mul(entry_size)?))
-        .filter_map(|offset| read_u32(bytes, offset, little_endian))
-        .collect()
+    let Ok(count) = usize::try_from(count) else {
+        return Vec::new();
+    };
+    if entry_size < 4 {
+        return Vec::new();
+    }
+    let Some(available) = bytes.len().checked_sub(8) else {
+        return Vec::new();
+    };
+    let complete_entries = available / entry_size;
+    if count > MAX_FAT_ARCHITECTURES || count > complete_entries {
+        return Vec::new();
+    }
+    let Some(header_end) = count
+        .checked_mul(entry_size)
+        .and_then(|entries| 8usize.checked_add(entries))
+    else {
+        return Vec::new();
+    };
+    if header_end > bytes.len() {
+        return Vec::new();
+    }
+
+    let mut architectures = Vec::with_capacity(count);
+    for index in 0..count {
+        let Some(offset) = index
+            .checked_mul(entry_size)
+            .and_then(|entry| 8usize.checked_add(entry))
+        else {
+            return Vec::new();
+        };
+        let Some(cpu) = read_u32(bytes, offset, little_endian) else {
+            return Vec::new();
+        };
+        architectures.push(cpu);
+    }
+    architectures
 }
 
 fn read_u32(bytes: &[u8], offset: usize, little_endian: bool) -> Option<u32> {
@@ -257,6 +299,10 @@ impl Vst3Inspector for FakeVst3Inspector {
 #[cfg(feature = "sdk")]
 pub mod sdk;
 
+/// Official native VST3 SDK backend with a C++ ABI containment shim.
+#[cfg(feature = "native-sdk")]
+pub mod native;
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -284,6 +330,32 @@ mod tests {
         assert_eq!(
             probe_macho_architecture(&fixture),
             Vst3Architecture::Universal
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_fat_header_count_without_iterating_missing_entries() {
+        let mut fixture = vec![0xca, 0xfe, 0xba, 0xbe];
+        fixture.extend(2u32.to_be_bytes());
+        fixture.extend(0x0100_000cu32.to_be_bytes());
+        fixture.extend([0; 16]);
+
+        assert_eq!(
+            probe_macho_architecture(&fixture),
+            Vst3Architecture::Unknown,
+            "a declared second architecture without its complete table entry is invalid"
+        );
+    }
+
+    #[test]
+    fn rejects_unreasonable_fat_header_count_before_looping() {
+        let mut fixture = vec![0xca, 0xfe, 0xba, 0xbe];
+        fixture.extend(u32::MAX.to_be_bytes());
+
+        assert_eq!(
+            probe_macho_architecture(&fixture),
+            Vst3Architecture::Unknown,
+            "untrusted count must not become an unbounded iteration limit"
         );
     }
 

@@ -36,6 +36,9 @@ fn valid_session() -> Session {
             source_id: SourceId("source".into()),
             endpoint_id: EndpointId("endpoint".into()),
             topology: RackTopology::Serial,
+            gain_db: sp_model::GainDb::default(),
+            muted: false,
+            bypassed: false,
             slots: vec![PluginSlot {
                 id: PluginInstanceId("slot".into()),
                 plugin: PluginDescriptor {
@@ -50,6 +53,7 @@ fn valid_session() -> Session {
                         plugin_version: "1.0".into(),
                     },
                 },
+                bypassed: false,
                 parameters: NormalizedParameters { values: parameters },
             }],
         }],
@@ -73,7 +77,7 @@ fn rejects_topology_and_layout_outside_phase_zero_support() {
     parallel.racks[0].topology = RackTopology::Parallel;
     assert!(matches!(
         PreparedGraph::compile(&parallel),
-        Err(PrepareError::UnsupportedTopology { .. })
+        Err(PrepareError::InvalidSession(_))
     ));
 
     let mut surround = valid_session();
@@ -81,7 +85,27 @@ fn rejects_topology_and_layout_outside_phase_zero_support() {
     surround.endpoints[0].layout = ChannelLayout::Discrete { channels: 6 };
     assert!(matches!(
         PreparedGraph::compile(&surround),
-        Err(PrepareError::UnsupportedChannelLayout { .. })
+        Err(PrepareError::InvalidSession(_))
+    ));
+}
+
+#[test]
+fn rejects_unreferenced_layouts_outside_alpha_support() {
+    let mut session = valid_session();
+    session.sources.push(Source {
+        id: SourceId("surround-source".into()),
+        name: "Surround source".into(),
+        layout: ChannelLayout::Discrete { channels: 6 },
+    });
+    session.endpoints.push(Endpoint {
+        id: EndpointId("surround-endpoint".into()),
+        name: "Surround endpoint".into(),
+        layout: ChannelLayout::Discrete { channels: 6 },
+    });
+
+    assert!(matches!(
+        PreparedGraph::compile(&session),
+        Err(PrepareError::InvalidSession(_))
     ));
 }
 
@@ -143,28 +167,31 @@ fn rack_gate_accepts_one_matching_completion_then_reopens() {
 }
 
 #[test]
-fn rack_gate_deadline_latches_fallback_and_ignores_late_completion() {
+fn rack_gate_closes_after_three_consecutive_deadline_misses() {
     let mut gate = RackGate::new();
-    let ticket = BlockTicket {
-        generation: 3,
-        sequence: 3,
-    };
-
-    assert_eq!(gate.dispatch(ticket, 20), GateOutcome::DispatchAllowed);
-    assert_eq!(
-        gate.deadline_expired(21),
-        GateOutcome::UseFallback(FallbackReason::DeadlineMiss)
-    );
+    for sequence in 1..=3 {
+        let ticket = BlockTicket {
+            generation: 3,
+            sequence,
+        };
+        assert_eq!(
+            gate.dispatch(ticket, 19 + sequence),
+            GateOutcome::DispatchAllowed
+        );
+        assert_eq!(
+            gate.deadline_expired(20 + sequence),
+            GateOutcome::UseFallback(FallbackReason::DeadlineMiss)
+        );
+        if sequence < 3 {
+            assert_eq!(gate.state(), RackGateState::Open);
+        }
+    }
     assert_eq!(
         gate.state(),
         RackGateState::Closed {
             reason: FallbackReason::DeadlineMiss,
-            closed_block: 21,
+            closed_block: 23,
         }
-    );
-    assert_eq!(
-        gate.observe(WorkerObservation::Completed(ticket), 22),
-        GateOutcome::UseFallback(FallbackReason::DeadlineMiss)
     );
     assert_eq!(
         gate.dispatch(
@@ -172,10 +199,48 @@ fn rack_gate_deadline_latches_fallback_and_ignores_late_completion() {
                 generation: 3,
                 sequence: 4,
             },
-            22,
+            24,
         ),
         GateOutcome::UseFallback(FallbackReason::DeadlineMiss)
     );
+}
+
+#[test]
+fn rack_gate_success_resets_deadline_miss_streak() {
+    let mut gate = RackGate::new();
+    for sequence in 1..=2 {
+        let ticket = BlockTicket {
+            generation: 8,
+            sequence,
+        };
+        assert_eq!(
+            gate.dispatch(ticket, sequence),
+            GateOutcome::DispatchAllowed
+        );
+        assert_eq!(
+            gate.deadline_expired(sequence),
+            GateOutcome::UseFallback(FallbackReason::DeadlineMiss)
+        );
+    }
+    let success = BlockTicket {
+        generation: 8,
+        sequence: 3,
+    };
+    assert_eq!(gate.dispatch(success, 3), GateOutcome::DispatchAllowed);
+    assert_eq!(
+        gate.observe(WorkerObservation::Completed(success), 3),
+        GateOutcome::WorkerResultAccepted
+    );
+    let next = BlockTicket {
+        generation: 8,
+        sequence: 4,
+    };
+    assert_eq!(gate.dispatch(next, 4), GateOutcome::DispatchAllowed);
+    assert_eq!(
+        gate.deadline_expired(4),
+        GateOutcome::UseFallback(FallbackReason::DeadlineMiss)
+    );
+    assert_eq!(gate.state(), RackGateState::Open);
 }
 
 #[test]

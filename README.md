@@ -8,14 +8,14 @@ Available now:
 
 - Versioned model/protocol contracts, fixed shared-memory banks, rack gates, and design tokens
 - `cargo xtask doctor`, `ipc-feasibility`, `ipc-matrix`, `fault-matrix`, and `device-feasibility`
-- Notification-based CoreAudio output harness (`sp-audio-io-macos`)
+- Direct duplex AUHAL/CoreAudio product path and attached feasibility harness (`sp-audio-io-macos`)
 - Disposable SDK-backed VST3 scanner plus SHA-256 content fingerprints and an atomic scan cache
 - Process supervisor, atomic session packages with recovery markers
 - Allocation-free, lock-free CoreMIDI callback ingress with a dedicated note-off safety lane
-- Interactive live-rack shell, real CoreAudio start/stop, and a component gallery (`⌘G`)
+- Interactive live-rack shell with duplex CoreAudio/MIDI selection, rack and slot editing, plug-in browsing, live gain/mute/bypass/meters, MIDI Learn, editable parameter scenes, generic and worker-owned resizing native editors, atomic opaque-state capture/restore, missing-plug-in placeholders, worker recovery, and a component gallery (`⌘G`)
 - Verification commands: `host-checker`, `compatibility`, `loopback`, `click-test`, `midi-timing`, `soak [--smoke]`, `bundle` (entitlement templates under `packaging/entitlements/`)
 
-Still not a shippable public release: multi-plug-in worker control IPC, worker-owned native editors, notarized bundles, approved brand assets, and long-run hardware certification remain incomplete. Worker isolation is an availability boundary, not a security sandbox.
+Still not a shippable public release: notarized bundles, approved brand assets, and long-run hardware certification remain incomplete. Worker isolation is an availability boundary, not a security sandbox.
 
 ## Hard Phase 1 feasibility gate
 

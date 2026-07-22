@@ -13,6 +13,7 @@ sdk = ["sp-vst3/sdk"]
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+sp-model = { path = "../../crates/sp-model" }
 sp-vst3 = { path = "../../crates/sp-vst3" }
 
 [lints]

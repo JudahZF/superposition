@@ -3021,8 +3021,11 @@ name = "sp-audio-io-macos"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "rtrb",
  "sp-audio-io",
  "sp-engine",
+ "sp-midi",
+ "sp-model",
  "sp-shared-memory",
  "sp-shared-memory-macos",
 ]
@@ -3060,6 +3063,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sp-model",
  "sp-vst3",
 ]
 
@@ -3067,6 +3071,8 @@ dependencies = [
 name = "sp-plugin-worker"
 version = "0.1.0"
 dependencies = [
+ "rtrb",
+ "sp-protocol",
  "sp-shared-memory",
  "sp-shared-memory-macos",
  "sp-test-support",
@@ -3109,6 +3115,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sp-model",
+ "sp-protocol",
 ]
 
 [[package]]
@@ -3123,6 +3131,11 @@ version = "0.1.0"
 name = "sp-vst3"
 version = "0.1.0"
 dependencies = [
+ "cc",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "sp-model",
  "vst3-host",
 ]
 
@@ -3186,7 +3199,9 @@ dependencies = [
  "sp-engine",
  "sp-midi",
  "sp-model",
+ "sp-protocol",
  "sp-session",
+ "sp-shared-memory-macos",
  "sp-supervisor",
  "sp-ui",
 ]
@@ -4340,6 +4355,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
  "sp-audio-io-macos",
  "sp-engine",
  "sp-midi",

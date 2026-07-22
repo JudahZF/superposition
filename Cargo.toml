@@ -19,6 +19,7 @@ members = [
     "crates/sp-test-support",
     "tools/xtask",
 ]
+default-members = ["apps/superposition"]
 
 [workspace.package]
 version = "0.1.0"
@@ -38,6 +39,7 @@ thiserror = "2.0.12"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

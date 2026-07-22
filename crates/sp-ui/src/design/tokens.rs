@@ -114,6 +114,13 @@ pub enum Accent {
     Lime,
 }
 
+/// A semantic focus treatment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Focus {
+    /// Keyboard focus and visible selection outline.
+    Ring,
+}
+
 /// A color token resolved by the active theme.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColorToken {
@@ -123,6 +130,8 @@ pub enum ColorToken {
     Text(TextColor),
     /// A semantic accent color.
     Accent(Accent),
+    /// A semantic focus treatment.
+    Focus(Focus),
 }
 
 impl ColorToken {
@@ -136,10 +145,52 @@ impl ColorToken {
             Self::Surface(Surface::Steel) => STEEL,
             Self::Text(TextColor::Primary) => PRIMARY_TEXT,
             Self::Text(TextColor::Secondary) => SECONDARY_TEXT,
-            Self::Accent(Accent::Cyan) => CYAN,
+            Self::Accent(Accent::Cyan) | Self::Focus(Focus::Ring) => CYAN,
             Self::Accent(Accent::Blue) => BLUE,
             Self::Accent(Accent::Lime) => LIME,
         }
+    }
+}
+
+/// Fixed layout dimensions, measured in logical pixels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum Layout {
+    /// System status bar height.
+    SystemBarHeight = 52,
+    /// Scene dock height.
+    SceneDockHeight = 64,
+    /// Rack navigator width.
+    NavigatorWidth = 260,
+    /// Inspector width.
+    InspectorWidth = 320,
+    /// Scene control width.
+    SceneControlWidth = 96,
+    /// Scene control height.
+    SceneControlHeight = 40,
+    /// Gallery scene control width.
+    GallerySceneControlWidth = 92,
+    /// Gallery scene control height.
+    GallerySceneControlHeight = 36,
+    /// Parameter row minimum width.
+    ParameterRowMinWidth = 460,
+    /// Generic parameter editor scroll height.
+    ParameterEditorHeight = 280,
+    /// Engine transport button width.
+    TransportButtonWidth = 132,
+    /// Engine transport button height.
+    TransportButtonHeight = 32,
+    /// Scene performance pad height.
+    ScenePadHeight = 48,
+    /// Level meter track height.
+    MeterHeight = 6,
+}
+
+impl Layout {
+    /// Returns this dimension in logical pixels.
+    #[must_use]
+    pub const fn pixels(self) -> u16 {
+        self as u16
     }
 }
 
@@ -179,6 +230,8 @@ pub enum Radius {
     Medium = 6,
     /// 8 logical pixels.
     Large = 8,
+    /// 12 logical pixels, for pill-shaped chips.
+    Pill = 12,
 }
 
 impl Radius {

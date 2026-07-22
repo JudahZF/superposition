@@ -7,11 +7,33 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# Isolated VST3 SDK hosting via vst3-host. Enabled only by helper binaries.
+# Isolated high-level VST3 hosting via vst3-host. Enabled only by helper binaries.
 sdk = ["dep:vst3-host"]
+# Official SDK backend. This is deliberately opt-in: build.rs requires VST3_SDK_DIR
+# only when this feature is enabled, keeping SDK-free and high-level helper builds portable.
+native-sdk = ["sdk"]
+# Worker-only AppKit parent window for native plug-in editors.
+editor-window = ["dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
 
 [dependencies]
+sp-model = { path = "../sp-model" }
 vst3-host = { version = "0.7.0", optional = true, default-features = false }
 
-[lints]
-workspace = true
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", optional = true }
+objc2-app-kit = { version = "0.3.2", optional = true, features = ["NSApplication", "NSEvent", "NSGraphics", "NSResponder", "NSRunningApplication", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3.2", optional = true, features = ["NSDate", "NSGeometry", "NSRunLoop", "NSString"] }
+
+[build-dependencies]
+cc = "1.2.47"
+
+[lints.rust]
+# The native-sdk feature's sole FFI boundary is intentionally contained in native.rs.
+unsafe_code = "allow"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"

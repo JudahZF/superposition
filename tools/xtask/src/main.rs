@@ -4,6 +4,7 @@
 //! bootstrapped workspace before the product crates are built.
 
 mod device_feasibility;
+mod phase0;
 mod phase1;
 mod phase_commands;
 mod scan_isolation;
@@ -36,6 +37,7 @@ const REQUIRED_DIRECTORIES: &[&str] = &[
     "tools/xtask",
     "compatibility",
     "docs/adr",
+    "docs/qualification",
 ];
 
 const REQUIRED_PATHS: &[&str] = &[
@@ -98,6 +100,9 @@ const REQUIRED_PATHS: &[&str] = &[
     "docs/adr/0007-no-general-pdc-or-splits.md",
     "docs/adr/0008-helper-library-validation-entitlement.md",
     "docs/adr/0009-brand-design-system.md",
+    "docs/adr/0010-direct-auhal-backend.md",
+    "docs/qualification/phase0-foundation.md",
+    "docs/qualification/phase1-m4pro.md",
 ];
 
 /// A dependency graph keyed by Cargo package name.
@@ -232,6 +237,15 @@ fn run(arguments: &[String]) -> Result<u8, XtaskError> {
             run_doctor(&workspace_root()).map_err(XtaskError::Standard)?;
             Ok(0)
         }
+        "phase0-report" => phase0::run_foundation_report(&workspace_root(), &arguments[1..])
+            .map(|()| 0)
+            .map_err(XtaskError::Standard),
+        "phase1-report" => phase1::run_phase1_report(&workspace_root(), &arguments[1..])
+            .map(|outcome| outcome.exit_code)
+            .map_err(XtaskError::Phase1),
+        "vst3-smoke" => phase1::run_vst3_smoke(&workspace_root(), &arguments[1..])
+            .map(|outcome| outcome.exit_code)
+            .map_err(XtaskError::Phase1),
         "ipc-feasibility" => phase1::run_ipc_feasibility(&workspace_root(), &arguments[1..])
             .map(|outcome| outcome.exit_code)
             .map_err(XtaskError::Phase1),
@@ -246,15 +260,20 @@ fn run(arguments: &[String]) -> Result<u8, XtaskError> {
                 .map(|outcome| outcome.exit_code)
                 .map_err(XtaskError::Phase1)
         }
+        "device-matrix" => {
+            device_feasibility::run_device_matrix(&workspace_root(), &arguments[1..])
+                .map(|outcome| outcome.exit_code)
+                .map_err(XtaskError::Phase1)
+        }
         "host-checker" => phase_commands::run_host_checker(&workspace_root(), &arguments[1..])
             .map(|outcome| outcome.exit_code)
             .map_err(XtaskError::Phase1),
         "compatibility" => phase_commands::run_compatibility(&workspace_root(), &arguments[1..])
             .map(|outcome| outcome.exit_code)
             .map_err(XtaskError::Phase1),
-        "loopback" => {
-            Ok(phase_commands::run_loopback(&workspace_root(), &arguments[1..]).exit_code)
-        }
+        "loopback" => phase_commands::run_loopback(&workspace_root(), &arguments[1..])
+            .map(|outcome| outcome.exit_code)
+            .map_err(XtaskError::Phase1),
         "click-test" => phase_commands::run_click_test(&workspace_root(), &arguments[1..])
             .map(|outcome| outcome.exit_code)
             .map_err(XtaskError::Phase1),
@@ -280,11 +299,15 @@ fn run(arguments: &[String]) -> Result<u8, XtaskError> {
 
 fn usage() -> String {
     format!(
-        "Usage: cargo xtask <command>\n\nAvailable now:\n  doctor\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}",
+        "Usage: cargo xtask <command>\n\nAvailable now:\n  doctor\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}",
+        phase0::foundation_report_usage(),
+        phase1::phase1_report_usage(),
+        phase1::vst3_smoke_usage(),
         phase1::feasibility_usage(),
         phase1::ipc_matrix_usage(),
         phase1::fault_matrix_usage(),
         device_feasibility::device_feasibility_usage(),
+        device_feasibility::device_matrix_usage(),
         phase_commands::usage_host_checker(),
         phase_commands::usage_compatibility(),
         phase_commands::usage_loopback(),
@@ -304,7 +327,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn run_doctor(workspace_root: &Path) -> Result<(), String> {
-    let mut checks = vec![
+    let mut implementation_checks = vec![
         platform_check(),
         toolchain_check(workspace_root),
         required_tooling_check(),
@@ -312,24 +335,33 @@ fn run_doctor(workspace_root: &Path) -> Result<(), String> {
     ];
 
     match cargo_metadata(workspace_root) {
-        Ok(graph) => checks.push(dependency_boundary_check(&graph)),
-        Err(error) => checks.push(CheckResult::fail(
+        Ok(graph) => implementation_checks.push(dependency_boundary_check(&graph)),
+        Err(error) => implementation_checks.push(CheckResult::fail(
             "workspace metadata",
             error,
             "Repair the listed Cargo manifests, then rerun `cargo xtask doctor`.",
         )),
     }
 
-    let failures = checks.iter().filter(|check| !check.passed).count();
-    for check in &checks {
+    println!("Implementation readiness (static checks only):");
+    let failures = implementation_checks
+        .iter()
+        .filter(|check| !check.passed)
+        .count();
+    for check in &implementation_checks {
         check.print();
     }
 
+    print_hardware_certification_status();
+    print_qualification_tooling();
+
     if failures == 0 {
-        println!("Doctor completed successfully.");
+        println!("Implementation readiness passed; hardware certification remains pending.");
         Ok(())
     } else {
-        Err(format!("doctor found {failures} failing check(s)"))
+        Err(format!(
+            "implementation readiness has {failures} failing check(s); hardware certification was not evaluated"
+        ))
     }
 }
 
@@ -390,17 +422,9 @@ fn toolchain_check(workspace_root: &Path) -> CheckResult {
 
 fn required_tooling_check() -> CheckResult {
     let mut missing = Vec::new();
-
-    for (name, arguments) in [
-        ("rustfmt", ["fmt", "--version"]),
-        ("clippy", ["clippy", "--version"]),
-    ] {
-        let available = Command::new("cargo")
-            .args(arguments)
-            .output()
-            .is_ok_and(|output| output.status.success());
-        if !available {
-            missing.push(name);
+    for requirement in REQUIRED_VERIFICATION_TOOLS {
+        if !command_succeeds("cargo", requirement.arguments) {
+            missing.push(requirement.name);
         }
     }
 
@@ -417,18 +441,114 @@ fn required_tooling_check() -> CheckResult {
         missing.push("aarch64-apple-darwin target");
     }
 
+    let llvm_tools_installed = Command::new("rustup")
+        .args(["component", "list", "--installed"])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(is_llvm_tools_component)
+        });
+    if !llvm_tools_installed {
+        missing.push("llvm-tools-preview component");
+    }
+
     if missing.is_empty() {
         CheckResult::pass(
-            "required tooling",
-            "rustfmt, Clippy, and the Apple Silicon target are installed",
+            "required verification tooling",
+            "rustfmt, Clippy, llvm-tools-preview, nextest, cargo-deny, cargo-audit, cargo-llvm-cov, and the Apple Silicon target are installed",
         )
     } else {
         CheckResult::fail(
-            "required tooling",
+            "required verification tooling",
             format!("missing {}", missing.join(", ")),
-            "Run `rustup component add rustfmt clippy` and `rustup target add aarch64-apple-darwin`.",
+            "Install the missing Cargo tools (`cargo install <tool> --locked`) and run `rustup component add rustfmt clippy llvm-tools-preview`; ensure `aarch64-apple-darwin` is installed with rustup.",
         )
     }
+}
+
+struct ToolRequirement {
+    name: &'static str,
+    arguments: &'static [&'static str],
+}
+
+const REQUIRED_VERIFICATION_TOOLS: &[ToolRequirement] = &[
+    ToolRequirement {
+        name: "rustfmt",
+        arguments: &["fmt", "--version"],
+    },
+    ToolRequirement {
+        name: "Clippy",
+        arguments: &["clippy", "--version"],
+    },
+    ToolRequirement {
+        name: "nextest",
+        arguments: &["nextest", "--version"],
+    },
+    ToolRequirement {
+        name: "cargo-deny",
+        arguments: &["deny", "--version"],
+    },
+    ToolRequirement {
+        name: "cargo-audit",
+        arguments: &["audit", "--version"],
+    },
+    ToolRequirement {
+        name: "cargo-llvm-cov",
+        arguments: &["llvm-cov", "--version"],
+    },
+];
+
+fn command_succeeds(program: &str, arguments: &[&str]) -> bool {
+    Command::new(program)
+        .args(arguments)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn is_llvm_tools_component(component: &str) -> bool {
+    let component = component.trim();
+    component == "llvm-tools-preview"
+        || component == "llvm-tools"
+        || component.starts_with("llvm-tools-preview-")
+        || component.starts_with("llvm-tools-")
+}
+
+fn print_hardware_certification_status() {
+    println!("\nHardware certification (not evaluated by doctor):");
+    println!(
+        "[PENDING] Phase 1 device qualification: no attached-device timing result is inspected or certified by `cargo xtask doctor`."
+    );
+    println!(
+        "          Action: run the documented 1/2/4/8-rack, 128/256-frame AUHAL `device-feasibility` matrix on the designated Apple Silicon host; collect the required long-run evidence separately."
+    );
+}
+
+fn print_qualification_tooling() {
+    println!("\nQualification tooling:");
+    println!(
+        "[REQUIRED] Static verification: cargo nextest, cargo-deny, cargo-audit, cargo-llvm-cov, rustfmt, Clippy, and the aarch64-apple-darwin target."
+    );
+    println!(
+        "[REQUIRED FOR HARDWARE CERTIFICATION] Dedicated Apple Silicon host and a fixed 48 kHz stereo output route (for example, BlackHole or a reconfigurable device)."
+    );
+    let sdk = env::var_os("VST3_SDK_DIR").is_some_and(|path| Path::new(&path).is_dir());
+    let cmake = command_succeeds("cmake", &["--version"]);
+    let xcodebuild = command_succeeds("xcodebuild", &["-version"]);
+    println!(
+        "[OPTIONAL / PHASE-SPECIFIC] VST3 SDK HostChecker: VST3_SDK_DIR={}, cmake={}, xcodebuild={}; required only when running SDK sample or HostChecker qualification.",
+        availability(sdk),
+        availability(cmake),
+        availability(xcodebuild),
+    );
+    println!(
+        "[OPTIONAL / PHASE-SPECIFIC] Structured energy evidence, a selected MIDI source, and a licensed plug-in corpus are collected only for their corresponding hardware qualification runs."
+    );
+}
+
+const fn availability(available: bool) -> &'static str {
+    if available { "available" } else { "not found" }
 }
 
 fn configured_toolchain(workspace_root: &Path) -> Result<String, String> {
@@ -558,17 +678,33 @@ fn graph_from_metadata(metadata: &Value) -> Result<PackageGraph, String> {
 
 fn dependency_boundary_check(graph: &PackageGraph) -> CheckResult {
     let prohibited_vst3_roots = ["superposition", "sp-engine"];
+    let vst3_targets = ["sp-vst3", "vst3", "vst3-host"];
     let vst3_violations = prohibited_vst3_roots
         .iter()
-        .filter(|root| graph.contains_path(root, "sp-vst3"))
-        .copied()
+        .flat_map(|root| {
+            vst3_targets
+                .iter()
+                .filter(move |target| graph.contains_path(root, target))
+                .map(move |target| format!("{root} -> {target}"))
+        })
         .collect::<Vec<_>>();
-    let allowed_dependents = BTreeSet::from(["sp-plugin-worker", "sp-plugin-scanner"]);
-    let unexpected_dependents = graph
-        .direct_dependents_of("sp-vst3")
-        .difference(&allowed_dependents)
-        .copied()
-        .collect::<Vec<_>>();
+    let helper_dependents = BTreeSet::from(["sp-plugin-worker", "sp-plugin-scanner"]);
+    let host_dependents = BTreeSet::from(["sp-vst3"]);
+    let sdk_dependents = BTreeSet::from(["vst3-host"]);
+    let unexpected_dependents = [
+        ("sp-vst3", &helper_dependents),
+        ("vst3-host", &host_dependents),
+        ("vst3", &sdk_dependents),
+    ]
+    .into_iter()
+    .flat_map(|(crate_name, allowed)| {
+        graph
+            .direct_dependents_of(crate_name)
+            .difference(allowed)
+            .map(move |dependent| format!("{dependent} -> {crate_name}"))
+            .collect::<Vec<_>>()
+    })
+    .collect::<Vec<_>>();
 
     let lower_layers = [
         "sp-model",
@@ -601,13 +737,13 @@ fn dependency_boundary_check(graph: &PackageGraph) -> CheckResult {
         let mut problems = Vec::new();
         if !vst3_violations.is_empty() {
             problems.push(format!(
-                "sp-vst3 is reachable from {}",
+                "VST3 loading is reachable through {}",
                 vst3_violations.join(", ")
             ));
         }
         if !unexpected_dependents.is_empty() {
             problems.push(format!(
-                "unexpected direct sp-vst3 dependents: {}",
+                "unexpected direct VST3 adapter/loading dependents: {}",
                 unexpected_dependents.join(", ")
             ));
         }
@@ -627,7 +763,10 @@ fn dependency_boundary_check(graph: &PackageGraph) -> CheckResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{PackageGraph, dependency_boundary_check, graph_from_metadata, parse_toml_string};
+    use super::{
+        PackageGraph, REQUIRED_VERIFICATION_TOOLS, availability, dependency_boundary_check,
+        graph_from_metadata, is_llvm_tools_component, parse_toml_string,
+    };
     use serde_json::json;
 
     #[test]
@@ -648,6 +787,16 @@ mod tests {
         let result = dependency_boundary_check(&graph);
         assert!(!result.passed);
         assert!(result.detail.contains("sp-engine -> sp-ui"));
+    }
+
+    #[test]
+    fn rejects_engine_dependency_on_vst3_host() {
+        let mut graph = PackageGraph::default();
+        graph.insert_edge("sp-engine", "vst3-host");
+
+        let result = dependency_boundary_check(&graph);
+        assert!(!result.passed);
+        assert!(result.detail.contains("sp-engine -> vst3-host"));
     }
 
     #[test]
@@ -678,5 +827,38 @@ mod tests {
             Some("1.95.0".to_owned())
         );
         assert_eq!(parse_toml_string(" = 1.95"), None);
+    }
+
+    #[test]
+    fn requires_the_full_static_verification_toolchain() {
+        let names = REQUIRED_VERIFICATION_TOOLS
+            .iter()
+            .map(|requirement| requirement.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            [
+                "rustfmt",
+                "Clippy",
+                "nextest",
+                "cargo-deny",
+                "cargo-audit",
+                "cargo-llvm-cov",
+            ]
+        );
+    }
+
+    #[test]
+    fn recognizes_legacy_and_target_qualified_llvm_tool_components() {
+        assert!(is_llvm_tools_component("llvm-tools-preview"));
+        assert!(is_llvm_tools_component("llvm-tools-aarch64-apple-darwin"));
+        assert!(!is_llvm_tools_component("rustfmt-aarch64-apple-darwin"));
+    }
+
+    #[test]
+    fn qualification_tool_availability_is_explicit() {
+        assert_eq!(availability(true), "available");
+        assert_eq!(availability(false), "not found");
     }
 }

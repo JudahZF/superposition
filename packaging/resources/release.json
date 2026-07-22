@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "profile": "release",
+  "release_approvals": {
+    "logo": { "approved": false, "approval_owner": null, "approval_reference": null },
+    "icon": { "approved": false, "approval_owner": null, "approval_reference": null },
+    "fonts": { "approved": false, "approval_owner": null, "approval_reference": null },
+    "fault_red": { "approved": false, "value": null, "approval_owner": null, "approval_reference": null },
+    "provenance": { "approved": false, "approval_owner": null, "approval_reference": null }
+  },
+  "resources": [
+    {
+      "source": "packaging/brand/Superposition.icns",
+      "destination": "Superposition.icns",
+      "sha256": null,
+      "provenance": {
+        "source": null,
+        "license": null,
+        "rights_holder": null,
+        "approval_owner": null,
+        "approval_reference": null
+      }
+    },
+    {
+      "source": "packaging/brand/Superposition.svg",
+      "destination": "Superposition.svg",
+      "sha256": null,
+      "provenance": {
+        "source": null,
+        "license": null,
+        "rights_holder": null,
+        "approval_owner": null,
+        "approval_reference": null
+      }
+    },
+    {
+      "source": "packaging/fonts/Sora-Regular.ttf",
+      "destination": "Fonts/Sora-Regular.ttf",
+      "sha256": null,
+      "provenance": {
+        "source": null,
+        "license": null,
+        "rights_holder": null,
+        "approval_owner": null,
+        "approval_reference": null
+      }
+    },
+    {
+      "source": "packaging/fonts/SpaceMono-Regular.ttf",
+      "destination": "Fonts/SpaceMono-Regular.ttf",
+      "sha256": null,
+      "provenance": {
+        "source": null,
+        "license": null,
+        "rights_holder": null,
+        "approval_owner": null,
+        "approval_reference": null
+      }
+    }
+  ]
+}

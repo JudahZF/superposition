@@ -1,23 +1,36 @@
-//! Cached, parent-supervised VST3 bundle scanning.
+//! Parent-supervised isolated VST3 scanning and fingerprint invalidation.
+//!
+//! The parent only discovers canonical bundle paths, fingerprints bytes, and launches one
+//! disposable scanner helper per bundle. Layout inspection and all SDK activity stay inside the
+//! helper, so the application process never loads third-party plug-in code.
 
 use std::{
-    collections::BTreeMap,
+    env,
     fmt::Write as _,
     fs::{self, File},
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     time::{Duration, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sp_model::{
+    PLUGIN_SCAN_METADATA_VERSION, PluginArchitecture, PluginClassScanMetadata, PluginScanMetadata,
+    PluginScanOutcome,
+};
 
-use crate::{CapturedHelperOutput, HelperKind, HelperLaunch, ProcessSupervisor, TimedHelperResult};
+use crate::{
+    CapturedHelperOutput, HelperKind, HelperLaunch, ProcessSupervisor, TimedHelperResult,
+    catalog::PluginCatalog,
+    quarantine::{PersistentQuarantine, PluginFailureKind},
+};
 
-const CACHE_VERSION: u32 = 1;
+/// The bounded scanner deadline used when a deployment does not provide one.
+pub const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Stable content identity used for scan-cache invalidation and quarantine.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Stable content identity used for catalog invalidation and quarantine.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct BundleFingerprint {
     /// Hash algorithm used for `digest`.
     pub algorithm: String,
@@ -25,160 +38,178 @@ pub struct BundleFingerprint {
     pub digest: String,
 }
 
-/// One VST3 class exposed by a scanned bundle.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ScanDescriptor {
-    /// Vendor-assigned VST3 class identifier.
-    pub class_id: String,
-    /// User-visible plug-in name.
-    pub name: String,
-    /// User-visible vendor name.
-    pub vendor: String,
-}
-
-/// Stable scanner outcome stored in the cache.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScanStatus {
-    /// Native bundle and factory enumeration succeeded.
-    Supported,
-    /// Bundle does not contain arm64 code.
-    UnsupportedArchitecture,
-    /// Bundle layout is malformed.
-    InvalidBundle,
-    /// Scanner exceeded its deadline.
-    TimedOut,
-    /// Scanner exited without a valid report.
-    Crashed,
-    /// VST3 SDK enumeration returned an error.
-    SdkError,
-}
+/// Compatibility alias for SDK-free per-class scan metadata.
+pub type ScanDescriptor = PluginClassScanMetadata;
+/// Compatibility alias for the platform-neutral isolated scan outcome.
+pub type ScanStatus = PluginScanOutcome;
+/// Compatibility alias for the persistent, versioned plug-in catalog.
+pub type ScanCache = PluginCatalog;
 
 /// Persisted outcome for one exact bundle fingerprint.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CachedScan {
     /// Canonical bundle path.
     pub bundle: PathBuf,
     /// Fingerprint that produced this result.
     pub fingerprint: BundleFingerprint,
-    /// Native architecture label from the helper.
-    pub architectures: String,
-    /// Scan outcome.
-    pub status: ScanStatus,
-    /// VST3 classes discovered by the helper.
-    pub descriptors: Vec<ScanDescriptor>,
-    /// Optional diagnostic detail.
-    pub detail: Option<String>,
+    /// Versioned, SDK-free metadata produced by the disposable helper.
+    pub metadata: PluginScanMetadata,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct CacheFile {
-    version: u32,
-    entries: BTreeMap<PathBuf, CachedScan>,
-}
-
-/// File-backed scan cache keyed by canonical bundle path and content fingerprint.
-#[derive(Debug)]
-pub struct ScanCache {
-    path: PathBuf,
-    entries: BTreeMap<PathBuf, CachedScan>,
-}
-
-impl ScanCache {
-    /// Opens an existing cache or creates an empty in-memory cache when absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for unreadable, malformed, or unsupported cache files.
-    pub fn open(path: impl Into<PathBuf>) -> std::io::Result<Self> {
-        let path = path.into();
-        let entries = match fs::read(&path) {
-            Ok(bytes) => {
-                let cache: CacheFile = serde_json::from_slice(&bytes).map_err(invalid_data)?;
-                if cache.version != CACHE_VERSION {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("unsupported scan cache version {}", cache.version),
-                    ));
-                }
-                cache.entries
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(error) => return Err(error),
-        };
-        Ok(Self { path, entries })
-    }
-
-    /// Returns a cached result only when its content fingerprint still matches.
+impl CachedScan {
+    /// Returns the outcome recorded by the isolated scanner.
     #[must_use]
-    pub fn get(&self, bundle: &Path, fingerprint: &BundleFingerprint) -> Option<&CachedScan> {
-        self.entries
-            .get(bundle)
-            .filter(|entry| &entry.fingerprint == fingerprint)
+    pub const fn outcome(&self) -> PluginScanOutcome {
+        self.metadata.outcome
     }
 
-    /// Inserts or replaces one canonical bundle result.
-    pub fn insert(&mut self, scan: CachedScan) {
-        self.entries.insert(scan.bundle.clone(), scan);
-    }
-
-    /// Persists the cache with a temporary-file replacement.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when serialization or file replacement fails.
-    pub fn save(&self) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let temporary = self.path.with_extension("tmp");
-        let bytes = serde_json::to_vec_pretty(&CacheFile {
-            version: CACHE_VERSION,
-            entries: self.entries.clone(),
-        })
-        .map_err(invalid_data)?;
-        let mut file = File::create(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        fs::rename(temporary, &self.path)
+    /// Returns whether this exact bundle can launch on Apple Silicon.
+    #[must_use]
+    pub fn is_supported(&self) -> bool {
+        self.metadata.outcome == PluginScanOutcome::Supported
+            && matches!(
+                self.metadata.architecture,
+                PluginArchitecture::Arm64 | PluginArchitecture::Universal
+            )
     }
 }
 
-/// Scanner executable plus timeout policy and persistent cache.
+/// Scanner executable, timeout policy, persistent catalog, and optional persistent quarantine.
 #[derive(Debug)]
 pub struct Scanner {
     executable: PathBuf,
     timeout: Duration,
-    cache: ScanCache,
+    catalog: PluginCatalog,
+    quarantine: Option<PersistentQuarantine>,
 }
 
 impl Scanner {
-    /// Creates a cached isolated scanner.
+    /// Creates a cached isolated scanner without scanner-failure quarantine ingestion.
+    ///
+    /// Production application code should call [`Self::with_quarantine`] before scanning.
     #[must_use]
-    pub fn new(executable: impl Into<PathBuf>, timeout: Duration, cache: ScanCache) -> Self {
+    pub fn new(executable: impl Into<PathBuf>, timeout: Duration, catalog: PluginCatalog) -> Self {
         Self {
             executable: executable.into(),
             timeout,
-            cache,
+            catalog,
+            quarantine: None,
         }
     }
 
-    /// Returns the scan cache.
+    /// Creates a scanner with the Phase 2 ten-second helper deadline.
     #[must_use]
-    pub const fn cache(&self) -> &ScanCache {
-        &self.cache
+    pub fn with_default_timeout(executable: impl Into<PathBuf>, catalog: PluginCatalog) -> Self {
+        Self::new(executable, DEFAULT_SCAN_TIMEOUT, catalog)
     }
 
-    /// Fingerprints and scans one bundle, reusing an unchanged cached result.
+    /// Adds persistent scanner-failure quarantine ingestion.
+    #[must_use]
+    pub fn with_quarantine(mut self, quarantine: PersistentQuarantine) -> Self {
+        self.quarantine = Some(quarantine);
+        self
+    }
+
+    /// Returns the persistent catalog.
+    #[must_use]
+    pub const fn catalog(&self) -> &PluginCatalog {
+        &self.catalog
+    }
+
+    /// Compatibility accessor for callers migrating from the Phase 2 scan-cache name.
+    #[must_use]
+    pub const fn cache(&self) -> &ScanCache {
+        &self.catalog
+    }
+
+    /// Returns persistent quarantine state when scanner fault ingestion is configured.
+    #[must_use]
+    pub fn quarantine(&self) -> Option<&PersistentQuarantine> {
+        self.quarantine.as_ref()
+    }
+
+    /// Fingerprints and scans one bundle, reusing an unchanged catalog result.
+    ///
+    /// The caller must use [`Self::rescan`] for an explicit user-requested retry.
     ///
     /// # Errors
     ///
-    /// Returns an error when the bundle cannot be fingerprinted, the helper cannot run,
-    /// or the updated cache cannot be persisted.
+    /// Returns an error when the bundle cannot be fingerprinted or persistent state cannot be
+    /// updated. A scanner launch failure is cached as a `crashed` outcome instead.
     pub fn scan(&mut self, bundle: &Path) -> std::io::Result<CachedScan> {
+        self.scan_inner(bundle, false)
+    }
+
+    /// Invalidates a selected catalog entry and launches a fresh isolated scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bundle cannot be fingerprinted or state cannot be persisted.
+    pub fn rescan(&mut self, bundle: &Path) -> std::io::Result<CachedScan> {
+        self.scan_inner(bundle, true)
+    }
+
+    /// Discovers standard VST3 directories and scans each bundle independently.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first persistence/fingerprinting error after prior discovered bundles have
+    /// already completed their own helper invocation.
+    pub fn scan_standard_locations(
+        &mut self,
+        home: Option<&Path>,
+    ) -> std::io::Result<Vec<CachedScan>> {
+        discover_vst3_bundles(home)
+            .into_iter()
+            .map(|bundle| self.scan(&bundle))
+            .collect()
+    }
+
+    /// Clears every catalog result and atomically persists the empty catalog for a manual reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the updated catalog cannot be persisted.
+    pub fn clear_catalog(&mut self) -> std::io::Result<()> {
+        self.catalog.clear_and_save()
+    }
+
+    /// Clears failure history and quarantine for one fingerprint after an explicit user review.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` if this scanner was not configured with persistent quarantine, or
+    /// an error when the atomic replacement cannot be persisted.
+    pub fn clear_quarantine(&mut self, fingerprint: &BundleFingerprint) -> std::io::Result<()> {
+        let Some(quarantine) = self.quarantine.as_mut() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "scanner has no configured persistent quarantine",
+            ));
+        };
+        quarantine.clear(fingerprint)
+    }
+
+    /// Clears all failure history and quarantines after an explicit user-requested reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` if this scanner was not configured with persistent quarantine, or
+    /// an error when the atomic replacement cannot be persisted.
+    pub fn clear_all_quarantine(&mut self) -> std::io::Result<()> {
+        let Some(quarantine) = self.quarantine.as_mut() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "scanner has no configured persistent quarantine",
+            ));
+        };
+        quarantine.clear_all()
+    }
+
+    fn scan_inner(&mut self, bundle: &Path, force: bool) -> std::io::Result<CachedScan> {
         let bundle = fs::canonicalize(bundle)?;
         let fingerprint = fingerprint_bundle(&bundle)?;
-        if let Some(cached) = self.cache.get(&bundle, &fingerprint) {
+        if !force && let Some(cached) = self.catalog.get(&bundle, &fingerprint) {
             return Ok(cached.clone());
         }
 
@@ -192,15 +223,49 @@ impl Scanner {
                 "--sdk-enumerate".to_owned(),
             ],
         };
-        let captured = ProcessSupervisor::new().launch_and_wait_capturing(&launch, self.timeout)?;
-        let scan = map_scan(bundle, fingerprint, &captured);
-        self.cache.insert(scan.clone());
-        self.cache.save()?;
+        let scan = match ProcessSupervisor::new().launch_and_wait_capturing(&launch, self.timeout) {
+            Ok(captured) => map_scan(bundle, fingerprint, &captured),
+            Err(error) => CachedScan {
+                bundle,
+                fingerprint,
+                metadata: metadata_with_detail(
+                    PluginArchitecture::Unknown,
+                    PluginScanOutcome::Crashed,
+                    format!("could not launch scanner helper: {error}"),
+                ),
+            },
+        };
+        self.catalog.insert(scan.clone());
+        self.catalog.save()?;
+        self.ingest_scan_failure(&scan)?;
         Ok(scan)
+    }
+
+    fn ingest_scan_failure(&mut self, scan: &CachedScan) -> std::io::Result<()> {
+        let Some(quarantine) = self.quarantine.as_mut() else {
+            return Ok(());
+        };
+        let kind = match scan.metadata.outcome {
+            PluginScanOutcome::TimedOut => Some(PluginFailureKind::ScannerTimeout),
+            PluginScanOutcome::Crashed => Some(PluginFailureKind::ScannerCrash),
+            PluginScanOutcome::Supported
+            | PluginScanOutcome::UnsupportedArchitecture
+            | PluginScanOutcome::InvalidBundle
+            | PluginScanOutcome::SdkError
+            | PluginScanOutcome::InvalidReport => None,
+        };
+        if let Some(kind) = kind {
+            quarantine.record_failure(scan.fingerprint.clone(), kind)?;
+        }
+        Ok(())
     }
 }
 
-/// Computes a deterministic SHA-256 over the canonical bundle path, entry metadata, and files.
+/// Computes a deterministic SHA-256 over canonical bundle metadata and regular-file content.
+///
+/// Symlinked descendants are not followed, preventing bundle-local cycles or content outside the
+/// canonical bundle root from affecting identity. Every regular file contributes relative path,
+/// size, modification time, and bytes, including `Info.plist` and executable content.
 ///
 /// # Errors
 ///
@@ -208,22 +273,20 @@ impl Scanner {
 pub fn fingerprint_bundle(bundle: &Path) -> std::io::Result<BundleFingerprint> {
     let bundle = fs::canonicalize(bundle)?;
     let mut files = Vec::new();
-    collect_files(&bundle, &mut files)?;
+    collect_regular_files(&bundle, &mut files)?;
     files.sort();
 
+    let root_metadata = fs::metadata(&bundle)?;
     let mut hasher = Sha256::new();
     hasher.update(bundle.as_os_str().as_encoded_bytes());
+    hasher.update(root_metadata.len().to_le_bytes());
+    update_modified_time(&mut hasher, &root_metadata);
     for path in files {
         let relative = path.strip_prefix(&bundle).unwrap_or(&path);
         let metadata = fs::metadata(&path)?;
         hasher.update(relative.as_os_str().as_encoded_bytes());
         hasher.update(metadata.len().to_le_bytes());
-        if let Ok(modified) = metadata.modified()
-            && let Ok(duration) = modified.duration_since(UNIX_EPOCH)
-        {
-            hasher.update(duration.as_secs().to_le_bytes());
-            hasher.update(duration.subsec_nanos().to_le_bytes());
-        }
+        update_modified_time(&mut hasher, &metadata);
         let mut file = File::open(path)?;
         let mut buffer = [0_u8; 8 * 1024];
         loop {
@@ -246,35 +309,46 @@ pub fn fingerprint_bundle(bundle: &Path) -> std::io::Result<BundleFingerprint> {
     })
 }
 
-/// Discovers direct child bundles in the two standard macOS VST3 locations.
+/// Discovers direct VST3 bundle children in the standard user and system macOS locations.
+///
+/// Passing `Some(home)` makes user-directory discovery deterministic for functional tests. With
+/// `None`, the current process's `HOME` is used when available. Discovery never opens a bundle.
 #[must_use]
 pub fn discover_vst3_bundles(home: Option<&Path>) -> Vec<PathBuf> {
+    let user_home = home
+        .map(Path::to_path_buf)
+        .or_else(|| env::var_os("HOME").map(PathBuf::from));
     let mut roots = vec![PathBuf::from("/Library/Audio/Plug-Ins/VST3")];
-    if let Some(home) = home {
+    if let Some(home) = user_home {
         roots.push(home.join("Library/Audio/Plug-Ins/VST3"));
     }
     let mut bundles = roots
         .into_iter()
         .filter_map(|root| fs::read_dir(root).ok())
         .flat_map(|entries| entries.filter_map(Result::ok))
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "vst3")
+        .filter_map(|entry| {
+            let path = entry.path();
+            let extension_is_vst3 = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("vst3"));
+            (extension_is_vst3 && entry.file_type().ok().is_some_and(|kind| kind.is_dir()))
+                .then_some(path)
         })
+        .filter_map(|path| fs::canonicalize(path).ok())
         .collect::<Vec<_>>();
     bundles.sort();
     bundles.dedup();
     bundles
 }
 
-fn collect_files(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn collect_regular_files(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            collect_files(&path, files)?;
+            collect_regular_files(&path, files)?;
         } else if file_type.is_file() {
             files.push(path);
         }
@@ -282,13 +356,13 @@ fn collect_files(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct ChildReport {
-    architectures: String,
-    outcome: ScanStatus,
-    #[serde(default)]
-    descriptors: Vec<ScanDescriptor>,
-    detail: Option<String>,
+fn update_modified_time(hasher: &mut Sha256, metadata: &fs::Metadata) {
+    if let Ok(modified) = metadata.modified()
+        && let Ok(duration) = modified.duration_since(UNIX_EPOCH)
+    {
+        hasher.update(duration.as_secs().to_le_bytes());
+        hasher.update(duration.subsec_nanos().to_le_bytes());
+    }
 }
 
 fn map_scan(
@@ -296,101 +370,121 @@ fn map_scan(
     fingerprint: BundleFingerprint,
     captured: &CapturedHelperOutput,
 ) -> CachedScan {
-    let parsed = serde_json::from_slice::<ChildReport>(&captured.stdout).ok();
-    match &captured.result {
-        TimedHelperResult::TimedOut { .. } => CachedScan {
-            bundle,
-            fingerprint,
-            architectures: "unknown".to_owned(),
-            status: ScanStatus::TimedOut,
-            descriptors: Vec::new(),
-            detail: Some("scanner exceeded its deadline".to_owned()),
-        },
+    let parsed = serde_json::from_slice::<ChildReport>(&captured.stdout)
+        .ok()
+        .filter(|report| report.metadata.version == PLUGIN_SCAN_METADATA_VERSION)
+        .map(|report| report.metadata);
+    let metadata = match &captured.result {
+        TimedHelperResult::TimedOut { .. } => metadata_with_detail(
+            PluginArchitecture::Unknown,
+            PluginScanOutcome::TimedOut,
+            "scanner exceeded its deadline".to_owned(),
+        ),
         TimedHelperResult::Exited { code, .. } => match parsed {
-            None => CachedScan {
-                bundle,
-                fingerprint,
-                architectures: "unknown".to_owned(),
-                status: ScanStatus::Crashed,
-                descriptors: Vec::new(),
-                detail: Some(format!(
-                    "scanner exited with code {code} without valid JSON"
-                )),
-            },
-            Some(report) => CachedScan {
-                bundle,
-                fingerprint,
-                architectures: report.architectures,
-                status: if *code == 0 || report.outcome != ScanStatus::Supported {
-                    report.outcome
-                } else {
-                    ScanStatus::Crashed
-                },
-                descriptors: report.descriptors,
-                detail: report.detail,
-            },
+            None => metadata_with_detail(
+                PluginArchitecture::Unknown,
+                PluginScanOutcome::Crashed,
+                format!("scanner exited with code {code} without valid metadata"),
+            ),
+            Some(mut metadata)
+                if *code != 0 && metadata.outcome == PluginScanOutcome::Supported =>
+            {
+                metadata.outcome = PluginScanOutcome::Crashed;
+                metadata.detail = Some(format!(
+                    "scanner exited with code {code} after reporting success"
+                ));
+                metadata
+            }
+            Some(metadata) => metadata,
         },
+    };
+    CachedScan {
+        bundle,
+        fingerprint,
+        metadata,
     }
 }
 
-fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+fn metadata_with_detail(
+    architecture: PluginArchitecture,
+    outcome: PluginScanOutcome,
+    detail: String,
+) -> PluginScanMetadata {
+    let mut metadata = PluginScanMetadata::new(architecture, outcome);
+    metadata.detail = Some(detail);
+    metadata
+}
+
+#[derive(Deserialize)]
+struct ChildReport {
+    #[serde(flatten)]
+    metadata: PluginScanMetadata,
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
         fs,
+        path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{CachedScan, ScanCache, ScanStatus, fingerprint_bundle};
+    use sp_model::{PluginArchitecture, PluginScanMetadata, PluginScanOutcome};
+
+    use super::{CachedScan, ScanCache, discover_vst3_bundles, fingerprint_bundle};
 
     fn temporary_root() -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
             .as_nanos();
-        let thread = std::thread::current().id();
-        std::env::temp_dir().join(format!("sp-scan-cache-{unique}-{thread:?}"))
+        std::env::temp_dir().join(format!("sp-scan-catalog-{}-{unique}", std::process::id()))
     }
-
-    use std::path::PathBuf;
 
     #[test]
     fn fingerprint_changes_with_bundle_content() {
         let root = temporary_root();
         let bundle = root.join("Example.vst3");
-        fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        fs::create_dir_all(bundle.join("Contents/MacOS")).expect("create bundle");
         let executable = bundle.join("Contents/MacOS/Example");
-        fs::write(&executable, b"first").unwrap();
-        let first = fingerprint_bundle(&bundle).unwrap();
-        fs::write(executable, b"second").unwrap();
-        let second = fingerprint_bundle(&bundle).unwrap();
+        fs::write(&executable, b"first").expect("write first content");
+        let first = fingerprint_bundle(&bundle).expect("fingerprint first content");
+        fs::write(executable, b"second").expect("write second content");
+        let second = fingerprint_bundle(&bundle).expect("fingerprint second content");
         assert_ne!(first, second);
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("remove temporary root");
     }
 
     #[test]
-    fn cache_reuses_only_an_exact_fingerprint() {
+    fn catalog_reuses_only_an_exact_fingerprint() {
         let root = temporary_root();
-        let cache_path = root.join("scan-cache.json");
+        let catalog_path = root.join("scan-catalog.json");
         let bundle = root.join("Example.vst3");
-        fs::create_dir_all(&bundle).unwrap();
-        let fingerprint = fingerprint_bundle(&bundle).unwrap();
-        let canonical = fs::canonicalize(&bundle).unwrap();
-        let mut cache = ScanCache::open(&cache_path).unwrap();
-        cache.insert(CachedScan {
+        fs::create_dir_all(&bundle).expect("create bundle");
+        let fingerprint = fingerprint_bundle(&bundle).expect("fingerprint bundle");
+        let canonical = fs::canonicalize(&bundle).expect("canonical bundle");
+        let mut catalog = ScanCache::open(&catalog_path).expect("open catalog");
+        catalog.insert(CachedScan {
             bundle: canonical.clone(),
             fingerprint: fingerprint.clone(),
-            architectures: "arm64".to_owned(),
-            status: ScanStatus::Supported,
-            descriptors: Vec::new(),
-            detail: None,
+            metadata: PluginScanMetadata::new(
+                PluginArchitecture::Arm64,
+                PluginScanOutcome::Supported,
+            ),
         });
-        cache.save().unwrap();
-        let reopened = ScanCache::open(cache_path).unwrap();
+        catalog.save().expect("save catalog");
+        let reopened = ScanCache::open(catalog_path).expect("reopen catalog");
         assert!(reopened.get(&canonical, &fingerprint).is_some());
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("remove temporary root");
+    }
+
+    #[test]
+    fn discovers_user_directory_without_scanning_a_bundle() {
+        let root = temporary_root();
+        let bundle = root.join("Library/Audio/Plug-Ins/VST3/Fixture.vst3");
+        fs::create_dir_all(&bundle).expect("create test bundle");
+        let discovered = discover_vst3_bundles(Some(&root));
+        assert!(discovered.contains(&fs::canonicalize(&bundle).expect("canonical bundle")));
+        fs::remove_dir_all(root).expect("remove temporary root");
     }
 }

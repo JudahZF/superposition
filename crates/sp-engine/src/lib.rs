@@ -6,7 +6,10 @@
 
 mod realtime;
 
-pub use realtime::{MAX_MIX_FRAMES, MIX_CHANNELS, MixError, RackAudioSource, RealtimeRackMixer};
+pub use realtime::{
+    MAX_MIX_FRAMES, MAX_TRANSITION_FRAMES, MIN_TRANSITION_FRAMES, MIX_CHANNELS, MixError,
+    RackAudioSource, RackMeterSnapshot, RackSettings, RealtimeRackMixer, WET_RECOVERY_BLOCKS,
+};
 
 use sp_model::{
     ChannelLayout, EntityKind, MAX_RACKS, MAX_SLOTS_PER_RACK, PluginSlot, RackTopology, Session,
@@ -45,7 +48,9 @@ impl PreparedGraph {
                 });
             }
         }
-        session.validate().map_err(PrepareError::InvalidSession)?;
+        session
+            .validate_for_alpha()
+            .map_err(PrepareError::InvalidSession)?;
 
         let mut graph = Self::empty();
         for (rack_index, rack) in session.racks.iter().enumerate() {
@@ -91,11 +96,14 @@ impl PreparedGraph {
                     endpoint_layout,
                 });
             }
+            let conversion = PreparedChannelConversion::between(source_layout, endpoint_layout);
 
             graph.racks[rack_index] = Some(PreparedRack::new(
                 source,
                 endpoint,
                 source_layout,
+                endpoint_layout,
+                conversion,
                 &rack.slots,
             ));
             graph.rack_count += 1;
@@ -136,7 +144,10 @@ impl Default for PreparedGraph {
 pub struct PreparedRack {
     source_index: usize,
     endpoint_index: usize,
-    layout: PreparedChannelLayout,
+    source_layout: PreparedChannelLayout,
+    endpoint_layout: PreparedChannelLayout,
+    conversion: PreparedChannelConversion,
+    fallback: PreparedFallbackRoute,
     slots: [Option<PreparedSlot>; MAX_SLOTS_PER_RACK],
     slot_count: usize,
 }
@@ -145,7 +156,9 @@ impl PreparedRack {
     fn new(
         source_index: usize,
         endpoint_index: usize,
-        layout: PreparedChannelLayout,
+        source_layout: PreparedChannelLayout,
+        endpoint_layout: PreparedChannelLayout,
+        conversion: PreparedChannelConversion,
         model_slots: &[PluginSlot],
     ) -> Self {
         let mut slots = [None; MAX_SLOTS_PER_RACK];
@@ -159,7 +172,10 @@ impl PreparedRack {
         Self {
             source_index,
             endpoint_index,
-            layout,
+            source_layout,
+            endpoint_layout,
+            conversion,
+            fallback: PreparedFallbackRoute::DelayedDry,
             slots,
             slot_count: model_slots.len(),
         }
@@ -177,10 +193,34 @@ impl PreparedRack {
         self.endpoint_index
     }
 
-    /// Returns the supported channel layout used by this rack.
+    /// Returns this rack's output layout. This is retained as the legacy route layout accessor.
     #[must_use]
     pub const fn layout(&self) -> PreparedChannelLayout {
-        self.layout
+        self.endpoint_layout
+    }
+
+    /// Returns the source layout accepted by this route.
+    #[must_use]
+    pub const fn source_layout(&self) -> PreparedChannelLayout {
+        self.source_layout
+    }
+
+    /// Returns the endpoint layout emitted by this route.
+    #[must_use]
+    pub const fn endpoint_layout(&self) -> PreparedChannelLayout {
+        self.endpoint_layout
+    }
+
+    /// Returns the explicit source-to-endpoint conversion selected at preparation time.
+    #[must_use]
+    pub const fn conversion(&self) -> PreparedChannelConversion {
+        self.conversion
+    }
+
+    /// Returns the deterministic fallback route for this rack.
+    #[must_use]
+    pub const fn fallback(&self) -> PreparedFallbackRoute {
+        self.fallback
     }
 
     /// Returns the number of prepared slots.
@@ -217,6 +257,37 @@ pub enum PreparedChannelLayout {
     Mono,
     /// Two discrete channels.
     Stereo,
+}
+
+/// Explicit conversion applied by a prepared route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedChannelConversion {
+    /// Source and endpoint have the same channel count.
+    Direct,
+    /// Duplicate the mono source to both stereo destination channels.
+    MonoToStereo,
+    /// Mix stereo source channels equally into the mono destination channel.
+    StereoToMono,
+}
+
+impl PreparedChannelConversion {
+    const fn between(source: PreparedChannelLayout, endpoint: PreparedChannelLayout) -> Self {
+        match (source, endpoint) {
+            (PreparedChannelLayout::Mono, PreparedChannelLayout::Mono)
+            | (PreparedChannelLayout::Stereo, PreparedChannelLayout::Stereo) => Self::Direct,
+            (PreparedChannelLayout::Mono, PreparedChannelLayout::Stereo) => Self::MonoToStereo,
+            (PreparedChannelLayout::Stereo, PreparedChannelLayout::Mono) => Self::StereoToMono,
+        }
+    }
+}
+
+/// Deterministic fallback route available without worker audio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedFallbackRoute {
+    /// Use latency-matched source input through the prepared channel conversion.
+    DelayedDry,
+    /// Use silence when an effect-style dry path is unavailable.
+    Silence,
 }
 
 impl TryFrom<&ChannelLayout> for PreparedChannelLayout {
@@ -441,6 +512,8 @@ pub enum GateOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RackGate {
     state: RackGateState,
+    consecutive_deadline_misses: u8,
+    expired_ticket: Option<BlockTicket>,
 }
 
 impl RackGate {
@@ -449,6 +522,8 @@ impl RackGate {
     pub const fn new() -> Self {
         Self {
             state: RackGateState::Open,
+            consecutive_deadline_misses: 0,
+            expired_ticket: None,
         }
     }
 
@@ -486,13 +561,28 @@ impl RackGate {
                 WorkerObservation::WorkerExited => {
                     self.close(FallbackReason::WorkerExited, block_index)
                 }
+                // A completion for a ticket that already expired is late, not a protocol
+                // violation: the block was rendered with fallback and the gate stays usable.
+                WorkerObservation::Completed(completed)
+                    if self.expired_ticket == Some(completed) =>
+                {
+                    self.expired_ticket = None;
+                    GateOutcome::UseFallback(FallbackReason::DeadlineMiss)
+                }
                 _ => self.close(FallbackReason::InvalidProtocolState, block_index),
             },
             RackGateState::Awaiting { ticket, .. } => match observation {
                 WorkerObservation::Pending => GateOutcome::Awaiting,
                 WorkerObservation::Completed(completed) if completed == ticket => {
                     self.state = RackGateState::Open;
+                    self.consecutive_deadline_misses = 0;
                     GateOutcome::WorkerResultAccepted
+                }
+                WorkerObservation::Completed(completed)
+                    if self.expired_ticket == Some(completed) =>
+                {
+                    self.expired_ticket = None;
+                    GateOutcome::UseFallback(FallbackReason::DeadlineMiss)
                 }
                 WorkerObservation::Completed(_) => {
                     self.close(FallbackReason::StaleCompletion, block_index)
@@ -507,12 +597,38 @@ impl RackGate {
         }
     }
 
-    /// Closes an awaiting gate when its bounded deadline expires.
+    /// Falls back for an expired block and closes after three consecutive misses.
     #[must_use]
     pub fn deadline_expired(&mut self, block_index: u64) -> GateOutcome {
         match self.state {
-            RackGateState::Awaiting { .. } => self.close(FallbackReason::DeadlineMiss, block_index),
+            RackGateState::Awaiting { ticket, .. } => {
+                self.consecutive_deadline_misses =
+                    self.consecutive_deadline_misses.saturating_add(1);
+                self.expired_ticket = Some(ticket);
+                if self.consecutive_deadline_misses >= 3 {
+                    self.close(FallbackReason::DeadlineMiss, block_index)
+                } else {
+                    self.state = RackGateState::Open;
+                    GateOutcome::UseFallback(FallbackReason::DeadlineMiss)
+                }
+            }
             RackGateState::Closed { reason, .. } => GateOutcome::UseFallback(reason),
+            RackGateState::Open => self.close(FallbackReason::InvalidProtocolState, block_index),
+        }
+    }
+
+    /// Closes this rack immediately for a hard deadline failure, such as an active device
+    /// callback exhausting its completion budget. Unlike [`RackGate::deadline_expired`], no
+    /// consecutive-miss tolerance applies: the abandoned slot cannot be reused, so the rack
+    /// stays latched to fallback until the control plane replaces its worker and bank.
+    #[must_use]
+    pub fn deadline_expired_hard(&mut self, block_index: u64) -> GateOutcome {
+        match self.state {
+            RackGateState::Closed { reason, .. } => GateOutcome::UseFallback(reason),
+            RackGateState::Awaiting { ticket, .. } => {
+                self.expired_ticket = Some(ticket);
+                self.close(FallbackReason::DeadlineMiss, block_index)
+            }
             RackGateState::Open => self.close(FallbackReason::InvalidProtocolState, block_index),
         }
     }
@@ -531,6 +647,8 @@ impl RackGate {
     /// Reopens the gate after the control plane installs a fresh worker and bank.
     pub fn reset_after_replacement(&mut self) {
         self.state = RackGateState::Open;
+        self.consecutive_deadline_misses = 0;
+        self.expired_ticket = None;
     }
 
     fn close(&mut self, reason: FallbackReason, block_index: u64) -> GateOutcome {
@@ -761,6 +879,15 @@ impl LiveBlockPlanner {
         if let Some(slot) = self.dry_delay_available.get_mut(index) {
             *slot = available;
         }
+    }
+
+    /// Returns whether rack `index` may fall back to delayed dry audio.
+    #[must_use]
+    pub fn dry_delay_available(&self, index: usize) -> bool {
+        self.dry_delay_available
+            .get(index)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Interprets one gate outcome for rack `index`.

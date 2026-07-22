@@ -57,6 +57,20 @@ pub enum FontWeight {
 /// A reusable typography role.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TypographyRole {
+    /// Product wordmark text.
+    Brand,
+    /// A rack or primary section title.
+    Section,
+    /// A card title.
+    Card,
+    /// Supporting descriptive text.
+    Supporting,
+    /// Component gallery title.
+    Gallery,
+    /// Compact explanatory text.
+    Caption,
+    /// The smallest metadata label.
+    Meta,
     /// Prominent display text.
     Display,
     /// Section headings.
@@ -108,6 +122,48 @@ impl TypographyRole {
     #[must_use]
     pub const fn typography(self) -> Typography {
         match self {
+            Self::Brand => Typography {
+                family: FontFamily::Display,
+                size: 18,
+                line_height: 24,
+                weight: FontWeight::Bold,
+            },
+            Self::Section => Typography {
+                family: FontFamily::Display,
+                size: 22,
+                line_height: 28,
+                weight: FontWeight::Semibold,
+            },
+            Self::Card => Typography {
+                family: FontFamily::Interface,
+                size: 15,
+                line_height: 20,
+                weight: FontWeight::Semibold,
+            },
+            Self::Supporting => Typography {
+                family: FontFamily::Interface,
+                size: 13,
+                line_height: 18,
+                weight: FontWeight::Regular,
+            },
+            Self::Gallery => Typography {
+                family: FontFamily::Display,
+                size: 26,
+                line_height: 32,
+                weight: FontWeight::Bold,
+            },
+            Self::Caption => Typography {
+                family: FontFamily::Interface,
+                size: 11,
+                line_height: 16,
+                weight: FontWeight::Regular,
+            },
+            Self::Meta => Typography {
+                family: FontFamily::Interface,
+                size: 10,
+                line_height: 14,
+                weight: FontWeight::Medium,
+            },
             Self::Display => Typography {
                 family: FontFamily::Display,
                 size: 32,

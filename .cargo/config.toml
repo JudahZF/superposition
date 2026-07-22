@@ -1,2 +1,12 @@
 [alias]
 xtask = "run --locked --package xtask --"
+
+# cargo-llvm-cov invokes the active Cargo compiler but needs matching LLVM binaries.
+# Resolve those through the repository's pinned Rustup toolchain instead of depending
+# on the shell's Cargo/Rust installation or a user-specific sysroot path.
+[build]
+rustc = "tools/llvm-tools/rustc"
+
+[env]
+LLVM_COV = { value = "tools/llvm-tools/llvm-cov", relative = true }
+LLVM_PROFDATA = { value = "tools/llvm-tools/llvm-profdata", relative = true }

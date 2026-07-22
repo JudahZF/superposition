@@ -8,10 +8,96 @@ pub const FAULT_MODE_OPTION: &str = "--fault-mode";
 pub const FAULT_TRIGGER_SEQUENCE_OPTION: &str = "--fault-trigger-sequence";
 /// Command-line option specifying fault-specific delay in microseconds.
 pub const FAULT_DELAY_MICROS_OPTION: &str = "--fault-delay-micros";
-/// Command-line option specifying simulated work duration in microseconds.
+/// Command-line option specifying simulated fault-path work duration in microseconds.
 pub const WORK_DURATION_MICROS_OPTION: &str = "--work-duration-micros";
-/// Maximum accepted fault delay or simulated work duration.
+/// Command-line option selecting bounded worker compute load.
+pub const COMPUTE_LOAD_MODE_OPTION: &str = "--compute-load-mode";
+/// Command-line option specifying the bounded compute-load duration in microseconds.
+pub const COMPUTE_LOAD_MICROS_OPTION: &str = "--compute-load-micros";
+/// Worker-only fault spelling which aborts immediately after claiming its trigger request.
+///
+/// This is intentionally separate from [`FaultMode`] so the Phase 1 harness can retain its
+/// existing exhaustive fallback classification while direct helper tests can prove a worker
+/// process crashes from inside its processing path.
+pub const SELF_CRASH_AFTER_CLAIM_MODE: &str = "self-crash";
+/// Maximum accepted fault delay, simulated work duration, or compute-load duration.
 pub const MAX_FEASIBILITY_DURATION: Duration = Duration::from_mins(1);
+
+/// Bounded CPU work applied to every claimed worker request.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ComputeLoadMode {
+    /// Do not add CPU work beyond normal block processing.
+    #[default]
+    None,
+    /// Busy-spin with a monotonic-clock deadline rather than yielding or sleeping.
+    CalibratedCpu,
+}
+
+impl ComputeLoadMode {
+    /// Returns the stable command-line spelling for this mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::CalibratedCpu => "calibrated-cpu",
+        }
+    }
+}
+
+impl FromStr for ComputeLoadMode {
+    type Err = FaultConfigurationError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "none" => Ok(Self::None),
+            "calibrated-cpu" => Ok(Self::CalibratedCpu),
+            _ => Err(FaultConfigurationError::new(format!(
+                "unknown compute load mode `{value}`"
+            ))),
+        }
+    }
+}
+
+/// Validated bounded worker compute-load settings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ComputeLoadConfiguration {
+    /// CPU load selected for every successfully claimed request.
+    pub mode: ComputeLoadMode,
+    /// Target CPU-spin duration per request.
+    pub duration: Duration,
+}
+
+impl ComputeLoadConfiguration {
+    /// Validates that a calibrated load has a bounded positive duration and `none` has none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a duration above the Phase 1 bound, a zero calibrated duration, or
+    /// a duration paired with [`ComputeLoadMode::None`].
+    pub fn validate(self) -> Result<Self, FaultConfigurationError> {
+        validate_duration(COMPUTE_LOAD_MICROS_OPTION, self.duration)?;
+        match self.mode {
+            ComputeLoadMode::None if !self.duration.is_zero() => Err(FaultConfigurationError::new(
+                format!("compute load mode `none` does not use {COMPUTE_LOAD_MICROS_OPTION}"),
+            )),
+            ComputeLoadMode::CalibratedCpu if self.duration.is_zero() => {
+                Err(FaultConfigurationError::new(format!(
+                    "compute load mode `calibrated-cpu` requires a nonzero {COMPUTE_LOAD_MICROS_OPTION}"
+                )))
+            }
+            ComputeLoadMode::None | ComputeLoadMode::CalibratedCpu => Ok(self),
+        }
+    }
+}
+
+impl Default for ComputeLoadConfiguration {
+    fn default() -> Self {
+        Self {
+            mode: ComputeLoadMode::None,
+            duration: Duration::ZERO,
+        }
+    }
+}
 
 /// Deterministic fault selected for one feasibility worker.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -217,6 +303,51 @@ where
     configuration.validate()
 }
 
+/// Parses bounded compute-load options from alternating option/value tokens.
+///
+/// The duration controls a monotonic-clock CPU spin in the worker; it is not a sleep budget.
+/// Omitted options select [`ComputeLoadMode::None`].
+///
+/// # Errors
+///
+/// Returns an error for unknown or duplicate options, missing values, invalid durations, or an
+/// invalid mode/duration combination.
+pub fn parse_compute_load_configuration<I, S>(
+    arguments: I,
+) -> Result<ComputeLoadConfiguration, FaultConfigurationError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut configuration = ComputeLoadConfiguration::default();
+    let mut arguments = arguments.into_iter().map(Into::into);
+    let mut mode_seen = false;
+    let mut duration_seen = false;
+
+    while let Some(option) = arguments.next() {
+        let value = arguments.next().ok_or_else(|| {
+            FaultConfigurationError::new(format!("missing value after `{option}`"))
+        })?;
+        match option.as_str() {
+            COMPUTE_LOAD_MODE_OPTION => {
+                reject_duplicate(option.as_str(), &mut mode_seen)?;
+                configuration.mode = value.parse()?;
+            }
+            COMPUTE_LOAD_MICROS_OPTION => {
+                reject_duplicate(option.as_str(), &mut duration_seen)?;
+                configuration.duration = Duration::from_micros(parse_u64(option.as_str(), &value)?);
+            }
+            _ => {
+                return Err(FaultConfigurationError::new(format!(
+                    "unknown compute load option `{option}`"
+                )));
+            }
+        }
+    }
+
+    configuration.validate()
+}
+
 fn reject_duplicate(option: &str, seen: &mut bool) -> Result<(), FaultConfigurationError> {
     if *seen {
         Err(FaultConfigurationError::new(format!(
@@ -363,6 +494,47 @@ mod tests {
                 FAULT_MODE_OPTION,
                 "late-completion",
                 FAULT_DELAY_MICROS_OPTION,
+                "60000001",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_bounded_calibrated_cpu_load() {
+        let configuration = parse_compute_load_configuration([
+            COMPUTE_LOAD_MODE_OPTION,
+            "calibrated-cpu",
+            COMPUTE_LOAD_MICROS_OPTION,
+            "750",
+        ])
+        .unwrap();
+
+        assert_eq!(configuration.mode, ComputeLoadMode::CalibratedCpu);
+        assert_eq!(configuration.duration, Duration::from_micros(750));
+    }
+
+    #[test]
+    fn rejects_invalid_or_ambiguous_compute_loads() {
+        assert!(parse_compute_load_configuration([COMPUTE_LOAD_MODE_OPTION, "unknown"]).is_err());
+        assert!(
+            parse_compute_load_configuration([COMPUTE_LOAD_MODE_OPTION, "calibrated-cpu"]).is_err()
+        );
+        assert!(parse_compute_load_configuration([COMPUTE_LOAD_MICROS_OPTION, "1"]).is_err());
+        assert!(
+            parse_compute_load_configuration([
+                COMPUTE_LOAD_MODE_OPTION,
+                "none",
+                COMPUTE_LOAD_MICROS_OPTION,
+                "1",
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_compute_load_configuration([
+                COMPUTE_LOAD_MODE_OPTION,
+                "calibrated-cpu",
+                COMPUTE_LOAD_MICROS_OPTION,
                 "60000001",
             ])
             .is_err()

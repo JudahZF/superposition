@@ -8,7 +8,7 @@ No brand image has been copied into the project. Do not extract, trace, recolor,
 
 ## Approved interface tokens
 
-The executable design-token module is the sole canonical source for color values and font-family names. Use these source-derived mappings for internal planning and future UI implementation rather than copying raw brand values:
+The executable design-token module is the sole canonical source for color values and font-family names. Use these source-derived mappings for UI implementation and maintenance rather than copying raw brand values:
 
 | Planning token | Runtime token | Intended use |
 | --- | --- | --- |
@@ -24,8 +24,18 @@ The executable design-token module is the sole canonical source for color values
 
 The approved gradients progress from cyan to blue and from blue to lime. Use the semantic interface/display and monospace font-family roles from the token module, subject to font licensing. The style is dark, precise, minimal, high-contrast, and technical; accessibility contrast and non-color status cues remain mandatory.
 
-## Gaps, fallbacks, and release blockers
+## Application-UI fonts
 
-Until source files arrive, use text-only `Superposition`/`Quanta Sound` labels in developer material and system fonts or properly licensed substitutions; do not invent a logo fallback. The displayed imagery, patterns, icon set, screenshot components, font files, source color profiles, SVG/vector marks, clearspace measurements, and copyright/trademark permissions are all unverified.
+The app UI embeds Sora (Regular/Medium/SemiBold/Bold) and Space Mono (Regular) from `crates/sp-ui/assets/fonts/`, downloaded from Google Fonts. Both families are licensed under the SIL Open Font License 1.1; the license texts are stored alongside the payloads (`OFL-Sora.txt`, `OFL-SpaceMono.txt`) and permit app embedding and redistribution. These embedded UI fonts are separate from the release asset manifest below: the manifest's font entries (with hashes and approval records) still gate `cargo xtask bundle --profile release` for production payloads.
 
-A public release is blocked on: written ownership/license and trademark permission; approved vector/raster logo exports and usage rules; font licenses and web/app embedding terms; provenance and usage rights for imagery/icons/textures; accessibility review of the final token implementation; and an asset manifest with hashes, source, license, and approval owner. See [ADR 0009](adr/0009-brand-design-system.md).
+## Release assets and provenance
+
+`packaging/resources/release.json` is the release asset manifest. It is deliberately unresolved: it names the expected production icon, vector logo, and Sora/Space Mono font payloads without providing substitute files, hashes, or approvals. `cargo xtask bundle --profile release` refuses to proceed until this manifest includes all of the following:
+
+1. Approved production logo and `.icns` icon exports.
+2. Licensed app-embedding font files and their exact SHA-256 hashes.
+3. An approved fault-red semantic token value.
+4. Per-resource source, license, rights holder, approval owner, and approval reference.
+5. Named approval owner and reference for the logo, icon, fonts, fault-red token, and provenance set.
+
+The manifest is staged by hash into the app bundle; it is not a place to copy a raster board, invent a logo, or claim an unverified license. Until these records are available, use text-only `Superposition`/`Quanta Sound` labels in developer material and system fonts or properly licensed substitutions. The displayed imagery, patterns, icon set, screenshot components, font files, source color profiles, SVG/vector marks, clearspace measurements, and copyright/trademark permissions remain unverified.
