@@ -14,7 +14,8 @@ pub use scanner::{
     discover_vst3_bundles, fingerprint_bundle,
 };
 pub use worker_control::{
-    WorkerControlClient, WorkerControlError, WorkerControlLaunch, WorkerControlSession,
+    EditorPreviewPoll, WorkerControlClient, WorkerControlError, WorkerControlLaunch,
+    WorkerControlSession,
 };
 
 use std::{
@@ -63,8 +64,9 @@ pub struct HelperLaunch {
 impl HelperLaunch {
     /// Validates that a control-plane launch targets its dedicated deployed helper.
     ///
-    /// The generic process supervisor also serves Phase 1 tooling, so this check is deliberately
-    /// opt-in for product worker lifecycle code rather than imposed on every helper invocation.
+    /// The generic process supervisor also serves development tooling, so this check is
+    /// deliberately opt-in for product worker lifecycle code rather than imposed on every helper
+    /// invocation.
     /// It rejects PATH lookup and role/executable mismatches before the supervisor can create a
     /// process capable of loading third-party plug-in code.
     ///
@@ -267,9 +269,9 @@ impl RackSupervisor {
 
     /// Launches a worker for `rack_index`, replacing any previous assignment.
     ///
-    /// This low-level operation exists for Phase 1 feasibility helpers. Production VST3 worker
-    /// launches must use [`Self::create_or_replace_plugin_worker`] so a quarantined bundle is
-    /// refused before a plug-in-loading process can be spawned.
+    /// This is the low-level launch step. Production VST3 worker launches must use
+    /// [`Self::create_or_replace_plugin_worker`] so a quarantined bundle is refused before a
+    /// plug-in-loading process can be spawned.
     ///
     /// # Errors
     ///
@@ -474,6 +476,7 @@ struct ManagedChild {
     child: Child,
     launch: HelperLaunch,
     restarts: u32,
+    stop_requested: bool,
 }
 
 struct PendingRestart {
@@ -545,33 +548,92 @@ impl ProcessSupervisor {
             .unwrap_or(HelperStatus::Stopped)
     }
 
+    /// Returns whether a known child has been reaped and no longer owns process resources.
+    ///
+    /// A child that exited unexpectedly is also reaped, even though its status is `Failed`.
+    /// Unknown process IDs return false.
+    #[must_use]
+    pub fn is_reaped(&self, process_id: u64) -> bool {
+        self.statuses.contains_key(&process_id) && !self.children.contains_key(&process_id)
+    }
+
+    /// Requests immediate child termination without waiting for process exit.
+    ///
+    /// The child remains owned by this supervisor. Call [`Self::reap`] until [`Self::is_reaped`]
+    /// returns true before reusing resources the child could still access.
+    /// Deliberately stopped children do not trigger the automatic restart policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the operating system rejects the kill request.
+    pub fn request_stop(&mut self, process_id: u64) -> std::io::Result<()> {
+        let Some(managed) = self.children.get_mut(&process_id) else {
+            return Ok(());
+        };
+        if managed.stop_requested {
+            return Ok(());
+        }
+        if managed.child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        match managed.child.kill() {
+            Ok(()) => {
+                managed.stop_requested = true;
+                Ok(())
+            }
+            Err(error) => {
+                if managed.child.try_wait()?.is_some() {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     /// Stops a child, first using the configured stdin shutdown line when present.
+    /// The child remains owned if termination or reaping fails. A broken shutdown pipe is
+    /// reported after the child has been killed and reaped.
     ///
     /// # Errors
     ///
     /// Returns an error when communicating with or terminating the child fails.
     pub fn stop(&mut self, process_id: u64) -> std::io::Result<()> {
-        let Some(mut managed) = self.children.remove(&process_id) else {
+        let Some(managed) = self.children.get_mut(&process_id) else {
             return Ok(());
         };
-        if let (Some(line), Some(stdin)) = (&self.shutdown_line, managed.child.stdin.as_mut()) {
-            stdin.write_all(line.as_bytes())?;
-            stdin.flush()?;
+        let mut graceful_error = None;
+        if !managed.stop_requested
+            && let (Some(line), Some(stdin)) = (&self.shutdown_line, managed.child.stdin.as_mut())
+            && let Err(error) = stdin
+                .write_all(line.as_bytes())
+                .and_then(|()| stdin.flush())
+        {
+            graceful_error = Some(error);
         }
-        let deadline = Instant::now() + self.shutdown_timeout;
-        while Instant::now() < deadline {
-            if managed.child.try_wait()?.is_some() {
-                self.statuses.insert(process_id, HelperStatus::Stopped);
-                self.events.push(SupervisorEvent::Stopped);
-                return Ok(());
+        let mut exited = false;
+        if graceful_error.is_none() {
+            let deadline = Instant::now() + self.shutdown_timeout;
+            while Instant::now() < deadline {
+                if managed.child.try_wait()?.is_some() {
+                    exited = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
             }
-            thread::sleep(Duration::from_millis(5));
         }
-        managed.child.kill()?;
-        managed.child.wait()?;
+        if !exited {
+            if let Err(error) = managed.child.kill()
+                && managed.child.try_wait()?.is_none()
+            {
+                return Err(error);
+            }
+            managed.child.wait()?;
+        }
+        self.children.remove(&process_id);
         self.statuses.insert(process_id, HelperStatus::Stopped);
         self.events.push(SupervisorEvent::Stopped);
-        Ok(())
+        graceful_error.map_or(Ok(()), Err)
     }
 
     /// Launches a helper and waits until it exits or `timeout` elapses.
@@ -606,9 +668,51 @@ impl ProcessSupervisor {
         }
     }
 
+    /// Runs a disposable helper with all stdio detached and enforces `timeout`.
+    ///
+    /// This avoids waiting for pipe EOF when third-party code spawns a descendant that keeps a
+    /// standard stream open after the helper exits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the helper cannot be started or polled.
+    pub fn launch_and_wait_silenced(
+        &mut self,
+        launch: &HelperLaunch,
+        timeout: Duration,
+    ) -> std::io::Result<TimedHelperResult> {
+        let mut command = Command::new(&launch.executable);
+        command.args(&launch.arguments);
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
+        let mut child = command.spawn()?;
+        let process_id = u64::from(child.id());
+        self.statuses.insert(process_id, HelperStatus::Running);
+        self.events.push(SupervisorEvent::Started);
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                let code = status.code().unwrap_or(-1);
+                self.statuses.insert(process_id, HelperStatus::Failed);
+                self.events.push(SupervisorEvent::Exited { code });
+                return Ok(TimedHelperResult::Exited { process_id, code });
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                self.statuses.insert(process_id, HelperStatus::Stopped);
+                self.events.push(SupervisorEvent::Stopped);
+                return Ok(TimedHelperResult::TimedOut { process_id });
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Like [`Self::launch_and_wait`], but captures stdout/stderr for disposable helpers.
     ///
-    /// Used by the Phase 2 isolated scanner so timeout/crash outcomes can still recover JSON.
+    /// Retained for disposable helpers that need bounded diagnostic capture.
     ///
     /// # Errors
     ///
@@ -674,11 +778,16 @@ impl ProcessSupervisor {
             if let Some(exit) = exit
                 && let Some(managed) = self.children.remove(&process_id)
             {
-                self.statuses.insert(process_id, HelperStatus::Failed);
-                self.events.push(SupervisorEvent::Exited {
-                    code: exit.code().unwrap_or(-1),
-                });
-                self.schedule_restart(managed);
+                if managed.stop_requested {
+                    self.statuses.insert(process_id, HelperStatus::Stopped);
+                    self.events.push(SupervisorEvent::Stopped);
+                } else {
+                    self.statuses.insert(process_id, HelperStatus::Failed);
+                    self.events.push(SupervisorEvent::Exited {
+                        code: exit.code().unwrap_or(-1),
+                    });
+                    self.schedule_restart(managed);
+                }
             }
         }
         std::mem::take(&mut self.events)
@@ -700,6 +809,7 @@ impl ProcessSupervisor {
                 child,
                 launch,
                 restarts,
+                stop_requested: false,
             },
         );
         self.statuses.insert(process_id, HelperStatus::Running);
@@ -925,10 +1035,109 @@ mod tests {
     }
 
     #[test]
+    fn broken_shutdown_pipe_still_reaps_targeted_child() {
+        let mut supervisor = ProcessSupervisor::new().with_shutdown_line("shutdown\n");
+        let process_id = supervisor
+            .launch(&launch("sh", &["-c", "exec 0<&-; sleep 5"]))
+            .expect("launch child that closes stdin");
+        thread::sleep(Duration::from_millis(50));
+        let result = supervisor.stop(process_id);
+        assert!(result.is_err(), "closed stdin must report its write error");
+        assert_eq!(supervisor.status(process_id), HelperStatus::Stopped);
+        assert!(supervisor.is_reaped(process_id));
+        assert!(supervisor.reap().contains(&SupervisorEvent::Stopped));
+    }
+
+    #[test]
+    fn is_reaped_distinguishes_unknown_and_unexpected_exit() {
+        let mut supervisor = ProcessSupervisor::new();
+        assert!(!supervisor.is_reaped(99));
+        let process_id = supervisor
+            .launch(&launch("true", &[]))
+            .expect("launch true");
+        assert!(!supervisor.is_reaped(process_id));
+        let _ = reap_until_exit(&mut supervisor);
+        assert_eq!(supervisor.status(process_id), HelperStatus::Failed);
+        assert!(supervisor.is_reaped(process_id));
+        supervisor
+            .request_stop(process_id)
+            .expect("already reaped stop is harmless");
+        assert!(supervisor.is_reaped(process_id));
+    }
+
+    #[test]
+    fn stop_request_after_natural_exit_preserves_failure_status() {
+        let mut supervisor = ProcessSupervisor::new();
+        let process_id = supervisor
+            .launch(&launch("false", &[]))
+            .expect("launch failing child");
+        let mut exited = false;
+        for _ in 0..50 {
+            let managed = supervisor
+                .children
+                .get_mut(&process_id)
+                .expect("owned child");
+            if managed.child.try_wait().expect("check exit").is_some() {
+                exited = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(exited, "child must exit before stop request");
+        assert_eq!(supervisor.status(process_id), HelperStatus::Running);
+        supervisor
+            .request_stop(process_id)
+            .expect("already-exited child needs no kill");
+        let events = supervisor.reap();
+        assert_eq!(supervisor.status(process_id), HelperStatus::Failed);
+        assert!(supervisor.is_reaped(process_id));
+        assert!(events.contains(&SupervisorEvent::Exited { code: 1 }));
+    }
+
+    #[test]
+    fn requested_stop_is_reaped_as_stopped_without_restart() {
+        let mut supervisor = ProcessSupervisor::new().with_restart_policy(RestartPolicy {
+            max_restarts: 1,
+            cooldown: Duration::ZERO,
+        });
+        let process_id = supervisor
+            .launch(&launch("sleep", &["5"]))
+            .expect("launch sleep");
+        supervisor.request_stop(process_id).expect("request stop");
+        assert_eq!(supervisor.status(process_id), HelperStatus::Running);
+        let mut stopped = false;
+        for _ in 0..50 {
+            let events = supervisor.reap();
+            if supervisor.status(process_id) == HelperStatus::Stopped {
+                assert!(events.contains(&SupervisorEvent::Stopped));
+                assert!(!events.contains(&SupervisorEvent::RestartScheduled));
+                stopped = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(stopped, "stopped child was not reaped");
+        assert!(
+            !supervisor
+                .reap()
+                .contains(&SupervisorEvent::RestartScheduled)
+        );
+    }
+
+    #[test]
     fn launch_and_wait_reports_timeout() {
         let mut supervisor = ProcessSupervisor::new();
         let result = supervisor
             .launch_and_wait(&launch("sleep", &["2"]), Duration::from_millis(50))
+            .expect("launch sleep");
+        assert!(matches!(result, TimedHelperResult::TimedOut { .. }));
+    }
+
+    #[test]
+    fn silenced_helper_still_obeys_timeout() {
+        let mut supervisor = ProcessSupervisor::new();
+        let result = supervisor
+            .launch_and_wait_silenced(&launch("sleep", &["2"]), Duration::from_millis(50))
             .expect("launch sleep");
         assert!(matches!(result, TimedHelperResult::TimedOut { .. }));
     }

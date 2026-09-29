@@ -26,6 +26,7 @@ fn health_then_rebuild_frames_stay_aligned() {
             input_channels: 2,
             output_channels: 2,
             event_input_active: false,
+            sidechain_active: false,
             bundle_path: "/Library/Audio/Plug-Ins/VST3/ValhallaSupermassive.vst3".to_owned(),
             class_id: Some("565354207376616C76616C68616C6C61".to_owned()),
         }],

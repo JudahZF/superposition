@@ -53,13 +53,12 @@ pub struct AudioDeviceCapabilities {
     pub is_default_output: bool,
 }
 
-/// A selected hardware route. Backends must reject unsupported cross-device duplex routes before
-/// they create a real-time stream; no callback-rate adaptation is implied by this type.
+/// A selected hardware route. Backends own clock synchronization for cross-device routes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioRouteConfig {
     /// Device supplying capture samples. `None` requests an output-only route.
     pub input: Option<AudioDeviceId>,
-    /// Device receiving the fixed product stereo output.
+    /// Device receiving the selected output channels.
     pub output: AudioDeviceId,
     /// Fixed stream format requested from the backend.
     pub format: AudioFormat,
@@ -86,20 +85,20 @@ pub enum AudioEndpointEvent {
 pub struct AudioFormat {
     /// Sample rate in hertz.
     pub sample_rate_hz: u32,
-    /// Interleaved channel count.
+    /// Interleaved output channel count.
     pub channel_count: u16,
     /// Maximum frames supplied in one callback.
     pub max_frames_per_callback: u32,
 }
 
 impl AudioFormat {
-    /// Returns the fixed 48 kHz stereo product format for `frames` (128 or 256).
+    /// Returns the fixed 48 kHz stereo product format for `frames` (32, 64, 128, or 256).
     ///
     /// # Errors
     ///
-    /// Returns [`AudioFormatError::UnsupportedProductFrames`] when `frames` is not 128 or 256.
+    /// Returns [`AudioFormatError::UnsupportedProductFrames`] for other frame counts.
     pub fn product_stereo(frames: u32) -> Result<Self, AudioFormatError> {
-        if frames != 128 && frames != 256 {
+        if !matches!(frames, 32 | 64 | 128 | 256) {
             return Err(AudioFormatError::UnsupportedProductFrames { frames });
         }
         Ok(Self {
@@ -132,7 +131,7 @@ impl AudioFormat {
     pub const fn is_product_format(self) -> bool {
         self.sample_rate_hz == PRODUCT_SAMPLE_RATE_HZ
             && self.channel_count == PRODUCT_CHANNEL_COUNT
-            && (self.max_frames_per_callback == 128 || self.max_frames_per_callback == 256)
+            && matches!(self.max_frames_per_callback, 32 | 64 | 128 | 256)
     }
 }
 
@@ -145,7 +144,7 @@ pub enum AudioFormatError {
     ZeroChannels,
     /// A callback must contain at least one frame.
     ZeroCallbackFrames,
-    /// Product mode only accepts 128- or 256-frame callbacks.
+    /// Product mode only accepts 32-, 64-, 128-, or 256-frame callbacks.
     UnsupportedProductFrames {
         /// Requested frames.
         frames: u32,
@@ -162,7 +161,7 @@ impl fmt::Display for AudioFormatError {
             }
             Self::UnsupportedProductFrames { frames } => write!(
                 formatter,
-                "product audio requires 128 or 256 frames, got {frames}"
+                "product audio requires 32, 64, 128, or 256 frames, got {frames}"
             ),
         }
     }
@@ -254,8 +253,8 @@ mod tests {
         assert_eq!(format.sample_rate_hz, PRODUCT_SAMPLE_RATE_HZ);
         assert!(format.is_product_format());
         assert_eq!(
-            AudioFormat::product_stereo(64),
-            Err(AudioFormatError::UnsupportedProductFrames { frames: 64 })
+            AudioFormat::product_stereo(16),
+            Err(AudioFormatError::UnsupportedProductFrames { frames: 16 })
         );
     }
 }

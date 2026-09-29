@@ -4,12 +4,12 @@ use std::collections::BTreeMap;
 
 use sp_model::{
     ChannelLayout, Endpoint, EndpointId, GainDb, MAX_RACKS, MidiController, MidiMapping,
-    MidiMappingId, NormalizedParameters, NormalizedValue, ParameterAddress, ParameterId,
-    PluginArchitecture, PluginBusConfiguration, PluginBusMetadata, PluginClassScanMetadata,
-    PluginDescriptor, PluginFingerprint, PluginIdentity, PluginInstanceId, PluginParameterMetadata,
-    PluginScanMetadata, PluginScanOutcome, PluginSlot, Rack, RackGain, RackId, RackMute,
-    RackTopology, Scene, SceneId, SceneParameterValue, Session, SlotBypass, Source, SourceId,
-    ValidationError,
+    MidiMappingId, NormalizedParameters, NormalizedValue, PageId, ParameterAddress, ParameterId,
+    PhysicalChannels, PluginArchitecture, PluginBusConfiguration, PluginBusMetadata,
+    PluginClassScanMetadata, PluginDescriptor, PluginFingerprint, PluginIdentity, PluginInstanceId,
+    PluginParameterMetadata, PluginScanMetadata, PluginScanOutcome, PluginSlot, Rack, RackBypass,
+    RackGain, RackId, RackMute, RackPage, RackTopology, Scene, SceneId, SceneParameterTransition,
+    SceneParameterValue, Session, SlotBypass, SlotSidechain, Source, SourceId, ValidationError,
 };
 
 fn valid_session() -> Session {
@@ -55,6 +55,7 @@ fn valid_session() -> Session {
                 },
                 bypassed: false,
                 parameters: NormalizedParameters { values: parameters },
+                sidechain: None,
             }],
         }],
         scenes: vec![Scene {
@@ -68,6 +69,10 @@ fn valid_session() -> Session {
                 rack_id: RackId("rack-a".into()),
                 muted: false,
             }],
+            rack_bypasses: vec![RackBypass {
+                rack_id: RackId("rack-a".into()),
+                bypassed: false,
+            }],
             bypasses: vec![SlotBypass {
                 rack_id: RackId("rack-a".into()),
                 slot_id: PluginInstanceId("slot-a".into()),
@@ -78,6 +83,7 @@ fn valid_session() -> Session {
                 slot_id: PluginInstanceId("slot-a".into()),
                 parameter_id: ParameterId("mix".into()),
                 value: NormalizedValue::new(0.75).unwrap(),
+                transition: SceneParameterTransition::Ramp,
             }],
             transition_ms: 250,
         }],
@@ -107,6 +113,181 @@ fn valid_session_round_trips_as_versioned_serde_data() {
     let encoded = serde_json::to_string(&session).unwrap();
     assert!(encoded.contains("\"version\":1"));
     let decoded: Session = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, session);
+    decoded.validate().unwrap();
+}
+
+#[test]
+fn legacy_scene_and_scan_metadata_default_new_fields() {
+    let session = valid_session();
+    let mut encoded = serde_json::to_value(&session).unwrap();
+    let scene = &mut encoded["scenes"][0];
+    scene.as_object_mut().unwrap().remove("rack_bypasses");
+    scene["parameter_values"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("transition");
+    let decoded: Session = serde_json::from_value(encoded).unwrap();
+    assert!(decoded.scenes[0].rack_bypasses.is_empty());
+    assert_eq!(
+        decoded.scenes[0].parameter_values[0].transition,
+        SceneParameterTransition::Ramp
+    );
+    decoded.validate().unwrap();
+
+    let old_parameter = serde_json::json!({
+        "id": 74,
+        "name": "Cutoff",
+        "default_normalized": 0.5
+    });
+    let decoded: PluginParameterMetadata = serde_json::from_value(old_parameter).unwrap();
+    assert_eq!(decoded.step_count, 0);
+}
+
+#[test]
+fn sidechain_sources_are_validated_and_round_trip() {
+    let mut session = valid_session();
+    let mut drums = session.racks[0].clone();
+    drums.id = RackId("rack-drums".into());
+    session.racks.push(drums);
+    let slot_id = || "slot-a".to_owned();
+    let mut set = |sidechain| {
+        session.racks[0].slots[0].sidechain = Some(sidechain);
+        session.clone()
+    };
+
+    let from_rack = set(SlotSidechain::RackOutput(RackId("rack-drums".into())));
+    from_rack.validate().unwrap();
+    let encoded = serde_json::to_value(&from_rack).unwrap();
+    assert_eq!(
+        encoded["racks"][0]["slots"][0]["sidechain"],
+        serde_json::json!({ "rack_output": "rack-drums" })
+    );
+    assert!(encoded["racks"][1]["slots"][0].get("sidechain").is_none());
+    assert_eq!(
+        serde_json::from_value::<Session>(encoded).unwrap(),
+        from_rack
+    );
+
+    let from_input = set(SlotSidechain::PhysicalInput(PhysicalChannels::Stereo {
+        left: 2,
+        right: 3,
+    }));
+    from_input.validate().unwrap();
+    assert_eq!(
+        serde_json::to_value(&from_input).unwrap()["racks"][0]["slots"][0]["sidechain"],
+        serde_json::json!({ "physical_input": { "kind": "stereo", "left": 2, "right": 3 } })
+    );
+
+    assert_eq!(
+        set(SlotSidechain::PhysicalInput(PhysicalChannels::Mono {
+            channel: 2
+        }))
+        .validate(),
+        Err(ValidationError::MonoSidechain { slot_id: slot_id() })
+    );
+    assert_eq!(
+        set(SlotSidechain::RackOutput(RackId("rack-a".into()))).validate(),
+        Err(ValidationError::SelfSidechain { slot_id: slot_id() })
+    );
+    assert!(matches!(
+        set(SlotSidechain::RackOutput(RackId("missing".into()))).validate(),
+        Err(ValidationError::UnknownReference {
+            owner: sp_model::EntityKind::PluginSlot,
+            reference: sp_model::EntityKind::Rack,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn rack_pages_reference_known_racks_once_and_are_omitted_when_empty() {
+    let mut session = valid_session();
+    assert!(
+        serde_json::to_value(&session)
+            .unwrap()
+            .get("pages")
+            .is_none(),
+        "sessions without pages keep their JSON shape"
+    );
+    let page = |racks: &[&str]| RackPage {
+        id: PageId("page-1".into()),
+        name: "Drums".into(),
+        racks: racks.iter().map(|rack| RackId((*rack).into())).collect(),
+    };
+    session.pages = vec![page(&["rack-a"])];
+    session.validate().unwrap();
+    let encoded = serde_json::to_value(&session).unwrap();
+    assert_eq!(serde_json::from_value::<Session>(encoded).unwrap(), session);
+
+    session.pages = vec![page(&["missing"])];
+    assert!(matches!(
+        session.validate(),
+        Err(ValidationError::UnknownReference {
+            owner: sp_model::EntityKind::Page,
+            reference: sp_model::EntityKind::Rack,
+            ..
+        })
+    ));
+    session.pages = vec![page(&["rack-a", "rack-a"])];
+    assert!(matches!(
+        session.validate(),
+        Err(ValidationError::DuplicateId { .. })
+    ));
+    session.pages = vec![page(&[]), page(&[])];
+    assert!(matches!(
+        session.validate(),
+        Err(ValidationError::DuplicateId {
+            kind: sp_model::EntityKind::Page,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn scene_rack_bypass_requires_one_known_target_per_rack() {
+    let mut session = valid_session();
+    session.scenes[0].rack_bypasses[0].rack_id = RackId("missing".into());
+    assert!(matches!(
+        session.validate(),
+        Err(ValidationError::UnknownReference {
+            reference: sp_model::EntityKind::Rack,
+            ..
+        })
+    ));
+
+    session.scenes[0].rack_bypasses[0].rack_id = RackId("rack-a".into());
+    let bypass = session.scenes[0].rack_bypasses[0].clone();
+    session.scenes[0].rack_bypasses.push(bypass.clone());
+    assert_eq!(
+        session.validate(),
+        Err(ValidationError::DuplicateTarget {
+            kind: sp_model::EntityKind::Scene,
+            id: "rack-a".into(),
+        })
+    );
+
+    session.scenes[0].rack_bypasses = vec![bypass; MAX_RACKS + 1];
+    assert_eq!(
+        session.validate(),
+        Err(ValidationError::CapacityExceeded {
+            collection: sp_model::Collection::SceneRackBypasses,
+            capacity: MAX_RACKS,
+            found: MAX_RACKS + 1,
+        })
+    );
+}
+
+#[test]
+fn step_transition_round_trips() {
+    let mut session = valid_session();
+    session.scenes[0].parameter_values[0].transition = SceneParameterTransition::Step;
+    let encoded = serde_json::to_value(&session).unwrap();
+    assert_eq!(
+        encoded["scenes"][0]["parameter_values"][0]["transition"],
+        "step"
+    );
+    let decoded: Session = serde_json::from_value(encoded).unwrap();
     assert_eq!(decoded, session);
     decoded.validate().unwrap();
 }
@@ -260,11 +441,13 @@ fn scan_metadata_round_trips_without_vst3_sdk_types() {
                 short_name: "Cut".into(),
                 unit: "Hz".into(),
                 default_normalized: Some(0.5),
+                step_count: 0,
                 automatable: true,
                 read_only: false,
                 bypass: false,
             }],
             editor_supported: true,
+            sidechain_capable: true,
         }],
         detail: None,
     };

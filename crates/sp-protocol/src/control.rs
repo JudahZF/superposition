@@ -17,7 +17,7 @@ use std::{
 };
 
 pub const CONTROL_PROTOCOL_MAGIC: u32 = u32::from_le_bytes(*b"SPC1");
-pub const CONTROL_PROTOCOL_VERSION: u16 = 2;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 6;
 pub const CONTROL_REQUEST_HEADER_BYTES: usize = 48;
 pub const CONTROL_RESPONSE_HEADER_BYTES: usize = 52;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 1_048_576;
@@ -26,7 +26,8 @@ pub const MAX_CONTROL_STATE_BYTES: usize = MAX_CONTROL_PAYLOAD_BYTES;
 pub const MAX_CONTROL_ERROR_RECORD_BYTES: usize = 512;
 pub const MAX_CONTROL_ERROR_MESSAGE_BYTES: usize = MAX_CONTROL_ERROR_RECORD_BYTES - 4;
 pub const CONTROL_BANK_COUNT: u8 = 2;
-pub const CONTROL_RACK_COUNT: u8 = 8;
+pub const CONTROL_RACK_COUNT: u8 = 64;
+pub const CONTROL_SLOT_COUNT: u8 = 8;
 pub const MAX_PLUGIN_REFERENCE_BYTES: usize = 4_096;
 pub const MAX_RACK_REBUILD_BYTES: usize = 32_768;
 /// Maximum control requests the worker may queue while preserving bounded memory.
@@ -65,10 +66,18 @@ pub enum ControlOperation {
     QuerySlotAttribution = 23,
     SetSlotBypass = 24,
     SetRackBypass = 25,
+    BeginStateCapture = 26,
+    ReadStateChunk = 27,
+    BeginStateRestore = 28,
+    WriteStateChunk = 29,
+    CommitStateRestore = 30,
+    ReleaseStateTransfer = 31,
+    ReadParameters = 32,
+    CaptureEditorPreview = 33,
 }
 
 impl ControlOperation {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 33] = [
         Self::PreloadPlugin,
         Self::LoadPlugin,
         Self::ActivateSlot,
@@ -94,6 +103,14 @@ impl ControlOperation {
         Self::QuerySlotAttribution,
         Self::SetSlotBypass,
         Self::SetRackBypass,
+        Self::BeginStateCapture,
+        Self::ReadStateChunk,
+        Self::BeginStateRestore,
+        Self::WriteStateChunk,
+        Self::CommitStateRestore,
+        Self::ReleaseStateTransfer,
+        Self::ReadParameters,
+        Self::CaptureEditorPreview,
     ];
 
     pub const fn from_wire(value: u16) -> Result<Self, ControlProtocolError> {
@@ -123,6 +140,14 @@ impl ControlOperation {
             23 => Ok(Self::QuerySlotAttribution),
             24 => Ok(Self::SetSlotBypass),
             25 => Ok(Self::SetRackBypass),
+            26 => Ok(Self::BeginStateCapture),
+            27 => Ok(Self::ReadStateChunk),
+            28 => Ok(Self::BeginStateRestore),
+            29 => Ok(Self::WriteStateChunk),
+            30 => Ok(Self::CommitStateRestore),
+            31 => Ok(Self::ReleaseStateTransfer),
+            32 => Ok(Self::ReadParameters),
+            33 => Ok(Self::CaptureEditorPreview),
             _ => Err(ControlProtocolError::UnknownOperation(value)),
         }
     }
@@ -159,12 +184,21 @@ impl ControlOperation {
             | Self::BeginParameterGesture
             | Self::EndParameterGesture
             | Self::NotifyLatency
-            | Self::ResizeNativeEditor => (8, 8),
+            | Self::ResizeNativeEditor
+            | Self::BeginStateRestore
+            | Self::CommitStateRestore
+            | Self::ReleaseStateTransfer
+            | Self::CaptureEditorPreview => (8, 8),
             Self::WriteParameter => (16, 16),
-            Self::CaptureState | Self::OpenNativeEditor => (0, 16),
+            Self::CaptureState => (0, 16),
+            // Empty, or the new window's screen position.
+            Self::OpenNativeEditor => (0, 8),
             Self::RestoreState => (1, MAX_CONTROL_STATE_BYTES),
             Self::NotifyRestart => (4, 16),
             Self::SetSlotBypass | Self::SetRackBypass => (1, 1),
+            Self::ReadStateChunk => (20, 20),
+            Self::ReadParameters => (1 + 8, 1 + crate::payload::MAX_PARAMETER_BATCH_SIZE * 8),
+            Self::WriteStateChunk => (17, 16 + crate::payload::MAX_STATE_TRANSFER_CHUNK_BYTES),
             Self::ActivateSlot
             | Self::DeactivateSlot
             | Self::UnloadSlot
@@ -172,7 +206,8 @@ impl ControlOperation {
             | Self::FocusNativeEditor
             | Self::Shutdown
             | Self::QueryHealth
-            | Self::QuerySlotAttribution => (0, 0),
+            | Self::QuerySlotAttribution
+            | Self::BeginStateCapture => (0, 0),
         }
     }
 
@@ -196,6 +231,10 @@ impl ControlOperation {
     }
 
     fn validate_payload_bytes(self, payload: &[u8]) -> Result<(), ControlProtocolError> {
+        use crate::payload::{
+            ControlPayloadCodec, EditorPosition, ParameterIds, StateChunkRequest, StateChunkWrite,
+            StateTransferId, StateTransferLengths,
+        };
         self.validate_payload(payload.len())?;
         if matches!(self, Self::SetSlotBypass | Self::SetRackBypass) && !matches!(payload, [0 | 1])
         {
@@ -203,6 +242,27 @@ impl ControlOperation {
         }
         if self == Self::ReorderRack {
             validate_reorder_payload(payload)?;
+        }
+        match self {
+            Self::ReadStateChunk => {
+                StateChunkRequest::decode(payload)?;
+            }
+            Self::ReadParameters => {
+                ParameterIds::decode(payload)?;
+            }
+            Self::BeginStateRestore => {
+                StateTransferLengths::decode(payload)?;
+            }
+            Self::WriteStateChunk => {
+                StateChunkWrite::decode(payload)?;
+            }
+            Self::CommitStateRestore | Self::ReleaseStateTransfer => {
+                StateTransferId::decode(payload)?;
+            }
+            Self::OpenNativeEditor if !payload.is_empty() => {
+                EditorPosition::decode(payload)?;
+            }
+            _ => {}
         }
         if matches!(
             self,
@@ -1027,10 +1087,10 @@ fn validate_slot(
 
 fn validate_reorder_payload(payload: &[u8]) -> Result<(), ControlProtocolError> {
     let count = usize::from(payload[0]);
-    if count == 0 || count > usize::from(CONTROL_RACK_COUNT) || payload.len() != 1 + count * 2 {
+    if count == 0 || count > usize::from(CONTROL_SLOT_COUNT) || payload.len() != 1 + count * 2 {
         return Err(ControlProtocolError::InvalidPayload);
     }
-    let mut current = [false; 8];
+    let mut current = [false; CONTROL_SLOT_COUNT as usize];
     for &slot in &payload[1..=count] {
         let index = usize::from(slot);
         if index >= current.len() || std::mem::replace(&mut current[index], true) {
@@ -1213,7 +1273,7 @@ pub mod unix {
     use super::{
         ControlProtocolError, ControlRequest, ControlRequestGate, ControlResponse, ControlTarget,
     };
-    use std::{io::Write, os::unix::net::UnixStream, path::Path};
+    use std::{io::Write, net::Shutdown, os::unix::net::UnixStream, path::Path, time::Duration};
 
     #[derive(Debug)]
     pub struct UnixControlClient {
@@ -1230,6 +1290,15 @@ pub mod unix {
                 stream,
                 last_sent_id: None,
             }
+        }
+        pub fn set_timeout(&self, timeout: Duration) -> Result<(), ControlProtocolError> {
+            self.stream.set_read_timeout(Some(timeout))?;
+            self.stream.set_write_timeout(Some(timeout))?;
+            Ok(())
+        }
+        pub fn close(&self) -> Result<(), ControlProtocolError> {
+            self.stream.shutdown(Shutdown::Both)?;
+            Ok(())
         }
         pub fn send(&mut self, request: &ControlRequest) -> Result<(), ControlProtocolError> {
             let id = request.request_id().get();
@@ -1297,6 +1366,7 @@ pub mod unix {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::payload::ControlPayloadCodec;
     use std::io::{self, Cursor, Read};
 
     fn target() -> ControlTarget {
@@ -1316,6 +1386,31 @@ mod tests {
         };
         let payload = if operation == ControlOperation::ReorderRack {
             vec![2, 0, 6, 6, 0]
+        } else if operation == ControlOperation::ReadStateChunk {
+            crate::payload::StateChunkRequest {
+                id: 1,
+                stream: 0,
+                offset: 0,
+                length: 1,
+            }
+            .encode()
+            .expect("chunk")
+        } else if operation == ControlOperation::WriteStateChunk {
+            crate::payload::StateChunkWrite {
+                id: 1,
+                stream: 0,
+                offset: 0,
+                data: vec![1],
+            }
+            .encode()
+            .expect("chunk")
+        } else if matches!(
+            operation,
+            ControlOperation::CommitStateRestore | ControlOperation::ReleaseStateTransfer
+        ) {
+            crate::payload::StateTransferId { id: 1 }
+                .encode()
+                .expect("transfer")
         } else {
             vec![1; minimum]
         };
@@ -1340,6 +1435,56 @@ mod tests {
                 request
             );
         }
+    }
+
+    #[test]
+    fn parameter_batch_requires_slot_and_a_well_formed_nonempty_id_list() {
+        let operation = ControlOperation::ReadParameters;
+        let valid = crate::payload::ParameterIds {
+            parameters: vec![crate::payload::ParameterId { value: 17 }],
+        }
+        .encode()
+        .unwrap();
+        assert!(
+            ControlRequest::new(
+                ControlRequestId::new(1).unwrap(),
+                target(),
+                operation,
+                Some(slot()),
+                &valid
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            ControlRequest::new(
+                ControlRequestId::new(2).unwrap(),
+                target(),
+                operation,
+                None,
+                &valid
+            ),
+            Err(ControlProtocolError::MissingSlotIdentity(_))
+        ));
+        assert!(
+            ControlRequest::new(
+                ControlRequestId::new(3).unwrap(),
+                target(),
+                operation,
+                Some(slot()),
+                &[0]
+            )
+            .is_err()
+        );
+        assert!(
+            ControlRequest::new(
+                ControlRequestId::new(4).unwrap(),
+                target(),
+                operation,
+                Some(slot()),
+                &[2, 0, 0, 0, 0, 0, 0, 0, 0]
+            )
+            .is_err()
+        );
     }
 
     #[test]

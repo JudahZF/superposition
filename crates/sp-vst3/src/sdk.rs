@@ -1,18 +1,20 @@
 //! Real VST3 SDK hosting boundary backed by `vst3-host`.
 //!
-//! All `vst3-host` / low-level VST3 types stay inside this module. Helper binaries enable
+//! Low-level VST3 COM types stay inside this module. Helper binaries enable
 //! `--features sdk`; the main application and engine must never depend on this crate's `sdk`
 //! feature.
 
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use vst3_host::audio::{
     AudioBuffers, BusArrangements, BusDirection, MediaType, SpeakerArrangement,
 };
 use vst3_host::discovery::get_detailed_plugin_info;
 use vst3_host::midi::{MidiChannel, MidiEvent};
-use vst3_host::plugin::{ParameterEditKind, WindowHandle};
-use vst3_host::simple;
+use vst3_host::plugin::ParameterEditKind;
+#[cfg(all(target_os = "macos", feature = "editor-window"))]
+use vst3_host::plugin::WindowHandle;
+use vst3_host::{Vst3Host, simple};
 
 use sp_model::{
     PluginBusConfiguration, PluginBusMetadata, PluginClassScanMetadata, PluginIdentity,
@@ -26,6 +28,101 @@ use super::adapter::{
     Vst3BusTopology, Vst3ClassDescriptor, Vst3ClassSelection, Vst3ParameterInfo, Vst3StateStreams,
 };
 use super::{Vst3BundlePath, Vst3PluginDescriptor};
+
+#[cfg(all(target_os = "macos", feature = "editor-window"))]
+pub use super::editor_window::EditorParentView;
+
+/// Main-thread visualization service that does not own the audio processor.
+pub use vst3_host::plugin::MainThreadService;
+
+/// Loading-thread editor access independent of the audio processor.
+/// A stale handle rejects calls after its plug-in is unloaded.
+pub struct SdkEditorHandle {
+    inner: vst3_host::plugin::MainThreadEditorHandle,
+}
+
+impl SdkEditorHandle {
+    /// Attaches an editor while the processor continues running.
+    ///
+    /// # Errors
+    /// Returns an error if the editor is unavailable or rejects its parent or size.
+    pub fn open_editor(&self, parent_view: &EditorParentView) -> Result<Vst3EditorSize, SdkError> {
+        #[cfg(all(target_os = "macos", feature = "editor-window"))]
+        {
+            // The parent token retains its NSView and cannot leave the main thread.
+            let parent = unsafe { WindowHandle::from_nsview(parent_view.as_ptr()) };
+            self.inner.open_editor(parent)?;
+            let size = self.get_editor_size();
+            if size.is_err() {
+                let _ = self.inner.close_editor();
+            }
+            size
+        }
+        #[cfg(not(all(target_os = "macos", feature = "editor-window")))]
+        {
+            let _ = parent_view;
+            Err(SdkError::Host(
+                "native editors require macOS editor-window support".to_owned(),
+            ))
+        }
+    }
+
+    /// Detaches the editor before its native parent is closed.
+    ///
+    /// # Errors
+    /// Returns an error if the plug-in has unloaded or rejects detachment.
+    pub fn close_editor(&self) -> Result<(), SdkError> {
+        self.inner.close_editor().map_err(SdkError::from)
+    }
+
+    /// Returns the editor's validated current size.
+    ///
+    /// # Errors
+    /// Returns an error if the editor is unavailable or its dimensions are invalid.
+    pub fn get_editor_size(&self) -> Result<Vst3EditorSize, SdkError> {
+        let (width, height) = self.inner.get_editor_size()?;
+        Vst3EditorSize::from_sdk(width, height)
+    }
+
+    /// Asks the editor to accept new dimensions.
+    ///
+    /// # Errors
+    /// Returns an error for invalid dimensions or a rejected resize.
+    pub fn resize_editor(&self, size: Vst3EditorSize) -> Result<Vst3EditorSize, SdkError> {
+        let width = i32::try_from(size.width)
+            .map_err(|_| SdkError::Host("VST3 editor width exceeds SDK limits".to_owned()))?;
+        let height = i32::try_from(size.height)
+            .map_err(|_| SdkError::Host("VST3 editor height exceeds SDK limits".to_owned()))?;
+        let (width, height) = self.inner.resize_editor(width, height)?;
+        Vst3EditorSize::from_sdk(width, height)
+    }
+
+    /// Captures the complete opaque state while the processor keeps running.
+    ///
+    /// # Errors
+    /// Returns an error if the plug-in has unloaded or cannot provide its state.
+    pub fn capture_state(&self) -> Result<Vst3StateStreams, SdkError> {
+        // Same single-envelope layout as the stopped capture path.
+        Ok(Vst3StateStreams {
+            component: self.inner.save_state()?,
+            controller: Vec::new(),
+        })
+    }
+
+    /// Reads one normalized controller value while the processor keeps running.
+    ///
+    /// # Errors
+    /// Returns an error if the plug-in has unloaded or has no controller.
+    pub fn read_parameter(&self, parameter_id: u32) -> Result<f64, SdkError> {
+        Ok(self.inner.get_parameter(parameter_id)?)
+    }
+}
+
+/// Placeholder editor parent on platforms or builds without `AppKit` editor hosting.
+#[cfg(not(all(target_os = "macos", feature = "editor-window")))]
+pub struct EditorParentView {
+    _private: (),
+}
 
 /// Matches [`sp_protocol::MAX_FRAMES`] without pulling that crate into the adapter.
 pub const SDK_MAX_FRAMES: usize = 256;
@@ -200,6 +297,7 @@ pub struct SdkPlugin {
     buffers: AudioBuffers,
     sample_rate_hz: f64,
     block_size: usize,
+    pending_control_parameter: Option<u32>,
 }
 
 impl SdkPlugin {
@@ -214,7 +312,7 @@ impl SdkPlugin {
 
     /// Loads, configures, and starts a bundle with an explicit sample rate and block size.
     ///
-    /// This legacy convenience method preserves the Phase 1 worker contract. New fixed-rack
+    /// This convenience method serves the standalone one-plug-in worker. New fixed-rack
     /// code uses [`Self::load_inactive_with_format`] and lets the rack enforce bus activation
     /// and `setProcessing` ordering.
     ///
@@ -246,6 +344,15 @@ impl SdkPlugin {
         sample_rate_hz: f64,
         block_size: usize,
     ) -> Result<Self, SdkError> {
+        Self::load_inactive_class_with_format(bundle, None, sample_rate_hz, block_size)
+    }
+
+    fn load_inactive_class_with_format(
+        bundle: &Vst3BundlePath,
+        class_id: Option<&str>,
+        sample_rate_hz: f64,
+        block_size: usize,
+    ) -> Result<Self, SdkError> {
         if !(sample_rate_hz.is_finite() && sample_rate_hz > 0.0)
             || block_size == 0
             || block_size > SDK_MAX_FRAMES
@@ -258,7 +365,17 @@ impl SdkPlugin {
         if !path.exists() {
             return Err(SdkError::InvalidBundle(path.display().to_string()));
         }
-        let plugin = simple::load_plugin_with_settings(path, sample_rate_hz, block_size)?;
+        let plugin = if let Some(class_id) = class_id {
+            Vst3Host::builder()
+                .sample_rate(sample_rate_hz)
+                .block_size(block_size)
+                .input_channels(2)
+                .output_channels(2)
+                .build()?
+                .load_plugin_class(path, class_id)?
+        } else {
+            simple::load_plugin_with_settings(path, sample_rate_hz, block_size)?
+        };
         let output_channels = plugin.output_channel_count().clamp(1, 2);
         let input_channels = plugin
             .bus_arrangements()
@@ -273,6 +390,7 @@ impl SdkPlugin {
             buffers,
             sample_rate_hz,
             block_size,
+            pending_control_parameter: None,
         })
     }
 
@@ -326,6 +444,7 @@ impl SdkPlugin {
     /// Returns [`SdkError`] when the parameter cannot be written.
     pub fn set_parameter(&mut self, id: u32, normalized: f64) -> Result<(), SdkError> {
         self.plugin.set_parameter(id, normalized)?;
+        self.pending_control_parameter = Some(id);
         Ok(())
     }
 
@@ -390,6 +509,8 @@ impl SdkPlugin {
     /// Returns [`SdkError`] when state cannot be applied.
     pub fn load_state(&mut self, data: &[u8]) -> Result<(), SdkError> {
         self.plugin.load_state(data)?;
+        // vst3-host discards the previous pending processor queue on state restore.
+        self.pending_control_parameter = None;
         Ok(())
     }
 
@@ -431,6 +552,7 @@ impl SdkPlugin {
         restore_channels(&mut self.buffers.inputs, self.block_size);
         restore_channels(&mut self.buffers.outputs, self.block_size);
         process_result?;
+        self.pending_control_parameter = None;
 
         for (channel, destination) in output.iter_mut().enumerate() {
             if let Some(source) = self.buffers.outputs.get(channel) {
@@ -489,9 +611,37 @@ impl SdkPlugin {
     ///
     /// # Errors
     ///
-    /// Returns [`SdkError`] when the component rejects `setProcessing`.
+    /// Returns [`SdkError`] when the component rejects `setProcessing` or saved-parameter flush.
     pub fn start_processing(&mut self) -> Result<(), SdkError> {
         self.plugin.start_processing()?;
+        if let Some(parameter_id) = self.pending_control_parameter
+            && let Err(error) = self.flush_control_parameters(parameter_id)
+        {
+            let stop_error = self.plugin.stop_processing().err();
+            let detail = match stop_error {
+                Some(stop_error) => format!(
+                    "could not flush saved parameters before live audio: {error}; \
+                     could not stop processing after flush failure: {stop_error}"
+                ),
+                None => format!("could not flush saved parameters before live audio: {error}"),
+            };
+            return Err(SdkError::Host(detail));
+        }
+        Ok(())
+    }
+
+    fn flush_control_parameters(&mut self, parameter_id: u32) -> Result<(), SdkError> {
+        // Saved writes arrive on the worker processing thread. Querying on the control thread
+        // first drains vst3-host's deferred controller mirror so the native editor sees them.
+        let _ = self.plugin.get_parameter(parameter_id)?;
+        self.buffers.clear();
+        truncate_channels(&mut self.buffers.inputs, 0);
+        truncate_channels(&mut self.buffers.outputs, 0);
+        let result = self.plugin.process_audio(&mut self.buffers);
+        restore_channels(&mut self.buffers.inputs, self.block_size);
+        restore_channels(&mut self.buffers.outputs, self.block_size);
+        result?;
+        self.pending_control_parameter = None;
         Ok(())
     }
 
@@ -549,25 +699,37 @@ impl SdkPlugin {
     /// Returns [`SdkError`] when the editor is unavailable or rejects attachment.
     pub fn open_editor(
         &mut self,
-        parent_view: *mut std::ffi::c_void,
+        parent_view: &EditorParentView,
     ) -> Result<Vst3EditorSize, SdkError> {
         if !self.plugin.has_editor() {
             return Err(SdkError::Host(
                 "selected VST3 class has no native editor".to_owned(),
             ));
         }
-        #[cfg(target_os = "macos")]
-        let parent_window = WindowHandle::from_nsview(parent_view);
-        #[cfg(not(target_os = "macos"))]
-        let parent_window = {
+        #[cfg(not(all(target_os = "macos", feature = "editor-window")))]
+        {
             let _ = parent_view;
-            return Err(SdkError::Host(
-                "native VST3 editor hosting is currently macOS-only".to_owned(),
-            ));
-        };
-        self.plugin.open_editor(parent_window)?;
-        let (width, height) = self.plugin.get_editor_size()?;
-        Vst3EditorSize::from_sdk(width, height)
+            Err(SdkError::Host(
+                "native VST3 editor hosting requires the macOS editor-window feature".to_owned(),
+            ))
+        }
+        #[cfg(all(target_os = "macos", feature = "editor-window"))]
+        {
+            // The token retains an NSView and cannot cross threads. Its pointer stays valid here.
+            let parent_window = unsafe { WindowHandle::from_nsview(parent_view.as_ptr()) };
+            self.plugin.open_editor(parent_window)?;
+            let size = self
+                .plugin
+                .get_editor_size()
+                .map_err(SdkError::from)
+                .and_then(|(width, height)| Vst3EditorSize::from_sdk(width, height));
+            if size.is_err() {
+                // Attachment succeeded, so release it even if the size query fails. Keep the
+                // original error because it explains why opening the editor failed.
+                let _ = self.plugin.close_editor();
+            }
+            size
+        }
     }
 
     /// Closes the worker-owned native editor.
@@ -607,46 +769,36 @@ impl SdkPlugin {
     ///
     /// Returns [`SdkError`] when the host layer cannot query bus arrangements.
     pub fn bus_topology(&self) -> Result<Vst3BusTopology, SdkError> {
-        let arrangements = self.bus_arrangements()?;
-        let audio_inputs = arrangements
+        let layout = self.plugin.audio_bus_layout()?;
+        let audio_inputs = audio_bus_descriptors(&layout.inputs, RackBusDirection::Input);
+        let audio_outputs = audio_bus_descriptors(&layout.outputs, RackBusDirection::Output);
+        let event_layout = self.plugin.event_bus_layout()?;
+        let event_inputs = event_layout
             .inputs
-            .iter()
-            .map(|arrangement| {
-                Vst3BusDescriptor::audio(
+            .into_iter()
+            .map(|role| {
+                Vst3BusDescriptor::event(
                     RackBusDirection::Input,
-                    BusRole::Main,
-                    u8::try_from(arrangement.channel_count()).unwrap_or(u8::MAX),
+                    match role {
+                        vst3_host::audio::EventBusRole::Main => BusRole::Main,
+                        vst3_host::audio::EventBusRole::Auxiliary => BusRole::Auxiliary,
+                    },
                 )
             })
             .collect();
-        let audio_outputs = arrangements
+        let event_outputs = event_layout
             .outputs
-            .iter()
-            .map(|arrangement| {
-                Vst3BusDescriptor::audio(
+            .into_iter()
+            .map(|role| {
+                Vst3BusDescriptor::event(
                     RackBusDirection::Output,
-                    BusRole::Main,
-                    u8::try_from(arrangement.channel_count()).unwrap_or(u8::MAX),
+                    match role {
+                        vst3_host::audio::EventBusRole::Main => BusRole::Main,
+                        vst3_host::audio::EventBusRole::Auxiliary => BusRole::Auxiliary,
+                    },
                 )
             })
             .collect();
-        let info = self.plugin.info();
-        let event_inputs = if info.has_midi_input {
-            vec![Vst3BusDescriptor::event(
-                RackBusDirection::Input,
-                BusRole::Main,
-            )]
-        } else {
-            Vec::new()
-        };
-        let event_outputs = if info.has_midi_output {
-            vec![Vst3BusDescriptor::event(
-                RackBusDirection::Output,
-                BusRole::Main,
-            )]
-        } else {
-            Vec::new()
-        };
         Ok(Vst3BusTopology {
             audio_inputs,
             audio_outputs,
@@ -730,6 +882,25 @@ impl SdkPlugin {
         self.buffers = AudioBuffers::new(
             input_channels,
             output_channels,
+            self.block_size,
+            self.sample_rate_hz,
+        );
+        Ok(())
+    }
+
+    /// Activates the first auxiliary audio input as a stereo sidechain while inactive. Its two
+    /// planes follow the main input planes passed to [`Self::process_planar`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SdkError`] when the component rejects the activation.
+    pub fn activate_sidechain_input(&mut self) -> Result<(), SdkError> {
+        self.plugin
+            .set_bus_active(MediaType::Audio, BusDirection::Input, 1, true)?;
+        // vst3-host feeds flat input planes to the active buses in bus order.
+        self.buffers = AudioBuffers::new(
+            self.buffers.inputs.len() + 2,
+            self.buffers.outputs.len(),
             self.block_size,
             self.sample_rate_hz,
         );
@@ -937,6 +1108,27 @@ fn validate_scanner_topology(topology: &Vst3BusTopology) -> Result<(), SdkError>
         .map_err(|error| SdkError::Host(format!("unsupported VST3 bus layout: {error}")))
 }
 
+fn audio_bus_descriptors(
+    buses: &[vst3_host::audio::AudioBusConfig],
+    direction: RackBusDirection,
+) -> Vec<Vst3BusDescriptor> {
+    buses
+        .iter()
+        .enumerate()
+        .map(|(index, bus)| {
+            Vst3BusDescriptor::audio(
+                direction,
+                if index == 0 {
+                    BusRole::Main
+                } else {
+                    BusRole::Auxiliary
+                },
+                u8::try_from(bus.channel_count).unwrap_or(u8::MAX),
+            )
+        })
+        .collect()
+}
+
 fn truncate_channels(channels: &mut [Vec<f32>], frames: usize) {
     for channel in channels {
         if channel.len() > frames {
@@ -1012,22 +1204,19 @@ impl HostSdkRackFactory {
         selection: &Vst3ClassSelection,
         format: ProcessingFormat,
     ) -> Result<Vst3ScanMetadata, SdkError> {
-        let class = self
-            .enumerate_classes(&selection.bundle)?
-            .into_iter()
-            .find(|class| class.class_id == selection.class_id)
-            .ok_or_else(|| {
-                SdkError::Host(format!(
-                    "selected class {} was not found in {}",
-                    selection.class_id,
-                    selection.bundle.as_path().display()
-                ))
-            })?;
-        let plugin = SdkPlugin::load_inactive_with_format(
+        let plugin = SdkPlugin::load_inactive_class_with_format(
             &selection.bundle,
+            Some(&selection.class_id),
             format.sample_rate_hz,
             format.maximum_frames,
         )?;
+        let info = plugin.plugin.info();
+        let class = Vst3ClassDescriptor {
+            class_id: info.uid.clone(),
+            name: info.name.clone(),
+            category: info.category.clone(),
+            version: info.version.clone(),
+        };
         plugin.scan_metadata(&class)
     }
 
@@ -1045,17 +1234,6 @@ impl HostSdkRackFactory {
         selection: &Vst3ClassSelection,
         format: ProcessingFormat,
     ) -> Result<PluginClassScanMetadata, SdkError> {
-        let class = self
-            .enumerate_classes(&selection.bundle)?
-            .into_iter()
-            .find(|class| class.class_id == selection.class_id)
-            .ok_or_else(|| {
-                SdkError::Host(format!(
-                    "selected class {} was not found in {}",
-                    selection.class_id,
-                    selection.bundle.as_path().display()
-                ))
-            })?;
         let mut adapter = self.create_adapter();
         adapter.select_module_class(selection, format)?;
         adapter.initialize_component()?;
@@ -1066,20 +1244,23 @@ impl HostSdkRackFactory {
         let parameters = adapter.parameters()?;
         let editor = adapter.editor_metadata()?;
         let info = adapter.plugin()?.plugin.info();
+        if info.uid != selection.class_id {
+            return Err(SdkError::Host(format!(
+                "loaded class {} does not match selected class {}",
+                info.uid, selection.class_id
+            )));
+        }
         Ok(PluginClassScanMetadata {
             identity: PluginIdentity {
                 vendor: info.vendor.clone(),
                 name: info.name.clone(),
                 unique_id: selection.class_id.clone(),
             },
-            version: if class.version.is_empty() {
-                info.version.clone()
-            } else {
-                class.version
-            },
+            version: info.version.clone(),
             buses: plugin_bus_configuration(&buses),
             parameters: parameters.iter().map(plugin_parameter_metadata).collect(),
             editor_supported: editor.supported,
+            sidechain_capable: buses.has_stereo_sidechain(),
         })
     }
 
@@ -1098,12 +1279,15 @@ impl HostSdkRackFactory {
 /// at the boundary, and retains only preallocated planar buffers in the process path.
 pub struct HostSdkRackAdapter {
     plugin: Option<SdkPlugin>,
+    parameter_cache: Option<BTreeMap<u32, Vst3ParameterInfo>>,
+    parameter_cache_dirty: bool,
     selected: Option<Vst3ClassSelection>,
     lifecycle: HostLifecycle,
     layout: Option<MainBusLayout>,
     editor: Option<EditorSession>,
     last_latency_samples: Option<u32>,
     pending_restart_flags: Option<u32>,
+    drain_editor_gestures: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1125,30 +1309,80 @@ enum HostLifecycle {
 }
 
 impl HostSdkRackAdapter {
+    /// Registers editor access on the loading thread before handing DSP to its worker thread.
+    #[must_use]
+    pub fn main_thread_editor_handle(&self) -> Option<SdkEditorHandle> {
+        self.plugin
+            .as_ref()?
+            .plugin
+            .main_thread_editor_handle()
+            .map(|inner| SdkEditorHandle { inner })
+    }
+
+    /// Registers a main-thread visualization pump for the loaded plug-in.
+    ///
+    /// The returned handle must remain on this thread and may be pumped while DSP runs.
+    /// It becomes inert when the plug-in is unloaded.
+    pub fn main_thread_service(&self) -> Option<MainThreadService> {
+        self.plugin.as_ref()?.plugin.main_thread_service()
+    }
+
     /// Creates an adapter with no loaded module.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             plugin: None,
+            parameter_cache: None,
+            parameter_cache_dirty: false,
             selected: None,
             lifecycle: HostLifecycle::Empty,
             layout: None,
             editor: None,
             last_latency_samples: None,
             pending_restart_flags: None,
+            drain_editor_gestures: true,
         }
+    }
+
+    /// Enables gesture feedback for hosts that consume adapter output changes.
+    ///
+    /// The production worker does not forward this feedback. Disabling its drain there avoids
+    /// taking the editor's gesture mutex on every DSP block. The separate `performEdit` value
+    /// queue still reaches the processor through `vst3-host`.
+    pub fn set_editor_gesture_feedback(&mut self, enabled: bool) {
+        self.drain_editor_gestures = enabled;
     }
 
     /// Records an SDK restart request for the bounded worker control handoff.
     ///
-    /// The current `vst3-host` surface does not publish `IComponentHandler::restartComponent`
-    /// directly. A low-level backend can call this same adapter seam when it receives that
-    /// callback; the fixed rack will then drain it as [`AdapterNotification::RestartRequested`].
+    /// A low-level backend can call this adapter seam when it receives that callback; the fixed
+    /// rack will then drain it as [`AdapterNotification::RestartRequested`].
     pub fn report_restart_requested(&mut self, flags: u32) {
+        if flags != 0 {
+            self.parameter_cache_dirty = true;
+        }
         self.pending_restart_flags = Some(
             self.pending_restart_flags
                 .map_or(flags, |pending| pending | flags),
         );
+    }
+
+    /// Drains the host callback's atomic restart flags without calling into the plug-in.
+    ///
+    /// # Errors
+    /// Returns [`SdkError`] when no plug-in is loaded.
+    pub fn take_plugin_restart_flags(&mut self) -> Result<u32, SdkError> {
+        let callback_flags = self.plugin_mut()?.plugin.take_restart_flags();
+        if callback_flags.param_titles_changed()
+            || callback_flags.param_id_mapping_changed()
+            || callback_flags.reload_component()
+        {
+            // A DSP block only marks the cache stale. Rebuilding it allocates and belongs to
+            // the next control-plane metadata query.
+            self.parameter_cache_dirty = true;
+        }
+        Ok(callback_flags.bits().cast_unsigned()
+            | self.pending_restart_flags.take().unwrap_or_default())
     }
 
     /// Sets one normalized controller parameter without exposing SDK parameter types.
@@ -1174,10 +1408,15 @@ impl HostSdkRackAdapter {
     ///
     /// Returns [`SdkError`] when the parameter is unknown or the controller cannot be queried.
     pub fn parameter_metadata(&mut self, parameter_id: u32) -> Result<Vst3ParameterInfo, SdkError> {
-        self.parameters()?
-            .into_iter()
-            .find(|parameter| parameter.id == parameter_id)
-            .ok_or_else(|| SdkError::Host(format!("unknown VST3 parameter {parameter_id}")))
+        self.ensure_parameter_cache()?;
+        let mut metadata = self
+            .parameter_cache
+            .as_ref()
+            .and_then(|parameters| parameters.get(&parameter_id))
+            .cloned()
+            .ok_or_else(|| SdkError::Host(format!("unknown VST3 parameter {parameter_id}")))?;
+        metadata.normalized = self.plugin()?.plugin.get_parameter(parameter_id)?;
+        Ok(metadata)
     }
 
     /// Reads one current normalized controller parameter value.
@@ -1185,7 +1424,17 @@ impl HostSdkRackAdapter {
     /// # Errors
     /// Returns [`SdkError`] when the parameter is unknown.
     pub fn read_parameter(&mut self, parameter_id: u32) -> Result<f64, SdkError> {
-        Ok(self.parameter_metadata(parameter_id)?.normalized)
+        self.ensure_parameter_cache()?;
+        if !self
+            .parameter_cache
+            .as_ref()
+            .is_some_and(|parameters| parameters.contains_key(&parameter_id))
+        {
+            return Err(SdkError::Host(format!(
+                "unknown VST3 parameter {parameter_id}"
+            )));
+        }
+        Ok(self.plugin()?.plugin.get_parameter(parameter_id)?)
     }
 
     /// Returns an explicit capability failure because `vst3-host` does not surface host-initiated
@@ -1227,7 +1476,7 @@ impl HostSdkRackAdapter {
     /// Returns [`SdkError`] when no class/editor is available or attachment fails.
     pub fn open_editor(
         &mut self,
-        parent_view: *mut std::ffi::c_void,
+        parent_view: &EditorParentView,
     ) -> Result<Vst3EditorSize, SdkError> {
         if self.editor.is_some() {
             return Err(SdkError::Host("VST3 editor is already open".to_owned()));
@@ -1257,27 +1506,33 @@ impl HostSdkRackAdapter {
         Ok(())
     }
 
-    /// Records the size applied to the worker-owned native editor window.
+    /// Asks the plug-in to resize its editor and returns the size it accepts.
     ///
-    /// The worker resizes its native container before invoking this method. A plug-in requested
-    /// size is obtained through [`Self::take_editor_resize_request`], preventing cross-process
-    /// view embedding or SDK objects from escaping the helper.
+    /// The worker applies the returned size to its native container. Fixed-size editors retain
+    /// their preferred size; resizable editors can constrain the requested dimensions.
     ///
     /// # Errors
     ///
-    /// Returns [`SdkError`] for a zero dimension or when no editor is open.
-    pub fn resize_editor(&mut self, size: Vst3EditorSize) -> Result<(), SdkError> {
+    /// Returns [`SdkError`] for invalid dimensions, a closed editor, or a rejected SDK call.
+    pub fn resize_editor(&mut self, size: Vst3EditorSize) -> Result<Vst3EditorSize, SdkError> {
         if size.width == 0 || size.height == 0 {
             return Err(SdkError::Host(
                 "VST3 editor size must be nonzero".to_owned(),
             ));
         }
-        let session = self
-            .editor
-            .as_mut()
-            .ok_or_else(|| SdkError::Host("VST3 editor is not open".to_owned()))?;
-        session.size = size;
-        Ok(())
+        if self.editor.is_none() {
+            return Err(SdkError::Host("VST3 editor is not open".to_owned()));
+        }
+        let width = i32::try_from(size.width)
+            .map_err(|_| SdkError::Host("VST3 editor width exceeds SDK limits".to_owned()))?;
+        let height = i32::try_from(size.height)
+            .map_err(|_| SdkError::Host("VST3 editor height exceeds SDK limits".to_owned()))?;
+        let (width, height) = self.plugin_mut()?.plugin.resize_editor(width, height)?;
+        let accepted = Vst3EditorSize::from_sdk(width, height)?;
+        if let Some(session) = self.editor.as_mut() {
+            session.size = accepted;
+        }
+        Ok(accepted)
     }
 
     /// Drains one plug-in initiated editor resize request.
@@ -1309,7 +1564,7 @@ impl HostSdkRackAdapter {
         Ok(())
     }
 
-    /// Captures distinct component/controller state streams while processing is inactive.
+    /// Captures a complete component-and-controller snapshot while processing is inactive.
     ///
     /// # Errors
     ///
@@ -1318,8 +1573,7 @@ impl HostSdkRackAdapter {
         <Self as RackPluginAdapter>::capture_state(self)
     }
 
-    /// Restores state while inactive in component, controller synchronization, then controller
-    /// state order. The method never starts processing implicitly.
+    /// Restores a complete snapshot while inactive. The method never starts processing implicitly.
     ///
     /// # Errors
     ///
@@ -1333,6 +1587,20 @@ impl HostSdkRackAdapter {
         <Self as RackPluginAdapter>::restore_component_state(self, &state.component)?;
         <Self as RackPluginAdapter>::synchronize_controller_from_component_state(self)?;
         <Self as RackPluginAdapter>::restore_controller_state(self, &state.controller)
+    }
+
+    fn ensure_parameter_cache(&mut self) -> Result<(), SdkError> {
+        if self.parameter_cache.is_none() || self.parameter_cache_dirty {
+            let parameters = <Self as RackPluginAdapter>::parameters(self)?;
+            self.parameter_cache = Some(
+                parameters
+                    .into_iter()
+                    .map(|parameter| (parameter.id, parameter))
+                    .collect(),
+            );
+            self.parameter_cache_dirty = false;
+        }
+        Ok(())
     }
 
     fn plugin(&self) -> Result<&SdkPlugin, SdkError> {
@@ -1358,53 +1626,7 @@ impl HostSdkRackAdapter {
     }
 
     fn topology(&self) -> Result<Vst3BusTopology, SdkError> {
-        let plugin = self.plugin()?;
-        let arrangements = plugin.bus_arrangements()?;
-        let audio_inputs = arrangements
-            .inputs
-            .iter()
-            .map(|arrangement| {
-                Vst3BusDescriptor::audio(
-                    RackBusDirection::Input,
-                    BusRole::Main,
-                    u8::try_from(arrangement.channel_count()).unwrap_or(u8::MAX),
-                )
-            })
-            .collect();
-        let audio_outputs = arrangements
-            .outputs
-            .iter()
-            .map(|arrangement| {
-                Vst3BusDescriptor::audio(
-                    RackBusDirection::Output,
-                    BusRole::Main,
-                    u8::try_from(arrangement.channel_count()).unwrap_or(u8::MAX),
-                )
-            })
-            .collect();
-        let info = plugin.plugin.info();
-        let event_inputs = if info.has_midi_input {
-            vec![Vst3BusDescriptor::event(
-                RackBusDirection::Input,
-                BusRole::Main,
-            )]
-        } else {
-            Vec::new()
-        };
-        let event_outputs = if info.has_midi_output {
-            vec![Vst3BusDescriptor::event(
-                RackBusDirection::Output,
-                BusRole::Main,
-            )]
-        } else {
-            Vec::new()
-        };
-        Ok(Vst3BusTopology {
-            audio_inputs,
-            audio_outputs,
-            event_inputs,
-            event_outputs,
-        })
+        self.plugin()?.bus_topology()
     }
 }
 
@@ -1428,31 +1650,23 @@ impl RackPluginAdapter for HostSdkRackAdapter {
                 "rack format exceeds SDK fixed buffer capacity {SDK_MAX_FRAMES}"
             )));
         }
-        let classes = HostSdkRackFactory.enumerate_classes(&selection.bundle)?;
-        if !classes
-            .iter()
-            .any(|class| class.class_id == selection.class_id)
-        {
-            return Err(SdkError::Host(format!(
-                "class {} is not an audio module in {}",
-                selection.class_id,
-                selection.bundle.as_path().display()
-            )));
-        }
-        let plugin = SdkPlugin::load_inactive_with_format(
+        let plugin = SdkPlugin::load_inactive_class_with_format(
             &selection.bundle,
+            Some(&selection.class_id),
             format.sample_rate_hz,
             format.maximum_frames,
         )?;
         if plugin.class_id() != selection.class_id {
             return Err(SdkError::Host(format!(
-                "vst3-host instantiated class {}, not selected class {}; class-specific loading requires the low-level backend",
+                "vst3-host instantiated class {}, not selected class {}",
                 plugin.class_id(),
                 selection.class_id
             )));
         }
         self.last_latency_samples = Some(plugin.latency_samples());
         self.plugin = Some(plugin);
+        self.parameter_cache = None;
+        self.parameter_cache_dirty = false;
         self.selected = Some(selection.clone());
         self.lifecycle = HostLifecycle::ClassSelected;
         Ok(())
@@ -1493,22 +1707,21 @@ impl RackPluginAdapter for HostSdkRackAdapter {
     fn negotiate_main_buses(&mut self, layout: MainBusLayout) -> Result<(), Self::Error> {
         self.require_lifecycle(HostLifecycle::Connected)?;
         let discovered = self.topology()?;
-        let inputs = match discovered.audio_inputs.len() {
-            0 if layout.input_channels == 0 => Vec::new(),
-            1 => vec![speaker_arrangement(layout.input_channels)],
-            _ => {
-                return Err(SdkError::Host(
-                    "main-bus negotiation requires at most one audio input".to_owned(),
-                ));
-            }
-        };
-        if discovered.audio_outputs.len() != 1 {
-            return Err(SdkError::Host(
-                "main-bus negotiation requires exactly one audio output".to_owned(),
-            ));
+        validate_scanner_topology(&discovered)?;
+        let mut arrangements = self.plugin()?.bus_arrangements()?;
+        if let Some(main) = arrangements.inputs.first_mut() {
+            *main = speaker_arrangement(layout.input_channels);
         }
+        if let Some(sidechain) = arrangements
+            .inputs
+            .get_mut(1)
+            .filter(|_| layout.sidechain_input)
+        {
+            *sidechain = SpeakerArrangement::STEREO;
+        }
+        arrangements.outputs[0] = speaker_arrangement(layout.output_channels);
         self.plugin_mut()?
-            .set_bus_arrangements(&inputs, &[speaker_arrangement(layout.output_channels)])?;
+            .set_bus_arrangements(&arrangements.inputs, &arrangements.outputs)?;
         self.layout = Some(layout);
         self.lifecycle = HostLifecycle::BusesNegotiated;
         Ok(())
@@ -1517,6 +1730,42 @@ impl RackPluginAdapter for HostSdkRackAdapter {
     fn activate_main_buses(&mut self, layout: MainBusLayout) -> Result<(), Self::Error> {
         self.require_lifecycle(HostLifecycle::BusesNegotiated)?;
         let discovered = self.topology()?;
+        for index in 1..discovered.audio_inputs.len() {
+            self.plugin_mut()?.set_bus_active(
+                MediaType::Audio,
+                BusDirection::Input,
+                i32::try_from(index)
+                    .map_err(|_| SdkError::Host("too many input buses".to_owned()))?,
+                false,
+            )?;
+        }
+        for index in 1..discovered.audio_outputs.len() {
+            self.plugin_mut()?.set_bus_active(
+                MediaType::Audio,
+                BusDirection::Output,
+                i32::try_from(index)
+                    .map_err(|_| SdkError::Host("too many output buses".to_owned()))?,
+                false,
+            )?;
+        }
+        for index in 1..discovered.event_inputs.len() {
+            self.plugin_mut()?.set_bus_active(
+                MediaType::Event,
+                BusDirection::Input,
+                i32::try_from(index)
+                    .map_err(|_| SdkError::Host("too many event input buses".to_owned()))?,
+                false,
+            )?;
+        }
+        for index in 1..discovered.event_outputs.len() {
+            self.plugin_mut()?.set_bus_active(
+                MediaType::Event,
+                BusDirection::Output,
+                i32::try_from(index)
+                    .map_err(|_| SdkError::Host("too many event output buses".to_owned()))?,
+                false,
+            )?;
+        }
         if layout.input_channels > 0 {
             self.plugin_mut()?
                 .set_bus_active(MediaType::Audio, BusDirection::Input, 0, true)?;
@@ -1526,6 +1775,9 @@ impl RackPluginAdapter for HostSdkRackAdapter {
         if layout.event_input_active && !discovered.event_inputs.is_empty() {
             self.plugin_mut()?
                 .set_bus_active(MediaType::Event, BusDirection::Input, 0, true)?;
+        }
+        if layout.sidechain_input {
+            self.plugin_mut()?.activate_sidechain_input()?;
         }
         self.lifecycle = HostLifecycle::BusesActivated;
         Ok(())
@@ -1561,6 +1813,7 @@ impl RackPluginAdapter for HostSdkRackAdapter {
             frames,
             input,
             output,
+            sidechain,
             midi,
             parameter_changes,
             output_changes,
@@ -1569,6 +1822,11 @@ impl RackPluginAdapter for HostSdkRackAdapter {
             return Err(SdkError::Host(format!(
                 "process frame count {frames} exceeds prepared capacity"
             )));
+        }
+        if sidechain.is_some() != self.layout.is_some_and(|layout| layout.sidechain_input) {
+            return Err(SdkError::Host(
+                "sidechain planes must match the activated sidechain input".to_owned(),
+            ));
         }
         for change in parameter_changes.iter() {
             self.plugin_mut()?.set_parameter_at(
@@ -1583,13 +1841,23 @@ impl RackPluginAdapter for HostSdkRackAdapter {
         }
         let (input_planes, input_channels) = input.into_parts();
         let (mut output_planes, output_channels) = output.into_parts();
+        // Flat planes feed the active input buses in order: main, then sidechain.
+        let mut planes: [&[f32]; 4] = [&[]; 4];
+        let mut plane_count = usize::from(input_channels);
+        planes[..plane_count].copy_from_slice(&input_planes[..plane_count]);
+        if let Some(sidechain) = sidechain {
+            planes[plane_count..plane_count + 2].copy_from_slice(&sidechain);
+            plane_count += 2;
+        }
         self.plugin_mut()?.process_planar(
-            &input_planes[..usize::from(input_channels)],
+            &planes[..plane_count],
             &mut output_planes[..usize::from(output_channels)],
             frames,
         )?;
         self.plugin_mut()?.drain_output_midi(output_changes);
-        self.plugin_mut()?.drain_parameter_gestures(output_changes);
+        if self.drain_editor_gestures {
+            self.plugin_mut()?.drain_parameter_gestures(output_changes);
+        }
         let latency = self.plugin()?.latency_samples();
         if self
             .last_latency_samples
@@ -1634,12 +1902,12 @@ impl RackPluginAdapter for HostSdkRackAdapter {
                 "opaque state capture requires stopped VST3 processing".to_owned(),
             ));
         }
-        // `vst3-host` exposes IComponent::getState but not IEditController::getState. Returning
-        // an empty controller stream would falsely claim a complete two-stream snapshot, so the
-        // high-level backend rejects this capability until a low-level VST3 backend supplies it.
-        Err(SdkError::Host(
-            "vst3-host cannot independently capture IEditController state; controller-specific state is unsupported".to_owned(),
-        ))
+        // vst3-host 0.9 stores both streams in one versioned envelope. The outer controller
+        // field stays empty because its bytes are already inside the complete envelope.
+        Ok(Vst3StateStreams {
+            component: self.plugin()?.save_state()?,
+            controller: Vec::new(),
+        })
     }
 
     fn restore_component_state(&mut self, component: &[u8]) -> Result<(), Self::Error> {
@@ -1648,7 +1916,10 @@ impl RackPluginAdapter for HostSdkRackAdapter {
                 "component state restore requires stopped VST3 processing".to_owned(),
             ));
         }
-        self.plugin_mut()?.load_state(component)
+        // The library accepts both its complete envelope and legacy raw component bytes.
+        self.plugin_mut()?.load_state(component)?;
+        self.parameter_cache_dirty = true;
+        Ok(())
     }
 
     fn synchronize_controller_from_component_state(&mut self) -> Result<(), Self::Error> {
@@ -1657,8 +1928,8 @@ impl RackPluginAdapter for HostSdkRackAdapter {
                 "controller synchronization requires stopped VST3 processing".to_owned(),
             ));
         }
-        // `SdkPlugin::load_state` performs the component -> controller synchronization exposed by
-        // vst3-host. The explicit method retains the official ordering in the SDK-free contract.
+        // `SdkPlugin::load_state` has already applied component state, synchronized the
+        // controller, and restored any controller stream inside the envelope.
         Ok(())
     }
 
@@ -1672,8 +1943,7 @@ impl RackPluginAdapter for HostSdkRackAdapter {
             return Ok(());
         }
         Err(SdkError::Host(
-            "vst3-host does not expose IEditController::setState; use the low-level adapter for controller-specific state"
-                .to_owned(),
+            "separate controller state is not supported by the combined-state backend".to_owned(),
         ))
     }
 
@@ -1732,6 +2002,7 @@ fn plugin_parameter_metadata(parameter: &Vst3ParameterInfo) -> PluginParameterMe
             .default_normalized
             .is_finite()
             .then_some(parameter.default_normalized),
+        step_count: parameter.step_count.max(0).cast_unsigned(),
         automatable: parameter.flags.contains(ParameterFlags::CAN_AUTOMATE),
         read_only: parameter.flags.contains(ParameterFlags::READ_ONLY),
         bypass: parameter.flags.contains(ParameterFlags::BYPASS),
@@ -1754,10 +2025,80 @@ pub fn bundle_exists(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{HostSdkFactory, SDK_MAX_FRAMES, SdkPlugin, SdkPluginFactory};
+    use super::{
+        HostSdkFactory, SDK_MAX_FRAMES, SdkPlugin, SdkPluginFactory, audio_bus_descriptors,
+        plugin_bus_configuration, plugin_parameter_metadata,
+    };
     use crate::Vst3BundlePath;
+    use crate::adapter::{
+        BusDirection, BusRole, ParameterFlags, Vst3BusTopology, Vst3ParameterInfo,
+    };
     use std::env;
     use std::path::PathBuf;
+    use vst3_host::audio::AudioBusConfig;
+
+    #[test]
+    fn scanner_preserves_discrete_parameter_steps() {
+        let mut parameter = Vst3ParameterInfo {
+            id: 42,
+            title: "Mode".to_owned(),
+            short_title: "Mode".to_owned(),
+            unit: String::new(),
+            normalized: 0.0,
+            default_normalized: 0.0,
+            step_count: 7,
+            flags: ParameterFlags(0),
+        };
+        assert_eq!(plugin_parameter_metadata(&parameter).step_count, 7);
+        parameter.step_count = -1;
+        assert_eq!(plugin_parameter_metadata(&parameter).step_count, 0);
+    }
+
+    #[test]
+    fn failed_editor_resize_preserves_the_last_accepted_size() {
+        let mut adapter = super::HostSdkRackAdapter::new();
+        let original = super::EditorSession {
+            size: super::Vst3EditorSize {
+                width: 640,
+                height: 480,
+            },
+            focused: true,
+        };
+        adapter.editor = Some(original);
+        // No SDK instance exists: recording a new size without consulting it must fail.
+        assert!(
+            adapter
+                .resize_editor(super::Vst3EditorSize {
+                    width: 900,
+                    height: 600,
+                })
+                .is_err()
+        );
+        assert_eq!(adapter.editor, Some(original));
+    }
+
+    #[test]
+    fn scanner_metadata_marks_optional_audio_bus_as_auxiliary() {
+        let declared = [
+            AudioBusConfig {
+                channel_count: 2,
+                active: true,
+            },
+            AudioBusConfig {
+                channel_count: 1,
+                active: false,
+            },
+        ];
+        let inputs = audio_bus_descriptors(&declared, BusDirection::Input);
+        assert_eq!(inputs[0].role, BusRole::Main);
+        assert_eq!(inputs[1].role, BusRole::Auxiliary);
+        let metadata = plugin_bus_configuration(&Vst3BusTopology {
+            audio_inputs: inputs,
+            ..Vst3BusTopology::default()
+        });
+        assert!(metadata.inputs[0].main);
+        assert!(!metadata.inputs[1].main);
+    }
 
     #[test]
     fn rejects_non_vst3_extension() {
@@ -1796,9 +2137,49 @@ mod tests {
         if !path.exists() {
             return;
         }
-        let mut plugin =
-            SdkPlugin::load(&Vst3BundlePath::new(path)).expect("env bundle should load");
+        let mut plugin = SdkPlugin::load_inactive_with_format(
+            &Vst3BundlePath::new(path),
+            48_000.0,
+            SDK_MAX_FRAMES,
+        )
+        .expect("env bundle should load inactive");
         assert_eq!(plugin.block_size(), SDK_MAX_FRAMES);
+        let writable = plugin
+            .parameters()
+            .expect("parameters should be readable")
+            .into_iter()
+            .filter(|parameter| !parameter.is_read_only)
+            .map(|parameter| (parameter.id, parameter.normalized))
+            .collect::<Vec<_>>();
+        if let Some(&(last_id, _)) = writable.last() {
+            std::thread::scope(|scope| {
+                let worker_plugin = &mut plugin;
+                scope
+                    .spawn(move || {
+                        for (id, normalized) in writable {
+                            worker_plugin
+                                .set_parameter(id, normalized)
+                                .expect("saved parameter replay should succeed");
+                        }
+                    })
+                    .join()
+                    .expect("parameter replay thread should finish");
+            });
+            assert_eq!(plugin.pending_control_parameter, Some(last_id));
+        }
+        plugin
+            .start_processing()
+            .expect("saved parameters should flush before live processing");
+        assert_eq!(plugin.pending_control_parameter, None);
+        assert!(
+            plugin
+                .buffers
+                .inputs
+                .iter()
+                .chain(&plugin.buffers.outputs)
+                .all(|channel| channel.len() == SDK_MAX_FRAMES),
+            "zero-frame flush must restore preallocated channel lengths"
+        );
         let left = [0.1_f32; 128];
         let right = [0.2_f32; 128];
         let input: [&[f32]; 2] = [&left, &right];

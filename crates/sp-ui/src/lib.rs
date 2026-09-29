@@ -1,15 +1,13 @@
 //! Shared UI design foundations for Superposition.
 //!
-//! This crate deliberately contains design tokens and renderer-independent component models.
+//! This crate contains the film-strip design tokens and renderer-independent component models.
 //! It has no rendering-framework dependency.
 
 #![forbid(unsafe_code)]
 
-/// Stable examples rendered by the component gallery and snapshot tests.
-pub mod component_gallery;
-/// Pure data models shared by future UI renderers.
+/// Pure data models shared by UI renderers.
 pub mod components;
-/// Design tokens and the dark application theme.
+/// Design tokens, typography, and accessibility rules.
 pub mod design;
 
 #[cfg(test)]
@@ -34,7 +32,15 @@ mod design_source_tests {
         contents.split("#[cfg(test)]").next().unwrap_or(contents)
     }
 
-    fn assert_tokenized_first_argument(source: &str, call: &str) {
+    /// The egui renderer: `ui.rs` and everything under `ui/`.
+    fn renderer_sources() -> Vec<PathBuf> {
+        let app = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/superposition/src");
+        let mut sources = vec![app.join("ui.rs")];
+        rust_sources(&app.join("ui"), &mut sources);
+        sources
+    }
+
+    fn assert_tokenized_first_argument(path: &Path, source: &str, call: &str) {
         let mut remaining = source;
         while let Some(position) = remaining.find(call) {
             remaining = &remaining[position + call.len()..];
@@ -45,19 +51,19 @@ mod design_source_tests {
                 .expect("visual call has an argument");
             assert!(
                 !first.is_ascii_digit() && !matches!(first, '+' | '-' | '.'),
-                "visual call {call:?} must start with a design token, not {first:?}"
+                "visual call {call:?} in {} must start with a design token, not {first:?}",
+                path.display()
             );
         }
     }
 
     #[test]
-    fn raw_brand_palette_values_are_confined_to_the_design_bridge() {
+    fn raw_palette_values_are_confined_to_the_token_module() {
         let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let approved = source_root.join("design/tokens.rs");
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut sources = Vec::new();
         rust_sources(&source_root, &mut sources);
-        sources.push(workspace.join("apps/superposition/src/ui.rs"));
+        sources.extend(renderer_sources());
 
         for source in sources {
             if source == approved {
@@ -67,15 +73,17 @@ mod design_source_tests {
             let production_source = production_source(&contents);
             for literal in [
                 "Color::rgb(",
-                "0x0A, 0x0F, 0x16",
-                "0x12, 0x18, 0x20",
-                "0x1B, 0x23, 0x30",
-                "0x2A, 0x32, 0x42",
-                "0xE6, 0xE8, 0xEC",
-                "0x9A, 0xA3, 0xAE",
-                "0x00, 0xE5, 0xFF",
-                "0x00, 0x7A, 0xFF",
-                "0xA6, 0xFF, 0x00",
+                "0x12, 0x13, 0x15",
+                "0xD9, 0xDA, 0xD6",
+                "0x7C, 0x80, 0x88",
+                "0x3A, 0x3E, 0x45",
+                "0x26, 0x29, 0x2E",
+                "0x24, 0x27, 0x2C",
+                "0x1B, 0x1D, 0x21",
+                "0xD9, 0xA2, 0x1B",
+                "0xE5, 0x48, 0x4D",
+                "0x7F, 0xB0, 0xFF",
+                "0x1A, 0x12, 0x14",
             ] {
                 assert!(
                     !production_source.contains(literal),
@@ -88,38 +96,29 @@ mod design_source_tests {
 
     #[test]
     fn egui_renderer_uses_the_token_bridge_for_visual_values() {
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let source = fs::read_to_string(workspace.join("apps/superposition/src/ui.rs"))
-            .expect("egui renderer source is readable");
-        let bridge = source
-            .split("fn token_color")
-            .nth(1)
-            .and_then(|source| source.split("\n}\n").next())
-            .expect("token-color bridge exists");
-
-        assert_eq!(
-            source.matches("Color32::").count(),
-            1,
-            "only the token bridge may construct an egui color"
-        );
-        assert!(
-            bridge.contains("Color32::from_rgb"),
-            "the token-color bridge must resolve design colors"
-        );
-
-        for call in [
-            ".exact_height(",
-            ".exact_width(",
-            ".inner_margin(",
-            ".corner_radius(",
-            ".stroke(",
-            ".size(",
-            ".min_size(",
-            "Vec2::new(",
-            "ui.set_min_width(",
-            "ui.add_space(",
-        ] {
-            assert_tokenized_first_argument(&source, call);
+        let mut constructors = 0;
+        for path in renderer_sources() {
+            let contents = fs::read_to_string(&path).expect("egui renderer source is readable");
+            let source = production_source(&contents);
+            constructors += source.matches("Color32::from").count();
+            for call in [
+                ".exact_height(",
+                ".exact_width(",
+                ".inner_margin(",
+                ".corner_radius(",
+                ".min_size(",
+                "Vec2::new(",
+                "vec2(",
+                "ui.set_min_width(",
+                "ui.add_space(",
+                "FontId::new(",
+            ] {
+                assert_tokenized_first_argument(&path, source, call);
+            }
         }
+        assert_eq!(
+            constructors, 1,
+            "only the token bridge may construct an egui colour"
+        );
     }
 }

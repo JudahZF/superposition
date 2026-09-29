@@ -1,10 +1,10 @@
 //! Isolated plug-in-host helper entry point.
 
 mod control_thread;
+#[cfg(feature = "sdk")]
+mod state_transfer;
 mod worker_runtime;
 
-#[cfg(feature = "sdk")]
-use std::ffi::c_void;
 use std::{
     cmp, io,
     os::unix::{fs::FileTypeExt, net::UnixListener},
@@ -19,52 +19,50 @@ use std::{
 
 #[cfg(feature = "sdk")]
 use sp_protocol::{
+    WORKER_PHASE_CONTROL, WORKER_PHASE_SCANNING, WORKER_PHASE_STOPPING, WORKER_PHASE_WAITING,
     control::{
         BankIdentity, ControlErrorCode, ControlErrorRecord, ControlOperation, ControlRequest,
-        ControlResponse, ControlResponseStatus, ControlTarget, MAX_PENDING_CONTROL_REQUESTS,
-        RackIdentity, SlotIdentity,
+        ControlResponse, ControlResponseStatus, ControlTarget, RackIdentity, SlotIdentity,
     },
     payload::{
-        Bypass, ControlPayloadCodec, EditorGeometry, HealthReport, ParameterId, ParameterMetadata,
-        ParameterWrite, PluginSlotConfiguration as WirePluginSlotConfiguration, RackTopology,
-        RestartReport, SlotOrder, StateRestore,
+        Bypass, ControlPayloadCodec, EditorGeometry, EditorPosition, EditorPreviewDescriptor,
+        EditorPreviewRequest, HealthReport, ParameterId, ParameterIds, ParameterMetadata,
+        ParameterValues, ParameterWrite, PluginSlotConfiguration as WirePluginSlotConfiguration,
+        RackTopology, RestartReport, SlotOrder, StateChunkRequest, StateChunkWrite, StateRestore,
+        StateTransferDescriptor, StateTransferId, StateTransferLengths,
     },
 };
 use sp_shared_memory::{
-    BLOCK_SLOT_COUNT, BlockRequest, BlockSlot, BlockTicket, ProtocolError, ProtocolHeader,
-    SlotState,
+    BLOCK_SLOT_COUNT, BlockRequest, BlockSlot, BlockTicket, MAX_PLUGINS_PER_RACK,
+    ParameterFeedbackBank, ProtocolError, ProtocolHeader, SharedBank, SlotState,
 };
 use sp_shared_memory_macos::{MonotonicClock, SharedMemoryRegion};
-use sp_test_support::{
-    COMPUTE_LOAD_MICROS_OPTION, COMPUTE_LOAD_MODE_OPTION, ComputeLoadConfiguration,
-    ComputeLoadMode, FAULT_DELAY_MICROS_OPTION, FAULT_MODE_OPTION, FAULT_TRIGGER_SEQUENCE_OPTION,
-    FaultConfiguration, FaultMode, SELF_CRASH_AFTER_CLAIM_MODE, WORK_DURATION_MICROS_OPTION,
-    parse_compute_load_configuration, parse_fault_configuration,
-};
 use sp_vst3::{Vst3BundlePath, adapter::Vst3ClassSelection};
-#[cfg(all(feature = "sdk", target_os = "macos"))]
+#[cfg(feature = "sdk")]
 use std::collections::BTreeMap;
 #[cfg(feature = "sdk")]
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::mpsc::{
+    Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
+};
 
 #[cfg(feature = "sdk")]
 use crate::{
     control_thread::{
         ControlThread, ProcessingControlEndpoint, ProcessingControlHandler, control_mailbox,
     },
+    state_transfer::StateTransfers,
     worker_runtime::{
-        EditorCommand, EditorSize, PlanarBlock, PluginFacade, PluginProcessRequest,
-        PluginRuntimeError, PluginSlotConfiguration, PluginState, PluginTopology, RackProcessor,
+        PlanarBlock, PluginFacade, PluginProcessRequest, PluginRuntimeError,
+        PluginSlotConfiguration, PluginState, PluginTopology, RackProcessor,
     },
 };
 
 #[cfg(feature = "sdk")]
 use sp_vst3::{
     adapter::{
-        AdapterNotification, BoundedMidiEvents, BoundedOutputChanges, BoundedParameterChanges,
-        MainBusLayout, MidiMessage, OutputChange, PlanarAudioInput, PlanarAudioOutput,
-        PluginProcessBlock, ProcessingFormat, RackPluginAdapter, TimedMidiMessage,
-        TimedParameterChange, Vst3StateStreams,
+        BoundedMidiEvents, BoundedOutputChanges, BoundedParameterChanges, MainBusLayout,
+        MidiMessage, PlanarAudioInput, PlanarAudioOutput, PluginProcessBlock, ProcessingFormat,
+        RackPluginAdapter, TimedMidiMessage, TimedParameterChange, Vst3StateStreams,
     },
     sdk::HostSdkRackAdapter,
 };
@@ -78,28 +76,19 @@ const BUNDLE_OPTION: &str = "--bundle";
 const WORKER_READY_LINE: &str = "ready";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(10);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TimingMode {
-    LegacyUntimed,
-    Timed,
-}
-
+/// Standalone one-bank worker used by `cargo xtask host-checker`.
+///
+/// It serves timed block requests from one shared-memory bank and has no control socket.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct FeasibilityWorkerConfiguration {
+struct StandaloneWorkerConfiguration {
     bank_name: String,
     worker_id: u32,
-    timing_mode: TimingMode,
-    fault: FaultConfiguration,
-    /// Abort immediately after claiming the exact configured fault request.
-    self_crash_after_claim: bool,
-    /// Bounded CPU work applied after audio processing and before completion publication.
-    compute_load: ComputeLoadConfiguration,
     /// Optional VST3 bundle. When set (and `sdk` is enabled), blocks are processed
-    /// through the plug-in instead of the feasibility pass-through copy.
+    /// through the plug-in instead of a pass-through copy.
     bundle: Option<Vst3BundlePath>,
 }
 
-/// Production worker configuration. Unlike Phase 1 feasibility mode, this is entered only by the
+/// Production worker configuration. Unlike standalone mode, this is entered only by the
 /// explicit `--worker` selector and always has a concrete VST3 class and control endpoint.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProductionWorkerConfiguration {
@@ -115,16 +104,8 @@ struct ProductionWorkerConfiguration {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum WorkerStartup {
-    Feasibility(FeasibilityWorkerConfiguration),
+    Standalone(StandaloneWorkerConfiguration),
     Production(ProductionWorkerConfiguration),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RequestPlan {
-    mode: FaultMode,
-    delay_before_claim: Duration,
-    delay_before_completion: Duration,
-    work_duration: Duration,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,7 +157,7 @@ fn main() {
         return;
     };
     let result = match startup {
-        WorkerStartup::Feasibility(configuration) => run_feasibility_worker(&configuration),
+        WorkerStartup::Standalone(configuration) => run_standalone_worker(&configuration),
         WorkerStartup::Production(configuration) => run_production_worker(configuration),
     };
     if let Err(error) = result {
@@ -190,16 +171,15 @@ where
     S: Into<String>,
 {
     let arguments: Vec<String> = arguments.into_iter().map(Into::into).collect();
-    if arguments
-        .first()
-        .is_some_and(|argument| argument == "--worker")
-    {
-        return parse_production_worker_arguments(&arguments[1..])
+    match arguments.first().map(String::as_str) {
+        None => Ok(None),
+        Some("--worker") => parse_production_worker_arguments(&arguments[1..])
             .map(WorkerStartup::Production)
-            .map(Some);
+            .map(Some),
+        Some(_) => parse_standalone_arguments(&arguments)
+            .map(WorkerStartup::Standalone)
+            .map(Some),
     }
-    parse_startup_arguments(arguments)
-        .map(|configuration| configuration.map(WorkerStartup::Feasibility))
 }
 
 fn exit_with_error(error: &str) -> ! {
@@ -207,123 +187,41 @@ fn exit_with_error(error: &str) -> ! {
     std::process::exit(1);
 }
 
-fn parse_startup_arguments<I, S>(
-    arguments: I,
-) -> Result<Option<FeasibilityWorkerConfiguration>, String>
-where
-    I: IntoIterator<Item = S>,
-    S: Into<String>,
-{
-    let mut arguments = arguments.into_iter().map(Into::into);
-    let Some(command) = arguments.next() else {
-        return Ok(None);
-    };
-    if command != "--feasibility-bank" && command != "--bank" {
-        return Err(format!("unknown argument `{command}`"));
-    }
-    let bank_name = arguments
-        .next()
-        .ok_or("missing shared-memory bank name after --feasibility-bank")?;
-    let remaining: Vec<String> = arguments.collect();
-    if command == "--bank" {
-        return parse_explicit_feasibility_arguments(bank_name, &remaining).map(Some);
-    }
-    if remaining
-        .first()
-        .is_some_and(|value| !value.starts_with("--"))
-    {
-        return parse_legacy_feasibility_arguments(bank_name, &remaining).map(Some);
-    }
-    parse_explicit_feasibility_arguments(bank_name, &remaining).map(Some)
-}
-
-fn parse_legacy_feasibility_arguments(
-    bank_name: String,
+fn parse_standalone_arguments(
     arguments: &[String],
-) -> Result<FeasibilityWorkerConfiguration, String> {
-    let [worker_id] = arguments else {
-        return Err("legacy feasibility mode requires exactly one worker ID".to_owned());
-    };
-    Ok(FeasibilityWorkerConfiguration {
-        bank_name,
-        worker_id: parse_worker_id(worker_id)?,
-        timing_mode: TimingMode::LegacyUntimed,
-        fault: FaultConfiguration::default(),
-        self_crash_after_claim: false,
-        compute_load: ComputeLoadConfiguration::default(),
-        bundle: None,
-    })
-}
-
-fn parse_explicit_feasibility_arguments(
-    bank_name: String,
-    arguments: &[String],
-) -> Result<FeasibilityWorkerConfiguration, String> {
+) -> Result<StandaloneWorkerConfiguration, String> {
+    if !arguments.len().is_multiple_of(2) {
+        return Err("standalone worker options must be option/value pairs".to_owned());
+    }
+    let mut bank_name = None;
     let mut worker_id = None;
     let mut bundle = None;
-    let mut fault_arguments = Vec::new();
-    let mut compute_load_arguments = Vec::new();
-    let mut fault_mode_seen = false;
-    let mut self_crash_after_claim = false;
-    let mut index = 0;
-    while index < arguments.len() {
-        let option = &arguments[index];
-        let value = arguments
-            .get(index + 1)
-            .ok_or_else(|| format!("missing value after `{option}`"))?;
+    for pair in arguments.chunks_exact(2) {
+        let option = &pair[0];
+        let value = &pair[1];
+        let duplicate = || format!("duplicate standalone worker option `{option}`");
         match option.as_str() {
-            WORKER_ID_OPTION => {
-                if worker_id.is_some() {
-                    return Err(format!("duplicate feasibility option `{WORKER_ID_OPTION}`"));
+            "--bank" => {
+                if bank_name.replace(value.clone()).is_some() || value.is_empty() {
+                    return Err(duplicate());
                 }
-                worker_id = Some(parse_worker_id(value)?);
+            }
+            WORKER_ID_OPTION => {
+                if worker_id.replace(parse_worker_id(value)?).is_some() {
+                    return Err(duplicate());
+                }
             }
             BUNDLE_OPTION => {
-                if bundle.is_some() {
-                    return Err(format!("duplicate feasibility option `{BUNDLE_OPTION}`"));
-                }
-                bundle = Some(Vst3BundlePath::new(value.clone()));
-            }
-            FAULT_MODE_OPTION => {
-                if fault_mode_seen {
-                    return Err(format!(
-                        "duplicate feasibility option `{FAULT_MODE_OPTION}`"
-                    ));
-                }
-                fault_mode_seen = true;
-                if value == SELF_CRASH_AFTER_CLAIM_MODE {
-                    self_crash_after_claim = true;
-                } else {
-                    fault_arguments.push(option.clone());
-                    fault_arguments.push(value.clone());
+                if bundle.replace(Vst3BundlePath::new(value.clone())).is_some() {
+                    return Err(duplicate());
                 }
             }
-            FAULT_TRIGGER_SEQUENCE_OPTION
-            | FAULT_DELAY_MICROS_OPTION
-            | WORK_DURATION_MICROS_OPTION => {
-                fault_arguments.push(option.clone());
-                fault_arguments.push(value.clone());
-            }
-            COMPUTE_LOAD_MODE_OPTION | COMPUTE_LOAD_MICROS_OPTION => {
-                compute_load_arguments.push(option.clone());
-                compute_load_arguments.push(value.clone());
-            }
-            _ => return Err(format!("unknown feasibility option `{option}`")),
+            _ => return Err(format!("unknown argument `{option}`")),
         }
-        index += 2;
     }
-
-    let worker_id = worker_id.ok_or_else(|| format!("missing required `{WORKER_ID_OPTION}`"))?;
-    let fault = parse_fault_configuration(fault_arguments).map_err(|error| error.to_string())?;
-    let compute_load = parse_compute_load_configuration(compute_load_arguments)
-        .map_err(|error| error.to_string())?;
-    Ok(FeasibilityWorkerConfiguration {
-        bank_name,
-        worker_id,
-        timing_mode: TimingMode::Timed,
-        fault,
-        self_crash_after_claim,
-        compute_load,
+    Ok(StandaloneWorkerConfiguration {
+        bank_name: bank_name.ok_or("standalone worker requires --bank")?,
+        worker_id: worker_id.ok_or_else(|| format!("missing required `{WORKER_ID_OPTION}`"))?,
         bundle,
     })
 }
@@ -457,7 +355,7 @@ fn parse_worker_id(value: &str) -> Result<u32, String> {
     Ok(worker_id)
 }
 
-fn run_feasibility_worker(configuration: &FeasibilityWorkerConfiguration) -> Result<(), String> {
+fn run_standalone_worker(configuration: &StandaloneWorkerConfiguration) -> Result<(), String> {
     let clock = MonotonicClock::new().map_err(|error| error.to_string())?;
     let mut heartbeat = HeartbeatPublisher::new(clock);
     let mut region =
@@ -488,11 +386,8 @@ fn run_feasibility_worker(configuration: &FeasibilityWorkerConfiguration) -> Res
             }
         }
         if !processed_request {
-            // The feasibility data plane has no control-socket wakeup: yielding here hands the
-            // no-op worker back to the general scheduler and was able to delay every concurrently
-            // yielded rack past a 256-frame callback boundary. Stay on the dedicated processing
-            // thread with a CPU relaxation hint instead. The resulting CPU/energy cost is recorded
-            // by the attached harness rather than hidden by a sleep-paced synthetic run.
+            // Standalone mode has no control-socket wakeup, so poll with a CPU relaxation hint
+            // rather than yielding to the general scheduler between requests.
             std::hint::spin_loop();
         }
     }
@@ -501,7 +396,7 @@ fn run_feasibility_worker(configuration: &FeasibilityWorkerConfiguration) -> Res
 
 #[cfg(feature = "sdk")]
 fn load_optional_plugin(
-    configuration: &FeasibilityWorkerConfiguration,
+    configuration: &StandaloneWorkerConfiguration,
 ) -> Result<Option<SdkPlugin>, String> {
     let Some(bundle) = configuration.bundle.as_ref() else {
         return Ok(None);
@@ -516,7 +411,7 @@ fn load_optional_plugin(
 
 #[cfg(not(feature = "sdk"))]
 fn load_optional_plugin(
-    configuration: &FeasibilityWorkerConfiguration,
+    configuration: &StandaloneWorkerConfiguration,
 ) -> Result<Option<()>, String> {
     if configuration.bundle.is_some() {
         return Err("worker built without the sdk feature cannot honor --bundle".to_owned());
@@ -551,7 +446,7 @@ fn wait_for_host_shutdown(mut input: impl io::Read) -> io::Result<()> {
 fn process_available_request(
     slot: &mut BlockSlot,
     header: &ProtocolHeader,
-    configuration: &FeasibilityWorkerConfiguration,
+    configuration: &StandaloneWorkerConfiguration,
     clock: MonotonicClock,
     heartbeat: &mut HeartbeatPublisher,
     #[cfg(feature = "sdk")] plugin: Option<&mut SdkPlugin>,
@@ -560,42 +455,23 @@ fn process_available_request(
     let Some(observed_ticket) = requested_ticket(slot)? else {
         return Ok(false);
     };
-    let mut plan = request_plan(configuration.fault, observed_ticket.sequence);
-    sleep_with_heartbeat(plan.delay_before_claim, header, heartbeat)?;
-
-    let ticket = match configuration.timing_mode {
-        TimingMode::LegacyUntimed => slot.claim_for_processing(configuration.worker_id),
-        TimingMode::Timed => slot.claim_ticket_for_processing_at(
-            configuration.worker_id,
-            observed_ticket,
-            clock.now_ticks(),
-        ),
-    };
-    let ticket = match ticket {
+    let ticket = match slot.claim_ticket_for_processing_at(
+        configuration.worker_id,
+        observed_ticket,
+        clock.now_ticks(),
+    ) {
         Ok(ticket) => ticket,
         Err(ProtocolError::UnexpectedState | ProtocolError::Owned | ProtocolError::StaleTicket) => {
             return Ok(false);
         }
         Err(error) => return Err(format!("invalid shared-memory request: {error}")),
     };
-    plan = request_plan(configuration.fault, ticket.sequence);
-    if configuration.self_crash_after_claim
-        && ticket.sequence == configuration.fault.trigger_request_sequence
-    {
-        self_crash_after_claim();
-    }
-    if plan.mode == FaultMode::HangAfterClaim {
-        hang_after_claim();
-    }
 
     process_slot_audio(slot, plugin)?;
-    run_calibrated_compute_load(configuration.compute_load, clock, header, heartbeat)?;
-    sleep_with_heartbeat(plan.work_duration, header, heartbeat)?;
-    sleep_with_heartbeat(plan.delay_before_completion, header, heartbeat)?;
-    publish_completion(slot, configuration, ticket, plan.mode, clock)?;
+    slot.publish_completion_at(configuration.worker_id, ticket, clock.now_ticks())
+        .map_err(|error| format!("could not publish completion: {error}"))?;
     // A completed block is a useful liveness boundary even when its period is shorter than the
-    // ordinary heartbeat interval. This gives the control monitor a progression sample before a
-    // deliberately injected crash or hang on the following request.
+    // ordinary heartbeat interval.
     heartbeat.publish_now(header)?;
     Ok(true)
 }
@@ -625,6 +501,7 @@ fn process_with_plugin(slot: &mut BlockSlot, plugin: &mut SdkPlugin) -> Result<(
         midi_event_count: slot.metadata.midi_event_count,
         event_count: slot.metadata.event_count,
         flags: slot.metadata.flags,
+        sidechain_slots: slot.metadata.sidechain_slots,
     };
     if !request.is_valid() {
         return Err(ProtocolError::InvalidRequest.to_string());
@@ -703,24 +580,6 @@ fn requested_ticket(slot: &BlockSlot) -> Result<Option<BlockTicket>, String> {
     }
 }
 
-fn request_plan(configuration: FaultConfiguration, request_sequence: u64) -> RequestPlan {
-    let mode = configuration.selected_mode(request_sequence);
-    RequestPlan {
-        mode,
-        delay_before_claim: if mode == FaultMode::DelayBeforeClaim {
-            configuration.fault_delay
-        } else {
-            Duration::ZERO
-        },
-        delay_before_completion: if mode == FaultMode::LateCompletion {
-            configuration.fault_delay
-        } else {
-            Duration::ZERO
-        },
-        work_duration: configuration.work_duration,
-    }
-}
-
 fn copy_bounded_audio(slot: &mut BlockSlot) -> Result<(), ProtocolError> {
     let request = BlockRequest {
         frame_count: slot.metadata.frame_count,
@@ -729,6 +588,7 @@ fn copy_bounded_audio(slot: &mut BlockSlot) -> Result<(), ProtocolError> {
         midi_event_count: slot.metadata.midi_event_count,
         event_count: slot.metadata.event_count,
         flags: slot.metadata.flags,
+        sidechain_slots: slot.metadata.sidechain_slots,
     };
     if !request.is_valid() {
         return Err(ProtocolError::InvalidRequest);
@@ -751,166 +611,29 @@ fn copy_bounded_audio(slot: &mut BlockSlot) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-fn publish_completion(
-    slot: &mut BlockSlot,
-    configuration: &FeasibilityWorkerConfiguration,
-    live_ticket: BlockTicket,
-    fault_mode: FaultMode,
-    clock: MonotonicClock,
-) -> Result<(), String> {
-    match configuration.timing_mode {
-        TimingMode::LegacyUntimed => slot
-            .publish_completion(configuration.worker_id, live_ticket)
-            .map_err(|error| format!("could not publish completion: {error}")),
-        TimingMode::Timed => {
-            let completed_tick = clock.now_ticks();
-            match fault_mode {
-                FaultMode::MalformedCompletion | FaultMode::StaleCompletion => {
-                    publish_injected_completion(
-                        slot,
-                        configuration.worker_id,
-                        live_ticket,
-                        fault_mode,
-                        completed_tick,
-                    )
-                }
-                FaultMode::None | FaultMode::DelayBeforeClaim | FaultMode::LateCompletion => slot
-                    .publish_completion_at(configuration.worker_id, live_ticket, completed_tick)
-                    .map_err(|error| format!("could not publish completion: {error}")),
-                FaultMode::HangAfterClaim => unreachable!("hang mode never publishes completion"),
-            }
-        }
-    }
-}
-
-#[cfg(any(test, feature = "feasibility-fault-injection"))]
-fn publish_injected_completion(
-    slot: &mut BlockSlot,
-    worker_id: u32,
-    live_ticket: BlockTicket,
-    fault_mode: FaultMode,
-    completed_tick: u64,
-) -> Result<(), String> {
-    let result = match fault_mode {
-        FaultMode::MalformedCompletion => {
-            slot.test_publish_malformed_completion_at(worker_id, live_ticket, completed_tick)
-        }
-        FaultMode::StaleCompletion => slot.test_publish_stale_completion_at(
-            worker_id,
-            live_ticket,
-            mismatched_ticket(live_ticket),
-            completed_tick,
-        ),
-        _ => {
-            return Err(
-                "requested an injected completion for a non-injection fault mode".to_owned(),
-            );
-        }
-    };
-    result.map_err(|error| format!("could not publish injected completion: {error}"))
-}
-
-#[cfg(not(any(test, feature = "feasibility-fault-injection")))]
-fn publish_injected_completion(
-    _slot: &mut BlockSlot,
-    _worker_id: u32,
-    _live_ticket: BlockTicket,
-    fault_mode: FaultMode,
-    _completed_tick: u64,
-) -> Result<(), String> {
-    Err(format!(
-        "fault mode `{}` requires the non-default `feasibility-fault-injection` worker feature",
-        fault_mode.as_str()
-    ))
-}
-
-#[cfg(any(test, feature = "feasibility-fault-injection"))]
-fn mismatched_ticket(ticket: BlockTicket) -> BlockTicket {
-    BlockTicket {
-        generation: ticket.generation,
-        sequence: if ticket.sequence == u64::MAX {
-            1
-        } else {
-            ticket.sequence + 1
-        },
-    }
-}
-
-/// Performs bounded CPU work against the shared monotonic clock.
-///
-/// This deliberately spins rather than sleeping so a Phase 1 run exercises the worker's actual
-/// compute and scheduler contention path. The configured interval remains bounded and heartbeats
-/// continue to advance while a long (but capped) load is active.
-fn run_calibrated_compute_load(
-    configuration: ComputeLoadConfiguration,
-    clock: MonotonicClock,
-    header: &ProtocolHeader,
-    heartbeat: &mut HeartbeatPublisher,
-) -> Result<(), String> {
-    if configuration.mode == ComputeLoadMode::None {
-        return Ok(());
-    }
-
-    let duration_ticks = clock.duration_to_ticks(configuration.duration).max(1);
-    let started = clock.now_ticks();
-    let deadline = started.saturating_add(duration_ticks);
-    let heartbeat_ticks = clock.duration_to_ticks(HEARTBEAT_INTERVAL).max(1);
-    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-    while clock.now_ticks() < deadline {
-        let slice_deadline = clock
-            .now_ticks()
-            .saturating_add(heartbeat_ticks)
-            .min(deadline);
-        while clock.now_ticks() < slice_deadline {
-            state = state
-                .rotate_left(17)
-                .wrapping_mul(0xbf58_476d_1ce4_e5b9)
-                .wrapping_add(0x94d0_49bb_1331_11eb);
-            std::hint::black_box(state);
-        }
-        heartbeat.publish_if_due(header)?;
-    }
-    let observed_ticks = clock.now_ticks().saturating_sub(started).max(1);
-    header
-        .record_worker_busy_ticks(duration_ticks, observed_ticks)
-        .map_err(|error| format!("could not publish calibrated busy duration: {error}"))?;
-    Ok(())
-}
-
-fn sleep_with_heartbeat(
-    duration: Duration,
-    header: &ProtocolHeader,
-    heartbeat: &mut HeartbeatPublisher,
-) -> Result<(), String> {
-    let mut remaining = duration;
-    while !remaining.is_zero() {
-        let chunk = cmp::min(remaining, HEARTBEAT_INTERVAL);
-        let started = Instant::now();
-        thread::sleep(chunk);
-        remaining = remaining.saturating_sub(started.elapsed());
-        heartbeat.publish_if_due(header)?;
-    }
-    Ok(())
-}
-
 const fn heartbeat_due(last_tick: u64, now_tick: u64, interval_ticks: u64) -> bool {
     last_tick == 0 || now_tick.saturating_sub(last_tick) >= interval_ticks
-}
-
-fn self_crash_after_claim() -> ! {
-    // Deliberate Phase 1 fault injection. `abort` avoids unwinding across any plug-in FFI.
-    std::process::abort()
-}
-
-fn hang_after_claim() -> ! {
-    loop {
-        thread::park();
-    }
 }
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(feature = "sdk")]
 const EDITOR_POLL_INTERVAL: Duration = Duration::from_millis(8);
+#[cfg(feature = "sdk")]
+const EDITOR_RUN_LOOP_INTERVAL: Duration = Duration::from_millis(2);
+/// `AppKit` removes a closed window only on a later run-loop pass, so events keep pumping this
+/// long after an editor closes, even when no other editor is open.
+#[cfg(all(feature = "sdk", target_os = "macos"))]
+const EDITOR_CLOSE_PUMP: Duration = Duration::from_millis(500);
+/// An editor is pictured this long after it opens or a parameter changes, once it has painted.
+#[cfg(all(feature = "sdk", target_os = "macos"))]
+const EDITOR_PREVIEW_SETTLE: Duration = Duration::from_millis(500);
+/// While parameters keep changing, an open editor is pictured at most this often.
+#[cfg(all(feature = "sdk", target_os = "macos"))]
+const EDITOR_PREVIEW_INTERVAL: Duration = Duration::from_secs(2);
+/// A loading thread without a loop pass for this long is held by plug-in code, such as a modal
+/// dialog or menu. Picture polls are refused then instead of waiting past the host's deadline.
+#[cfg(feature = "sdk")]
+const EDITOR_THREAD_STALL: Duration = Duration::from_millis(250);
 
 #[cfg(feature = "sdk")]
 struct MainThreadRequest {
@@ -924,18 +647,496 @@ struct MainThreadResponse {
     response: ControlResponse,
 }
 
+/// A chain change the loading thread prepares and the processing thread applies between
+/// blocks. Plug-in loading, activation, editor windows, and teardown stay off the processing
+/// thread, so the rest of the chain keeps its deadline.
 #[cfg(feature = "sdk")]
-#[derive(Clone, Copy)]
-struct EditorResizeRequest {
-    slot: usize,
-    size: EditorSize,
+enum ChainEdit {
+    /// An activated plug-in for an empty slot. It warms up before it is heard.
+    Insert(Box<InsertedPlugin>),
+    Remove(usize),
+    /// Slot `i` receives the plug-in previously at `from[i]`.
+    Reorder([usize; MAX_PLUGINS_PER_RACK]),
 }
 
 #[cfg(feature = "sdk")]
-#[derive(Default)]
+struct InsertedPlugin {
+    configuration: WirePluginSlotConfiguration,
+    facade: Vst3Facade,
+}
+
+#[cfg(feature = "sdk")]
+enum LoadingReply {
+    /// The loading thread answered the request itself.
+    Response(ControlResponse),
+    /// The processing thread applies `edit`, then answers `request`.
+    Apply {
+        request: ControlRequest,
+        edit: ChainEdit,
+    },
+}
+
+/// Live captures use the upper half of the transfer ID space, so chunk and release requests
+/// can be routed to the loading thread without consulting the processing thread's state.
+#[cfg(feature = "sdk")]
+const LIVE_CAPTURE_TRANSFER_BASE: u64 = 1 << 63;
+
+#[cfg(feature = "sdk")]
 struct EditorHost {
+    // Loading-thread captures run beside the DSP instead of taking the runtime away from it.
+    state_transfers: StateTransfers,
+    services: BTreeMap<usize, sp_vst3::sdk::MainThreadService>,
+    feedback_loss_counts: BTreeMap<usize, u64>,
+    container_loss_counts: BTreeMap<usize, u64>,
+    editors: BTreeMap<usize, sp_vst3::sdk::SdkEditorHandle>,
     #[cfg(target_os = "macos")]
-    windows: BTreeMap<usize, sp_vst3::editor_window::MacOsEditorWindow>,
+    windows: BTreeMap<usize, OpenEditor>,
+    /// Newest editor picture per slot. It outlives the window, so the host can still fetch the
+    /// picture taken as the editor closed.
+    #[cfg(target_os = "macos")]
+    previews: BTreeMap<usize, EditorPreview>,
+    #[cfg(target_os = "macos")]
+    last_preview_sequence: u64,
+    /// Keeps the event pump running until a closed window has left the screen.
+    #[cfg(target_os = "macos")]
+    pump_until: Option<Instant>,
+}
+
+/// An open editor window and when it is next pictured.
+#[cfg(all(feature = "sdk", target_os = "macos"))]
+struct OpenEditor {
+    window: sp_vst3::editor_window::MacOsEditorWindow,
+    /// When to picture the editor next; `None` until a parameter changes.
+    preview_due: Option<Instant>,
+    pictured_at: Option<Instant>,
+}
+
+#[cfg(all(feature = "sdk", target_os = "macos"))]
+impl OpenEditor {
+    /// Schedules a picture once the editor has repainted, and no sooner than
+    /// [`EDITOR_PREVIEW_INTERVAL`] after the last one.
+    fn parameter_changed(&mut self, now: Instant) {
+        if self.preview_due.is_none() {
+            let earliest = self
+                .pictured_at
+                .map_or(now, |at| at + EDITOR_PREVIEW_INTERVAL);
+            self.preview_due = Some(earliest.max(now + EDITOR_PREVIEW_SETTLE));
+        }
+    }
+}
+
+/// A PNG picture of a slot's editor, numbered in capture order across the worker.
+#[cfg(all(feature = "sdk", target_os = "macos"))]
+struct EditorPreview {
+    sequence: u64,
+    captured_at_unix_ms: u64,
+    png: Vec<u8>,
+}
+
+#[cfg(feature = "sdk")]
+impl Default for EditorHost {
+    fn default() -> Self {
+        Self {
+            state_transfers: StateTransfers::starting_at(LIVE_CAPTURE_TRANSFER_BASE),
+            services: BTreeMap::new(),
+            feedback_loss_counts: BTreeMap::new(),
+            container_loss_counts: BTreeMap::new(),
+            editors: BTreeMap::new(),
+            #[cfg(target_os = "macos")]
+            windows: BTreeMap::new(),
+            #[cfg(target_os = "macos")]
+            previews: BTreeMap::new(),
+            #[cfg(target_os = "macos")]
+            last_preview_sequence: 0,
+            #[cfg(target_os = "macos")]
+            pump_until: None,
+        }
+    }
+}
+
+#[cfg(feature = "sdk")]
+impl EditorHost {
+    fn register_services(&mut self, rack: &RackProcessor<Vst3Facade>) {
+        self.services = rack
+            .plugins()
+            .filter_map(|(slot, plugin)| {
+                plugin
+                    .adapter
+                    .main_thread_service()
+                    .map(|service| (slot, service))
+            })
+            .collect();
+        self.editors = rack
+            .plugins()
+            .filter_map(|(slot, plugin)| {
+                plugin
+                    .adapter
+                    .main_thread_editor_handle()
+                    .map(|editor| (slot, editor))
+            })
+            .collect();
+    }
+
+    fn handle_editor_request(&mut self, request: &ControlRequest) -> ControlResponse {
+        if is_live_read_operation(request.operation()) {
+            let result = self.handle_live_read(request);
+            return ProductionRuntime::response(request, result);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            return ProductionRuntime::unsupported(request, "native editors require macOS");
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let result = match request.operation() {
+                ControlOperation::OpenNativeEditor => ProductionRuntime::slot_index(request)
+                    .and_then(|slot| {
+                        if let Some(open) = self.windows.get(&slot) {
+                            open.window.focus();
+                            return Ok(Vec::new());
+                        }
+                        let position = (!request.payload().is_empty())
+                            .then(|| EditorPosition::decode(request.payload()))
+                            .transpose()
+                            .map_err(|error| error.to_string())?;
+                        let editor = self
+                            .editors
+                            .get_mut(&slot)
+                            .ok_or("native editor slot is not loaded")?;
+                        let window = sp_vst3::editor_window::MacOsEditorWindow::new(
+                            "Superposition Plug-in Editor",
+                        )?;
+                        let parent_view = window.content_view()?;
+                        let size = editor
+                            .open_editor(&parent_view)
+                            .map_err(|error| error.to_string())?;
+                        window.resize(size.width, size.height);
+                        if let Some(position) = position {
+                            window.set_top_left(f64::from(position.left), f64::from(position.top));
+                        }
+                        window.focus();
+                        self.windows.insert(
+                            slot,
+                            OpenEditor {
+                                window,
+                                preview_due: Some(Instant::now() + EDITOR_PREVIEW_SETTLE),
+                                pictured_at: None,
+                            },
+                        );
+                        Ok(Vec::new())
+                    }),
+                ControlOperation::CloseNativeEditor => ProductionRuntime::slot_index(request)
+                    .and_then(|slot| {
+                        let window = &self
+                            .windows
+                            .get(&slot)
+                            .ok_or("native editor window is not open")?
+                            .window;
+                        window.request_close();
+                        if !window.take_close_request() {
+                            return Err("native editor window did not accept close".to_owned());
+                        }
+                        self.close_editor(slot)?;
+                        Ok(Vec::new())
+                    }),
+                ControlOperation::FocusNativeEditor => ProductionRuntime::slot_index(request)
+                    .and_then(|slot| {
+                        self.windows
+                            .get(&slot)
+                            .ok_or("native editor window is not open")?
+                            .window
+                            .focus();
+                        Ok(Vec::new())
+                    }),
+                ControlOperation::ResizeNativeEditor => ProductionRuntime::slot_index(request)
+                    .and_then(|slot| {
+                        let geometry = EditorGeometry::decode(request.payload())
+                            .map_err(|error| error.to_string())?;
+                        let editor = self
+                            .editors
+                            .get_mut(&slot)
+                            .ok_or("native editor slot is not loaded")?;
+                        let window = &self
+                            .windows
+                            .get(&slot)
+                            .ok_or("native editor window is not open")?
+                            .window;
+                        let accepted = editor
+                            .resize_editor(sp_vst3::sdk::Vst3EditorSize {
+                                width: geometry.width,
+                                height: geometry.height,
+                            })
+                            .map_err(|error| error.to_string())?;
+                        window.resize(accepted.width, accepted.height);
+                        Ok(Vec::new())
+                    }),
+                ControlOperation::CaptureEditorPreview => ProductionRuntime::slot_index(request)
+                    .and_then(|slot| self.describe_preview(slot, request.payload())),
+                _ => Err("request is not a native-editor operation".to_owned()),
+            };
+            ProductionRuntime::response(request, result)
+        }
+    }
+
+    /// Loads, closes, or rekeys loading-thread resources for a chain edit. The processing thread
+    /// has already checked the edit against the rack.
+    fn prepare_chain_edit(
+        &mut self,
+        request: &ControlRequest,
+        feedback: &ParameterFeedbackBank,
+    ) -> Result<ChainEdit, String> {
+        self.state_transfers.clear();
+        match request.operation() {
+            ControlOperation::LoadPlugin => {
+                let configuration = WirePluginSlotConfiguration::decode(request.payload())
+                    .map_err(|error| error.to_string())?;
+                let slot = ProductionRuntime::request_configuration_slot(request, &configuration)?;
+                let mut facade = ProductionRuntime::load_facade(&configuration)?;
+                facade.set_active(true).map_err(|error| error.to_string())?;
+                self.forget_slot(slot);
+                if let Some(service) = facade.adapter.main_thread_service() {
+                    self.services.insert(slot, service);
+                }
+                if let Some(editor) = facade.adapter.main_thread_editor_handle() {
+                    self.editors.insert(slot, editor);
+                }
+                let _ = feedback.reset_slot(slot);
+                Ok(ChainEdit::Insert(Box::new(InsertedPlugin {
+                    configuration,
+                    facade,
+                })))
+            }
+            ControlOperation::UnloadSlot => {
+                let slot = ProductionRuntime::slot_index(request)?;
+                #[cfg(target_os = "macos")]
+                if self.windows.contains_key(&slot) {
+                    self.close_editor(slot)?;
+                }
+                self.forget_slot(slot);
+                let _ = feedback.reset_slot(slot);
+                Ok(ChainEdit::Remove(slot))
+            }
+            ControlOperation::ReorderRack => {
+                let order =
+                    SlotOrder::decode(request.payload()).map_err(|error| error.to_string())?;
+                let from = slot_permutation(&order);
+                permute_slot_keys(&mut self.services, &from);
+                permute_slot_keys(&mut self.editors, &from);
+                permute_slot_keys(&mut self.feedback_loss_counts, &from);
+                permute_slot_keys(&mut self.container_loss_counts, &from);
+                #[cfg(target_os = "macos")]
+                {
+                    permute_slot_keys(&mut self.windows, &from);
+                    permute_slot_keys(&mut self.previews, &from);
+                }
+                for (slot, &source) in from.iter().enumerate() {
+                    if slot != source {
+                        let _ = feedback.reset_slot(slot);
+                    }
+                }
+                Ok(ChainEdit::Reorder(from))
+            }
+            _ => Err("request is not a chain edit".to_owned()),
+        }
+    }
+
+    fn forget_slot(&mut self, slot: usize) {
+        self.services.remove(&slot);
+        self.editors.remove(&slot);
+        self.feedback_loss_counts.remove(&slot);
+        self.container_loss_counts.remove(&slot);
+        #[cfg(target_os = "macos")]
+        self.previews.remove(&slot);
+    }
+
+    /// Serves state and parameter reads on the loading thread while the rack keeps processing.
+    fn handle_live_read(&mut self, request: &ControlRequest) -> Result<Vec<u8>, String> {
+        let slot = ProductionRuntime::slot_index(request)?;
+        let editor = self
+            .editors
+            .get(&slot)
+            .ok_or("plug-in slot is not loaded")?;
+        match request.operation() {
+            ControlOperation::BeginStateCapture => {
+                // Apply processor-originated values to the controller before it is serialized.
+                if let Some(service) = self.services.get(&slot) {
+                    let _ = service.pump_foreground();
+                }
+                let state = editor.capture_state().map_err(|error| error.to_string())?;
+                let descriptor = self.state_transfers.begin_capture(
+                    slot,
+                    PluginState {
+                        component: state.component,
+                        controller: state.controller,
+                    },
+                )?;
+                StateTransferDescriptor {
+                    id: descriptor.id,
+                    component_len: descriptor.component_len,
+                    controller_len: descriptor.controller_len,
+                }
+                .encode()
+                .map_err(|error| error.to_string())
+            }
+            ControlOperation::ReadStateChunk => {
+                let chunk = StateChunkRequest::decode(request.payload())
+                    .map_err(|error| error.to_string())?;
+                self.state_transfers.read_chunk(
+                    slot,
+                    chunk.id,
+                    chunk.stream,
+                    chunk.offset,
+                    chunk.length,
+                )
+            }
+            ControlOperation::ReleaseStateTransfer => {
+                let transfer = StateTransferId::decode(request.payload())
+                    .map_err(|error| error.to_string())?;
+                self.state_transfers.release(slot, transfer.id)?;
+                Ok(Vec::new())
+            }
+            ControlOperation::ReadParameters => {
+                let ids =
+                    ParameterIds::decode(request.payload()).map_err(|error| error.to_string())?;
+                let parameters = ids
+                    .parameters
+                    .into_iter()
+                    .map(|id| {
+                        let parameter_id = u32::try_from(id.value)
+                            .map_err(|_| "parameter ID exceeds VST3 u32 range".to_owned())?;
+                        let normalized = editor
+                            .read_parameter(parameter_id)
+                            .map_err(|error| error.to_string())?;
+                        Ok(ParameterWrite { id, normalized })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                ParameterValues { parameters }
+                    .encode()
+                    .map_err(|error| error.to_string())
+            }
+            _ => Err("request is not a live read operation".to_owned()),
+        }
+    }
+
+    /// Describes `slot`'s newest picture and stages its PNG as a live-capture transfer when the
+    /// host's known sequence differs. It answers from stored pictures and never pictures the
+    /// editor itself.
+    #[cfg(target_os = "macos")]
+    fn describe_preview(&mut self, slot: usize, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let known = EditorPreviewRequest::decode(payload)
+            .map_err(|error| error.to_string())?
+            .known_sequence;
+        let editor_open = self.windows.contains_key(&slot);
+        let descriptor = match self.previews.get(&slot) {
+            None => EditorPreviewDescriptor {
+                sequence: 0,
+                captured_at_unix_ms: 0,
+                png_len: 0,
+                editor_open,
+                transfer_id: None,
+            },
+            Some(preview) => EditorPreviewDescriptor {
+                sequence: preview.sequence,
+                captured_at_unix_ms: preview.captured_at_unix_ms,
+                png_len: u32::try_from(preview.png.len())
+                    .map_err(|_| "editor preview is too large")?,
+                editor_open,
+                transfer_id: (preview.sequence != known)
+                    .then(|| {
+                        self.state_transfers.begin_capture(
+                            slot,
+                            PluginState {
+                                component: preview.png.clone(),
+                                controller: Vec::new(),
+                            },
+                        )
+                    })
+                    .transpose()?
+                    .map(|transfer| transfer.id),
+            },
+        };
+        descriptor.encode().map_err(|error| error.to_string())
+    }
+
+    /// Pictures `slot`'s open editor and keeps the picture as the slot's newest preview.
+    #[cfg(target_os = "macos")]
+    fn capture_preview(&mut self, slot: usize) {
+        let Some(open) = self.windows.get_mut(&slot) else {
+            return;
+        };
+        open.preview_due = None;
+        open.pictured_at = Some(Instant::now());
+        match open.window.capture_preview_png() {
+            Ok(png) => {
+                self.last_preview_sequence += 1;
+                let captured_at_unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| {
+                        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                    });
+                self.previews.insert(
+                    slot,
+                    EditorPreview {
+                        sequence: self.last_preview_sequence,
+                        captured_at_unix_ms,
+                        png,
+                    },
+                );
+            }
+            Err(error) => eprintln!("sp-plugin-worker: could not picture editor: {error}"),
+        }
+    }
+
+    /// Pictures the editor one last time, then detaches its view and closes its window.
+    #[cfg(target_os = "macos")]
+    fn close_editor(&mut self, slot: usize) -> Result<(), String> {
+        self.log_service_stats("editor-close");
+        self.capture_preview(slot);
+        let window = &self
+            .windows
+            .get(&slot)
+            .ok_or("native editor window is not open")?
+            .window;
+        let detach_result = self
+            .editors
+            .get_mut(&slot)
+            .ok_or_else(|| "native editor slot is not loaded".to_owned())
+            .and_then(|editor| editor.close_editor().map_err(|error| error.to_string()));
+        window.close();
+        self.windows.remove(&slot);
+        self.pump_until = Some(Instant::now() + EDITOR_CLOSE_PUMP);
+        detach_result
+    }
+
+    /// Whether `AppKit` events need pumping: an editor is open or one closed recently.
+    #[cfg(target_os = "macos")]
+    fn needs_event_pump(&self) -> bool {
+        !self.windows.is_empty() || self.pump_until.is_some_and(|until| Instant::now() < until)
+    }
+
+    fn log_service_stats(&self, reason: &str) {
+        use std::io::Write as _;
+
+        let Some(path) = std::env::var_os("SUPERPOSITION_EDITOR_DIAGNOSTICS") else {
+            return;
+        };
+        let Ok(mut output) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        else {
+            return;
+        };
+        for (slot, service) in &self.services {
+            let _ = writeln!(
+                output,
+                "visualization: slot={} reason={reason} stats={:?}",
+                slot + 1,
+                service.stats()
+            );
+        }
+    }
 }
 
 #[allow(
@@ -946,6 +1147,9 @@ struct EditorHost {
 fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result<(), String> {
     #[cfg(feature = "sdk")]
     {
+        if !sp_shared_memory_macos::request_wake_supported() {
+            return Err("live plug-in workers require macOS 14.4 or later".to_owned());
+        }
         let listener = bind_control_listener(&configuration.control_socket)?;
         let target = ControlTarget::new(
             RackIdentity::new(configuration.rack_index, configuration.rack_generation)
@@ -964,14 +1168,14 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
         }
         let clock = MonotonicClock::new().map_err(|error| error.to_string())?;
         let mut heartbeat = HeartbeatPublisher::new(clock);
-        let facade = Vst3Facade::load(&configuration.selection)?;
+        // The initial plug-in has no sidechain. A rebuild that asks for one reloads it.
+        let facade = Vst3Facade::load(&configuration.selection, false)?;
         let initial_plugin = WirePluginSlotConfiguration {
             slot: 0,
-            input_channels: u8::try_from(facade.topology.input_channels)
-                .map_err(|_| "plug-in input topology exceeds u8")?,
-            output_channels: u8::try_from(facade.topology.output_channels)
-                .map_err(|_| "plug-in output topology exceeds u8")?,
-            event_input_active: facade.event_input_active,
+            input_channels: facade.layout.input_channels,
+            output_channels: facade.layout.output_channels,
+            event_input_active: facade.layout.event_input_active,
+            sidechain_active: false,
             bundle_path: configuration
                 .selection
                 .bundle
@@ -986,74 +1190,216 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
             initial_plugin,
         )?);
         heartbeat.publish_now(&region.bank().header)?;
-        let (socket_endpoint, processing_endpoint) = control_mailbox();
+        let (mut socket_endpoint, processing_endpoint) = control_mailbox();
+        socket_endpoint
+            .set_request_wake(&configuration.bank_name)
+            .map_err(|error| error.to_string())?;
         let control_thread =
             ControlThread::spawn(listener, target, socket_endpoint, CONTROL_TIMEOUT)
                 .map_err(|error| error.to_string())?;
-        // Product workers use the authenticated control shutdown request. Unlike the Phase 1
-        // feasibility child, EOF on inherited stdin must not terminate a rack immediately when
-        // the supervisor deliberately launches it with null stdin.
+        // Product workers use the authenticated control shutdown request. Unlike the standalone
+        // worker, EOF on inherited stdin must not terminate a rack immediately when the
+        // supervisor deliberately launches it with null stdin.
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         runtime.shutdown_requested = Arc::clone(&shutdown_requested);
+        let loading_pass = Arc::clone(&runtime.loading_pass);
         let processing_shutdown = Arc::clone(&shutdown_requested);
         let (main_request_tx, main_request_rx) = sync_channel(1);
         let (main_response_tx, main_response_rx) = sync_channel(1);
-        let (editor_resize_tx, editor_resize_rx) = sync_channel(8);
-        #[cfg(not(target_os = "macos"))]
-        let _ = &editor_resize_rx;
+        let (editor_request_tx, editor_request_rx) = sync_channel(1);
+        let (editor_response_tx, editor_response_rx) = sync_channel(1);
+        // Plug-ins removed from the chain return here for teardown on the loading thread.
+        let (retired_tx, retired_rx) = sync_channel::<Vst3Facade>(MAX_PLUGINS_PER_RACK);
+        let mut editor_host = EditorHost::default();
+        editor_host.register_services(&runtime.rack);
+        // This second mapping belongs to the loading/main thread. The processing thread keeps
+        // its own mapping, and neither audio blocks nor control RPCs carry editor feedback.
+        let feedback_region = SharedMemoryRegion::open(&configuration.bank_name)
+            .map_err(|error| format!("could not open parameter feedback mapping: {error}"))?;
+        feedback_region
+            .bank()
+            .feedback
+            .reset_slot(0)
+            .ok_or("could not initialize first parameter feedback slot")?;
+        publish_worker_telemetry(region.bank(), &mut runtime);
         let processing = thread::Builder::new()
             .name("sp-worker-processing".to_owned())
             .spawn(move || {
+                let mut runtime = Some(runtime);
                 let result = run_production_processing_thread(
                     region,
                     clock,
                     heartbeat,
-                    runtime,
+                    &mut runtime,
                     processing_endpoint,
                     main_request_tx,
                     main_response_rx,
-                    editor_resize_tx,
+                    editor_request_tx,
+                    editor_response_rx,
+                    &retired_tx,
                     &processing_shutdown,
                 );
                 processing_shutdown.store(true, Ordering::Release);
-                result
+                (result, runtime)
             })
             .map_err(|error| format!("could not start worker processing thread: {error}"))?;
 
-        let mut editor_host = EditorHost::default();
-        while !shutdown_requested.load(Ordering::Acquire) {
-            match main_request_rx.recv_timeout(EDITOR_POLL_INTERVAL) {
-                Ok(mut task) => {
-                    let response = task
-                        .runtime
-                        .handle_editor_control(task.request, &mut editor_host);
-                    if main_response_tx
-                        .send(MainThreadResponse {
-                            runtime: task.runtime,
-                            response,
-                        })
-                        .is_err()
+        while !shutdown_requested.load(Ordering::Acquire) && !control_thread.is_stopped() {
+            loading_pass.store(clock.now_ticks(), Ordering::Release);
+            if let Ok(request) = editor_request_rx.try_recv() {
+                let reply = if is_chain_edit(request.operation()) {
+                    match editor_host.prepare_chain_edit(&request, &feedback_region.bank().feedback)
                     {
-                        break;
+                        Ok(edit) => LoadingReply::Apply { request, edit },
+                        Err(error) => LoadingReply::Response(ProductionRuntime::response(
+                            &request,
+                            Err(error),
+                        )),
                     }
+                } else {
+                    LoadingReply::Response(editor_host.handle_editor_request(&request))
+                };
+                if editor_response_tx.send(reply).is_err() {
+                    break;
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            let mut removed = false;
+            while let Ok(mut facade) = retired_rx.try_recv() {
+                if let Err(error) = facade.set_active(false) {
+                    eprintln!("sp-plugin-worker: could not deactivate removed plug-in: {error}");
+                }
+                removed = true;
+            }
+            // Teardown can outlast the close pump that removes the plug-in's editor window.
+            #[cfg(target_os = "macos")]
+            if removed {
+                editor_host.pump_until = Some(Instant::now() + EDITOR_CLOSE_PUMP);
+            }
+            #[cfg(target_os = "macos")]
+            let pumping = editor_host.needs_event_pump();
+            #[cfg(not(target_os = "macos"))]
+            let pumping = false;
+            let next_request = if pumping {
+                match main_request_rx.try_recv() {
+                    Ok(task) => Some(task),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            } else {
+                match main_request_rx.recv_timeout(EDITOR_POLL_INTERVAL) {
+                    Ok(task) => Some(task),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            };
+            if let Some(mut task) = next_request {
+                let operation = task.request.operation();
+                let response = task
+                    .runtime
+                    .handle_main_thread_control(task.request, &mut editor_host);
+                if response.status() == ControlResponseStatus::Ok
+                    && operation == ControlOperation::RebuildRack
+                {
+                    for slot in 0..MAX_PLUGINS_PER_RACK {
+                        let _ = feedback_region.bank().feedback.reset_slot(slot);
+                    }
+                    editor_host.feedback_loss_counts.clear();
+                    editor_host.container_loss_counts.clear();
+                    #[cfg(target_os = "macos")]
+                    editor_host.previews.clear();
+                }
+                editor_host.register_services(&task.runtime.rack);
+                if main_response_tx
+                    .send(MainThreadResponse {
+                        runtime: task.runtime,
+                        response,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            for (&slot, service) in &editor_host.services {
+                let _ = service.pump_foreground();
+                let values = service.take_parameter_values(128);
+                #[cfg(target_os = "macos")]
+                if !values.is_empty()
+                    && let Some(open) = editor_host.windows.get_mut(&slot)
+                {
+                    open.parameter_changed(Instant::now());
+                }
+                for (parameter_id, normalized) in values {
+                    let _ = feedback_region
+                        .bank()
+                        .feedback
+                        .publish(slot, parameter_id, normalized);
+                }
+                let lost = service.parameter_feedback_loss_count();
+                let previous = editor_host.feedback_loss_counts.entry(slot).or_default();
+                let feedback_delta = lost.saturating_sub(*previous);
+                *previous = lost;
+                let container_lost = service.parameter_container_loss_count();
+                let previous = editor_host.container_loss_counts.entry(slot).or_default();
+                let container_delta = container_lost.saturating_sub(*previous);
+                *previous = container_lost;
+                feedback_region
+                    .bank()
+                    .feedback
+                    .report_overflow(slot, feedback_delta.saturating_add(container_delta));
             }
             #[cfg(target_os = "macos")]
             {
-                while let Ok(request) = editor_resize_rx.try_recv() {
-                    if let Some(window) = editor_host.windows.get(&request.slot) {
-                        window.resize(request.size.width, request.size.height);
+                let close_requests: Vec<usize> = editor_host
+                    .windows
+                    .iter()
+                    .filter_map(|(&slot, open)| open.window.take_close_request().then_some(slot))
+                    .collect();
+                for slot in close_requests {
+                    if let Err(error) = editor_host.close_editor(slot) {
+                        eprintln!("sp-plugin-worker: could not close editor: {error}");
                     }
                 }
-                sp_vst3::editor_window::pump_events();
+                for (&slot, open) in &editor_host.windows {
+                    let Some(service) = editor_host.services.get(&slot) else {
+                        continue;
+                    };
+                    if let Some((width, height)) = service.take_editor_resize_request()
+                        && let Ok(size) = sp_vst3::sdk::Vst3EditorSize::from_sdk(width, height)
+                    {
+                        open.window.resize(size.width, size.height);
+                    }
+                }
+                // One due picture per pass keeps each pump interval short.
+                let now = Instant::now();
+                if let Some(slot) = editor_host.windows.iter().find_map(|(&slot, open)| {
+                    open.preview_due
+                        .is_some_and(|due| due <= now)
+                        .then_some(slot)
+                }) {
+                    editor_host.capture_preview(slot);
+                }
+                if editor_host.needs_event_pump() {
+                    sp_vst3::editor_window::pump_events(EDITOR_RUN_LOOP_INTERVAL);
+                }
             }
         }
+        editor_host.log_service_stats("shutdown");
+        shutdown_requested.store(true, Ordering::Release);
+        // Unblock a pending ownership handoff before joining the processing thread.
+        drop(main_request_rx);
+        drop(main_response_tx);
         let control_result = control_thread.shutdown().map_err(|error| error.to_string());
-        let processing_result = processing
+        let (processing_result, runtime) = processing
             .join()
             .map_err(|_| "worker processing thread panicked".to_owned())?;
+        #[cfg(target_os = "macos")]
+        for slot in editor_host.windows.keys().copied().collect::<Vec<_>>() {
+            if let Err(error) = editor_host.close_editor(slot) {
+                eprintln!("sp-plugin-worker: could not detach editor on shutdown: {error}");
+            }
+        }
+        // VST3 controller teardown belongs on its loading thread, after native views detach.
+        drop(runtime);
         let _ = std::fs::remove_file(&configuration.control_socket);
         control_result?;
         processing_result
@@ -1068,41 +1414,64 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
 #[cfg(feature = "sdk")]
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     clippy::needless_pass_by_value,
-    reason = "the processing thread owns every channel endpoint it is handed"
+    reason = "the processing thread owns its channel endpoints and ordered scheduling transitions"
 )]
 fn run_production_processing_thread(
     mut region: SharedMemoryRegion,
     clock: MonotonicClock,
     mut heartbeat: HeartbeatPublisher,
-    runtime: Box<ProductionRuntime>,
+    runtime: &mut Option<Box<ProductionRuntime>>,
     mut processing_endpoint: ProcessingControlEndpoint,
     main_request: SyncSender<MainThreadRequest>,
     main_response: Receiver<MainThreadResponse>,
-    editor_resize: SyncSender<EditorResizeRequest>,
+    editor_request: SyncSender<ControlRequest>,
+    editor_response: Receiver<LoadingReply>,
+    retired: &SyncSender<Vst3Facade>,
     shutdown_requested: &AtomicBool,
 ) -> Result<(), String> {
-    let mut runtime = Some(runtime);
-    let mut next_editor_poll = Instant::now();
+    let mut audio_policy = sp_shared_memory_macos::AudioThreadPolicy::new()
+        .map_err(|error| format!("could not initialize worker scheduling: {error}"))?;
+    let mut last_audio = None;
     while !shutdown_requested.load(Ordering::Acquire) {
-        drain_production_commands(
-            &mut processing_endpoint,
-            &mut runtime,
-            &main_request,
-            &main_response,
-        )?;
-        heartbeat.publish_if_due(&region.bank().header)?;
-        if Instant::now() >= next_editor_poll
-            && let Some(runtime) = runtime.as_mut()
-        {
-            for slot in 0..sp_shared_memory::MAX_PLUGINS_PER_RACK {
-                if let Ok(Some(size)) = runtime.rack.take_editor_resize_request(slot) {
-                    let _ = editor_resize.try_send(EditorResizeRequest { slot, size });
+        if let Ok(reply) = editor_response.try_recv() {
+            let response = match reply {
+                LoadingReply::Response(response) => response,
+                LoadingReply::Apply { request, edit } => {
+                    let result = runtime
+                        .as_mut()
+                        .expect("runtime is present between commands")
+                        .apply_chain_edit(edit, retired);
+                    ProductionRuntime::response(&request, result.map(|()| Vec::new()))
                 }
-            }
-            next_editor_poll = Instant::now() + EDITOR_POLL_INTERVAL;
+            };
+            processing_endpoint
+                .try_reply(response)
+                .map_err(|_| "worker control reply mailbox is full".to_owned())?;
         }
-        let mut processed_request = false;
+        if last_audio.is_some_and(|(idle_deadline, _)| clock.now_ticks() >= idle_deadline) {
+            audio_policy.leave().map_err(|error| error.to_string())?;
+            last_audio = None;
+        }
+        region
+            .bank()
+            .header
+            .worker_loop_tick
+            .store(clock.now_ticks(), Ordering::Release);
+        // Snapshot before scanning: a publication during the scan invalidates the wait.
+        let wake_sequence = region.request_wake_sequence();
+        region
+            .bank()
+            .header
+            .worker_wait_sequence
+            .store(wake_sequence, Ordering::Release);
+        region
+            .bank()
+            .header
+            .worker_phase
+            .store(WORKER_PHASE_SCANNING, Ordering::Release);
+        let mut observed_request = false;
         for slot_index in 0..BLOCK_SLOT_COUNT {
             let bank = region.bank_mut();
             let header = &bank.header;
@@ -1112,21 +1481,90 @@ fn run_production_processing_thread(
             let runtime = runtime
                 .as_mut()
                 .expect("runtime is returned after editor command");
-            if process_production_request(
+            match process_production_request(
                 slot,
                 header,
                 runtime.worker_id,
                 clock,
                 &mut heartbeat,
                 &mut runtime.rack,
+                &mut audio_policy,
             )? {
-                processed_request = true;
+                RequestProgress::Idle => {}
+                RequestProgress::Retry => observed_request = true,
+                RequestProgress::Processed(frames) => {
+                    observed_request = true;
+                    let idle_ticks = clock.duration_to_ticks(Duration::from_nanos(
+                        u64::from(frames) * 2_000_000_000 / 48_000,
+                    ));
+                    last_audio = Some((clock.now_ticks().saturating_add(idle_ticks), frames));
+                }
             }
         }
-        if !processed_request {
-            std::hint::spin_loop();
+        region
+            .bank()
+            .header
+            .worker_phase
+            .store(WORKER_PHASE_CONTROL, Ordering::Release);
+        if let Some(runtime) = runtime.as_mut() {
+            publish_worker_telemetry(region.bank(), runtime);
+        }
+        if processing_endpoint.has_pending() {
+            drain_production_commands(
+                &mut processing_endpoint,
+                runtime,
+                &main_request,
+                &main_response,
+                &editor_request,
+                &mut audio_policy,
+                clock,
+            )?;
+            if let Some(runtime) = runtime.as_mut() {
+                publish_worker_telemetry(region.bank(), runtime);
+            }
+            // Recheck published audio before taking another control command. A burst of
+            // controller requests must not keep the rack away from its next block.
+            observed_request |= processing_endpoint.has_pending();
+        }
+        heartbeat.publish_if_due(&region.bank().header)?;
+        if let Some((idle_deadline, frames)) = last_audio
+            && clock.now_ticks() < idle_deadline
+        {
+            audio_policy
+                .enter(frames, 48_000)
+                .map_err(|error| error.to_string())?;
+        }
+        if !observed_request {
+            let wait_timeout = last_audio.map_or(EDITOR_POLL_INTERVAL, |(idle_deadline, _)| {
+                clock
+                    .ticks_to_duration(idle_deadline.saturating_sub(clock.now_ticks()))
+                    .min(EDITOR_POLL_INTERVAL)
+            });
+            if wait_timeout.is_zero() {
+                continue;
+            }
+            // The finite wait also services control, editor requests, and heartbeat when
+            // the device is stopped. Only workers wait; the device callback only wakes.
+            region
+                .bank()
+                .header
+                .worker_phase
+                .store(WORKER_PHASE_WAITING, Ordering::Release);
+            region
+                .wait_for_request(wake_sequence, wait_timeout)
+                .map_err(|error| format!("worker request wait failed: {error}"))?;
+            region
+                .bank()
+                .header
+                .worker_phase
+                .store(WORKER_PHASE_SCANNING, Ordering::Release);
         }
     }
+    region
+        .bank()
+        .header
+        .worker_phase
+        .store(WORKER_PHASE_STOPPING, Ordering::Release);
     Ok(())
 }
 
@@ -1136,52 +1574,174 @@ fn drain_production_commands(
     runtime: &mut Option<Box<ProductionRuntime>>,
     main_request: &SyncSender<MainThreadRequest>,
     main_response: &Receiver<MainThreadResponse>,
+    editor_request: &SyncSender<ControlRequest>,
+    audio_policy: &mut sp_shared_memory_macos::AudioThreadPolicy,
+    clock: MonotonicClock,
 ) -> Result<(), String> {
-    for _ in 0..MAX_PENDING_CONTROL_REQUESTS {
-        let Some(request) = endpoint.try_receive() else {
-            return Ok(());
-        };
-        let response = if is_main_thread_operation(request.operation()) {
-            main_request
-                .send(MainThreadRequest {
-                    runtime: runtime.take().expect("runtime has one owner"),
-                    request,
-                })
-                .map_err(|_| "worker main-thread editor owner stopped".to_owned())?;
-            let returned = main_response
-                .recv()
-                .map_err(|_| "worker main-thread editor owner stopped".to_owned())?;
-            *runtime = Some(returned.runtime);
-            returned.response
-        } else {
-            runtime
-                .as_mut()
-                .expect("runtime has one owner")
-                .handle_control(request)
-        };
-        let _ = endpoint.try_reply(response);
+    let Some(request) = endpoint.try_receive() else {
+        return Ok(());
+    };
+    if is_chain_edit(request.operation())
+        && let Err(error) = runtime
+            .as_ref()
+            .expect("runtime has one owner")
+            .check_chain_edit(&request)
+    {
+        let response = ProductionRuntime::response(&request, Err(error));
+        endpoint
+            .try_reply(response)
+            .map_err(|_| "worker control reply mailbox is full".to_owned())?;
+        return Ok(());
     }
+    if request.operation() == ControlOperation::CaptureEditorPreview
+        && clock.now_ticks().saturating_sub(
+            runtime
+                .as_ref()
+                .expect("runtime has one owner")
+                .loading_pass
+                .load(Ordering::Acquire),
+        ) > clock.duration_to_ticks(EDITOR_THREAD_STALL)
+    {
+        let response = ProductionRuntime::response(
+            &request,
+            Err("worker editor thread is busy; poll again later".to_owned()),
+        );
+        endpoint
+            .try_reply(response)
+            .map_err(|_| "worker control reply mailbox is full".to_owned())?;
+        return Ok(());
+    }
+    if routes_to_loading_thread(&request) {
+        if let Err(error) = editor_request.try_send(request) {
+            let request = match error {
+                TrySendError::Full(request) | TrySendError::Disconnected(request) => request,
+            };
+            let response = ProductionRuntime::response(
+                &request,
+                Err("worker main-thread editor queue is unavailable".to_owned()),
+            );
+            endpoint
+                .try_reply(response)
+                .map_err(|_| "worker control reply mailbox is full".to_owned())?;
+        }
+        return Ok(());
+    }
+    audio_policy.leave().map_err(|error| error.to_string())?;
+    let response = if is_main_thread_operation(request.operation()) {
+        if let Err(error) = main_request.send(MainThreadRequest {
+            runtime: runtime.take().expect("runtime has one owner"),
+            request,
+        }) {
+            *runtime = Some(error.0.runtime);
+            return Err("worker main-thread editor owner stopped".to_owned());
+        }
+        let returned = main_response
+            .recv()
+            .map_err(|_| "worker main-thread editor owner stopped".to_owned())?;
+        *runtime = Some(returned.runtime);
+        returned.response
+    } else {
+        runtime
+            .as_mut()
+            .expect("runtime has one owner")
+            .handle_control(request)
+    };
+    let _ = endpoint.try_reply(response);
     Ok(())
 }
 
 #[cfg(feature = "sdk")]
-const fn is_main_thread_operation(operation: ControlOperation) -> bool {
-    let editor = matches!(
+const fn is_editor_operation(operation: ControlOperation) -> bool {
+    matches!(
         operation,
         ControlOperation::OpenNativeEditor
             | ControlOperation::CloseNativeEditor
             | ControlOperation::FocusNativeEditor
             | ControlOperation::ResizeNativeEditor
-    );
-    editor
-        || (cfg!(target_os = "macos")
-            && matches!(
-                operation,
-                ControlOperation::LoadPlugin
-                    | ControlOperation::UnloadSlot
-                    | ControlOperation::RebuildRack
-                    | ControlOperation::Shutdown
-            ))
+            | ControlOperation::CaptureEditorPreview
+    )
+}
+
+/// Reads that the loading thread serves without pausing the processing thread.
+#[cfg(feature = "sdk")]
+const fn is_live_read_operation(operation: ControlOperation) -> bool {
+    matches!(
+        operation,
+        ControlOperation::BeginStateCapture
+            | ControlOperation::ReadStateChunk
+            | ControlOperation::ReleaseStateTransfer
+            | ControlOperation::ReadParameters
+    )
+}
+
+/// Plug-in insert, removal, and reorder while the rack keeps processing.
+#[cfg(feature = "sdk")]
+const fn is_chain_edit(operation: ControlOperation) -> bool {
+    matches!(
+        operation,
+        ControlOperation::LoadPlugin | ControlOperation::UnloadSlot | ControlOperation::ReorderRack
+    )
+}
+
+/// Chooses the loading-thread queue for editor work, live reads, and chain edits. Chunk and
+/// release requests carry a transfer ID; only IDs from the live-capture space belong to the
+/// loading thread.
+#[cfg(feature = "sdk")]
+fn routes_to_loading_thread(request: &ControlRequest) -> bool {
+    let transfer_id = match request.operation() {
+        ControlOperation::ReadStateChunk => StateChunkRequest::decode(request.payload())
+            .map(|chunk| chunk.id)
+            .ok(),
+        ControlOperation::ReleaseStateTransfer => StateTransferId::decode(request.payload())
+            .map(|transfer| transfer.id)
+            .ok(),
+        operation => {
+            return is_editor_operation(operation)
+                || is_live_read_operation(operation)
+                || is_chain_edit(operation);
+        }
+    };
+    transfer_id.is_some_and(|id| id >= LIVE_CAPTURE_TRANSFER_BASE)
+}
+
+/// Slot `i` receives the plug-in previously at `from[i]`: each `current` slot takes the plug-in
+/// from the matching `order` slot, and unlisted slots stay put.
+#[cfg(feature = "sdk")]
+fn slot_permutation(order: &SlotOrder) -> [usize; MAX_PLUGINS_PER_RACK] {
+    let mut from = std::array::from_fn(|slot| slot);
+    for (&slot, &source) in order.current.iter().zip(&order.order) {
+        from[usize::from(slot)] = usize::from(source);
+    }
+    from
+}
+
+#[cfg(feature = "sdk")]
+fn permute_slot_keys<V>(map: &mut BTreeMap<usize, V>, from: &[usize; MAX_PLUGINS_PER_RACK]) {
+    let mut previous = std::mem::take(map);
+    for (slot, source) in from.iter().enumerate() {
+        if let Some(value) = previous.remove(source) {
+            map.insert(slot, value);
+        }
+    }
+}
+
+#[cfg(feature = "sdk")]
+const fn is_main_thread_operation(operation: ControlOperation) -> bool {
+    matches!(
+        operation,
+        ControlOperation::RebuildRack
+            | ControlOperation::ActivateSlot
+            | ControlOperation::DeactivateSlot
+            | ControlOperation::ParameterMetadata
+            | ControlOperation::ReadParameter
+            | ControlOperation::CaptureState
+            | ControlOperation::RestoreState
+            | ControlOperation::BeginStateRestore
+            | ControlOperation::WriteStateChunk
+            | ControlOperation::CommitStateRestore
+            | ControlOperation::ReleaseStateTransfer
+            | ControlOperation::Shutdown
+    )
 }
 
 fn bind_control_listener(path: &std::path::Path) -> Result<UnixListener, String> {
@@ -1199,6 +1759,17 @@ fn bind_control_listener(path: &std::path::Path) -> Result<UnixListener, String>
 }
 
 #[cfg(feature = "sdk")]
+enum RequestProgress {
+    Idle,
+    Retry,
+    Processed(u32),
+}
+
+#[cfg(feature = "sdk")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one processing call owns the claimed audio block and its scheduling policy"
+)]
 fn process_production_request(
     slot: &mut BlockSlot,
     header: &ProtocolHeader,
@@ -1206,9 +1777,10 @@ fn process_production_request(
     clock: MonotonicClock,
     heartbeat: &mut HeartbeatPublisher,
     rack: &mut RackProcessor<Vst3Facade>,
-) -> Result<bool, String> {
+    audio_policy: &mut sp_shared_memory_macos::AudioThreadPolicy,
+) -> Result<RequestProgress, String> {
     let Some(observed_ticket) = requested_ticket(slot)? else {
-        return Ok(false);
+        return Ok(RequestProgress::Idle);
     };
     let ticket =
         match slot.claim_ticket_for_processing_at(worker_id, observed_ticket, clock.now_ticks()) {
@@ -1216,32 +1788,62 @@ fn process_production_request(
             Err(
                 ProtocolError::UnexpectedState | ProtocolError::Owned | ProtocolError::StaleTicket,
             ) => {
-                return Ok(false);
+                // A publication wake is not repeated after transient owner contention.
+                // Rescan instead of sleeping while the observed request may remain pending.
+                return Ok(RequestProgress::Retry);
             }
             Err(error) => return Err(format!("invalid shared-memory request: {error}")),
         };
+    let frames = slot.metadata.frame_count;
+    audio_policy
+        .enter(frames, 48_000)
+        .map_err(|error| error.to_string())?;
     rack.process_block(slot)
         .map_err(|error| format!("could not process VST3 rack: {error}"))?;
     slot.publish_completion_at(worker_id, ticket, clock.now_ticks())
         .map_err(|error| format!("could not publish completion: {error}"))?;
     heartbeat.publish_now(header)?;
-    Ok(true)
+    Ok(RequestProgress::Processed(frames))
+}
+
+#[cfg(feature = "sdk")]
+fn publish_worker_telemetry(bank: &SharedBank, runtime: &mut ProductionRuntime) {
+    bank.header
+        .worker_latency_samples
+        .store(runtime.rack.latency_samples(), Ordering::Release);
+    for (slot, flags) in runtime
+        .rack
+        .take_slot_restart_flags()
+        .into_iter()
+        .enumerate()
+    {
+        if flags != 0 {
+            let _ = bank.feedback.publish_restart(slot, flags);
+            runtime.restart_flags_seen |= flags;
+            bank.header
+                .worker_restart_requested
+                .fetch_or(flags, Ordering::AcqRel);
+        }
+    }
 }
 
 #[cfg(feature = "sdk")]
 struct Vst3Facade {
     adapter: HostSdkRackAdapter,
     topology: PluginTopology,
-    event_input_active: bool,
+    layout: MainBusLayout,
     latency_samples: u32,
     output_changes: BoundedOutputChanges<512>,
 }
 
 #[cfg(feature = "sdk")]
 impl Vst3Facade {
-    fn load(selection: &Vst3ClassSelection) -> Result<Self, String> {
+    /// Loads the plug-in with its default main buses and, when `sidechain` is set, its first
+    /// auxiliary input negotiated to stereo and active.
+    fn load(selection: &Vst3ClassSelection, sidechain: bool) -> Result<Self, String> {
         let format = ProcessingFormat::new(48_000.0, 256).map_err(|error| error.to_string())?;
         let mut adapter = HostSdkRackAdapter::new();
+        adapter.set_editor_gesture_feedback(false);
         adapter
             .select_module_class(selection, format)
             .map_err(|error| error.to_string())?;
@@ -1265,18 +1867,29 @@ impl Vst3Facade {
             .audio_outputs
             .first()
             .map_or(0, |bus| bus.channel_count);
-        let layout = MainBusLayout::new(
+        let main = MainBusLayout::new(
             input_channels,
             output_channels,
             !buses.event_inputs.is_empty(),
         )
         .map_err(|error| error.to_string())?;
         buses
-            .validate_fixed(layout)
+            .validate_fixed(main)
             .map_err(|error| error.to_string())?;
+        let layout = MainBusLayout {
+            sidechain_input: sidechain,
+            ..main
+        };
         adapter
             .negotiate_main_buses(layout)
             .map_err(|error| error.to_string())?;
+        if sidechain {
+            adapter
+                .discover_buses()
+                .map_err(|error| error.to_string())?
+                .validate_fixed(layout)
+                .map_err(|error| error.to_string())?;
+        }
         adapter
             .activate_main_buses(layout)
             .map_err(|error| error.to_string())?;
@@ -1289,7 +1902,7 @@ impl Vst3Facade {
                 input_channels: u32::from(layout.input_channels),
                 output_channels: u32::from(layout.output_channels),
             },
-            event_input_active: layout.event_input_active,
+            layout,
             latency_samples,
             output_changes: BoundedOutputChanges::default(),
         })
@@ -1357,15 +1970,14 @@ impl PluginFacade for Vst3Facade {
                     u8::try_from(request.output_channels)
                         .map_err(|_| PluginRuntimeError::InvalidRequest)?,
                 ),
+                sidechain: request.sidechain.map(|[left, right]| {
+                    [&left[..request.frame_count], &right[..request.frame_count]]
+                }),
                 midi: &midi,
                 parameter_changes: &parameters,
                 output_changes: &mut self.output_changes,
             })
             .map_err(|error| PluginRuntimeError::Plugin(error.to_string()))?;
-        self.latency_samples = self
-            .adapter
-            .latency_samples()
-            .unwrap_or(self.latency_samples);
         Ok(())
     }
 
@@ -1375,7 +1987,14 @@ impl PluginFacade for Vst3Facade {
         } else {
             self.adapter.stop_processing()
         }
-        .map_err(|error| PluginRuntimeError::Plugin(error.to_string()))
+        .map_err(|error| PluginRuntimeError::Plugin(error.to_string()))?;
+        if active {
+            self.latency_samples = self
+                .adapter
+                .latency_samples()
+                .map_err(|error| PluginRuntimeError::Plugin(error.to_string()))?;
+        }
+        Ok(())
     }
 
     fn set_parameter(
@@ -1436,6 +2055,13 @@ impl PluginFacade for Vst3Facade {
                 component: state.component.clone(),
                 controller: state.controller.clone(),
             })
+            .map_err(|error| PluginRuntimeError::Plugin(error.to_string()))?;
+        let buses = self
+            .adapter
+            .discover_buses()
+            .map_err(|error| PluginRuntimeError::Plugin(error.to_string()))?;
+        buses
+            .validate_fixed(self.layout)
             .map_err(|error| PluginRuntimeError::Plugin(error.to_string()))
     }
 
@@ -1444,49 +2070,7 @@ impl PluginFacade for Vst3Facade {
     }
 
     fn take_restart_flags(&mut self) -> u32 {
-        let mut output: BoundedOutputChanges<512> = BoundedOutputChanges::default();
-        if self.adapter.drain_notifications(&mut output).is_err() {
-            return 0;
-        }
-        output.iter().fold(0, |flags, change| match change {
-            OutputChange::Notification(AdapterNotification::RestartRequested {
-                flags: requested,
-            }) => flags | requested,
-            _ => flags,
-        })
-    }
-
-    fn editor(&mut self, command: EditorCommand) -> Result<Option<EditorSize>, PluginRuntimeError> {
-        let result = match command {
-            EditorCommand::Open { parent_view } => self
-                .adapter
-                .open_editor(parent_view as *mut c_void)
-                .map(|size| {
-                    Some(EditorSize {
-                        width: size.width,
-                        height: size.height,
-                    })
-                }),
-            EditorCommand::Focus => self.adapter.focus_editor(true).map(|()| None),
-            EditorCommand::Resize { width, height } => self
-                .adapter
-                .resize_editor(sp_vst3::sdk::Vst3EditorSize { width, height })
-                .map(|()| None),
-            EditorCommand::Close => self.adapter.close_editor().map(|()| None),
-        };
-        result.map_err(|error| PluginRuntimeError::Plugin(error.to_string()))
-    }
-
-    fn take_editor_resize_request(&mut self) -> Result<Option<EditorSize>, PluginRuntimeError> {
-        self.adapter
-            .take_editor_resize_request()
-            .map(|request| {
-                request.map(|size| EditorSize {
-                    width: size.width,
-                    height: size.height,
-                })
-            })
-            .map_err(|error| PluginRuntimeError::Plugin(error.to_string()))
+        self.adapter.take_plugin_restart_flags().unwrap_or_default()
     }
 }
 
@@ -1539,15 +2123,14 @@ struct ProductionRuntime {
     worker_id: u32,
     rack: RackProcessor<Vst3Facade>,
     loaded: [Option<WirePluginSlotConfiguration>; 8],
-    preloaded: [Option<PreloadedSlot>; 8],
     rack_committed: bool,
+    state_transfers: StateTransfers,
     shutdown_requested: Arc<AtomicBool>,
-}
-
-#[cfg(feature = "sdk")]
-struct PreloadedSlot {
-    configuration: WirePluginSlotConfiguration,
-    facade: Vst3Facade,
+    /// When the loading thread last began a loop pass, in monotonic ticks.
+    loading_pass: Arc<std::sync::atomic::AtomicU64>,
+    // Legacy health RPCs report whether this worker has ever observed a restart. The host's
+    // per-slot cursor, not these RPCs, acknowledges pending maintenance in shared memory.
+    restart_flags_seen: u32,
 }
 
 #[cfg(feature = "sdk")]
@@ -1559,6 +2142,7 @@ impl ProductionRuntime {
     ) -> Result<Self, String> {
         let mut rack = RackProcessor::new();
         let topology = facade.topology;
+        let sidechain = facade.layout.sidechain_input;
         let slot = usize::from(configuration.slot);
         rack.replace_slot(
             slot,
@@ -1567,6 +2151,7 @@ impl ProductionRuntime {
                 topology,
                 bypassed: false,
                 active: false,
+                sidechain,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -1578,9 +2163,11 @@ impl ProductionRuntime {
             worker_id,
             rack,
             loaded,
-            preloaded: std::array::from_fn(|_| None),
             rack_committed: false,
+            state_transfers: StateTransfers::default(),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            loading_pass: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            restart_flags_seen: 0,
         })
     }
 
@@ -1593,6 +2180,18 @@ impl ProductionRuntime {
         (index < 8)
             .then_some(index)
             .ok_or("slot identity is outside alpha rack capacity".to_owned())
+    }
+
+    fn inactive_slot(&self, request: &ControlRequest) -> Result<usize, String> {
+        let slot = Self::slot_index(request)?;
+        let configuration = self
+            .rack
+            .slot_configuration(slot)
+            .ok_or("state transfer slot is not loaded")?;
+        if configuration.active {
+            return Err("state transfer requires an inactive plug-in slot".to_owned());
+        }
+        Ok(slot)
     }
 
     fn request_configuration_slot(
@@ -1612,60 +2211,97 @@ impl ProductionRuntime {
             .as_deref()
             .filter(|class_id| !class_id.is_empty())
             .ok_or("plug-in load requires a scanner-selected class ID")?;
-        Vst3Facade::load(&Vst3ClassSelection::new(
-            Vst3BundlePath::new(&configuration.bundle_path),
-            class_id,
-        ))
+        Vst3Facade::load(
+            &Vst3ClassSelection::new(Vst3BundlePath::new(&configuration.bundle_path), class_id),
+            configuration.sidechain_active,
+        )
     }
 
-    fn preload_plugin(
-        &mut self,
-        request: &ControlRequest,
-        configuration: WirePluginSlotConfiguration,
-    ) -> Result<Vec<u8>, String> {
-        let slot = Self::request_configuration_slot(request, &configuration)?;
-        let facade = Self::load_facade(&configuration)?;
-        self.preloaded[slot] = Some(PreloadedSlot {
-            configuration,
-            facade,
-        });
-        Ok(Vec::new())
+    /// Checks a chain edit against the rack before the loading thread prepares it.
+    fn check_chain_edit(&self, request: &ControlRequest) -> Result<(), String> {
+        match request.operation() {
+            ControlOperation::LoadPlugin => {
+                let configuration = WirePluginSlotConfiguration::decode(request.payload())
+                    .map_err(|error| error.to_string())?;
+                let slot = Self::request_configuration_slot(request, &configuration)?;
+                if self.rack.slot_configuration(slot).is_some() {
+                    return Err("plug-in insert requires an empty slot".to_owned());
+                }
+                Ok(())
+            }
+            ControlOperation::UnloadSlot => {
+                let slot = Self::slot_index(request)?;
+                self.rack
+                    .slot_configuration(slot)
+                    .map(|_| ())
+                    .ok_or_else(|| "plug-in slot is not loaded".to_owned())
+            }
+            ControlOperation::ReorderRack => SlotOrder::decode(request.payload())
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            _ => Err("request is not a chain edit".to_owned()),
+        }
     }
 
-    fn load_preloaded(
+    /// Applies a prepared chain edit between blocks. Removed plug-ins go to the loading thread
+    /// for teardown; if its queue is full they drop here instead.
+    fn apply_chain_edit(
         &mut self,
-        request: &ControlRequest,
-        configuration: WirePluginSlotConfiguration,
-    ) -> Result<Vec<u8>, String> {
-        let slot = Self::request_configuration_slot(request, &configuration)?;
-        if self
-            .rack
-            .slot_configuration(slot)
-            .is_some_and(|existing| existing.active)
-        {
-            return Err("plug-in load requires the replaced slot to be inactive".to_owned());
+        edit: ChainEdit,
+        retired: &SyncSender<Vst3Facade>,
+    ) -> Result<(), String> {
+        self.state_transfers.clear();
+        match edit {
+            ChainEdit::Insert(inserted) => {
+                let InsertedPlugin {
+                    configuration,
+                    facade,
+                } = *inserted;
+                let slot = usize::from(configuration.slot);
+                let topology = facade.topology;
+                let sidechain = facade.layout.sidechain_input;
+                self.rack
+                    .replace_slot(
+                        slot,
+                        facade,
+                        PluginSlotConfiguration {
+                            topology,
+                            bypassed: false,
+                            active: true,
+                            sidechain,
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                self.rack
+                    .start_warmup(slot)
+                    .map_err(|error| error.to_string())?;
+                self.loaded[slot] = Some(configuration);
+            }
+            ChainEdit::Remove(slot) => {
+                if let Some(facade) = self
+                    .rack
+                    .remove_slot(slot)
+                    .map_err(|error| error.to_string())?
+                {
+                    let _ = retired.try_send(facade);
+                }
+                self.loaded[slot] = None;
+            }
+            ChainEdit::Reorder(from) => {
+                self.rack
+                    .reorder(&from)
+                    .map_err(|error| error.to_string())?;
+                let mut previous =
+                    std::mem::replace(&mut self.loaded, std::array::from_fn(|_| None));
+                for (slot, &source) in from.iter().enumerate() {
+                    self.loaded[slot] = previous[source].take().map(|mut configuration| {
+                        configuration.slot = u8::try_from(slot).expect("rack slot fits u8");
+                        configuration
+                    });
+                }
+            }
         }
-        let preloaded = self.preloaded[slot]
-            .take()
-            .ok_or("requested slot has not been preloaded")?;
-        if preloaded.configuration != configuration {
-            self.preloaded[slot] = Some(preloaded);
-            return Err("load configuration does not match the preloaded plug-in".to_owned());
-        }
-        let topology = preloaded.facade.topology;
-        self.rack
-            .replace_slot(
-                slot,
-                preloaded.facade,
-                PluginSlotConfiguration {
-                    topology,
-                    bypassed: false,
-                    active: false,
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        self.loaded[slot] = Some(configuration);
-        Ok(Vec::new())
+        Ok(())
     }
 
     fn rebuild_rack(&mut self, topology: RackTopology) -> Result<Vec<u8>, String> {
@@ -1702,13 +2338,13 @@ impl ProductionRuntime {
                 None
             };
             self.loaded[slot] = None;
-            self.preloaded[slot] = None;
 
             let Some(configuration) = requested[slot].take() else {
                 continue;
             };
             let facade = Self::load_facade(&configuration)?;
             let plugin_topology = facade.topology;
+            let sidechain = facade.layout.sidechain_input;
             self.rack
                 .replace_slot(
                     slot,
@@ -1717,6 +2353,7 @@ impl ProductionRuntime {
                         topology: plugin_topology,
                         bypassed: false,
                         active: false,
+                        sidechain,
                     },
                 )
                 .map_err(|error| error.to_string())?;
@@ -1734,129 +2371,37 @@ impl ProductionRuntime {
         Ok(Vec::new())
     }
 
-    fn apply_slot_order(&mut self, mut order: SlotOrder) -> Result<(), String> {
-        for destination in 0..order.order.len() {
-            let source = order
-                .current
-                .iter()
-                .position(|slot| *slot == order.order[destination])
-                .ok_or("reorder payload omitted an occupied slot")?;
-            if source != destination {
-                self.rack
-                    .reorder(source, destination)
-                    .map_err(|error| error.to_string())?;
-                self.loaded.swap(source, destination);
-                order.current.swap(source, destination);
-            }
-        }
-        for (slot, configuration) in self.loaded.iter_mut().enumerate() {
-            if let Some(configuration) = configuration {
-                configuration.slot = u8::try_from(slot).expect("rack slot fits u8");
-            }
-        }
-        Ok(())
-    }
-
-    fn handle_editor_control(
+    fn handle_main_thread_control(
         &mut self,
         request: ControlRequest,
         host: &mut EditorHost,
     ) -> ControlResponse {
-        #[cfg(not(target_os = "macos"))]
-        return Self::unsupported(&request, "native editors require macOS");
-
-        #[cfg(target_os = "macos")]
         if matches!(
             request.operation(),
-            ControlOperation::LoadPlugin
-                | ControlOperation::UnloadSlot
-                | ControlOperation::RebuildRack
-                | ControlOperation::Shutdown
+            ControlOperation::RebuildRack | ControlOperation::Shutdown
         ) {
-            let slots = match request.operation() {
-                ControlOperation::LoadPlugin | ControlOperation::UnloadSlot => {
-                    Self::slot_index(&request).map_or_else(|_| Vec::new(), |slot| vec![slot])
-                }
-                _ => host.windows.keys().copied().collect(),
-            };
-            for slot in slots {
-                let _ = self.rack.editor(slot, EditorCommand::Close);
-                if let Some(window) = host.windows.remove(&slot) {
-                    window.close();
-                }
-            }
+            host.state_transfers.clear();
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
             return self.handle_control(request);
         }
 
         #[cfg(target_os = "macos")]
-        let result = match request.operation() {
-            ControlOperation::OpenNativeEditor => Self::slot_index(&request).and_then(|slot| {
-                if let Some(window) = host.windows.get(&slot) {
-                    window.focus();
-                    return Ok(Vec::new());
+        {
+            if matches!(
+                request.operation(),
+                ControlOperation::RebuildRack | ControlOperation::Shutdown
+            ) {
+                for slot in host.windows.keys().copied().collect::<Vec<_>>() {
+                    if let Err(error) = host.close_editor(slot) {
+                        return Self::response(&request, Err(error));
+                    }
                 }
-                let window =
-                    sp_vst3::editor_window::MacOsEditorWindow::new("Superposition Plug-in Editor")?;
-                let parent_view = window.content_view()?;
-                let size = self
-                    .rack
-                    .editor(slot, EditorCommand::Open { parent_view })
-                    .map_err(|error| error.to_string())?;
-                if let Some(size) = size {
-                    window.resize(size.width, size.height);
-                }
-                window.focus();
-                host.windows.insert(slot, window);
-                Ok(Vec::new())
-            }),
-            ControlOperation::CloseNativeEditor => Self::slot_index(&request).and_then(|slot| {
-                self.close_editor(host, slot)?;
-                Ok(Vec::new())
-            }),
-            ControlOperation::FocusNativeEditor => Self::slot_index(&request).and_then(|slot| {
-                self.rack
-                    .editor(slot, EditorCommand::Focus)
-                    .map_err(|error| error.to_string())?;
-                host.windows
-                    .get(&slot)
-                    .ok_or("native editor window is not open")?
-                    .focus();
-                Ok(Vec::new())
-            }),
-            ControlOperation::ResizeNativeEditor => Self::slot_index(&request).and_then(|slot| {
-                let geometry =
-                    EditorGeometry::decode(request.payload()).map_err(|error| error.to_string())?;
-                self.rack
-                    .editor(
-                        slot,
-                        EditorCommand::Resize {
-                            width: geometry.width,
-                            height: geometry.height,
-                        },
-                    )
-                    .map_err(|error| error.to_string())?;
-                host.windows
-                    .get(&slot)
-                    .ok_or("native editor window is not open")?
-                    .resize(geometry.width, geometry.height);
-                Ok(Vec::new())
-            }),
-            _ => Err("request is not a native-editor operation".to_owned()),
-        };
-        Self::response(&request, result)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn close_editor(&mut self, host: &mut EditorHost, slot: usize) -> Result<(), String> {
-        self.rack
-            .editor(slot, EditorCommand::Close)
-            .map_err(|error| error.to_string())?;
-        let window = host
-            .windows
-            .remove(&slot)
-            .ok_or("native editor window is not open")?;
-        window.close();
-        Ok(())
+            }
+            self.handle_control(request)
+        }
     }
 
     fn unsupported(request: &ControlRequest, message: &str) -> ControlResponse {
@@ -1927,20 +2472,24 @@ impl ProcessingControlHandler for ProductionRuntime {
         reason = "flat dispatch over every control operation reads clearest in one match"
     )]
     fn handle_control(&mut self, request: ControlRequest) -> ControlResponse {
+        if matches!(
+            request.operation(),
+            ControlOperation::RebuildRack | ControlOperation::Shutdown
+        ) {
+            self.state_transfers.clear();
+        }
         let result = match request.operation() {
             ControlOperation::PreloadPlugin => {
-                WirePluginSlotConfiguration::decode(request.payload())
-                    .map_err(|error| error.to_string())
-                    .and_then(|configuration| self.preload_plugin(&request, configuration))
+                return Self::unsupported(&request, "LoadPlugin loads and inserts in one step");
             }
-            ControlOperation::LoadPlugin => WirePluginSlotConfiguration::decode(request.payload())
-                .map_err(|error| error.to_string())
-                .and_then(|configuration| self.load_preloaded(&request, configuration)),
             ControlOperation::RebuildRack => RackTopology::decode(request.payload())
                 .map_err(|error| error.to_string())
                 .and_then(|topology| self.rebuild_rack(topology)),
             ControlOperation::ActivateSlot => Self::slot_index(&request)
                 .and_then(|slot| {
+                    if self.state_transfers.holds_slot(slot) {
+                        return Err("state transfer must finish before activation".to_owned());
+                    }
                     self.rack
                         .set_active(slot, true)
                         .map_err(|error| error.to_string())
@@ -1953,26 +2502,6 @@ impl ProcessingControlHandler for ProductionRuntime {
                         .map_err(|error| error.to_string())
                 })
                 .map(|()| Vec::new()),
-            ControlOperation::UnloadSlot => Self::slot_index(&request)
-                .and_then(|slot| {
-                    if self
-                        .rack
-                        .slot_configuration(slot)
-                        .is_some_and(|configuration| configuration.active)
-                    {
-                        return Err("plug-in unload requires an inactive slot".to_owned());
-                    }
-                    let removed = self
-                        .rack
-                        .remove_slot(slot)
-                        .map_err(|error| error.to_string())?;
-                    self.loaded[slot] = None;
-                    Ok(removed)
-                })
-                .map(|_| Vec::new()),
-            ControlOperation::ReorderRack => SlotOrder::decode(request.payload())
-                .map_err(|error| error.to_string())
-                .and_then(|order| self.apply_slot_order(order).map(|()| Vec::new())),
             ControlOperation::SetSlotBypass => Self::slot_index(&request).and_then(|slot| {
                 Bypass::decode(request.payload())
                     .map_err(|error| error.to_string())
@@ -2073,20 +2602,69 @@ impl ProcessingControlHandler for ProductionRuntime {
                     })
                     .map(|()| Vec::new())
             }),
+            ControlOperation::BeginStateRestore => self.inactive_slot(&request).and_then(|slot| {
+                let lengths = StateTransferLengths::decode(request.payload())
+                    .map_err(|error| error.to_string())?;
+                let descriptor = self.state_transfers.begin_restore(
+                    slot,
+                    lengths.component_len,
+                    lengths.controller_len,
+                )?;
+                StateTransferDescriptor {
+                    id: descriptor.id,
+                    component_len: descriptor.component_len,
+                    controller_len: descriptor.controller_len,
+                }
+                .encode()
+                .map_err(|error| error.to_string())
+            }),
+            ControlOperation::WriteStateChunk => self.inactive_slot(&request).and_then(|slot| {
+                let chunk = StateChunkWrite::decode(request.payload())
+                    .map_err(|error| error.to_string())?;
+                self.state_transfers.write_chunk(
+                    slot,
+                    chunk.id,
+                    chunk.stream,
+                    chunk.offset,
+                    &chunk.data,
+                )?;
+                Ok(Vec::new())
+            }),
+            ControlOperation::CommitStateRestore => self.inactive_slot(&request).and_then(|slot| {
+                let transfer = StateTransferId::decode(request.payload())
+                    .map_err(|error| error.to_string())?;
+                let state = self.state_transfers.commit_restore(slot, transfer.id)?;
+                self.rack
+                    .restore_state(slot, &state)
+                    .map_err(|error| error.to_string())?;
+                Ok(Vec::new())
+            }),
+            ControlOperation::ReleaseStateTransfer => {
+                self.inactive_slot(&request).and_then(|slot| {
+                    let transfer = StateTransferId::decode(request.payload())
+                        .map_err(|error| error.to_string())?;
+                    self.state_transfers.release(slot, transfer.id)?;
+                    Ok(Vec::new())
+                })
+            }
             ControlOperation::OpenNativeEditor
             | ControlOperation::CloseNativeEditor
             | ControlOperation::FocusNativeEditor
-            | ControlOperation::ResizeNativeEditor => {
-                return Self::unsupported(
-                    &request,
-                    "native editor operation missed main-thread routing",
-                );
+            | ControlOperation::ResizeNativeEditor
+            | ControlOperation::CaptureEditorPreview
+            | ControlOperation::BeginStateCapture
+            | ControlOperation::ReadStateChunk
+            | ControlOperation::ReadParameters
+            | ControlOperation::LoadPlugin
+            | ControlOperation::UnloadSlot
+            | ControlOperation::ReorderRack => {
+                return Self::unsupported(&request, "loading-thread operation missed its routing");
             }
             ControlOperation::NotifyLatency => Ok(u64::from(self.rack.latency_samples())
                 .to_le_bytes()
                 .to_vec()),
             ControlOperation::NotifyRestart => RestartReport {
-                requested: self.rack.take_restart_flags() != 0,
+                requested: self.restart_flags_seen != 0,
                 reason: 0,
             }
             .encode()
@@ -2098,7 +2676,7 @@ impl ProcessingControlHandler for ProductionRuntime {
                     .current_slot()
                     .and_then(|slot| SlotIdentity::new(u64::try_from(slot + 1).ok()?).ok()),
                 latency_samples: self.rack.latency_samples(),
-                restart_requested: self.rack.take_restart_flags() != 0,
+                restart_requested: self.restart_flags_seen != 0,
             }
             .encode()
             .map_err(|error| error.to_string()),
@@ -2126,21 +2704,29 @@ mod tests {
 
     #[test]
     fn no_arguments_print_usage_mode() {
-        assert_eq!(parse_startup_arguments(Vec::<String>::new()).unwrap(), None);
+        assert_eq!(parse_worker_startup(Vec::<String>::new()).unwrap(), None);
     }
 
     #[cfg(feature = "sdk")]
     #[test]
-    fn editor_lifecycle_is_never_dispatched_on_the_processing_thread() {
-        assert!(is_main_thread_operation(ControlOperation::OpenNativeEditor));
-        assert!(is_main_thread_operation(
-            ControlOperation::ResizeNativeEditor
+    fn editor_operations_use_independent_main_thread_routing() {
+        assert!(is_editor_operation(ControlOperation::OpenNativeEditor));
+        assert!(is_editor_operation(ControlOperation::CloseNativeEditor));
+        assert!(is_editor_operation(ControlOperation::FocusNativeEditor));
+        assert!(is_editor_operation(ControlOperation::ResizeNativeEditor));
+        assert!(is_editor_operation(ControlOperation::CaptureEditorPreview));
+        assert!(!is_main_thread_operation(
+            ControlOperation::OpenNativeEditor
         ));
+        assert!(!is_editor_operation(ControlOperation::ReadParameter));
+        assert!(is_main_thread_operation(ControlOperation::ReadParameter));
+        assert!(!is_main_thread_operation(ControlOperation::ReadParameters));
+        assert!(is_live_read_operation(ControlOperation::ReadParameters));
+        assert!(is_live_read_operation(ControlOperation::BeginStateCapture));
+        assert!(is_main_thread_operation(ControlOperation::CaptureState));
         assert!(!is_main_thread_operation(ControlOperation::WriteParameter));
-        assert_eq!(
-            is_main_thread_operation(ControlOperation::Shutdown),
-            cfg!(target_os = "macos")
-        );
+        assert!(!is_main_thread_operation(ControlOperation::QueryHealth));
+        assert!(is_main_thread_operation(ControlOperation::Shutdown));
     }
 
     #[test]
@@ -2202,9 +2788,16 @@ mod tests {
         );
     }
 
+    fn standalone(arguments: &[&str]) -> Result<StandaloneWorkerConfiguration, String> {
+        match parse_worker_startup(arguments.iter().copied())? {
+            Some(WorkerStartup::Standalone(configuration)) => Ok(configuration),
+            other => panic!("expected standalone worker startup, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn product_arguments_require_a_bundle_and_use_timed_processing() {
-        let configuration = parse_startup_arguments([
+    fn standalone_arguments_parse_bank_worker_and_optional_bundle() {
+        let configuration = standalone(&[
             "--bank",
             BANK_NAME,
             WORKER_ID_OPTION,
@@ -2212,14 +2805,17 @@ mod tests {
             BUNDLE_OPTION,
             "Example.vst3",
         ])
-        .expect("product arguments parse")
-        .expect("configuration");
-
-        assert_eq!(configuration.timing_mode, TimingMode::Timed);
+        .expect("standalone arguments parse");
+        assert_eq!(configuration.bank_name, BANK_NAME);
+        assert_eq!(configuration.worker_id, 7);
         assert_eq!(
             configuration.bundle,
             Some(Vst3BundlePath::new("Example.vst3"))
         );
+
+        let without_bundle =
+            standalone(&["--bank", BANK_NAME, WORKER_ID_OPTION, "7"]).expect("bundle is optional");
+        assert_eq!(without_bundle.bundle, None);
     }
 
     #[test]
@@ -2251,85 +2847,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_feasibility_arguments_remain_untimed_and_fault_free() {
-        let configuration = parse_startup_arguments(["--feasibility-bank", BANK_NAME, "7"])
-            .unwrap()
-            .unwrap();
-        assert_eq!(configuration.bank_name, BANK_NAME);
-        assert_eq!(configuration.worker_id, 7);
-        assert_eq!(configuration.timing_mode, TimingMode::LegacyUntimed);
-        assert_eq!(configuration.fault, FaultConfiguration::default());
-    }
-
-    #[test]
-    fn explicit_feasibility_arguments_parse_timing_and_fault_options() {
-        let configuration = parse_startup_arguments([
-            "--feasibility-bank",
-            BANK_NAME,
-            WORKER_ID_OPTION,
-            "9",
-            FAULT_MODE_OPTION,
-            "late-completion",
-            FAULT_TRIGGER_SEQUENCE_OPTION,
-            "12",
-            FAULT_DELAY_MICROS_OPTION,
-            "400",
-            WORK_DURATION_MICROS_OPTION,
-            "100",
-            COMPUTE_LOAD_MODE_OPTION,
-            "calibrated-cpu",
-            COMPUTE_LOAD_MICROS_OPTION,
-            "250",
-        ])
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(configuration.worker_id, 9);
-        assert_eq!(configuration.timing_mode, TimingMode::Timed);
-        assert_eq!(configuration.fault.mode, FaultMode::LateCompletion);
-        assert_eq!(configuration.fault.trigger_request_sequence, 12);
-        assert_eq!(configuration.fault.fault_delay, Duration::from_micros(400));
-        assert_eq!(
-            configuration.fault.work_duration,
-            Duration::from_micros(100)
-        );
-        assert_eq!(
-            configuration.compute_load.mode,
-            ComputeLoadMode::CalibratedCpu
-        );
-        assert_eq!(
-            configuration.compute_load.duration,
-            Duration::from_micros(250)
-        );
-    }
-
-    #[test]
-    fn worker_parser_accepts_exact_self_crash_fault_trigger() {
-        let configuration = parse_startup_arguments([
-            "--feasibility-bank",
-            BANK_NAME,
-            WORKER_ID_OPTION,
-            "9",
-            FAULT_MODE_OPTION,
-            SELF_CRASH_AFTER_CLAIM_MODE,
-            FAULT_TRIGGER_SEQUENCE_OPTION,
-            "12",
-        ])
-        .unwrap()
-        .unwrap();
-
-        assert!(configuration.self_crash_after_claim);
-        assert_eq!(configuration.fault.mode, FaultMode::None);
-        assert_eq!(configuration.fault.trigger_request_sequence, 12);
-        assert_eq!(configuration.fault.selected_mode(12), FaultMode::None);
-    }
-
-    #[test]
-    fn feasibility_parser_rejects_missing_duplicate_and_reserved_worker_ids() {
-        assert!(parse_startup_arguments(["--feasibility-bank", BANK_NAME]).is_err());
+    fn standalone_parser_rejects_missing_duplicate_unknown_and_reserved_worker_ids() {
+        assert!(standalone(&["--bank", BANK_NAME]).is_err());
+        assert!(standalone(&["--bank", BANK_NAME, WORKER_ID_OPTION]).is_err());
         assert!(
-            parse_startup_arguments([
-                "--feasibility-bank",
+            standalone(&[
+                "--bank",
                 BANK_NAME,
                 WORKER_ID_OPTION,
                 "1",
@@ -2338,74 +2861,20 @@ mod tests {
             ])
             .is_err()
         );
+        assert!(
+            standalone(&[
+                "--bank",
+                BANK_NAME,
+                WORKER_ID_OPTION,
+                "1",
+                "--fault-mode",
+                "none"
+            ])
+            .is_err()
+        );
         for worker_id in ["0", "4294967293", "4294967294", "4294967295"] {
-            assert!(
-                parse_startup_arguments([
-                    "--feasibility-bank",
-                    BANK_NAME,
-                    WORKER_ID_OPTION,
-                    worker_id,
-                ])
-                .is_err()
-            );
+            assert!(standalone(&["--bank", BANK_NAME, WORKER_ID_OPTION, worker_id]).is_err());
         }
-    }
-
-    #[test]
-    fn request_plan_selects_each_fault_only_at_the_exact_trigger() {
-        for mode in [
-            FaultMode::None,
-            FaultMode::HangAfterClaim,
-            FaultMode::DelayBeforeClaim,
-            FaultMode::LateCompletion,
-            FaultMode::MalformedCompletion,
-            FaultMode::StaleCompletion,
-        ] {
-            let configuration = FaultConfiguration {
-                mode,
-                trigger_request_sequence: 5,
-                fault_delay: if matches!(
-                    mode,
-                    FaultMode::DelayBeforeClaim | FaultMode::LateCompletion
-                ) {
-                    Duration::from_micros(10)
-                } else {
-                    Duration::ZERO
-                },
-                work_duration: Duration::from_micros(3),
-            };
-            assert_eq!(request_plan(configuration, 4).mode, FaultMode::None);
-            assert_eq!(request_plan(configuration, 5).mode, mode);
-            assert_eq!(request_plan(configuration, 6).mode, FaultMode::None);
-        }
-    }
-
-    #[test]
-    fn request_plan_places_delays_at_the_named_transition() {
-        let before_claim = request_plan(
-            FaultConfiguration {
-                mode: FaultMode::DelayBeforeClaim,
-                trigger_request_sequence: 1,
-                fault_delay: Duration::from_micros(20),
-                work_duration: Duration::from_micros(3),
-            },
-            1,
-        );
-        assert_eq!(before_claim.delay_before_claim, Duration::from_micros(20));
-        assert_eq!(before_claim.delay_before_completion, Duration::ZERO);
-
-        let late = request_plan(
-            FaultConfiguration {
-                mode: FaultMode::LateCompletion,
-                trigger_request_sequence: 1,
-                fault_delay: Duration::from_micros(20),
-                work_duration: Duration::from_micros(3),
-            },
-            1,
-        );
-        assert_eq!(late.delay_before_claim, Duration::ZERO);
-        assert_eq!(late.delay_before_completion, Duration::from_micros(20));
-        assert_eq!(late.work_duration, Duration::from_micros(3));
     }
 
     #[test]
@@ -2428,6 +2897,7 @@ mod tests {
                 midi_event_count: 0,
                 event_count: 0,
                 flags: 0,
+                sidechain_slots: 0,
             },
         )
         .unwrap();
@@ -2469,7 +2939,11 @@ mod tests {
         let mut heartbeat = HeartbeatPublisher::new(clock);
         let mut slot = timed_requested_slot(clock, 1);
         slot.input_audio[0][0] = 0.75;
-        let configuration = timed_configuration(FaultMode::None, 1);
+        let configuration = StandaloneWorkerConfiguration {
+            bank_name: BANK_NAME.to_owned(),
+            worker_id: 7,
+            bundle: None,
+        };
 
         assert!(
             process_available_request(
@@ -2490,69 +2964,6 @@ mod tests {
         slot.consume_completion(snapshot.ticket).unwrap();
     }
 
-    #[test]
-    fn malformed_fault_uses_the_deliberate_protocol_hook() {
-        let clock = MonotonicClock::new().unwrap();
-        let header = ProtocolHeader::new(1, 1);
-        let mut heartbeat = HeartbeatPublisher::new(clock);
-        let mut slot = timed_requested_slot(clock, 2);
-        let configuration = timed_configuration(FaultMode::MalformedCompletion, 2);
-        let ticket = BlockTicket {
-            generation: 1,
-            sequence: 2,
-        };
-
-        assert!(
-            process_available_request(
-                &mut slot,
-                &header,
-                &configuration,
-                clock,
-                &mut heartbeat,
-                None,
-            )
-            .unwrap()
-        );
-        assert_eq!(
-            slot.consume_completion(ticket),
-            Err(ProtocolError::MalformedCompletion)
-        );
-        assert_eq!(slot.metadata.state(), Ok(SlotState::Complete));
-    }
-
-    #[test]
-    fn stale_fault_uses_a_valid_mismatched_completion_ticket() {
-        let clock = MonotonicClock::new().unwrap();
-        let header = ProtocolHeader::new(1, 1);
-        let mut heartbeat = HeartbeatPublisher::new(clock);
-        let mut slot = timed_requested_slot(clock, 3);
-        let configuration = timed_configuration(FaultMode::StaleCompletion, 3);
-        let live_ticket = BlockTicket {
-            generation: 1,
-            sequence: 3,
-        };
-
-        assert!(
-            process_available_request(
-                &mut slot,
-                &header,
-                &configuration,
-                clock,
-                &mut heartbeat,
-                None,
-            )
-            .unwrap()
-        );
-        let snapshot = slot.completion_snapshot().unwrap().unwrap();
-        assert!(snapshot.ticket.is_valid());
-        assert_ne!(snapshot.ticket, live_ticket);
-        assert_eq!(
-            slot.consume_completion(live_ticket),
-            Err(ProtocolError::StaleCompletion)
-        );
-        assert_eq!(slot.metadata.state(), Ok(SlotState::Complete));
-    }
-
     fn timed_requested_slot(clock: MonotonicClock, sequence: u64) -> BlockSlot {
         let mut slot = BlockSlot::new();
         slot.publish_request_at(
@@ -2567,39 +2978,11 @@ mod tests {
                 midi_event_count: 0,
                 event_count: 0,
                 flags: 0,
+                sidechain_slots: 0,
             },
             clock.now_ticks(),
         )
         .unwrap();
         slot
-    }
-
-    fn timed_configuration(mode: FaultMode, sequence: u64) -> FeasibilityWorkerConfiguration {
-        FeasibilityWorkerConfiguration {
-            bank_name: BANK_NAME.to_owned(),
-            worker_id: 7,
-            timing_mode: TimingMode::Timed,
-            fault: FaultConfiguration {
-                mode,
-                trigger_request_sequence: sequence,
-                fault_delay: Duration::ZERO,
-                work_duration: Duration::ZERO,
-            },
-            self_crash_after_claim: false,
-            compute_load: ComputeLoadConfiguration::default(),
-            bundle: None,
-        }
-    }
-
-    #[test]
-    fn mismatched_ticket_stays_valid_at_sequence_wrap() {
-        let ticket = BlockTicket {
-            generation: 8,
-            sequence: u64::MAX,
-        };
-        let mismatched = mismatched_ticket(ticket);
-        assert!(mismatched.is_valid());
-        assert_ne!(mismatched, ticket);
-        assert_eq!(mismatched.sequence, 1);
     }
 }

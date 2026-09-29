@@ -15,15 +15,19 @@ fn main() {
     );
 
     let sdk = std::env::var_os("VST3_SDK_DIR").map_or_else(|| {
-        panic!("sp-vst3 native-sdk requires VST3_SDK_DIR to name the VST3 SDK root (for example /Users/judahfuller/SDKs/vst3sdk)")
+        panic!("sp-vst3 native-sdk requires VST3_SDK_DIR to name the VST3 SDK root (for example $HOME/SDKs/vst3sdk)")
     }, std::path::PathBuf::from);
     let required = [
         "pluginterfaces/base/funknown.h",
+        "pluginterfaces/base/coreiids.cpp",
         "pluginterfaces/vst/ivstcomponent.h",
         "pluginterfaces/vst/ivstaudioprocessor.h",
         "pluginterfaces/vst/ivsteditcontroller.h",
         "pluginterfaces/gui/iplugview.h",
         "public.sdk/source/common/memorystream.h",
+        "public.sdk/source/common/commonstringconvert.cpp",
+        "public.sdk/source/vst/utility/stringconvert.cpp",
+        "public.sdk/source/vst/vstinitiids.cpp",
     ];
     for relative in required {
         assert!(
@@ -37,10 +41,14 @@ fn main() {
         .cpp(true)
         .file("src/native/vst3_shim.cpp")
         .file(sdk.join("pluginterfaces/base/funknown.cpp"))
+        .file(sdk.join("pluginterfaces/base/coreiids.cpp"))
         .file(sdk.join("pluginterfaces/base/ustring.cpp"))
+        .file(sdk.join("public.sdk/source/common/commonstringconvert.cpp"))
         .file(sdk.join("public.sdk/source/common/memorystream.cpp"))
         .file(sdk.join("public.sdk/source/vst/hosting/hostclasses.cpp"))
         .file(sdk.join("public.sdk/source/vst/hosting/pluginterfacesupport.cpp"))
+        .file(sdk.join("public.sdk/source/vst/utility/stringconvert.cpp"))
+        .file(sdk.join("public.sdk/source/vst/vstinitiids.cpp"))
         .include(&sdk)
         .flag_if_supported("-std=c++17")
         .warnings(true)

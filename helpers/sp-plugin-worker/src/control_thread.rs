@@ -24,6 +24,7 @@ use sp_protocol::control::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
+const SLOW_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Processing-thread endpoint of the bounded worker control mailbox.
 pub struct ProcessingControlEndpoint {
@@ -32,6 +33,12 @@ pub struct ProcessingControlEndpoint {
 }
 
 impl ProcessingControlEndpoint {
+    /// Reports queued control work without consuming it or blocking.
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        !self.commands.is_empty()
+    }
+
     /// Pops one validated request without blocking the processing thread.
     #[must_use]
     pub fn try_receive(&mut self) -> Option<ControlRequest> {
@@ -55,6 +62,18 @@ impl ProcessingControlEndpoint {
 pub struct SocketControlEndpoint {
     commands: Producer<ControlRequest>,
     replies: Consumer<ControlResponse>,
+    request_wake: Option<sp_shared_memory_macos::SharedMemoryRegion>,
+}
+
+impl SocketControlEndpoint {
+    /// Opens a separate mapping to wake the processing thread after publishing control work.
+    ///
+    /// # Errors
+    /// Returns an error when the live worker bank cannot be mapped.
+    pub fn set_request_wake(&mut self, bank_name: &str) -> io::Result<()> {
+        self.request_wake = Some(sp_shared_memory_macos::SharedMemoryRegion::open(bank_name)?);
+        Ok(())
+    }
 }
 
 /// Creates the two fixed SPSC channels connecting a Unix control thread and processing thread.
@@ -66,6 +85,7 @@ pub fn control_mailbox() -> (SocketControlEndpoint, ProcessingControlEndpoint) {
         SocketControlEndpoint {
             commands: command_producer,
             replies: reply_consumer,
+            request_wake: None,
         },
         ProcessingControlEndpoint {
             commands: command_consumer,
@@ -81,6 +101,12 @@ pub struct ControlThread {
 }
 
 impl ControlThread {
+    /// Returns whether the control thread has retired after a fatal transport timeout.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+
     /// Starts the supplied bound Unix listener on a separate control thread.
     ///
     /// The listener is configured nonblocking only so orderly shutdown can be observed; each
@@ -278,8 +304,27 @@ fn forward_request(
             "worker control queue is full",
         );
     }
+    if let Some(region) = &mailbox.request_wake
+        && !region.notify_request()
+    {
+        shutdown.store(true, Ordering::Release);
+        return Err(io::Error::other(
+            "could not wake worker for control request",
+        ));
+    }
 
-    let deadline = Instant::now() + timeout;
+    let operation_timeout = if matches!(
+        request.operation(),
+        ControlOperation::BeginStateCapture
+            | ControlOperation::CommitStateRestore
+            | ControlOperation::OpenNativeEditor
+            | ControlOperation::CloseNativeEditor
+    ) {
+        SLOW_CONTROL_TIMEOUT
+    } else {
+        timeout
+    };
+    let deadline = Instant::now() + operation_timeout;
     loop {
         // The real reply is preferred even during shutdown: a `Shutdown` request races its own
         // orderly teardown, and the completed response may already be queued.
@@ -299,12 +344,13 @@ fn forward_request(
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
         }
         if Instant::now() >= deadline {
-            return failure_response(
-                request,
-                ControlResponseStatus::Rejected,
-                ControlErrorCode::UNAVAILABLE,
-                "worker processing thread did not complete control request before timeout",
-            );
+            // A late reply would otherwise be mistaken for the next request on this mailbox.
+            // Retire the worker instead of reusing a poisoned request/reply sequence.
+            shutdown.store(true, Ordering::Release);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "worker did not complete the control request before its deadline",
+            ));
         }
         thread::sleep(POLL_INTERVAL);
     }

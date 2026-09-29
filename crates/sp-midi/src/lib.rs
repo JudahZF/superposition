@@ -9,7 +9,7 @@ use std::sync::{
 use std::time::Instant;
 
 use rtrb::{Consumer, Producer, RingBuffer};
-use sp_model::{Scene, SceneParameterValue};
+use sp_model::{Scene, SceneParameterTransition, SceneParameterValue};
 
 /// Maximum number of MIDI events delivered to one audio processing block.
 pub const MAX_MIDI_EVENTS_PER_BLOCK: usize = 256;
@@ -104,9 +104,18 @@ impl MidiEvent {
         kind == 0x80 || (kind == 0x90 && self.len == 3 && self.bytes[2] == 0)
     }
 
+    /// Returns whether this event must survive ordinary controller traffic to release sound.
+    #[must_use]
+    pub const fn is_safety_event(self) -> bool {
+        self.is_note_off()
+            || (self.len == 3
+                && self.bytes[0] & 0xf0 == 0xb0
+                && matches!(self.bytes[1], 120 | 121 | 123))
+    }
+
     fn continuous_key(self) -> Option<(u8, u8)> {
         match self.bytes[0] & 0xf0 {
-            0xb0 => Some((self.bytes[0], self.bytes[1])),
+            0xb0 if !self.is_safety_event() => Some((self.bytes[0], self.bytes[1])),
             // Pitch bend and channel pressure have one current value per channel.
             0xd0 | 0xe0 => Some((self.bytes[0], 0)),
             _ => None,
@@ -223,6 +232,9 @@ pub trait MidiInput {
 pub struct SpscMidiQueue {
     safety: BoundedMidiEvents,
     regular: BoundedMidiEvents,
+    safety_sequence: [u64; MAX_MIDI_EVENTS_PER_BLOCK],
+    regular_sequence: [u64; MAX_MIDI_EVENTS_PER_BLOCK],
+    next_sequence: u64,
     rejected_count: u64,
     coalesced_count: u64,
 }
@@ -240,6 +252,9 @@ impl SpscMidiQueue {
         Self {
             safety: BoundedMidiEvents::new(),
             regular: BoundedMidiEvents::new(),
+            safety_sequence: [0; MAX_MIDI_EVENTS_PER_BLOCK],
+            regular_sequence: [0; MAX_MIDI_EVENTS_PER_BLOCK],
+            next_sequence: 0,
             rejected_count: 0,
             coalesced_count: 0,
         }
@@ -251,55 +266,85 @@ impl SpscMidiQueue {
     /// # Errors
     /// Returns the event back when its lane is full.
     pub fn try_push(&mut self, event: MidiEvent) -> Result<(), MidiEvent> {
-        if event.is_note_off() {
-            return self.safety.try_push(event).inspect_err(|_event| {
-                self.rejected_count += 1;
-            });
+        if !self.can_accept(event) {
+            self.rejected_count += 1;
+            return Err(event);
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        if event.is_safety_event() {
+            self.safety_sequence[self.safety.len] = sequence;
+            return self.safety.try_push(event);
         }
         if let Some(key) = event.continuous_key()
-            && let Some(existing) = self.regular.events[..self.regular.len]
-                .iter_mut()
-                .find(|existing| existing.continuous_key() == Some(key))
+            && let Some(index) = self.regular.events[..self.regular.len]
+                .iter()
+                .position(|existing| existing.continuous_key() == Some(key))
         {
-            *existing = event;
+            self.regular
+                .events
+                .copy_within(index + 1..self.regular.len, index);
+            self.regular_sequence
+                .copy_within(index + 1..self.regular.len, index);
+            self.regular.events[self.regular.len - 1] = event;
+            self.regular_sequence[self.regular.len - 1] = sequence;
             self.coalesced_count += 1;
             return Ok(());
         }
-        self.regular.try_push(event).inspect_err(|_event| {
-            self.rejected_count += 1;
-        })
+        self.regular_sequence[self.regular.len] = sequence;
+        self.regular.try_push(event)
     }
 
-    /// Drains a block without allocating. Note-offs are delivered first and are never displaced
-    /// by regular events. Events beyond `output` capacity remain queued for the next block.
+    fn can_accept(&self, event: MidiEvent) -> bool {
+        if event.is_safety_event() {
+            return self.safety.len < MAX_MIDI_EVENTS_PER_BLOCK;
+        }
+        self.regular.len < MAX_MIDI_EVENTS_PER_BLOCK
+            || event.continuous_key().is_some_and(|key| {
+                self.regular.events[..self.regular.len]
+                    .iter()
+                    .any(|existing| existing.continuous_key() == Some(key))
+            })
+    }
+
+    /// Drains a block in arrival order without allocating. Protected note-offs cannot be
+    /// displaced by regular events. Events beyond `output` capacity remain queued.
     pub fn drain_into<const CAPACITY: usize>(&mut self, output: &mut BoundedMidiEvents<CAPACITY>) {
-        self.drain_lane(&mut output.events, &mut output.len, true);
-        self.drain_lane(&mut output.events, &mut output.len, false);
+        let mut safety_index = 0;
+        let mut regular_index = 0;
+        while output.len < CAPACITY
+            && (safety_index < self.safety.len || regular_index < self.regular.len)
+        {
+            let safety_remaining = self.safety.len - safety_index;
+            let output_remaining = CAPACITY - output.len;
+            let safety = (safety_remaining >= output_remaining && safety_remaining > 0)
+                || regular_index == self.regular.len
+                || (safety_index < self.safety.len
+                    && self.safety_sequence[safety_index] < self.regular_sequence[regular_index]);
+            output.events[output.len] = if safety {
+                let event = self.safety.events[safety_index];
+                safety_index += 1;
+                event
+            } else {
+                let event = self.regular.events[regular_index];
+                regular_index += 1;
+                event
+            };
+            output.len += 1;
+        }
+        Self::discard_prefix(&mut self.safety, &mut self.safety_sequence, safety_index);
+        Self::discard_prefix(&mut self.regular, &mut self.regular_sequence, regular_index);
     }
 
-    fn drain_lane<const CAPACITY: usize>(
-        &mut self,
-        destination: &mut [MidiEvent; CAPACITY],
-        destination_len: &mut usize,
-        safety: bool,
+    fn discard_prefix(
+        lane: &mut BoundedMidiEvents,
+        sequences: &mut [u64; MAX_MIDI_EVENTS_PER_BLOCK],
+        count: usize,
     ) {
-        let lane = if safety {
-            &mut self.safety
-        } else {
-            &mut self.regular
-        };
-        let take = lane.len.min(CAPACITY.saturating_sub(*destination_len));
-        for index in 0..take {
-            destination[*destination_len + index] = lane.events[index];
-        }
-        if take > 0 {
-            lane.events.copy_within(take..lane.len, 0);
-            for entry in &mut lane.events[lane.len - take..lane.len] {
-                *entry = EMPTY_MIDI_EVENT;
-            }
-            lane.len -= take;
-            *destination_len += take;
-        }
+        lane.events.copy_within(count..lane.len, 0);
+        sequences.copy_within(count..lane.len, 0);
+        lane.len -= count;
+        lane.events[lane.len..lane.len + count].fill(EMPTY_MIDI_EVENT);
     }
 
     /// Returns total queued events across both lanes.
@@ -534,15 +579,24 @@ fn port_id(name: &str, occurrence: usize) -> MidiPortId {
     MidiPortId::new(format!("midir:{name}:{occurrence}"))
 }
 
+fn next_port_id(occurrences: &mut BTreeMap<String, usize>, name: &str) -> MidiPortId {
+    let occurrence = occurrences.entry(name.to_owned()).or_default();
+    let id = port_id(name, *occurrence);
+    *occurrence += 1;
+    id
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RealtimeMidiPacket {
+    sequence: u64,
     timestamp_micros: u64,
     bytes: [u8; MIDI_MESSAGE_BYTES],
     len: u8,
 }
 impl RealtimeMidiPacket {
-    fn from_message(timestamp_micros: u64, message: &[u8]) -> Option<Self> {
+    fn from_message(sequence: u64, timestamp_micros: u64, message: &[u8]) -> Option<Self> {
         MidiEvent::from_bytes(0, message).ok().map(|event| Self {
+            sequence,
             timestamp_micros,
             bytes: event.bytes,
             len: event.len,
@@ -627,6 +681,7 @@ pub struct MidirInput {
     connection: Option<midir::MidiInputConnection<()>>,
     regular: Consumer<RealtimeMidiPacket>,
     safety: Consumer<RealtimeMidiPacket>,
+    pending: SpscMidiQueue,
     telemetry: Arc<IngressTelemetry>,
     port: Option<MidiPortInfo>,
     selected_port: Option<MidiPortId>,
@@ -641,6 +696,7 @@ impl MidirInput {
             connection: None,
             regular,
             safety,
+            pending: SpscMidiQueue::new(),
             telemetry: Arc::new(IngressTelemetry::default()),
             port: None,
             selected_port: None,
@@ -660,9 +716,7 @@ impl MidirInput {
             .iter()
             .filter_map(|port| {
                 let name = input.port_name(port).ok()?;
-                let occurrence = occurrences.entry(name.clone()).or_default();
-                let id = port_id(&name, *occurrence);
-                *occurrence += 1;
+                let id = next_port_id(&mut occurrences, &name);
                 Some(MidiPortInfo { id, name })
             })
             .collect())
@@ -676,28 +730,17 @@ impl MidirInput {
         selected: &MidiPortId,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let input = midir::MidiInput::new("superposition")?;
-        let ports = Self::enumerate_ports()?;
-        let Some(info) = ports.into_iter().find(|info| &info.id == selected) else {
+        let mut occurrences = BTreeMap::<String, usize>::new();
+        let selected_port = input.ports().into_iter().find_map(|port| {
+            let name = input.port_name(&port).ok()?;
+            let id = next_port_id(&mut occurrences, &name);
+            (id == *selected).then_some((port, MidiPortInfo { id, name }))
+        });
+        let Some((port, info)) = selected_port else {
             self.connection = None;
             self.port = None;
             return Err(Box::new(MidiPortOpenError::NotFound(selected.clone())));
         };
-        let mut occurrence = 0usize;
-        let port = input
-            .ports()
-            .into_iter()
-            .find(|port| {
-                let Ok(name) = input.port_name(port) else {
-                    return false;
-                };
-                let id = port_id(&name, occurrence);
-                occurrence += 1;
-                id == info.id
-            })
-            .ok_or_else(|| {
-                Box::new(MidiPortOpenError::NotFound(selected.clone()))
-                    as Box<dyn std::error::Error + Send + Sync>
-            })?;
         self.connect(input, &port, info)
     }
     /// Opens the first port and records its identity for later [`Self::reconnect`].
@@ -732,18 +775,23 @@ impl MidirInput {
         let (mut regular_producer, regular, mut safety_producer, safety) = ingress_queues();
         let telemetry = Arc::new(IngressTelemetry::default());
         let callback_telemetry = Arc::clone(&telemetry);
+        let mut next_packet_sequence = 0u64;
         let connection = input.connect(
             port,
             "superposition-input",
             move |timestamp_micros, message, ()| {
-                let Some(packet) = RealtimeMidiPacket::from_message(timestamp_micros, message)
-                else {
+                let Some(packet) = RealtimeMidiPacket::from_message(
+                    next_packet_sequence,
+                    timestamp_micros,
+                    message,
+                ) else {
                     callback_telemetry.rejected.fetch_add(1, Ordering::Relaxed);
                     return;
                 };
+                next_packet_sequence = next_packet_sequence.wrapping_add(1);
                 callback_telemetry.received.fetch_add(1, Ordering::Relaxed);
                 callback_telemetry.observe_cc(message);
-                let result = if packet.into_event().is_note_off() {
+                let result = if packet.into_event().is_safety_event() {
                     safety_producer.push(packet)
                 } else {
                     regular_producer.push(packet)
@@ -759,6 +807,7 @@ impl MidirInput {
         self.connection = Some(connection);
         self.regular = regular;
         self.safety = safety;
+        self.pending = SpscMidiQueue::new();
         self.telemetry = telemetry;
         self.opened_at = Instant::now();
         Ok(())
@@ -781,16 +830,51 @@ impl MidirInput {
             observed: 0,
         }
     }
-    /// Moves pending ingress packets into a fixed queue, consuming the protected lane first.
+    /// Moves pending ingress packets into a fixed queue in callback arrival order.
     pub fn pump_into(&mut self, queue: &mut SpscMidiQueue) {
-        while let Ok(packet) = self.safety.pop() {
-            if queue.try_push(packet.into_event()).is_err() {
-                self.telemetry.rejected.fetch_add(1, Ordering::Relaxed);
+        Self::pump_queues(&mut self.regular, &mut self.safety, queue);
+    }
+    fn pump_queues(
+        regular: &mut Consumer<RealtimeMidiPacket>,
+        safety: &mut Consumer<RealtimeMidiPacket>,
+        queue: &mut SpscMidiQueue,
+    ) {
+        loop {
+            let next = match (regular.peek(), safety.peek()) {
+                (Ok(regular), Ok(safety)) => {
+                    if regular.sequence < safety.sequence {
+                        regular
+                    } else {
+                        safety
+                    }
+                }
+                (Ok(regular), Err(_)) => regular,
+                (Err(_), Ok(safety)) => safety,
+                (Err(_), Err(_)) => break,
+            };
+            let event = next.into_event();
+            if !queue.can_accept(event) {
+                if let Ok(safety_packet) = safety.peek()
+                    && queue.can_accept(safety_packet.into_event())
+                {
+                    let packet = safety.pop().expect("peeked safety packet is present");
+                    queue
+                        .try_push(packet.into_event())
+                        .expect("queue has capacity");
+                    continue;
+                }
+                break;
             }
-        }
-        while let Ok(packet) = self.regular.pop() {
-            if queue.try_push(packet.into_event()).is_err() {
-                self.telemetry.rejected.fetch_add(1, Ordering::Relaxed);
+            if event.is_safety_event() {
+                let packet = safety.pop().expect("peeked safety packet is present");
+                queue
+                    .try_push(packet.into_event())
+                    .expect("queue has capacity");
+            } else {
+                let packet = regular.pop().expect("peeked regular packet is present");
+                queue
+                    .try_push(packet.into_event())
+                    .expect("queue has capacity");
             }
         }
     }
@@ -820,9 +904,8 @@ impl MidiInput for MidirInput {
         &mut self,
         output: &mut BoundedMidiEvents,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut queue = SpscMidiQueue::new();
-        self.pump_into(&mut queue);
-        queue.drain_into(output);
+        Self::pump_queues(&mut self.regular, &mut self.safety, &mut self.pending);
+        self.pending.drain_into(output);
         Ok(())
     }
 }
@@ -906,6 +989,7 @@ struct ActiveScene {
     len: usize,
     starts: [f32; MAX_SCENE_PARAMETERS],
     ends: [SceneParameterTarget; MAX_SCENE_PARAMETERS],
+    steps: [bool; MAX_SCENE_PARAMETERS],
 }
 /// Applies prepared parameter scenes with sample-clock determinism and automatic completion retirement.
 #[derive(Clone, Debug, Default)]
@@ -927,12 +1011,8 @@ impl ScenePlayer {
         sample_rate: u32,
         resolve: impl Fn(&SceneParameterValue) -> Option<(usize, usize, u32)>,
     ) {
-        let mut ends = [SceneParameterTarget {
-            rack_index: 0,
-            slot_index: 0,
-            parameter_id: 0,
-            value: 0.0,
-        }; MAX_SCENE_PARAMETERS];
+        let mut ends = [EMPTY_SCENE_TARGET; MAX_SCENE_PARAMETERS];
+        let mut steps = [false; MAX_SCENE_PARAMETERS];
         let mut len = 0;
         for parameter in scene.parameter_values.iter().take(MAX_SCENE_PARAMETERS) {
             let Some((rack_index, slot_index, parameter_id)) = resolve(parameter) else {
@@ -945,10 +1025,12 @@ impl ScenePlayer {
                 value: parameter.value.get(),
             };
             ends[len] = end;
+            steps[len] = parameter.transition == SceneParameterTransition::Step;
             len += 1;
         }
-        self.trigger_targets(
+        self.trigger_targets_with_steps(
             &ends[..len],
+            &steps[..len],
             current,
             scene.transition_ms,
             start_sample,
@@ -965,19 +1047,88 @@ impl ScenePlayer {
         start_sample: u64,
         sample_rate: u32,
     ) {
+        self.trigger_targets_with_steps(
+            targets,
+            &[],
+            current,
+            transition_ms,
+            start_sample,
+            sample_rate,
+        );
+    }
+
+    /// Starts a scene with per-target step markers. Missing current values never invent zero.
+    pub fn trigger_targets_with_steps(
+        &mut self,
+        targets: &[SceneParameterTarget],
+        steps: &[bool],
+        current: &[SceneParameterTarget],
+        transition_ms: u32,
+        start_sample: u64,
+        sample_rate: u32,
+    ) {
+        self.trigger_targets_with_lookup(
+            targets,
+            steps,
+            transition_ms,
+            start_sample,
+            sample_rate,
+            |end| {
+                current
+                    .iter()
+                    .find(|value| scene_target_key(**value) == scene_target_key(end))
+                    .map(|value| value.value)
+                    .filter(|value| value.is_finite())
+            },
+        );
+    }
+
+    /// Starts a scene using a sorted current-value cache for bounded callback lookup.
+    pub fn trigger_targets_sorted_with_steps(
+        &mut self,
+        targets: &[SceneParameterTarget],
+        steps: &[bool],
+        current: &[SceneParameterTarget],
+        transition_ms: u32,
+        start_sample: u64,
+        sample_rate: u32,
+    ) {
+        self.trigger_targets_with_lookup(
+            targets,
+            steps,
+            transition_ms,
+            start_sample,
+            sample_rate,
+            |end| {
+                current
+                    .binary_search_by_key(&scene_target_key(end), |target| {
+                        scene_target_key(*target)
+                    })
+                    .ok()
+                    .map(|index| current[index].value)
+                    .filter(|value| value.is_finite())
+            },
+        );
+    }
+
+    fn trigger_targets_with_lookup(
+        &mut self,
+        targets: &[SceneParameterTarget],
+        steps: &[bool],
+        transition_ms: u32,
+        start_sample: u64,
+        sample_rate: u32,
+        lookup: impl Fn(SceneParameterTarget) -> Option<f32>,
+    ) {
         let mut ends = [EMPTY_SCENE_TARGET; MAX_SCENE_PARAMETERS];
         let mut starts = [0.0; MAX_SCENE_PARAMETERS];
+        let mut step_flags = [false; MAX_SCENE_PARAMETERS];
         let len = targets.len().min(MAX_SCENE_PARAMETERS);
         for (index, end) in targets.iter().copied().take(len).enumerate() {
             ends[index] = end;
-            starts[index] = current
-                .iter()
-                .find(|value| {
-                    value.rack_index == end.rack_index
-                        && value.slot_index == end.slot_index
-                        && value.parameter_id == end.parameter_id
-                })
-                .map_or(0.0, |value| value.value);
+            let known = lookup(end);
+            starts[index] = known.unwrap_or(end.value);
+            step_flags[index] = steps.get(index).copied().unwrap_or(false) || known.is_none();
         }
         let transition_samples = u64::from(transition_ms)
             .saturating_mul(u64::from(sample_rate))
@@ -989,6 +1140,7 @@ impl ScenePlayer {
             len,
             starts,
             ends,
+            steps: step_flags,
         });
     }
     /// Renders one block using absolute sample time. No allocation occurs, and completion retires
@@ -1015,12 +1167,15 @@ impl ScenePlayer {
         output.transition_samples = active.transition_samples;
         for index in 0..active.len {
             let end = active.ends[index];
-            output.targets[index] = SceneParameterTarget {
+            if active.steps[index] && elapsed < active.transition_samples {
+                continue;
+            }
+            output.targets[output.len] = SceneParameterTarget {
                 value: active.starts[index] + (end.value - active.starts[index]) * progress,
                 ..end
             };
+            output.len += 1;
         }
-        output.len = active.len;
         if elapsed >= active.transition_samples {
             self.active = None;
         }
@@ -1030,6 +1185,9 @@ impl ScenePlayer {
     pub const fn is_active(&self) -> bool {
         self.active.is_some()
     }
+}
+const fn scene_target_key(target: SceneParameterTarget) -> (usize, usize, u32) {
+    (target.rack_index, target.slot_index, target.parameter_id)
 }
 /// Program-change scene trigger: maps program number → scene index.
 #[must_use]
@@ -1065,10 +1223,145 @@ mod tests {
             .unwrap();
         let mut output: BoundedMidiEvents = BoundedMidiEvents::new();
         queue.drain_into(&mut output);
-        assert!(output.as_slice()[0].is_note_off());
+        assert_eq!(output.as_slice()[0].message(), &[0xb0, 74, 255]);
+        assert!(output.as_slice()[1].is_note_off());
         assert_eq!(
             queue.coalesced_count(),
             (MAX_MIDI_EVENTS_PER_BLOCK - 1) as u64
+        );
+    }
+    #[test]
+    fn channel_mode_resets_survive_regular_overflow() {
+        for controller in [120, 121, 123] {
+            let mut queue = SpscMidiQueue::new();
+            for _ in 0..MAX_MIDI_EVENTS_PER_BLOCK {
+                queue
+                    .try_push(MidiEvent::from_bytes(0, &[0x90, 60, 100]).unwrap())
+                    .unwrap();
+            }
+            let reset = MidiEvent::from_bytes(0, &[0xb0, controller, 0]).unwrap();
+            assert!(reset.is_safety_event());
+            queue.try_push(reset).unwrap();
+            let mut block: BoundedMidiEvents = BoundedMidiEvents::new();
+            queue.drain_into(&mut block);
+            assert_eq!(block.as_slice().last().unwrap().message(), reset.message());
+            assert_eq!(queue.len(), 1);
+        }
+    }
+    #[test]
+    fn port_ids_count_each_name_independently() {
+        let mut occurrences = BTreeMap::new();
+        let ids =
+            ["Keyboard", "Pad", "Keyboard", "Pad"].map(|name| next_port_id(&mut occurrences, name));
+        assert_eq!(ids[0].as_str(), "midir:Keyboard:0");
+        assert_eq!(ids[1].as_str(), "midir:Pad:0");
+        assert_eq!(ids[2].as_str(), "midir:Keyboard:1");
+        assert_eq!(ids[3].as_str(), "midir:Pad:1");
+    }
+    #[test]
+    fn note_retriggers_keep_arrival_order_with_equal_timestamps() {
+        let mut queue = SpscMidiQueue::new();
+        for bytes in [&[0x90, 60, 100][..], &[0x80, 60, 0], &[0x90, 60, 80]] {
+            let mut event = MidiEvent::from_bytes(0, bytes).unwrap();
+            event.timestamp_micros = 42;
+            queue.try_push(event).unwrap();
+        }
+        let mut output: BoundedMidiEvents = BoundedMidiEvents::new();
+        queue.drain_into(&mut output);
+        assert_eq!(
+            output
+                .as_slice()
+                .iter()
+                .map(MidiEvent::message)
+                .collect::<Vec<_>>(),
+            vec![&[0x90, 60, 100][..], &[0x80, 60, 0], &[0x90, 60, 80]]
+        );
+    }
+    #[test]
+    fn full_block_delivers_note_off_before_regular_backlog() {
+        let mut queue = SpscMidiQueue::new();
+        for _ in 0..MAX_MIDI_EVENTS_PER_BLOCK {
+            queue
+                .try_push(MidiEvent::from_bytes(0, &[0x90, 60, 100]).unwrap())
+                .unwrap();
+        }
+        assert!(
+            queue
+                .try_push(MidiEvent::from_bytes(0, &[0x90, 61, 100]).unwrap())
+                .is_err()
+        );
+        queue
+            .try_push(MidiEvent::from_bytes(0, &[0x80, 60, 0]).unwrap())
+            .unwrap();
+        let mut first: BoundedMidiEvents = BoundedMidiEvents::new();
+        queue.drain_into(&mut first);
+        assert_eq!(first.len(), MAX_MIDI_EVENTS_PER_BLOCK);
+        assert!(first.as_slice().last().unwrap().is_note_off());
+        assert_eq!(queue.len(), 1);
+        let mut second: BoundedMidiEvents = BoundedMidiEvents::new();
+        queue.drain_into(&mut second);
+        assert_eq!(second.as_slice()[0].message(), &[0x90, 60, 100]);
+        assert!(queue.is_empty());
+        assert_eq!(queue.rejected_count(), 1);
+    }
+    #[test]
+    fn input_retains_ingress_beyond_one_block_and_merges_equal_timestamps() {
+        let mut input = MidirInput::new();
+        let (mut regular, regular_consumer, mut safety, safety_consumer) = ingress_queues();
+        input.regular = regular_consumer;
+        input.safety = safety_consumer;
+        for sequence in 0..MAX_MIDI_EVENTS_PER_BLOCK {
+            regular
+                .push(
+                    RealtimeMidiPacket::from_message(sequence as u64, 10, &[0x90, 60, 100])
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        safety
+            .push(
+                RealtimeMidiPacket::from_message(
+                    MAX_MIDI_EVENTS_PER_BLOCK as u64,
+                    10,
+                    &[0x80, 60, 0],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut first = BoundedMidiEvents::new();
+        input.drain_into(&mut first).unwrap();
+        assert_eq!(first.len(), MAX_MIDI_EVENTS_PER_BLOCK);
+        assert!(first.as_slice().last().unwrap().is_note_off());
+        let mut second = BoundedMidiEvents::new();
+        input.drain_into(&mut second).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second.as_slice()[0].message(), &[0x90, 60, 100]);
+        assert_eq!(input.rejected_count(), 0);
+    }
+    #[test]
+    fn input_preserves_interleaved_note_order_with_equal_timestamps() {
+        let mut input = MidirInput::new();
+        let (mut regular, regular_consumer, mut safety, safety_consumer) = ingress_queues();
+        input.regular = regular_consumer;
+        input.safety = safety_consumer;
+        regular
+            .push(RealtimeMidiPacket::from_message(0, 10, &[0x90, 60, 100]).unwrap())
+            .unwrap();
+        safety
+            .push(RealtimeMidiPacket::from_message(1, 10, &[0x80, 60, 0]).unwrap())
+            .unwrap();
+        regular
+            .push(RealtimeMidiPacket::from_message(2, 10, &[0x90, 60, 80]).unwrap())
+            .unwrap();
+        let mut output: BoundedMidiEvents = BoundedMidiEvents::new();
+        input.drain_into(&mut output).unwrap();
+        assert_eq!(
+            output
+                .as_slice()
+                .iter()
+                .map(MidiEvent::message)
+                .collect::<Vec<_>>(),
+            vec![&[0x90, 60, 100][..], &[0x80, 60, 0], &[0x90, 60, 80]]
         );
     }
     #[test]
@@ -1127,12 +1420,14 @@ mod tests {
             name: "scene".into(),
             gains: vec![],
             mutes: vec![],
+            rack_bypasses: vec![],
             bypasses: vec![],
             parameter_values: vec![SceneParameterValue {
                 rack_id: sp_model::RackId("rack".into()),
                 slot_id: sp_model::PluginInstanceId("slot".into()),
                 parameter_id: sp_model::ParameterId("parameter".into()),
                 value: sp_model::NormalizedValue::new(1.0).unwrap(),
+                transition: SceneParameterTransition::Ramp,
             }],
             transition_ms: 10,
         };
@@ -1154,5 +1449,75 @@ mod tests {
         player.render_block(110, 1, &mut output);
         assert!((output.targets()[0].value - 1.0).abs() < f32::EPSILON);
         assert!(!player.is_active());
+    }
+
+    #[test]
+    fn step_parameter_waits_for_commit_and_unknown_start_never_ramps_from_zero() {
+        let ramp = SceneParameterTarget {
+            rack_index: 0,
+            slot_index: 0,
+            parameter_id: 1,
+            value: 0.8,
+        };
+        let step = SceneParameterTarget {
+            parameter_id: 2,
+            value: 1.0,
+            ..ramp
+        };
+        let mut player = ScenePlayer::new();
+        player.trigger_targets_sorted_with_steps(
+            &[ramp, step],
+            &[false, true],
+            &[SceneParameterTarget { value: 0.2, ..ramp }],
+            10,
+            0,
+            1_000,
+        );
+        let mut block = SceneRampBlock::new();
+        player.render_block(5, 1, &mut block);
+        assert_eq!(block.targets().len(), 1);
+        assert_eq!(block.targets()[0].parameter_id, 1);
+        assert!((block.targets()[0].value - 0.5).abs() < f32::EPSILON);
+        player.render_block(10, 1, &mut block);
+        assert_eq!(block.targets().len(), 2);
+        assert_eq!(block.targets()[1].value.to_bits(), 1.0_f32.to_bits());
+    }
+
+    #[test]
+    fn model_scene_trigger_honors_step_transition() {
+        let scene = Scene {
+            id: sp_model::SceneId("scene".into()),
+            name: "scene".into(),
+            gains: vec![],
+            mutes: vec![],
+            rack_bypasses: vec![],
+            bypasses: vec![],
+            parameter_values: vec![SceneParameterValue {
+                rack_id: sp_model::RackId("rack".into()),
+                slot_id: sp_model::PluginInstanceId("slot".into()),
+                parameter_id: sp_model::ParameterId("parameter".into()),
+                value: sp_model::NormalizedValue::new(1.0).unwrap(),
+                transition: SceneParameterTransition::Step,
+            }],
+            transition_ms: 10,
+        };
+        let mut player = ScenePlayer::new();
+        player.trigger(
+            &scene,
+            &[SceneParameterTarget {
+                rack_index: 0,
+                slot_index: 0,
+                parameter_id: 1,
+                value: 0.2,
+            }],
+            0,
+            1_000,
+            |_| Some((0, 0, 1)),
+        );
+        let mut block = SceneRampBlock::new();
+        player.render_block(5, 1, &mut block);
+        assert!(block.targets().is_empty());
+        player.render_block(10, 1, &mut block);
+        assert_eq!(block.targets()[0].value.to_bits(), 1.0_f32.to_bits());
     }
 }

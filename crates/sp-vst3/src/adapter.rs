@@ -84,7 +84,8 @@ impl ProcessingFormat {
     }
 }
 
-/// The fixed main-bus arrangement supported by an alpha rack.
+/// The fixed bus arrangement supported by an alpha rack: the main buses plus, optionally, a
+/// stereo sidechain on the first auxiliary audio input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MainBusLayout {
     /// Main audio input channel count: 0 for an instrument, 1 for mono, or 2 for stereo.
@@ -93,10 +94,13 @@ pub struct MainBusLayout {
     pub output_channels: u8,
     /// Whether the single main event input bus is active.
     pub event_input_active: bool,
+    /// Whether the first auxiliary audio input is negotiated to stereo and activated as a
+    /// sidechain. Every other auxiliary bus stays inactive.
+    pub sidechain_input: bool,
 }
 
 impl MainBusLayout {
-    /// Creates and validates a fixed main-bus layout.
+    /// Creates and validates a fixed main-bus layout without a sidechain.
     ///
     /// # Errors
     ///
@@ -122,6 +126,7 @@ impl MainBusLayout {
             input_channels,
             output_channels,
             event_input_active,
+            sidechain_input: false,
         })
     }
 }
@@ -149,7 +154,8 @@ pub enum BusMedia {
 pub enum BusRole {
     /// The one routable main bus.
     Main,
-    /// An auxiliary/sidechain bus that alpha racks reject.
+    /// An auxiliary bus. Only the first auxiliary audio input can be activated, as a stereo
+    /// sidechain; the rest stay inactive.
     Auxiliary,
 }
 
@@ -204,12 +210,20 @@ pub struct Vst3BusTopology {
 }
 
 impl Vst3BusTopology {
-    /// Validates the alpha fixed-main-bus contract after bus negotiation.
+    /// Whether the first auxiliary audio input has two channels, the only sidechain
+    /// arrangement the adapter activates.
+    #[must_use]
+    pub fn has_stereo_sidechain(&self) -> bool {
+        self.audio_inputs
+            .get(1)
+            .is_some_and(|bus| bus.channel_count == 2)
+    }
+
+    /// Validates the alpha fixed-bus contract after bus negotiation.
     ///
-    /// A component may expose no audio input (instrument), but if it exposes one it must be the
-    /// sole main input. Exactly one main audio output is required. At most one main event input
-    /// and output are permitted. Any auxiliary bus is rejected instead of silently disabling a
-    /// sidechain or switching layouts at runtime.
+    /// A component may expose no audio input (instrument). The routable main audio buses must
+    /// be first. A requested sidechain needs a stereo first auxiliary input; other auxiliary
+    /// buses stay inactive. Exactly one main audio output is required.
     ///
     /// # Errors
     ///
@@ -233,6 +247,11 @@ impl Vst3BusTopology {
             expected.event_input_active,
         )?;
         validate_event_buses(&self.event_outputs, BusDirection::Output, false)?;
+        if expected.sidechain_input && !self.has_stereo_sidechain() {
+            return Err(LayoutError::UnsupportedSidechain {
+                channels: self.audio_inputs.get(1).map_or(0, |bus| bus.channel_count),
+            });
+        }
         Ok(())
     }
 }
@@ -243,20 +262,16 @@ fn validate_audio_buses(
     expected_channels: u8,
     input_can_be_absent: bool,
 ) -> Result<(), LayoutError> {
-    if buses.iter().any(|bus| {
-        bus.media != BusMedia::Audio || bus.direction != direction || bus.role != BusRole::Main
-    }) {
-        return Err(LayoutError::SidechainOrAuxiliaryBus { direction });
-    }
+    validate_bus_order(buses, BusMedia::Audio, direction)?;
     if buses.is_empty() && input_can_be_absent && expected_channels == 0 {
         return Ok(());
     }
-    if buses.len() != 1 {
+    if buses.is_empty() {
         return Err(LayoutError::UnexpectedBusCount {
             media: BusMedia::Audio,
             direction,
             expected: 1,
-            actual: buses.len(),
+            actual: 0,
         });
     }
     let actual_channels = buses[0].channel_count;
@@ -275,21 +290,28 @@ fn validate_event_buses(
     direction: BusDirection,
     should_be_active: bool,
 ) -> Result<(), LayoutError> {
-    if buses.iter().any(|bus| {
-        bus.media != BusMedia::Event || bus.direction != direction || bus.role != BusRole::Main
-    }) {
-        return Err(LayoutError::SidechainOrAuxiliaryBus { direction });
-    }
-    if buses.len() > 1 {
-        return Err(LayoutError::UnexpectedBusCount {
-            media: BusMedia::Event,
-            direction,
-            expected: 1,
-            actual: buses.len(),
-        });
-    }
+    validate_bus_order(buses, BusMedia::Event, direction)?;
     if should_be_active && buses.is_empty() {
         return Err(LayoutError::MissingEventInput);
+    }
+    Ok(())
+}
+
+fn validate_bus_order(
+    buses: &[Vst3BusDescriptor],
+    media: BusMedia,
+    direction: BusDirection,
+) -> Result<(), LayoutError> {
+    if buses
+        .iter()
+        .any(|bus| bus.media != media || bus.direction != direction)
+        || buses.first().is_some_and(|bus| bus.role != BusRole::Main)
+        || buses
+            .iter()
+            .skip(1)
+            .any(|bus| bus.role != BusRole::Auxiliary)
+    {
+        return Err(LayoutError::SidechainOrAuxiliaryBus { direction });
     }
     Ok(())
 }
@@ -304,7 +326,7 @@ pub enum LayoutError {
         /// Requested number of channels.
         channels: u8,
     },
-    /// The adapter reported an auxiliary or malformed bus where a single main bus is required.
+    /// The adapter reported an auxiliary or malformed bus where the main bus is required.
     SidechainOrAuxiliaryBus {
         /// Direction of the unsupported bus.
         direction: BusDirection,
@@ -322,6 +344,11 @@ pub enum LayoutError {
     },
     /// A plugin exposes no main event input despite an active event-input request.
     MissingEventInput,
+    /// A requested sidechain has no stereo first auxiliary audio input.
+    UnsupportedSidechain {
+        /// Channels on the first auxiliary audio input, or zero when there is none.
+        channels: u8,
+    },
     /// A negotiated main bus did not retain the requested channel count.
     NegotiatedChannelMismatch {
         /// Main-bus direction with an incompatible result.
@@ -352,7 +379,7 @@ impl fmt::Display for LayoutError {
             ),
             Self::SidechainOrAuxiliaryBus { direction } => write!(
                 formatter,
-                "sidechain, auxiliary, or malformed {direction:?} bus is unsupported"
+                "main {direction:?} bus is missing, misplaced, or malformed"
             ),
             Self::UnexpectedBusCount {
                 media,
@@ -366,6 +393,10 @@ impl fmt::Display for LayoutError {
             Self::MissingEventInput => {
                 formatter.write_str("requested event input is not available")
             }
+            Self::UnsupportedSidechain { channels } => write!(
+                formatter,
+                "sidechain needs a stereo auxiliary input; found {channels} channels"
+            ),
             Self::NegotiatedChannelMismatch {
                 direction,
                 expected,
@@ -858,6 +889,8 @@ pub struct PluginProcessBlock<'a> {
     pub input: PlanarAudioInput<'a>,
     /// Planar output audio for the component.
     pub output: PlanarAudioOutput<'a>,
+    /// Stereo sidechain planes, present exactly when the sidechain input is active.
+    pub sidechain: Option<[&'a [f32]; 2]>,
     /// Fixed-capacity MIDI events for this block.
     pub midi: &'a BoundedMidiEvents<MAX_RACK_MIDI_EVENTS>,
     /// Fixed-capacity parameter changes for this block.
@@ -866,12 +899,15 @@ pub struct PluginProcessBlock<'a> {
     pub output_changes: &'a mut dyn OutputChangeSink,
 }
 
-/// Separate opaque VST3 state streams.
+/// Opaque VST3 state transport.
+///
+/// The high-level backend stores a complete, versioned component-and-controller snapshot in
+/// `component` and leaves `controller` empty. A low-level backend may use separate raw streams.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Vst3StateStreams {
-    /// State written by `IComponent::getState`.
+    /// Raw component state or a complete backend-owned state envelope.
     pub component: Vec<u8>,
-    /// State written by `IEditController::getState`.
+    /// Separate raw controller state, if the backend stores it outside the envelope.
     pub controller: Vec<u8>,
 }
 
@@ -924,14 +960,16 @@ pub trait RackPluginAdapter {
     /// Returns the backend error when bus metadata cannot be read.
     fn discover_buses(&mut self) -> Result<Vst3BusTopology, Self::Error>;
 
-    /// Requests the fixed main-bus layout while the component is inactive.
+    /// Requests the fixed main-bus layout, and a stereo sidechain arrangement when the layout
+    /// asks for one, while the component is inactive.
     ///
     /// # Errors
     ///
     /// Returns the backend error when inactive bus negotiation fails.
     fn negotiate_main_buses(&mut self, layout: MainBusLayout) -> Result<(), Self::Error>;
 
-    /// Activates only the accepted main audio/event buses while inactive.
+    /// Activates only the accepted main audio/event buses, plus the sidechain input when the
+    /// layout asks for one, while inactive.
     ///
     /// # Errors
     ///
@@ -1280,6 +1318,7 @@ where
                     ],
                     self.layout.output_channels,
                 ),
+                sidechain: None,
                 midi,
                 parameter_changes,
                 output_changes,
@@ -1443,53 +1482,44 @@ fn validate_discovery_for_request(
     discovered: &Vst3BusTopology,
     expected: MainBusLayout,
 ) -> Result<(), LayoutError> {
-    for bus in discovered
-        .audio_inputs
-        .iter()
-        .chain(&discovered.audio_outputs)
-        .chain(&discovered.event_inputs)
-        .chain(&discovered.event_outputs)
-    {
-        if bus.role == BusRole::Auxiliary {
-            return Err(LayoutError::SidechainOrAuxiliaryBus {
-                direction: bus.direction,
-            });
-        }
-    }
-    if discovered.audio_inputs.len() > 1 {
+    validate_bus_order(
+        &discovered.audio_inputs,
+        BusMedia::Audio,
+        BusDirection::Input,
+    )?;
+    validate_bus_order(
+        &discovered.audio_outputs,
+        BusMedia::Audio,
+        BusDirection::Output,
+    )?;
+    validate_bus_order(
+        &discovered.event_inputs,
+        BusMedia::Event,
+        BusDirection::Input,
+    )?;
+    validate_bus_order(
+        &discovered.event_outputs,
+        BusMedia::Event,
+        BusDirection::Output,
+    )?;
+    if discovered.audio_inputs.is_empty() && expected.input_channels != 0 {
         return Err(LayoutError::UnexpectedBusCount {
             media: BusMedia::Audio,
             direction: BusDirection::Input,
             expected: 1,
-            actual: discovered.audio_inputs.len(),
+            actual: 0,
         });
     }
-    if discovered.audio_outputs.len() != 1 {
+    if discovered.audio_outputs.is_empty() {
         return Err(LayoutError::UnexpectedBusCount {
             media: BusMedia::Audio,
             direction: BusDirection::Output,
             expected: 1,
-            actual: discovered.audio_outputs.len(),
-        });
-    }
-    if discovered.event_inputs.len() > 1 {
-        return Err(LayoutError::UnexpectedBusCount {
-            media: BusMedia::Event,
-            direction: BusDirection::Input,
-            expected: 1,
-            actual: discovered.event_inputs.len(),
+            actual: 0,
         });
     }
     if expected.event_input_active && discovered.event_inputs.is_empty() {
         return Err(LayoutError::MissingEventInput);
-    }
-    if discovered.event_outputs.len() > 1 {
-        return Err(LayoutError::UnexpectedBusCount {
-            media: BusMedia::Event,
-            direction: BusDirection::Output,
-            expected: 1,
-            actual: discovered.event_outputs.len(),
-        });
     }
     Ok(())
 }
@@ -1806,7 +1836,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_rack_rejects_sidechains_before_activation() {
+    fn fixed_rack_accepts_inactive_auxiliary_buses() {
         let layout = MainBusLayout::new(2, 2, true).expect("valid stereo layout");
         let format = ProcessingFormat::new(48_000.0, 128).expect("valid format");
         let mut adapter = FakeAdapter::stereo();
@@ -1815,20 +1845,89 @@ mod tests {
             BusRole::Auxiliary,
             1,
         ));
+        adapter
+            .topology
+            .audio_outputs
+            .push(Vst3BusDescriptor::audio(
+                BusDirection::Output,
+                BusRole::Auxiliary,
+                2,
+            ));
         let mut rack = FixedSerialRack::<FakeAdapter, 1, 128>::new(layout, format)
             .expect("fixed rack construction");
         rack.insert(adapter, selection()).expect("slot insertion");
 
-        let error = rack.prepare().expect_err("sidechain must be rejected");
+        rack.prepare().expect("auxiliary buses are not routed");
+        let slot = rack.slots[0].as_ref().expect("inserted slot");
+        assert!(slot.adapter.log.contains(&"activate"));
+    }
+
+    #[test]
+    fn fixed_rack_rejects_auxiliary_bus_before_main() {
+        let layout = MainBusLayout::new(2, 2, true).expect("valid stereo layout");
+        let format = ProcessingFormat::new(48_000.0, 128).expect("valid format");
+        let mut adapter = FakeAdapter::stereo();
+        adapter.topology.audio_inputs.insert(
+            0,
+            Vst3BusDescriptor::audio(BusDirection::Input, BusRole::Auxiliary, 1),
+        );
+        let mut rack = FixedSerialRack::<FakeAdapter, 1, 128>::new(layout, format)
+            .expect("fixed rack construction");
+        rack.insert(adapter, selection()).expect("slot insertion");
+
         assert!(matches!(
-            error,
-            RackError::Layout {
+            rack.prepare(),
+            Err(RackError::Layout {
                 source: LayoutError::SidechainOrAuxiliaryBus { .. },
                 ..
-            }
+            })
         ));
-        let slot = rack.slots[0].as_ref().expect("inserted slot");
-        assert!(!slot.adapter.log.contains(&"activate"));
+    }
+
+    #[test]
+    fn sidechain_layout_requires_a_stereo_first_auxiliary_input() {
+        let main = MainBusLayout::new(2, 2, true).expect("valid stereo layout");
+        let sidechain = MainBusLayout {
+            sidechain_input: true,
+            ..main
+        };
+        let mut topology = FakeAdapter::stereo().topology;
+        assert_eq!(
+            topology.validate_fixed(sidechain),
+            Err(LayoutError::UnsupportedSidechain { channels: 0 })
+        );
+        topology.audio_inputs.push(Vst3BusDescriptor::audio(
+            BusDirection::Input,
+            BusRole::Auxiliary,
+            1,
+        ));
+        assert_eq!(
+            topology.validate_fixed(sidechain),
+            Err(LayoutError::UnsupportedSidechain { channels: 1 })
+        );
+        topology.audio_inputs[1].channel_count = 2;
+        topology.audio_inputs.push(Vst3BusDescriptor::audio(
+            BusDirection::Input,
+            BusRole::Auxiliary,
+            6,
+        ));
+        assert!(topology.has_stereo_sidechain());
+        topology
+            .validate_fixed(sidechain)
+            .expect("one stereo sidechain; later auxiliary buses stay inactive");
+        topology
+            .validate_fixed(main)
+            .expect("an unrequested sidechain bus stays inactive");
+    }
+
+    #[test]
+    fn discovery_allows_main_bus_channel_negotiation() {
+        let mut topology = FakeAdapter::stereo().topology;
+        topology.audio_inputs[0].channel_count = 1;
+        topology.audio_outputs[0].channel_count = 1;
+        let requested = MainBusLayout::new(2, 2, true).expect("valid stereo layout");
+        validate_discovery_for_request(&topology, requested)
+            .expect("main channel counts can change during negotiation");
     }
 
     #[test]

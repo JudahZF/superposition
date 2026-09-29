@@ -1,7 +1,8 @@
-//! Foundational design tokens.
+//! Foundational design tokens for the film-strip UI.
 //!
-//! Brand color values are intentionally defined only in this module. Consumers use
-//! semantic token types rather than copying color values into components.
+//! Every chrome colour and fixed dimension is defined only in this module. The chrome is almost
+//! colourless so the plug-in editor pictures supply the colour; warn, fault, and info are the only
+//! chromatic values and always accompany a text state token.
 
 /// An opaque sRGB color.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,147 +70,90 @@ fn linear_srgb(channel: u8) -> f64 {
     }
 }
 
-const CANVAS: Color = Color::rgb(0x0A, 0x0F, 0x16);
-const PANEL: Color = Color::rgb(0x12, 0x18, 0x20);
-const RAISED: Color = Color::rgb(0x1B, 0x23, 0x30);
-const STEEL: Color = Color::rgb(0x2A, 0x32, 0x42);
-const PRIMARY_TEXT: Color = Color::rgb(0xE6, 0xE8, 0xEC);
-const SECONDARY_TEXT: Color = Color::rgb(0x9A, 0xA3, 0xAE);
-const CYAN: Color = Color::rgb(0x00, 0xE5, 0xFF);
-const BLUE: Color = Color::rgb(0x00, 0x7A, 0xFF);
-const LIME: Color = Color::rgb(0xA6, 0xFF, 0x00);
-
-/// A semantic background surface.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Surface {
-    /// The application canvas.
-    Canvas,
-    /// A standard panel.
-    Panel,
-    /// An elevated panel or popover.
-    Raised,
-    /// A strong structural surface such as a secondary control.
-    Steel,
-}
-
-/// A semantic text color.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TextColor {
-    /// Default high-emphasis text.
-    Primary,
-    /// Supporting text with lower emphasis.
-    Secondary,
-    /// Text placed on an accent fill.
-    OnAccent,
-}
-
-/// A semantic accent color.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Accent {
-    /// The active and informational accent.
-    Cyan,
-    /// The focus and selection accent.
-    Blue,
-    /// The positive accent.
-    Lime,
-}
-
-/// A semantic focus treatment.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Focus {
-    /// Keyboard focus and visible selection outline.
-    Ring,
-}
-
-/// A color token resolved by the active theme.
+/// One of the eleven chrome colours.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColorToken {
-    /// A semantic surface.
-    Surface(Surface),
-    /// A semantic text color.
-    Text(TextColor),
-    /// A semantic accent color.
-    Accent(Accent),
-    /// A semantic focus treatment.
-    Focus(Focus),
+    /// Window background.
+    Base,
+    /// Primary text, lit meter segments, and the inverted-selection fill.
+    Text,
+    /// Labels, secondary text, and tick marks.
+    Dim,
+    /// Empty slots, unlit borders, and disabled text. Also secondary text on an inverted fill.
+    Faint,
+    /// Column dividers and the head and foot rules.
+    Hairline,
+    /// An unlit meter segment.
+    SegmentOff,
+    /// Row hover in lists.
+    HoverFill,
+    /// LDG and REC tokens, mute lit, and route warnings.
+    Warn,
+    /// MIS and FLT tokens, the top two meter segments, and the fault line.
+    Fault,
+    /// Bypass lit, the sidechain marker, and mapped CCs.
+    Info,
+    /// Fault line background.
+    FaultTint,
 }
 
 impl ColorToken {
-    /// Resolves this token to its Phase 0 dark-theme color.
+    /// Every chrome colour, in the order of the design brief.
+    pub const ALL: [Self; 11] = [
+        Self::Base,
+        Self::Text,
+        Self::Dim,
+        Self::Faint,
+        Self::Hairline,
+        Self::SegmentOff,
+        Self::HoverFill,
+        Self::Warn,
+        Self::Fault,
+        Self::Info,
+        Self::FaultTint,
+    ];
+
+    /// Resolves this token to its colour.
     #[must_use]
     pub const fn color(self) -> Color {
         match self {
-            Self::Surface(Surface::Canvas) | Self::Text(TextColor::OnAccent) => CANVAS,
-            Self::Surface(Surface::Panel) => PANEL,
-            Self::Surface(Surface::Raised) => RAISED,
-            Self::Surface(Surface::Steel) => STEEL,
-            Self::Text(TextColor::Primary) => PRIMARY_TEXT,
-            Self::Text(TextColor::Secondary) => SECONDARY_TEXT,
-            Self::Accent(Accent::Cyan) | Self::Focus(Focus::Ring) => CYAN,
-            Self::Accent(Accent::Blue) => BLUE,
-            Self::Accent(Accent::Lime) => LIME,
+            Self::Base => Color::rgb(0x12, 0x13, 0x15),
+            Self::Text => Color::rgb(0xD9, 0xDA, 0xD6),
+            Self::Dim => Color::rgb(0x7C, 0x80, 0x88),
+            Self::Faint => Color::rgb(0x3A, 0x3E, 0x45),
+            Self::Hairline => Color::rgb(0x26, 0x29, 0x2E),
+            Self::SegmentOff => Color::rgb(0x24, 0x27, 0x2C),
+            Self::HoverFill => Color::rgb(0x1B, 0x1D, 0x21),
+            Self::Warn => Color::rgb(0xD9, 0xA2, 0x1B),
+            Self::Fault => Color::rgb(0xE5, 0x48, 0x4D),
+            Self::Info => Color::rgb(0x7F, 0xB0, 0xFF),
+            Self::FaultTint => Color::rgb(0x1A, 0x12, 0x14),
         }
     }
 }
 
-/// Fixed layout dimensions, measured in logical pixels.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u16)]
-pub enum Layout {
-    /// System status bar height.
-    SystemBarHeight = 52,
-    /// Scene dock height.
-    SceneDockHeight = 64,
-    /// Rack navigator width.
-    NavigatorWidth = 260,
-    /// Inspector width.
-    InspectorWidth = 320,
-    /// Scene control width.
-    SceneControlWidth = 96,
-    /// Scene control height.
-    SceneControlHeight = 40,
-    /// Gallery scene control width.
-    GallerySceneControlWidth = 92,
-    /// Gallery scene control height.
-    GallerySceneControlHeight = 36,
-    /// Parameter row minimum width.
-    ParameterRowMinWidth = 460,
-    /// Generic parameter editor scroll height.
-    ParameterEditorHeight = 280,
-    /// Engine transport button width.
-    TransportButtonWidth = 132,
-    /// Engine transport button height.
-    TransportButtonHeight = 32,
-    /// Scene performance pad height.
-    ScenePadHeight = 48,
-    /// Level meter track height.
-    MeterHeight = 6,
-}
-
-impl Layout {
-    /// Returns this dimension in logical pixels.
-    #[must_use]
-    pub const fn pixels(self) -> u16 {
-        self as u16
-    }
-}
-
-/// The approved spacing scale, measured in logical pixels.
+/// The spacing scale in logical pixels: a 4 px unit with 2 px half-steps.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum Spacing {
-    /// 4 logical pixels.
-    Xs = 4,
-    /// 8 logical pixels.
-    Sm = 8,
-    /// 12 logical pixels.
-    Md = 12,
-    /// 16 logical pixels.
-    Lg = 16,
-    /// 24 logical pixels.
-    Xl = 24,
-    /// 32 logical pixels.
-    Xxl = 32,
+    /// 2 px: meter segment gaps and hairline offsets.
+    S2 = 2,
+    /// 4 px: the base unit, preview gaps.
+    S4 = 4,
+    /// 6 px: toggle and caption padding.
+    S6 = 6,
+    /// 8 px.
+    S8 = 8,
+    /// 10 px: popover vertical padding, meter column gaps.
+    S10 = 10,
+    /// 12 px: column and popover horizontal padding.
+    S12 = 12,
+    /// 16 px.
+    S16 = 16,
+    /// 20 px: head, foot, and fault-line edge padding.
+    S20 = 20,
+    /// 24 px: gaps between head readouts.
+    S24 = 24,
 }
 
 impl Spacing {
@@ -220,58 +164,114 @@ impl Spacing {
     }
 }
 
-/// The approved corner-radius scale, measured in logical pixels.
+/// Fixed layout dimensions in logical pixels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum Radius {
-    /// 4 logical pixels.
-    Small = 4,
-    /// 6 logical pixels.
-    Medium = 6,
-    /// 8 logical pixels.
-    Large = 8,
-    /// 12 logical pixels, for pill-shaped chips.
-    Pill = 12,
+pub enum Layout {
+    /// Divider and border width.
+    Hairline,
+    /// The text line grid.
+    Line,
+    /// Head height.
+    Head,
+    /// Fault line height, shown only while a fault is showing.
+    FaultLine,
+    /// Foot height.
+    Foot,
+    /// Rack column width: eight across 1920 px, six on the 1512 px laptop preset.
+    ColumnWidth,
+    /// The "+ add rack" column.
+    AddRackWidth,
+    /// Preview tile height at 1920×1080.
+    PreviewMaxHeight,
+    /// Preview tile height on the 1512×982 laptop preset.
+    PreviewMinHeight,
+    /// Preview caption bar height.
+    Caption,
+    /// Editor capture width.
+    CaptureWidth,
+    /// Editor capture height.
+    CaptureHeight,
+    /// The live-editor dot.
+    LiveDot,
+    /// Gain track thickness.
+    GainTrack,
+    /// Gain marker width.
+    GainMarkerWidth,
+    /// Gain marker height.
+    GainMarkerHeight,
+    /// The 0 dB tick height.
+    GainTick,
+    /// LED meter height.
+    MeterHeight,
+    /// One LED meter column's width.
+    MeterWidth,
+    /// One LED segment's height: sixteen segments and 2 px gaps fill the meter height.
+    MeterSegment,
+    /// Menu minimum width.
+    MenuMinWidth,
+    /// Route and sidechain popover width.
+    PopoverWidth,
+    /// Longest device or session name shown in the head.
+    SessionNameWidth,
+    /// Plug-in picker width.
+    PickerWidth,
+    /// Plug-in picker and scene modal maximum height.
+    ModalMaxHeight,
+    /// Scene capture and edit modal width.
+    SceneModalWidth,
+    /// Confirmation modal width.
+    ConfirmWidth,
+    /// One route or sidechain jack's width.
+    JackWidth,
+    /// One route or sidechain jack's height.
+    JackHeight,
+    /// Setup page tab rail width.
+    SetupRailWidth,
+    /// Setup page content width limit.
+    SetupPageWidth,
+    /// One callback-load bar's width.
+    LoadBarWidth,
+    /// Tallest callback-load bar.
+    LoadBarHeight,
+    /// Text field width for names.
+    NameFieldWidth,
+    /// Text field width for filters.
+    FilterFieldWidth,
 }
 
-impl Radius {
-    /// Returns this radius token's logical-pixel value.
+impl Layout {
+    /// Returns this dimension in logical pixels.
     #[must_use]
-    pub const fn pixels(self) -> u8 {
-        self as u8
+    pub const fn pixels(self) -> u16 {
+        match self {
+            Self::Hairline => 1,
+            Self::GainTrack | Self::GainMarkerWidth => 2,
+            Self::LoadBarWidth | Self::MeterSegment => 3,
+            Self::LiveDot | Self::GainTick => 6,
+            Self::GainMarkerHeight | Self::MeterWidth => 12,
+            Self::Caption | Self::LoadBarHeight => 14,
+            Self::Line => 16,
+            Self::JackHeight => 20,
+            Self::JackWidth => 30,
+            Self::FaultLine => 32,
+            Self::Foot => 40,
+            Self::Head => 56,
+            Self::PreviewMinHeight => 60,
+            Self::MeterHeight => 80,
+            Self::PreviewMaxHeight => 84,
+            Self::AddRackWidth => 120,
+            Self::MenuMinWidth => 190,
+            Self::ColumnWidth => 240,
+            Self::CaptureHeight | Self::SetupRailWidth | Self::FilterFieldWidth => 200,
+            Self::NameFieldWidth => 260,
+            Self::PopoverWidth => 336,
+            Self::SessionNameWidth => 180,
+            Self::CaptureWidth => 320,
+            Self::ConfirmWidth => 460,
+            Self::PickerWidth => 560,
+            Self::SceneModalWidth => 640,
+            Self::ModalMaxHeight => 760,
+            Self::SetupPageWidth => 900,
+        }
     }
-}
-
-/// The approved border-width scale, measured in logical pixels.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum BorderWidth {
-    /// 1 logical pixel.
-    Thin = 1,
-    /// 2 logical pixels.
-    Thick = 2,
-}
-
-impl BorderWidth {
-    /// Returns this border token's logical-pixel value.
-    #[must_use]
-    pub const fn pixels(self) -> u8 {
-        self as u8
-    }
-}
-
-/// The semantic meaning of status content.
-///
-/// Status color is always supplemental; components must pair it with explicit text
-/// and, where appropriate, an icon or other non-color indicator.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Status {
-    /// Informational state.
-    Info,
-    /// Successful or positive state.
-    Success,
-    /// State requiring attention.
-    Warning,
-    /// Failed or blocking state.
-    Error,
 }

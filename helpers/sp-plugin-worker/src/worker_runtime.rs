@@ -19,6 +19,18 @@ use sp_shared_memory::{
 
 /// Sentinel used when no plug-in call is currently executing.
 pub const NO_CURRENT_SLOT: u32 = u32::MAX;
+/// Consecutive good blocks a plug-in inserted into a running chain must produce before its
+/// output is heard. A good block processed without error and produced only finite samples.
+pub const WARMUP_BLOCKS: u8 = 3;
+/// Fade length when a slot's output starts or stops being heard: after warmup, and on bypass.
+pub const SLOT_FADE_FRAMES: usize = 16;
+/// Largest plug-in latency a bypassed or warming slot can match exactly. Beyond this, the slot
+/// passes silence instead of misaligned audio.
+pub const MAX_BYPASS_DELAY_FRAMES: usize = 65_536;
+// Each slot writes a whole block before reading delayed frames, so the ring holds one extra.
+const BYPASS_DELAY_CAPACITY_FRAMES: usize = MAX_BYPASS_DELAY_FRAMES + MAX_FRAMES;
+/// Fed to an active sidechain input when the request carries no audio for its slot.
+static SILENT_SIDECHAIN: [[f32; MAX_FRAMES]; MAX_CHANNELS] = [[0.0; MAX_FRAMES]; MAX_CHANNELS];
 
 /// Preallocated planar audio used between serial plug-in calls.
 #[derive(Clone)]
@@ -65,11 +77,87 @@ impl PlanarBlock {
                 .copy_from_slice(&self.channels[channel][..frame_count]);
         }
     }
+
+    fn is_finite(&self, channels: usize, frame_count: usize) -> bool {
+        self.channels[..channels].iter().all(|channel| {
+            channel[..frame_count]
+                .iter()
+                .all(|sample| sample.is_finite())
+        })
+    }
+}
+
+/// Planar history of the audio entering one slot position. A bypassed or warming plug-in's
+/// output is replaced by this input, delayed by the plug-in's latency, so the chain keeps the
+/// same timing whether the plug-in is heard or not.
+struct BypassDelay {
+    channels: [Box<[f32]>; MAX_CHANNELS],
+    write: usize,
+}
+
+impl BypassDelay {
+    fn new() -> Self {
+        Self {
+            channels: array::from_fn(|_| {
+                vec![0.0; BYPASS_DELAY_CAPACITY_FRAMES].into_boxed_slice()
+            }),
+            write: 0,
+        }
+    }
+
+    fn write(&mut self, input: &PlanarBlock, frame_count: usize) {
+        for (history, input) in self.channels.iter_mut().zip(input.channels()) {
+            for (frame, sample) in input[..frame_count].iter().enumerate() {
+                history[(self.write + frame) % BYPASS_DELAY_CAPACITY_FRAMES] = *sample;
+            }
+        }
+        self.write = (self.write + frame_count) % BYPASS_DELAY_CAPACITY_FRAMES;
+    }
+
+    /// Reads the block just written, `latency` frames late.
+    fn read(&self, output: &mut PlanarBlock, latency: usize, frame_count: usize) {
+        for (history, output) in self.channels.iter().zip(output.channels_mut()) {
+            if latency > MAX_BYPASS_DELAY_FRAMES {
+                output[..frame_count].fill(0.0);
+                continue;
+            }
+            let start = self.write + BYPASS_DELAY_CAPACITY_FRAMES - frame_count - latency;
+            for (frame, sample) in output[..frame_count].iter_mut().enumerate() {
+                *sample = history[(start + frame) % BYPASS_DELAY_CAPACITY_FRAMES];
+            }
+        }
+    }
 }
 
 impl Default for PlanarBlock {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Blends `input` into the plug-in `output` in place, `position` frames into a
+/// [`SLOT_FADE_FRAMES`] fade toward the output (`to_output`) or toward the input.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "fade positions are bounded far below f32 precision limits"
+)]
+fn crossfade(
+    output: &mut PlanarBlock,
+    input: &PlanarBlock,
+    channels: usize,
+    frame_count: usize,
+    position: usize,
+    to_output: bool,
+) {
+    for (output, input) in output.channels_mut()[..channels]
+        .iter_mut()
+        .zip(&input.channels()[..channels])
+    {
+        for frame in 0..frame_count {
+            let amount = ((position + frame) as f32 / SLOT_FADE_FRAMES as f32).min(1.0);
+            let weight = if to_output { amount } else { 1.0 - amount };
+            output[frame] = input[frame] + (output[frame] - input[frame]) * weight;
+        }
     }
 }
 
@@ -126,10 +214,14 @@ impl PluginTopology {
 pub struct PluginSlotConfiguration {
     /// Main-bus topology negotiated while the slot was inactive.
     pub topology: PluginTopology,
-    /// Whether this plug-in is omitted from processing while retaining its instance/state.
+    /// Whether this plug-in's output is ignored. It still processes its input, and the chain
+    /// receives that input delayed by the plug-in's latency.
     pub bypassed: bool,
     /// Whether the plug-in is activated for processing.
     pub active: bool,
+    /// Whether the plug-in's stereo sidechain input is active. It reads this slot's aux region
+    /// when the request marks it, and silence otherwise.
+    pub sidechain: bool,
 }
 
 impl PluginSlotConfiguration {
@@ -141,6 +233,7 @@ impl PluginSlotConfiguration {
             topology,
             bypassed: false,
             active: true,
+            sidechain: false,
         }
     }
 }
@@ -156,56 +249,29 @@ pub struct PluginProcessRequest<'a> {
     pub input_channels: usize,
     /// Negotiated main-output channel count for the current slot.
     pub output_channels: usize,
+    /// Planar stereo sidechain, present exactly when the slot's sidechain input is active.
+    pub sidechain: Option<&'a [[f32; MAX_FRAMES]; MAX_CHANNELS]>,
     /// Fixed-capacity MIDI events for this block.
     pub midi_events: &'a [MidiEvent],
     /// Fixed-capacity automation events for this block.
     pub automation_events: &'a [BlockEvent],
 }
 
-/// Component and controller state kept distinct on the control plane.
+/// Opaque plug-in state carried on the control plane.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PluginState {
-    /// Opaque component state returned by the VST3 adapter.
+    /// Component state or a complete component-and-controller envelope.
     pub component: Vec<u8>,
-    /// Opaque controller-specific state returned by the VST3 adapter.
+    /// Separate controller state when the backend provides raw streams.
     pub controller: Vec<u8>,
-}
-
-/// A native-editor operation that must be fulfilled by the worker `AppKit` main-thread boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EditorCommand {
-    /// Create and show the worker-owned top-level editor window.
-    Open {
-        /// Opaque worker-owned native parent view pointer.
-        parent_view: usize,
-    },
-    /// Apply the requested content size to the worker-owned editor window.
-    Resize {
-        /// Requested window content width in logical points.
-        width: u32,
-        /// Requested window content height in logical points.
-        height: u32,
-    },
-    /// Make the existing worker-owned editor window key.
-    Focus,
-    /// Close and release the worker-owned editor window.
-    Close,
-}
-
-/// Worker-local native editor content size.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EditorSize {
-    /// Content width in logical points.
-    pub width: u32,
-    /// Content height in logical points.
-    pub height: u32,
 }
 
 /// Safe, helper-local abstraction supplied by the VST3 adapter.
 ///
-/// All methods execute either on the dedicated processing thread (`process`) or on a worker
-/// control/AppKit boundary. No VST3 SDK type escapes this trait. State restoration is expressly a
-/// control-plane operation: callers must first deactivate the slot and never use it for scenes.
+/// All methods execute on the dedicated processing thread or a quiescent control handoff. Native
+/// editor operations use a separate main-thread handle. No VST3 SDK type escapes this trait. State
+/// restoration is a control-plane operation: callers must first deactivate the slot and never use
+/// it for scenes.
 pub trait PluginFacade {
     /// Processes a bounded audio block using preallocated planar buffers and event slices.
     fn process(
@@ -253,14 +319,6 @@ pub trait PluginFacade {
 
     /// Drains the adapter's bounded restart flags since the previous observation.
     fn take_restart_flags(&mut self) -> u32;
-
-    /// Performs an AppKit-main-thread editor lifecycle operation.
-    fn editor(&mut self, command: EditorCommand) -> Result<Option<EditorSize>, PluginRuntimeError>;
-
-    /// Drains one plug-in-initiated editor resize request.
-    fn take_editor_resize_request(&mut self) -> Result<Option<EditorSize>, PluginRuntimeError> {
-        Ok(None)
-    }
 }
 
 /// Failure reported by a helper-local plug-in facade or serial-chain validation.
@@ -304,36 +362,62 @@ impl std::error::Error for PluginRuntimeError {}
 struct PluginSlot<P> {
     plugin: P,
     configuration: PluginSlotConfiguration,
+    /// Consecutive good blocks, counted up to [`WARMUP_BLOCKS`]. Below that the plug-in runs
+    /// beside the chain and its output is ignored.
+    good_blocks: u8,
+    /// Whether the chain last switched to this plug-in's output. Each switch fades over
+    /// [`SLOT_FADE_FRAMES`]; `fade_position` counts frames since it.
+    audible: bool,
+    fade_position: usize,
+}
+
+impl<P> PluginSlot<P> {
+    const fn heard(&self) -> bool {
+        !self.configuration.bypassed && self.good_blocks >= WARMUP_BLOCKS
+    }
 }
 
 /// Fixed-capacity, serial plug-in chain owned exclusively by a worker processing thread.
 ///
-/// This type has exactly two fixed planar ping-pong buffers. It performs no allocation, locking,
-/// filesystem access, control IPC, or `AppKit` work while processing a shared-memory block.
+/// This type has three fixed planar buffers and one preallocated bypass delay per slot. It
+/// performs no allocation, locking, filesystem access, control IPC, or `AppKit` work while
+/// processing a shared-memory block.
 pub struct RackProcessor<P> {
     slots: [Option<PluginSlot<P>>; MAX_PLUGINS_PER_RACK],
+    delays: Box<[BypassDelay; MAX_PLUGINS_PER_RACK]>,
     ping_a: PlanarBlock,
     ping_b: PlanarBlock,
+    passthrough: PlanarBlock,
     rack_bypassed: bool,
     current_slot: Arc<AtomicU32>,
 }
 
 impl<P> RackProcessor<P> {
+    /// Iterates occupied slots for control-thread service registration.
+    pub fn plugins(&self) -> impl Iterator<Item = (usize, &P)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.as_ref().map(|slot| (index, &slot.plugin)))
+    }
+
     /// Creates an empty serial rack with preallocated ping-pong buffers.
     #[must_use]
     pub fn new() -> Self {
         Self {
             slots: array::from_fn(|_| None),
+            delays: Box::new(array::from_fn(|_| BypassDelay::new())),
             ping_a: PlanarBlock::new(),
             ping_b: PlanarBlock::new(),
+            passthrough: PlanarBlock::new(),
             rack_bypassed: false,
             current_slot: Arc::new(AtomicU32::new(NO_CURRENT_SLOT)),
         }
     }
 
-    /// Replaces one slot with an already loaded helper-owned plug-in.
+    /// Replaces one slot with an already loaded helper-owned plug-in, heard from the next block.
     ///
-    /// Loading/preloading itself occurs on the control thread before the instance crosses into this
+    /// Loading itself occurs on another thread before the instance crosses into this
     /// processing-thread-owned rack.
     ///
     /// # Errors
@@ -355,8 +439,30 @@ impl<P> RackProcessor<P> {
             .replace(PluginSlot {
                 plugin,
                 configuration,
+                good_blocks: WARMUP_BLOCKS,
+                audible: !configuration.bypassed,
+                fade_position: SLOT_FADE_FRAMES,
             })
             .map(|slot| slot.plugin))
+    }
+
+    /// Keeps an occupied slot unheard until it produces [`WARMUP_BLOCKS`] consecutive good
+    /// blocks. Until then it processes its input beside the chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an out-of-range or unoccupied slot.
+    pub fn start_warmup(&mut self, slot_index: usize) -> Result<(), PluginRuntimeError> {
+        let slot = self
+            .slots
+            .get_mut(slot_index)
+            .ok_or(PluginRuntimeError::InvalidSlot)?
+            .as_mut()
+            .ok_or(PluginRuntimeError::EmptySlot)?;
+        slot.good_blocks = 0;
+        slot.audible = false;
+        slot.fade_position = SLOT_FADE_FRAMES;
+        Ok(())
     }
 
     /// Removes an occupied slot and returns its helper-owned instance.
@@ -372,19 +478,34 @@ impl<P> RackProcessor<P> {
         Ok(slot.take().map(|slot| slot.plugin))
     }
 
-    /// Reorders two occupied slot positions without reallocating the fixed rack.
+    /// Moves plug-ins so that slot `i` holds the plug-in previously at `from[i]`. Plug-ins keep
+    /// their state and warmup progress; bypass delay history stays with the slot position.
     ///
     /// # Errors
     ///
-    /// Returns an error for an out-of-range or unoccupied source/destination slot.
-    pub fn reorder(&mut self, source: usize, destination: usize) -> Result<(), PluginRuntimeError> {
-        if source >= MAX_PLUGINS_PER_RACK || destination >= MAX_PLUGINS_PER_RACK {
-            return Err(PluginRuntimeError::InvalidSlot);
+    /// Returns an error unless `from` is a permutation of the slot positions.
+    pub fn reorder(
+        &mut self,
+        from: &[usize; MAX_PLUGINS_PER_RACK],
+    ) -> Result<(), PluginRuntimeError> {
+        let mut seen = [false; MAX_PLUGINS_PER_RACK];
+        for &source in from {
+            if source >= MAX_PLUGINS_PER_RACK || mem::replace(&mut seen[source], true) {
+                return Err(PluginRuntimeError::InvalidSlot);
+            }
         }
-        if self.slots[source].is_none() || self.slots[destination].is_none() {
-            return Err(PluginRuntimeError::EmptySlot);
+        let mut done = [false; MAX_PLUGINS_PER_RACK];
+        for start in 0..MAX_PLUGINS_PER_RACK {
+            let mut index = start;
+            while !mem::replace(&mut done[index], true) {
+                let next = from[index];
+                if next == start {
+                    break;
+                }
+                self.slots.swap(index, next);
+                index = next;
+            }
         }
-        self.slots.swap(source, destination);
         Ok(())
     }
 
@@ -521,7 +642,8 @@ impl<P: PluginFacade> RackProcessor<P> {
         slot.plugin.restore_state(state)
     }
 
-    /// Returns the summed latency of active, non-bypassed slots.
+    /// Returns the summed latency of active slots. Bypassed and warming slots count, because
+    /// their delayed pass-through keeps each plug-in's latency.
     #[must_use]
     pub fn latency_samples(&self) -> u32 {
         if self.rack_bypassed {
@@ -530,52 +652,33 @@ impl<P: PluginFacade> RackProcessor<P> {
         self.slots
             .iter()
             .flatten()
-            .filter(|slot| slot.configuration.active && !slot.configuration.bypassed)
+            .filter(|slot| slot.configuration.active)
             .fold(0_u32, |total, slot| {
                 total.saturating_add(slot.plugin.latency_samples())
             })
     }
 
-    /// Drains and combines restart notifications from all occupied slots.
-    pub fn take_restart_flags(&mut self) -> u32 {
-        self.slots.iter_mut().flatten().fold(0_u32, |flags, slot| {
-            flags | slot.plugin.take_restart_flags()
+    /// Drain restart notifications with their plug-in slot identity intact.
+    pub fn take_slot_restart_flags(&mut self) -> [u32; MAX_PLUGINS_PER_RACK] {
+        std::array::from_fn(|index| {
+            self.slots[index]
+                .as_mut()
+                .map_or(0, |slot| slot.plugin.take_restart_flags())
         })
-    }
-
-    /// Delivers a worker-AppKit-bound editor command to an occupied slot.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an out-of-range or unoccupied slot, or when the facade rejects the
-    /// requested editor lifecycle operation.
-    pub fn editor(
-        &mut self,
-        slot_index: usize,
-        command: EditorCommand,
-    ) -> Result<Option<EditorSize>, PluginRuntimeError> {
-        self.slot_mut(slot_index)?.plugin.editor(command)
-    }
-
-    /// Drains a resize request from one occupied plug-in editor.
-    pub fn take_editor_resize_request(
-        &mut self,
-        slot_index: usize,
-    ) -> Result<Option<EditorSize>, PluginRuntimeError> {
-        self.slot_mut(slot_index)?
-            .plugin
-            .take_editor_resize_request()
     }
 
     /// Processes one shared-memory request through the active serial chain.
     ///
     /// The processing thread calls this only after it owns the slot. The local ping-pong buffers
     /// avoid per-plug-in allocation and ensure every stage receives the previous stage's output.
+    /// Every active plug-in processes its input. A bypassed or warming plug-in's output is
+    /// discarded, and the next stage receives this stage's input delayed by its latency.
     ///
     /// # Errors
     ///
     /// Returns an error when request metadata or active chain topology is invalid, or when a
-    /// helper-owned plug-in rejects a bounded processing call.
+    /// heard plug-in rejects a bounded processing call. An unheard plug-in's failure only
+    /// restarts its warmup.
     pub fn process_block(&mut self, slot: &mut BlockSlot) -> Result<(), PluginRuntimeError> {
         let request = block_request(slot)?;
         let frame_count =
@@ -618,47 +721,16 @@ impl<P: PluginFacade> RackProcessor<P> {
             return Ok(());
         }
         for slot_index in 0..MAX_PLUGINS_PER_RACK {
-            let Some(plugin_slot) = self.slots[slot_index].as_mut() else {
-                continue;
-            };
-            if self.rack_bypassed
-                || plugin_slot.configuration.bypassed
-                || !plugin_slot.configuration.active
-            {
-                continue;
-            }
-
-            let topology = plugin_slot.configuration.topology;
-            let input_channels = usize::try_from(topology.input_channels)
-                .map_err(|_| PluginRuntimeError::InvalidTopology)?;
-            let output_channels = usize::try_from(topology.output_channels)
-                .map_err(|_| PluginRuntimeError::InvalidTopology)?;
-            adapt_channels(
-                &mut self.ping_a,
+            let sidechain = (request.sidechain_slots & (1 << slot_index) != 0)
+                .then_some(&slot.sidechain_audio[slot_index]);
+            carried_channels = self.process_slot(
+                slot_index,
                 carried_channels,
-                input_channels,
                 frame_count,
+                sidechain,
+                &slot.midi_events[..midi_count],
+                &slot.events[..automation_count],
             )?;
-            self.ping_b.clear(frame_count);
-            let current_slot =
-                u32::try_from(slot_index).map_err(|_| PluginRuntimeError::InvalidSlot)?;
-            self.current_slot.store(current_slot, Ordering::Release);
-            let result = plugin_slot.plugin.process(
-                &self.ping_a,
-                &mut self.ping_b,
-                PluginProcessRequest {
-                    slot_index,
-                    frame_count,
-                    input_channels,
-                    output_channels,
-                    midi_events: &slot.midi_events[..midi_count],
-                    automation_events: &slot.events[..automation_count],
-                },
-            );
-            self.current_slot.store(NO_CURRENT_SLOT, Ordering::Release);
-            result?;
-            mem::swap(&mut self.ping_a, &mut self.ping_b);
-            carried_channels = output_channels;
         }
         adapt_channels(
             &mut self.ping_a,
@@ -669,6 +741,112 @@ impl<P: PluginFacade> RackProcessor<P> {
         self.ping_a
             .copy_to_slot(slot, requested_outputs, frame_count);
         Ok(())
+    }
+
+    /// Runs one slot on `ping_a` and returns the channel count it carries on. An unheard slot
+    /// leaves its delayed input in `ping_a`; a slot changing between the two fades. `sidechain`
+    /// is this slot's aux region when the request marks it.
+    fn process_slot(
+        &mut self,
+        slot_index: usize,
+        carried_channels: usize,
+        frame_count: usize,
+        sidechain: Option<&[[f32; MAX_FRAMES]; MAX_CHANNELS]>,
+        midi_events: &[MidiEvent],
+        automation_events: &[BlockEvent],
+    ) -> Result<usize, PluginRuntimeError> {
+        let Some(plugin_slot) = self.slots[slot_index].as_mut() else {
+            return Ok(carried_channels);
+        };
+        if !plugin_slot.configuration.active {
+            return Ok(carried_channels);
+        }
+        // Record every slot's input so bypass can engage at any block with full history.
+        let delay = &mut self.delays[slot_index];
+        delay.write(&self.ping_a, frame_count);
+        let heard = plugin_slot.heard();
+        delay.read(
+            &mut self.passthrough,
+            plugin_slot.plugin.latency_samples() as usize,
+            frame_count,
+        );
+
+        let topology = plugin_slot.configuration.topology;
+        let input_channels = usize::try_from(topology.input_channels)
+            .map_err(|_| PluginRuntimeError::InvalidTopology)?;
+        let output_channels = usize::try_from(topology.output_channels)
+            .map_err(|_| PluginRuntimeError::InvalidTopology)?;
+        adapt_channels(
+            &mut self.ping_a,
+            carried_channels,
+            input_channels,
+            frame_count,
+        )?;
+        self.ping_b.clear(frame_count);
+        let current_slot =
+            u32::try_from(slot_index).map_err(|_| PluginRuntimeError::InvalidSlot)?;
+        self.current_slot.store(current_slot, Ordering::Release);
+        let result = plugin_slot.plugin.process(
+            &self.ping_a,
+            &mut self.ping_b,
+            PluginProcessRequest {
+                slot_index,
+                frame_count,
+                input_channels,
+                output_channels,
+                sidechain: plugin_slot
+                    .configuration
+                    .sidechain
+                    .then(|| sidechain.unwrap_or(&SILENT_SIDECHAIN)),
+                midi_events,
+                automation_events,
+            },
+        );
+        self.current_slot.store(NO_CURRENT_SLOT, Ordering::Release);
+        let usable = if heard {
+            result?;
+            true
+        } else {
+            let good = result.is_ok() && self.ping_b.is_finite(output_channels, frame_count);
+            plugin_slot.good_blocks = if good {
+                plugin_slot.good_blocks.saturating_add(1).min(WARMUP_BLOCKS)
+            } else {
+                0
+            };
+            good
+        };
+        if heard != plugin_slot.audible {
+            plugin_slot.audible = heard;
+            // A failed block has no output to fade from.
+            plugin_slot.fade_position = if usable { 0 } else { SLOT_FADE_FRAMES };
+        }
+        if plugin_slot.fade_position < SLOT_FADE_FRAMES {
+            adapt_channels(
+                &mut self.passthrough,
+                carried_channels,
+                output_channels,
+                frame_count,
+            )?;
+            crossfade(
+                &mut self.ping_b,
+                &self.passthrough,
+                output_channels,
+                frame_count,
+                plugin_slot.fade_position,
+                heard,
+            );
+            plugin_slot.fade_position =
+                (plugin_slot.fade_position + frame_count).min(SLOT_FADE_FRAMES);
+            mem::swap(&mut self.ping_a, &mut self.ping_b);
+            return Ok(output_channels);
+        }
+        if heard {
+            mem::swap(&mut self.ping_a, &mut self.ping_b);
+            Ok(output_channels)
+        } else {
+            mem::swap(&mut self.ping_a, &mut self.passthrough);
+            Ok(carried_channels)
+        }
     }
 
     fn slot_mut(&mut self, slot_index: usize) -> Result<&mut PluginSlot<P>, PluginRuntimeError> {
@@ -694,6 +872,7 @@ fn block_request(slot: &BlockSlot) -> Result<BlockRequest, PluginRuntimeError> {
         midi_event_count: slot.metadata.midi_event_count,
         event_count: slot.metadata.event_count,
         flags: slot.metadata.flags,
+        sidechain_slots: slot.metadata.sidechain_slots,
     };
     request
         .is_valid()
@@ -712,6 +891,9 @@ mod tests {
         active: bool,
         restart_flags: u32,
         state: PluginState,
+        processed_blocks: u32,
+        /// First left sidechain sample of the latest block, when a sidechain was supplied.
+        sidechain: Option<f32>,
     }
 
     impl Default for FakePlugin {
@@ -722,6 +904,8 @@ mod tests {
                 active: false,
                 restart_flags: 0,
                 state: PluginState::default(),
+                processed_blocks: 0,
+                sidechain: None,
             }
         }
     }
@@ -733,6 +917,8 @@ mod tests {
             output: &mut PlanarBlock,
             request: PluginProcessRequest<'_>,
         ) -> Result<(), PluginRuntimeError> {
+            self.processed_blocks += 1;
+            self.sidechain = request.sidechain.map(|planes| planes[0][0]);
             for channel in 0..request.output_channels {
                 let source = if request.input_channels == 0 {
                     0
@@ -779,13 +965,6 @@ mod tests {
         fn take_restart_flags(&mut self) -> u32 {
             mem::take(&mut self.restart_flags)
         }
-
-        fn editor(
-            &mut self,
-            _command: EditorCommand,
-        ) -> Result<Option<EditorSize>, PluginRuntimeError> {
-            Ok(None)
-        }
     }
 
     fn requested_slot() -> BlockSlot {
@@ -804,6 +983,7 @@ mod tests {
                 midi_event_count: 0,
                 event_count: 0,
                 flags: 0,
+                sidechain_slots: 0,
             },
         )
         .expect("valid fixed request");
@@ -827,6 +1007,7 @@ mod tests {
                 midi_event_count: 0,
                 event_count: 1,
                 flags: 0,
+                sidechain_slots: 0,
             },
         )
         .expect("valid event request");
@@ -872,6 +1053,57 @@ mod tests {
     }
 
     #[test]
+    fn sidechained_slot_reads_its_region_only_when_the_request_marks_it() {
+        let mut processor = RackProcessor::new();
+        let configuration = PluginSlotConfiguration::active(PluginTopology {
+            input_channels: 2,
+            output_channels: 2,
+        });
+        processor
+            .replace_slot(0, FakePlugin::default(), configuration)
+            .expect("plain slot");
+        processor
+            .replace_slot(
+                1,
+                FakePlugin::default(),
+                PluginSlotConfiguration {
+                    sidechain: true,
+                    ..configuration
+                },
+            )
+            .expect("sidechained slot");
+        let received = |processor: &RackProcessor<FakePlugin>| {
+            processor
+                .plugins()
+                .map(|(_, plugin)| plugin.sidechain)
+                .collect::<Vec<_>>()
+        };
+        for (sidechain_slots, expected) in [(0b10, Some(0.75)), (0, Some(0.0))] {
+            let mut slot = BlockSlot::new();
+            slot.sidechain_audio[0][0][0] = 0.5;
+            slot.sidechain_audio[1][0][0] = 0.75;
+            slot.publish_request(
+                BlockTicket {
+                    generation: 1,
+                    sequence: 1,
+                },
+                BlockRequest {
+                    frame_count: 1,
+                    input_channel_count: 2,
+                    output_channel_count: 2,
+                    midi_event_count: 0,
+                    event_count: 0,
+                    flags: 0,
+                    sidechain_slots,
+                },
+            )
+            .expect("valid sidechain request");
+            processor.process_block(&mut slot).expect("processing");
+            assert_eq!(received(&processor), [None, expected]);
+        }
+    }
+
+    #[test]
     fn state_restore_requires_an_inactive_slot() {
         let mut processor = RackProcessor::new();
         processor
@@ -889,6 +1121,40 @@ mod tests {
         processor
             .restore_state(0, &PluginState::default())
             .expect("inactive restore");
+    }
+
+    #[test]
+    fn restart_flags_keep_slot_identity_and_drain_once() {
+        let mut processor = RackProcessor::new();
+        let configuration = PluginSlotConfiguration::active(PluginTopology {
+            input_channels: 2,
+            output_channels: 2,
+        });
+        for (slot, flags) in [(0, 1), (3, 8)] {
+            processor
+                .replace_slot(
+                    slot,
+                    FakePlugin {
+                        restart_flags: flags,
+                        ..FakePlugin::default()
+                    },
+                    configuration,
+                )
+                .expect("fixed slot");
+        }
+        let flags = processor.take_slot_restart_flags();
+        assert_eq!(flags[0], 1);
+        assert_eq!(flags[3], 8);
+        assert!(
+            flags
+                .iter()
+                .enumerate()
+                .all(|(slot, flags)| { slot == 0 || slot == 3 || *flags == 0 })
+        );
+        assert_eq!(
+            processor.take_slot_restart_flags(),
+            [0; MAX_PLUGINS_PER_RACK]
+        );
     }
 
     #[test]
@@ -918,10 +1184,97 @@ mod tests {
             flags: 2,
         });
 
-        processor.process_block(&mut slot).expect("targeted bypass");
+        // Each one-frame block repeats the bypass event; wait out the fade.
+        for _ in 0..=SLOT_FADE_FRAMES {
+            processor.process_block(&mut slot).expect("targeted bypass");
+        }
 
         assert!((slot.output_audio[0][0] - 0.5).abs() < f32::EPSILON);
         assert!((slot.output_audio[1][0] + 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn bypassed_slot_processes_input_but_passes_it_on_delayed_by_its_latency() {
+        let mut processor = RackProcessor::new();
+        processor
+            .replace_slot(
+                0,
+                FakePlugin {
+                    gain: 2.0,
+                    latency: 1,
+                    ..FakePlugin::default()
+                },
+                PluginSlotConfiguration {
+                    bypassed: true,
+                    ..PluginSlotConfiguration::active(PluginTopology {
+                        input_channels: 2,
+                        output_channels: 2,
+                    })
+                },
+            )
+            .expect("fixed slot");
+        let mut slot = requested_slot();
+
+        processor.process_block(&mut slot).expect("first block");
+        assert!(
+            slot.output_audio[0][0].abs() < f32::EPSILON,
+            "delayed by one frame"
+        );
+        processor.process_block(&mut slot).expect("second block");
+        assert!(
+            (slot.output_audio[0][0] - 0.25).abs() < f32::EPSILON,
+            "input, not output"
+        );
+
+        assert_eq!(processor.latency_samples(), 1, "bypass keeps the latency");
+        let plugin = processor.plugins().next().expect("slot").1;
+        assert_eq!(
+            plugin.processed_blocks, 2,
+            "bypassed plug-in still processes"
+        );
+    }
+
+    /// The requests here are one frame long, so each fade frame is one block.
+    #[test]
+    fn inserted_slot_fades_in_only_after_warmup_blocks() {
+        let mut processor = RackProcessor::new();
+        processor
+            .replace_slot(
+                0,
+                FakePlugin {
+                    gain: 2.0,
+                    ..FakePlugin::default()
+                },
+                PluginSlotConfiguration::active(PluginTopology {
+                    input_channels: 2,
+                    output_channels: 2,
+                }),
+            )
+            .expect("fixed slot");
+        processor.start_warmup(0).expect("warmup");
+        let mut slot = requested_slot();
+
+        for _ in 0..WARMUP_BLOCKS {
+            processor.process_block(&mut slot).expect("warming block");
+            assert!(
+                (slot.output_audio[0][0] - 0.25).abs() < f32::EPSILON,
+                "unheard"
+            );
+        }
+        for frame in 0..SLOT_FADE_FRAMES {
+            processor.process_block(&mut slot).expect("fading block");
+            #[allow(clippy::cast_precision_loss, reason = "small fade frame index")]
+            let expected = 0.25 + 0.25 * frame as f32 / SLOT_FADE_FRAMES as f32;
+            assert!(
+                (slot.output_audio[0][0] - expected).abs() < 1e-6,
+                "fading in"
+            );
+        }
+        processor.process_block(&mut slot).expect("joined block");
+        assert!(
+            (slot.output_audio[0][0] - 0.5).abs() < f32::EPSILON,
+            "heard"
+        );
     }
 
     #[test]

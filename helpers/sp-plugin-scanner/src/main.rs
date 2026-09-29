@@ -4,7 +4,7 @@
 //! eligible to load. The parent launches this helper once per bundle and applies its deadline;
 //! all machine-readable data is serialized as the SDK-free scan-metadata schema.
 
-use std::{env, path::PathBuf, process};
+use std::{env, fs, path::PathBuf, process};
 
 use serde::Serialize;
 use sp_model::{PluginArchitecture, PluginScanMetadata, PluginScanOutcome};
@@ -36,6 +36,7 @@ struct Args {
     bundle: PathBuf,
     json: bool,
     sdk_enumerate: bool,
+    report_path: Option<PathBuf>,
 }
 
 fn main() {
@@ -43,7 +44,7 @@ fn main() {
         Ok(args) => args,
         Err(message) => {
             eprintln!(
-                "{message}\nusage: sp-plugin-scanner --bundle <path> [--json] [--sdk-enumerate]"
+                "{message}\nusage: sp-plugin-scanner --bundle <path> [--json] [--sdk-enumerate] [--report-path <path>]"
             );
             process::exit(2);
         }
@@ -52,6 +53,17 @@ fn main() {
         Ok(info) => report_for_info(info, args.sdk_enumerate),
         Err(_) => invalid_report(args.bundle),
     };
+
+    if let Some(path) = &args.report_path {
+        let bytes = serde_json::to_vec(&report).expect("ScanReport is serializable");
+        if let Err(error) = fs::write(path, bytes) {
+            eprintln!(
+                "could not write scanner report to {}: {error}",
+                path.display()
+            );
+            process::exit(2);
+        }
+    }
 
     if args.json {
         println!(
@@ -80,12 +92,19 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<Args, &'static 
     let mut bundle = None;
     let mut json = false;
     let mut sdk_enumerate = false;
+    let mut report_path = None;
     let mut arguments = arguments;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--bundle" if bundle.is_none() => bundle = arguments.next().map(PathBuf::from),
             "--json" => json = true,
             "--sdk-enumerate" => sdk_enumerate = true,
+            "--report-path" if report_path.is_none() => {
+                report_path = arguments.next().map(PathBuf::from);
+                if report_path.is_none() {
+                    return Err("--report-path requires a path");
+                }
+            }
             _ => return Err("invalid arguments"),
         }
     }
@@ -94,6 +113,7 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<Args, &'static 
             bundle,
             json,
             sdk_enumerate,
+            report_path,
         })
         .ok_or("--bundle is required")
 }
@@ -267,16 +287,39 @@ mod tests {
     use super::parse_args;
 
     #[test]
-    fn parses_required_bundle_json_and_sdk_flag() {
+    fn parses_required_bundle_json_sdk_flag_and_report_path() {
         let args = parse_args(
-            ["--bundle", "Example.vst3", "--json", "--sdk-enumerate"]
-                .map(str::to_owned)
-                .into_iter(),
+            [
+                "--bundle",
+                "Example.vst3",
+                "--json",
+                "--sdk-enumerate",
+                "--report-path",
+                "/tmp/report.json",
+            ]
+            .map(str::to_owned)
+            .into_iter(),
         )
         .expect("arguments should parse");
 
         assert_eq!(args.bundle.to_string_lossy(), "Example.vst3");
         assert!(args.json);
         assert!(args.sdk_enumerate);
+        assert_eq!(
+            args.report_path.as_deref(),
+            Some(std::path::Path::new("/tmp/report.json"))
+        );
+    }
+
+    #[test]
+    fn rejects_report_path_without_a_value() {
+        assert!(
+            parse_args(
+                ["--bundle", "Example.vst3", "--report-path"]
+                    .map(str::to_owned)
+                    .into_iter(),
+            )
+            .is_err()
+        );
     }
 }

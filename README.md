@@ -1,61 +1,103 @@
 # Superposition
 
-Superposition is a macOS-native live VST3 host alpha focused on bounded latency and isolating third-party plug-ins from the audio engine. The repository contains the **Phase 0** contracts, **Phase 1** synthetic and CoreAudio-attached feasibility harnesses, isolated VST3 scanning/processing, supervision, session packages, MIDI/scenes, and an egui live-rack application.
+Superposition is a macOS-native live VST3 host. It runs each rack's plug-ins in a separate worker process, so a plug-in that crashes or misses its deadline affects only its own rack. The audio engine keeps bounded latency and keeps the other racks playing.
 
-## Status
+**Status: alpha.** It runs real plug-ins live on Apple Silicon, but it is not a certified release. Notarized bundles, approved brand assets, and long-run hardware testing are still incomplete. Worker isolation protects availability; it is not a security sandbox.
 
-Available now:
+## Features
 
-- Versioned model/protocol contracts, fixed shared-memory banks, rack gates, and design tokens
-- `cargo xtask doctor`, `ipc-feasibility`, `ipc-matrix`, `fault-matrix`, and `device-feasibility`
-- Direct duplex AUHAL/CoreAudio product path and attached feasibility harness (`sp-audio-io-macos`)
-- Disposable SDK-backed VST3 scanner plus SHA-256 content fingerprints and an atomic scan cache
-- Process supervisor, atomic session packages with recovery markers
-- Allocation-free, lock-free CoreMIDI callback ingress with a dedicated note-off safety lane
-- Interactive live-rack shell with duplex CoreAudio/MIDI selection, rack and slot editing, plug-in browsing, live gain/mute/bypass/meters, MIDI Learn, editable parameter scenes, generic and worker-owned resizing native editors, atomic opaque-state capture/restore, missing-plug-in placeholders, worker recovery, and a component gallery (`⌘G`)
-- Verification commands: `host-checker`, `compatibility`, `loopback`, `click-test`, `midi-timing`, `soak [--smoke]`, `bundle` (entitlement templates under `packaging/entitlements/`)
+- Direct AUHAL/CoreAudio audio with separate input and output devices, 1–64 physical channels, and 32/64/128/256-frame buffers at 48 kHz
+- One worker process per rack, with up to eight serial plug-ins, rack-local fallback, and automatic worker recovery
+- Per-rack mono/stereo input and stereo output routes, and per-plug-in sidechains from a physical input pair or another rack
+- Worker-owned native plug-in editors; all parameter editing happens there
+- Parameter scenes with ramps, CoreMIDI input, MIDI Learn, and Program Change scene recall
+- Atomic session packages, autosave, crash recovery, missing-plug-in placeholders, and plug-in quarantine
+- A disposable, isolated VST3 scanner with content fingerprints
+- A headless mode that uses the same engine and workers as the desktop app
 
-Still not a shippable public release: notarized bundles, approved brand assets, and long-run hardware certification remain incomplete. Worker isolation is an availability boundary, not a security sandbox.
+## Build and run
 
-## Hard Phase 1 feasibility gate
-
-Before product UI investment, an Apple Silicon machine must still prove the hard gate with an active device callback:
+Requires an Apple Silicon Mac, macOS 14.4 or later, and the Rust toolchain in `rust-toolchain.toml` (rustup installs it automatically).
 
 ```sh
-cargo xtask device-feasibility --racks 8 --frames 128 --duration-seconds 1800
-cargo xtask ipc-matrix --duration-seconds 1800 --output-dir target/phase1/ipc-matrix
-cargo xtask fault-matrix --racks 8 --frames 128 --output-dir target/phase1/fault-matrix
+cargo build --workspace
+cargo run -p superposition
 ```
 
-Synthetic preflight remains useful for development:
+The app finds its helper executables beside its own executable. Packaged builds use the bundle's `Helpers` directory. `SUPERPOSITION_HELPERS_DIR` overrides both, and `SUPERPOSITION_APP_SUPPORT` selects a separate catalog and quarantine directory.
+
+## Using the app
+
+The show screen has one column per rack, left to right ([UI design](docs/ui-design.md)). Each column shows the rack's route, a picture of each plug-in's editor, gain, meters, and a state token. Click a picture to open that plug-in's native editor, and right-click it for the slot menu. **Setup** (⌘,) holds audio devices, MIDI, the plug-in catalog, and diagnostics. Use **Rescan plug-ins** there to fill the plug-in browser.
+
+| Key | Action |
+| --- | --- |
+| ⌘S | Save |
+| ⌘N | Add a rack |
+| ⌘← / ⌘→ | Move the selected rack |
+| ⌘⇧C | Capture a scene |
+| 1–8 | Recall scenes 1–8 |
+| ⌘0–⌘9 | Show all racks, or a page |
+| Esc | Close the topmost overlay |
+
+Audio keeps running while you:
+
+- add, remove, or reorder racks and plug-ins (untouched racks keep playing, and a rack with a changed plug-in keeps its other plug-ins playing);
+- open or close native editors;
+- save (each worker serializes plug-in state on its loading thread);
+- capture or recall scenes.
+
+A new plug-in fades in over 16 samples after it produces three good blocks. Bypass also fades over 16 samples, and it keeps the plug-in's latency, so timing does not shift.
+
+Scenes capture up to 256 selected plug-in parameters, plus rack gain, mute, rack bypass, and slot bypass. Continuous parameters ramp, and switches change at the end of the transition. MIDI Program Change selects the matching scene.
+
+If the audio device disconnects, audio stops. The app checks once per second for the saved devices and restarts audio when they return.
+
+## Headless mode
 
 ```sh
-cargo xtask ipc-feasibility --racks 8 --frames 128 --duration-seconds 30
+target/debug/superposition --list-devices
+target/debug/superposition --list-midi-ports
+target/debug/superposition --scan
+target/debug/superposition --headless --session /path/to/Live.superposition \
+  --device "BlackHole 64ch" --frames 128 --duration-seconds 10
+target/debug/superposition --headless --session /path/to/Live.superposition \
+  --input-device "Built-in Microphone" --output-device "BlackHole 64ch" \
+  --frames 128 --duration-seconds 10
 ```
 
-Reports label `phase1_hard_gate_certified=false` until official long-run evidence is collected on dedicated hardware.
+Headless mode needs an explicit device and a saved session with at least one loaded rack. Use names or IDs from `--list-devices`. `--input-device none` selects output-only processing, and `--midi-port <id-or-name>` opens one MIDI input. At the end it reports callbacks, rack completions, deadline misses, fallback, closed gates, and output levels. It fails on callback errors, deadline misses, protocol faults, or an unhealthy worker. Use `--release` builds for timing checks. See [live validation](docs/live-validation.md) for measured results.
+
+## Development
+
+```sh
+cargo xtask doctor   # platform, toolchain, workspace, and dependency-boundary checks
+cargo xtask help     # lists the hardware verification commands
+```
+
+The hardware verification commands (`host-checker`, `compatibility`, `loopback`, `click-test`, `midi-timing`, `soak`, `bundle`) check captured evidence from real devices. See [testing](docs/testing.md).
+
+To render the show screen to PNGs for visual review:
+
+```sh
+SUPERPOSITION_UI_SNAPSHOT=<dir> cargo test -p superposition --bin superposition render_show_screen_snapshots -- --ignored
+```
+
+CI (`.github/workflows/ci.yml`) runs doctor, formatting, Clippy, tests, coverage, `cargo-deny`, and `cargo-audit` on macOS. Live timing needs real Apple Silicon hardware and does not run in CI.
 
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [UI design](docs/ui-design.md)
 - [Real-time safety contract](docs/realtime-safety.md)
 - [Session format](docs/session-format.md)
 - [Plug-in compatibility](docs/plugin-compatibility.md)
-- [Testing strategy](docs/testing.md)
+- [Testing](docs/testing.md)
+- [Live validation](docs/live-validation.md)
 - [Brand assets and release provenance](docs/brand-assets.md)
 - [macOS distribution](docs/macos-distribution.md)
 - [Architecture decision records](docs/adr/)
 
-## Workspace
-
-Run `cargo xtask doctor` for platform, toolchain, scaffold, and dependency-boundary diagnostics. `cargo xtask help` lists every verification command.
-
-Run `SUPERPOSITION_COMPONENT_GALLERY=1 cargo run -p superposition` to open the deterministic gallery used for visual/accessibility review.
-
-## CI
-
-`.github/workflows/ci.yml` runs doctor, formatting, Clippy, tests, `cargo-deny`, and `cargo-audit`, plus short synthetic Phase 1 smokes. Long CoreAudio qualification still requires dedicated Apple Silicon hardware.
-
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option. `third-party/vst3-host` is a patched copy of the MIT-licensed `vst3-host` crate; see its `SUPERPOSITION.md`.

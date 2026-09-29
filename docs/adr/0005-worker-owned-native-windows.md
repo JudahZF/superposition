@@ -1,6 +1,6 @@
 # ADR 0005: Worker-owned native editor windows
 
-- **Status:** Accepted (Phase 0 target)
+- **Status:** Accepted
 - **Date:** 2026-07-13
 
 ## Context
@@ -13,4 +13,4 @@ The rack worker owns creation, lifetime, focus, and destruction of its native ed
 
 ## Consequences
 
-A worker exit removes the editor and leaves its rack unavailable rather than risking host UI corruption. Integration is less seamless and requires macOS-specific feasibility testing.
+A worker exit removes the editor and leaves its rack unavailable rather than risking host UI corruption. Integration is less seamless and requires macOS-specific testing.

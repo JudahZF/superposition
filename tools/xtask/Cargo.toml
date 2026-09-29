@@ -10,13 +10,10 @@ repository.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-sp-audio-io-macos = { path = "../../crates/sp-audio-io-macos" }
-sp-engine = { path = "../../crates/sp-engine" }
 sp-midi = { path = "../../crates/sp-midi" }
 sp-shared-memory = { path = "../../crates/sp-shared-memory" }
 sp-shared-memory-macos = { path = "../../crates/sp-shared-memory-macos" }
 sp-supervisor = { path = "../../crates/sp-supervisor" }
-sp-test-support = { path = "../../crates/sp-test-support" }
 
 [lints]
 workspace = true

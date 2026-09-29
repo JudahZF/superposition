@@ -21,9 +21,9 @@
 
 _Static_assert(ATOMIC_LONG_LOCK_FREE == 2 &&
                    ATOMIC_LLONG_LOCK_FREE == 2,
-               "Phase 1 telemetry requires lock-free 64-bit atomics");
+               "callback telemetry requires lock-free 64-bit atomics");
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2,
-               "Phase 1 telemetry requires a lock-free writer guard");
+               "callback telemetry requires a lock-free writer guard");
 
 enum SpAudioOperation {
     SP_AUDIO_OPERATION_NONE = 0,
@@ -61,6 +61,7 @@ enum SpAudioOperation {
     SP_AUDIO_OPERATION_REMOVE_SAMPLE_RATE_LISTENER = 38,
     SP_AUDIO_OPERATION_ADD_FRAME_COUNT_LISTENER = 39,
     SP_AUDIO_OPERATION_REMOVE_FRAME_COUNT_LISTENER = 40,
+    SP_AUDIO_OPERATION_REMOVE_DEVICE_CHANGE_LISTENER = 42,
 };
 
 enum SpLifecycleEvent {
@@ -82,8 +83,9 @@ enum SpLifecycleEvent {
 
 typedef uint32_t (*SpRenderCallback)(void *renderer, float *interleaved,
                                      uint32_t frames);
-typedef uint32_t (*SpDuplexRenderCallback)(void *renderer, const float *input,
-                                           float *output, uint32_t frames);
+typedef uint32_t (*SpMultichannelRenderCallback)(void *renderer, const float *input,
+                                                 uint32_t input_channels, float *output,
+                                                 uint32_t output_channels, uint32_t frames);
 typedef void (*SpLifecycleCallback)(void *context, uint32_t event);
 typedef void (*SpRetirementCallback)(void *context);
 
@@ -106,6 +108,8 @@ typedef struct {
     uint64_t invalid_buffers;
     uint64_t invalid_channels;
     uint64_t invalid_bytes;
+    uint64_t frame_histogram_32;
+    uint64_t frame_histogram_64;
     uint64_t frame_histogram_128;
     uint64_t frame_histogram_256;
 } SpCallbackTelemetry;
@@ -170,6 +174,8 @@ typedef struct {
     _Atomic uint64_t invalid_buffers;
     _Atomic uint64_t invalid_channels;
     _Atomic uint64_t invalid_bytes;
+    _Atomic uint64_t frame_histogram_32;
+    _Atomic uint64_t frame_histogram_64;
     _Atomic uint64_t frame_histogram_128;
     _Atomic uint64_t frame_histogram_256;
 } SpAtomicTelemetry;
@@ -192,11 +198,20 @@ typedef struct SpAudioOutput {
     SpPropertyListenerState frame_count_listener;
     void *renderer;
     SpRenderCallback render;
-    SpDuplexRenderCallback duplex_render;
+    SpMultichannelRenderCallback multichannel_render;
     uint8_t duplex;
-    uint8_t device_listener_attached;
+    uint8_t multichannel;
+    AudioDeviceID input_device;
+    AudioDeviceID output_device;
+    AudioDeviceID aggregate_device;
+    uint32_t input_channels;
+    uint32_t output_channels;
+    uint32_t output_channel_offset;
+    uint32_t input_channel_offset;
+    uint8_t device_listener_attached[3][5];
     _Atomic uint32_t device_event;
-    float input_scratch[512];
+    _Atomic uint32_t device_event_pending;
+    float input_scratch[256 * 64];
     void *observer_context;
     SpLifecycleCallback lifecycle_observer;
     SpRetirementCallback retirement_observer;
@@ -236,10 +251,12 @@ static void sp_mark_renderer_retired(SpAudioOutput *output) {
     // ownership to Rust; setup/rollback observers remain until the wrapper is released.
     output->renderer = NULL;
     output->render = NULL;
+    output->multichannel_render = NULL;
 }
 
 static uint32_t sp_native_releasable(const SpAudioOutput *output) {
     return output->renderer_retired && !output->unit_created &&
+           output->aggregate_device == kAudioObjectUnknown &&
            !output->sample_rate_listener_attached &&
            !output->frame_count_listener_attached;
 }
@@ -267,6 +284,8 @@ static void sp_telemetry_init(SpAtomicTelemetry *telemetry) {
     atomic_init(&telemetry->invalid_buffers, 0);
     atomic_init(&telemetry->invalid_channels, 0);
     atomic_init(&telemetry->invalid_bytes, 0);
+    atomic_init(&telemetry->frame_histogram_32, 0);
+    atomic_init(&telemetry->frame_histogram_64, 0);
     atomic_init(&telemetry->frame_histogram_128, 0);
     atomic_init(&telemetry->frame_histogram_256, 0);
 }
@@ -346,7 +365,8 @@ static OSStatus sp_render_callback(void *reference, AudioUnitRenderActionFlags *
         sp_callback_finish(output);
         return noErr;
     }
-    if (buffer->mNumberChannels != 2) {
+    uint32_t channels = output->multichannel ? output->output_channels : 2;
+    if (buffer->mNumberChannels != channels) {
         atomic_fetch_add_explicit(&output->telemetry.invalid_channels, 1,
                                   memory_order_seq_cst);
         sp_callback_finish(output);
@@ -354,7 +374,7 @@ static OSStatus sp_render_callback(void *reference, AudioUnitRenderActionFlags *
     }
 
     const uint32_t expected_bytes =
-        output->frames * 2u * (uint32_t)sizeof(float);
+        output->frames * channels * (uint32_t)sizeof(float);
     if (buffer->mDataByteSize != expected_bytes) {
         atomic_fetch_add_explicit(&output->telemetry.invalid_bytes, 1,
                                   memory_order_seq_cst);
@@ -362,7 +382,13 @@ static OSStatus sp_render_callback(void *reference, AudioUnitRenderActionFlags *
         return noErr;
     }
 
-    if (output->frames == 128) {
+    if (output->frames == 32) {
+        atomic_fetch_add_explicit(&output->telemetry.frame_histogram_32, 1,
+                                  memory_order_seq_cst);
+    } else if (output->frames == 64) {
+        atomic_fetch_add_explicit(&output->telemetry.frame_histogram_64, 1,
+                                  memory_order_seq_cst);
+    } else if (output->frames == 128) {
         atomic_fetch_add_explicit(&output->telemetry.frame_histogram_128, 1,
                                   memory_order_seq_cst);
     } else {
@@ -376,22 +402,26 @@ static OSStatus sp_render_callback(void *reference, AudioUnitRenderActionFlags *
         return noErr;
     }
     uint32_t disposition;
-    if (output->duplex) {
-        AudioBufferList input_buffers = {
-            .mNumberBuffers = 1,
-            .mBuffers = {{.mNumberChannels = 2,
-                          .mDataByteSize = output->frames * 2u * (uint32_t)sizeof(float),
-                          .mData = output->input_scratch}},
-        };
-        OSStatus capture = AudioUnitRender(output->unit, flags, timestamp, 1, output->frames,
-                                           &input_buffers);
-        if (capture != noErr || output->duplex_render == NULL) {
-            atomic_fetch_add_explicit(&output->telemetry.silenced, 1, memory_order_seq_cst);
-            sp_callback_finish(output);
-            return noErr;
+    if (output->multichannel) {
+        if (output->input_channels != 0) {
+            AudioBufferList input_buffers = {
+                .mNumberBuffers = 1,
+                .mBuffers = {{.mNumberChannels = output->input_channels,
+                              .mDataByteSize = output->frames * output->input_channels *
+                                               (uint32_t)sizeof(float),
+                              .mData = output->input_scratch}},
+            };
+            if (AudioUnitRender(output->unit, flags, timestamp, 1, output->frames,
+                                &input_buffers) != noErr) {
+                atomic_fetch_add_explicit(&output->telemetry.silenced, 1,
+                                          memory_order_seq_cst);
+                sp_callback_finish(output);
+                return noErr;
+            }
         }
-        disposition = output->duplex_render(output->renderer, output->input_scratch,
-                                             (float *)buffer->mData, output->frames);
+        disposition = output->multichannel_render(
+            output->renderer, output->input_scratch, output->input_channels,
+            (float *)buffer->mData, output->output_channels, output->frames);
     } else {
         disposition = output->render(output->renderer, (float *)buffer->mData, output->frames);
     }
@@ -718,11 +748,11 @@ static SpNativeFailure sp_wait_notification(SpAudioOutput *output,
 }
 
 static int sp_report_has_immutable_requirements(SpDeviceFormatReport report,
-                                                uint32_t frames) {
+                                                uint32_t frames, uint32_t channels) {
     // The AUHAL client stream is fixed stereo, so an output with more physical channels is
     // supported when it has channels 1 and 2 available. `sp_configure_output_channel_map`
     // explicitly silences every physical channel after those two.
-    return report.channel_count >= 2 &&
+    return report.channel_count >= channels &&
            !report.uses_variable_buffer_frame_sizes &&
            report.maximum_callback_frames_per_slice ==
                report.current_frames_per_slice &&
@@ -730,8 +760,9 @@ static int sp_report_has_immutable_requirements(SpDeviceFormatReport report,
            frames <= report.supported_maximum_frames_per_slice;
 }
 
-static int sp_report_matches(SpDeviceFormatReport report, uint32_t frames) {
-    return sp_report_has_immutable_requirements(report, frames) &&
+static int sp_report_matches(SpDeviceFormatReport report, uint32_t frames,
+                             uint32_t channels) {
+    return sp_report_has_immutable_requirements(report, frames, channels) &&
            report.sample_rate_hz == 48000.0 &&
            report.current_frames_per_slice == frames &&
            report.maximum_callback_frames_per_slice == frames;
@@ -741,8 +772,11 @@ static int sp_report_matches(SpDeviceFormatReport report, uint32_t frames) {
 // output-unit channel-map array indexes destination physical channels, so every remaining device
 // channel receives -1 and stays silent. This runs only during control-thread setup.
 static SpNativeFailure sp_configure_output_channel_map(AudioUnit unit,
-                                                       uint32_t physical_channels) {
-    if (physical_channels < 2 ||
+                                                       uint32_t physical_channels,
+                                                       uint32_t client_channels,
+                                                       uint32_t offset) {
+    if (client_channels == 0 || offset > physical_channels ||
+        client_channels > physical_channels - offset ||
         physical_channels > UINT32_MAX / (uint32_t)sizeof(SInt32)) {
         return sp_native_error(SP_AUDIO_STATUS_UNSUPPORTED_FORMAT,
                                SP_AUDIO_OPERATION_CONFIGURE_CLIENT_FORMAT);
@@ -753,10 +787,9 @@ static SpNativeFailure sp_configure_output_channel_map(AudioUnit unit,
         return sp_native_error(kAudio_MemFullError,
                                SP_AUDIO_OPERATION_CONFIGURE_CLIENT_FORMAT);
     }
-    channel_map[0] = 0;
-    channel_map[1] = 1;
-    for (uint32_t channel = 2; channel < physical_channels; ++channel) {
-        channel_map[channel] = -1;
+    for (uint32_t channel = 0; channel < physical_channels; ++channel) {
+        channel_map[channel] = (channel >= offset && channel - offset < client_channels)
+                                   ? (SInt32)(channel - offset) : -1;
     }
     OSStatus status = AudioUnitSetProperty(
         unit, kAudioOutputUnitProperty_ChannelMap, kAudioUnitScope_Input, 0,
@@ -791,7 +824,7 @@ static int sp_fake_teardown_fails(const SpAudioOutput *output,
 
 static SpAudioResult sp_destroy_output(SpAudioOutput *output);
 static OSStatus sp_add_device_change_listeners(SpAudioOutput *output);
-static void sp_remove_device_change_listeners(SpAudioOutput *output);
+static OSStatus sp_remove_device_change_listeners(SpAudioOutput *output);
 
 static SpAudioResult sp_finish_failed_create(SpAudioOutput *output,
                                              SpAudioResult failure) {
@@ -843,13 +876,13 @@ static SpAudioResult sp_create_fake_output(SpAudioOutput *output,
     }
 
     if (!sp_report_has_immutable_requirements(output->fake_report,
-                                              output->frames)) {
+                                               output->frames, 2)) {
         result = sp_result_error(SP_AUDIO_STATUS_UNSUPPORTED_FORMAT,
                                  SP_AUDIO_OPERATION_VERIFY_DEVICE_FORMAT,
                                  output->fake_report);
         return sp_finish_failed_create(output, result);
     }
-    if (!sp_report_matches(output->fake_report, output->frames) &&
+    if (!sp_report_matches(output->fake_report, output->frames, 2) &&
         !allow_reconfiguration) {
         result = sp_result_error(SP_AUDIO_STATUS_UNSUPPORTED_FORMAT,
                                  SP_AUDIO_OPERATION_VERIFY_DEVICE_FORMAT,
@@ -931,7 +964,7 @@ static SpAudioResult sp_create_fake_output(SpAudioOutput *output,
         output->mutation_flags |= SP_MUTATION_FRAME_COUNT_ACKNOWLEDGED;
     }
 
-    if (!sp_report_matches(output->fake_report, output->frames)) {
+    if (!sp_report_matches(output->fake_report, output->frames, 2)) {
         result = sp_result_error(SP_AUDIO_STATUS_UNSUPPORTED_FORMAT,
                                  SP_AUDIO_OPERATION_VERIFY_DEVICE_FORMAT,
                                  output->fake_report);
@@ -1015,13 +1048,15 @@ static SpAudioResult sp_create_core_audio_output(
                 failure.status != 0 ? failure.operation : SP_AUDIO_OPERATION_VERIFY_DEVICE_FORMAT, report));
         }
     }
-    if (!sp_report_has_immutable_requirements(report, output->frames)) {
+    if (!sp_report_has_immutable_requirements(report, output->frames,
+                                              output->multichannel ? output->output_channels + output->output_channel_offset : 2)) {
         return sp_finish_failed_create(
             output, sp_result_error(SP_AUDIO_STATUS_UNSUPPORTED_FORMAT,
                                     SP_AUDIO_OPERATION_VERIFY_DEVICE_FORMAT,
                                     report));
     }
-    if (!sp_report_matches(report, output->frames) &&
+    if (!sp_report_matches(report, output->frames,
+                           output->multichannel ? output->output_channels + output->output_channel_offset : 2) &&
         !allow_reconfiguration) {
         return sp_finish_failed_create(
             output, sp_result_error(SP_AUDIO_STATUS_UNSUPPORTED_FORMAT,
@@ -1120,7 +1155,8 @@ static SpAudioResult sp_create_core_audio_output(
         return sp_finish_failed_create(
             output, sp_result_error(failure.status, failure.operation, report));
     }
-    if (!sp_report_matches(report, output->frames)) {
+    if (!sp_report_matches(report, output->frames,
+                           output->multichannel ? output->output_channels + output->output_channel_offset : 2)) {
         return sp_finish_failed_create(
             output, sp_result_error(SP_AUDIO_STATUS_UNSUPPORTED_FORMAT,
                                     SP_AUDIO_OPERATION_VERIFY_DEVICE_FORMAT,
@@ -1179,14 +1215,15 @@ static SpAudioResult sp_create_core_audio_output(
                                     report));
     }
 
+    uint32_t output_channels = output->multichannel ? output->output_channels : 2;
     AudioStreamBasicDescription client_format = {
         .mSampleRate = 48000.0,
         .mFormatID = kAudioFormatLinearPCM,
         .mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-        .mBytesPerPacket = 2 * sizeof(float),
+        .mBytesPerPacket = output_channels * sizeof(float),
         .mFramesPerPacket = 1,
-        .mBytesPerFrame = 2 * sizeof(float),
-        .mChannelsPerFrame = 2,
+        .mBytesPerFrame = output_channels * sizeof(float),
+        .mChannelsPerFrame = output_channels,
         .mBitsPerChannel = 8 * sizeof(float),
         .mReserved = 0,
     };
@@ -1201,17 +1238,34 @@ static SpAudioResult sp_create_core_audio_output(
                             SP_AUDIO_OPERATION_CONFIGURE_CLIENT_FORMAT,
                             report));
     }
-    failure = sp_configure_output_channel_map(output->unit, report.channel_count);
+    failure = sp_configure_output_channel_map(output->unit, report.channel_count,
+                                              output_channels, output->output_channel_offset);
     if (failure.status != 0) {
         return sp_finish_failed_create(
             output, sp_result_error(failure.status, failure.operation, report));
     }
     if (output->duplex) {
+        if (output->multichannel) {
+            client_format.mBytesPerPacket = output->input_channels * sizeof(float);
+            client_format.mBytesPerFrame = client_format.mBytesPerPacket;
+            client_format.mChannelsPerFrame = output->input_channels;
+        }
         status = AudioUnitSetProperty(output->unit, kAudioUnitProperty_StreamFormat,
                                       kAudioUnitScope_Output, 1, &client_format,
                                       sizeof(client_format));
         if (status != noErr) return sp_finish_failed_create(output, sp_result_error(
             status, SP_AUDIO_OPERATION_CONFIGURE_CLIENT_FORMAT, report));
+        if (output->multichannel) {
+            SInt32 map[64];
+            for (uint32_t channel = 0; channel < output->input_channels; ++channel) {
+                map[channel] = (SInt32)(output->input_channel_offset + channel);
+            }
+            status = AudioUnitSetProperty(output->unit, kAudioOutputUnitProperty_ChannelMap,
+                                          kAudioUnitScope_Output, 1, map,
+                                          output->input_channels * sizeof(SInt32));
+            if (status != noErr) return sp_finish_failed_create(output, sp_result_error(
+                status, SP_AUDIO_OPERATION_CONFIGURE_CLIENT_FORMAT, report));
+        }
     }
 
     UInt32 maximum_frames = report.maximum_callback_frames_per_slice;
@@ -1273,7 +1327,7 @@ static SpAudioResult sp_create_core_audio_output(
             sp_result_error(status, SP_AUDIO_OPERATION_START, report));
     }
     output->started = 1;
-    if (output->duplex) {
+    if (output->duplex || output->multichannel) {
         status = sp_add_device_change_listeners(output);
         if (status != noErr) return sp_finish_failed_create(output, sp_result_error(
             status, SP_AUDIO_OPERATION_START, report));
@@ -1299,7 +1353,7 @@ SpAudioResult sp_audio_output_create(
     };
     *output_result = NULL;
 
-    if (frames != 128 && frames != 256) {
+    if (frames != 32 && frames != 64 && frames != 128 && frames != 256) {
         SpAudioResult result = sp_result_error(
             SP_AUDIO_STATUS_UNSUPPORTED_FORMAT,
             SP_AUDIO_OPERATION_VERIFY_DEVICE_FORMAT, report);
@@ -1330,6 +1384,7 @@ SpAudioResult sp_audio_output_create(
     atomic_init(&output->sample_rate_listener.generation, 0);
     atomic_init(&output->frame_count_listener.generation, 0);
     atomic_init(&output->device_event, 0);
+    atomic_init(&output->device_event_pending, 0);
     *output_result = output;
 
     output->frames = frames;
@@ -1475,7 +1530,15 @@ static SpAudioResult sp_destroy_fake_output(SpAudioOutput *output) {
 }
 
 static SpAudioResult sp_destroy_core_audio_output(SpAudioOutput *output) {
-    sp_remove_device_change_listeners(output);
+    OSStatus device_listener_status = sp_remove_device_change_listeners(output);
+    if (device_listener_status != noErr) {
+        SpAudioResult result = sp_result_error(device_listener_status,
+                                               SP_AUDIO_OPERATION_REMOVE_DEVICE_CHANGE_LISTENER,
+                                               (SpDeviceFormatReport){0});
+        result.renderer_retired = 0;
+        result.native_releasable = 0;
+        return result;
+    }
     SpDeviceFormatReport report = {0};
     if (output->device != kAudioObjectUnknown) {
         (void)sp_read_device_format(output->device, &report);
@@ -1557,6 +1620,16 @@ static SpAudioResult sp_destroy_core_audio_output(SpAudioOutput *output) {
         output->unit = NULL;
         output->unit_created = 0;
     }
+    if (output->aggregate_device != kAudioObjectUnknown) {
+        OSStatus status = AudioHardwareDestroyAggregateDevice(output->aggregate_device);
+        if (status != noErr) {
+            result = sp_result_error(status, SP_AUDIO_OPERATION_DISPOSE, report);
+            result.renderer_retired = 0;
+            result.native_releasable = 0;
+            return result;
+        }
+        output->aggregate_device = kAudioObjectUnknown;
+    }
     sp_mark_renderer_retired(output);
     result.renderer_retired = 1;
     result.native_releasable = 1;
@@ -1606,6 +1679,10 @@ SpCallbackTelemetry sp_audio_output_telemetry(const SpAudioOutput *output) {
             &output->telemetry.invalid_channels, memory_order_seq_cst);
         snapshot.invalid_bytes = atomic_load_explicit(
             &output->telemetry.invalid_bytes, memory_order_seq_cst);
+        snapshot.frame_histogram_32 = atomic_load_explicit(
+            &output->telemetry.frame_histogram_32, memory_order_seq_cst);
+        snapshot.frame_histogram_64 = atomic_load_explicit(
+            &output->telemetry.frame_histogram_64, memory_order_seq_cst);
         snapshot.frame_histogram_128 = atomic_load_explicit(
             &output->telemetry.frame_histogram_128,
             memory_order_seq_cst);
@@ -1654,6 +1731,8 @@ typedef struct {
     uint32_t output_channels;
     uint32_t is_default_input;
     uint32_t is_default_output;
+    uint32_t supports_32_frames;
+    uint32_t supports_64_frames;
     uint32_t supports_128_frames;
     uint32_t supports_256_frames;
     char name[256];
@@ -1702,10 +1781,16 @@ int32_t sp_audio_device_at(uint32_t index, SpEnumeratedDevice *result) {
         result->output_channels = sp_channel_count(device, kAudioDevicePropertyScopeOutput);
         SpDeviceFormatReport report = {0};
         uint32_t supports_48000 = 0;
-        if (result->input_channels >= 2 && result->output_channels >= 2 &&
+        if ((result->input_channels > 0 || result->output_channels > 0) &&
             sp_read_device_format(device, &report).status == 0 &&
             sp_supports_sample_rate(device, 48000.0, &supports_48000) == noErr &&
             supports_48000 && !report.uses_variable_buffer_frame_sizes) {
+            result->supports_32_frames =
+                report.supported_minimum_frames_per_slice <= 32 &&
+                32 <= report.supported_maximum_frames_per_slice;
+            result->supports_64_frames =
+                report.supported_minimum_frames_per_slice <= 64 &&
+                64 <= report.supported_maximum_frames_per_slice;
             result->supports_128_frames =
                 report.supported_minimum_frames_per_slice <= 128 &&
                 128 <= report.supported_maximum_frames_per_slice;
@@ -1736,13 +1821,14 @@ int32_t sp_audio_device_at(uint32_t index, SpEnumeratedDevice *result) {
 
 static OSStatus sp_device_change_listener(AudioObjectID object, UInt32 count,
                                           const AudioObjectPropertyAddress addresses[], void *context) {
-    (void)object;
     SpAudioOutput *output = context;
-    uint32_t event = 2;
+    uint32_t event = object == output->input_device &&
+                     output->input_device != output->output_device ? 4 : 2;
     for (UInt32 i = 0; i < count; ++i) {
-        if (addresses[i].mSelector == kAudioDevicePropertyDeviceIsAlive) event = 1;
+        if (addresses[i].mSelector == kAudioDevicePropertyDeviceIsAlive) event -= 1;
     }
     atomic_store_explicit(&output->device_event, event, memory_order_release);
+    atomic_store_explicit(&output->device_event_pending, event, memory_order_release);
     return noErr;
 }
 
@@ -1754,17 +1840,22 @@ static OSStatus sp_add_device_change_listeners(SpAudioOutput *output) {
         {kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyScopeInput, kAudioObjectPropertyElementMain},
         {kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain},
     };
-    for (uint32_t i = 0; i < sizeof(addresses) / sizeof(addresses[0]); ++i) {
-        OSStatus status = AudioObjectAddPropertyListener(output->device, &addresses[i],
-                                                          sp_device_change_listener, output);
-        if (status != noErr) return status;
+    AudioDeviceID devices[] = {output->device, output->output_device, output->input_device};
+    for (uint32_t source = 0; source < 3; ++source) {
+        if (devices[source] == kAudioObjectUnknown ||
+            (source == 1 && devices[source] == devices[0]) ||
+            (source == 2 && (devices[source] == devices[0] || devices[source] == devices[1]))) continue;
+        for (uint32_t i = 0; i < 5; ++i) {
+            OSStatus status = AudioObjectAddPropertyListener(devices[source], &addresses[i],
+                                                              sp_device_change_listener, output);
+            if (status != noErr) return status;
+            output->device_listener_attached[source][i] = 1;
+        }
     }
-    output->device_listener_attached = 1;
     return noErr;
 }
 
-static void sp_remove_device_change_listeners(SpAudioOutput *output) {
-    if (!output->device_listener_attached) return;
+static OSStatus sp_remove_device_change_listeners(SpAudioOutput *output) {
     AudioObjectPropertyAddress addresses[] = {
         {kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
         {kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
@@ -1772,43 +1863,170 @@ static void sp_remove_device_change_listeners(SpAudioOutput *output) {
         {kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyScopeInput, kAudioObjectPropertyElementMain},
         {kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain},
     };
-    for (uint32_t i = 0; i < sizeof(addresses) / sizeof(addresses[0]); ++i)
-        (void)AudioObjectRemovePropertyListener(output->device, &addresses[i],
-                                                sp_device_change_listener, output);
-    output->device_listener_attached = 0;
+    AudioDeviceID devices[] = {output->device, output->output_device, output->input_device};
+    OSStatus first_error = noErr;
+    for (uint32_t source = 0; source < 3; ++source) {
+        for (uint32_t i = 0; i < 5; ++i) {
+            if (output->device_listener_attached[source][i]) {
+                OSStatus status = AudioObjectRemovePropertyListener(
+                    devices[source], &addresses[i], sp_device_change_listener, output);
+                if (status == noErr) output->device_listener_attached[source][i] = 0;
+                else if (first_error == noErr) first_error = status;
+            }
+        }
+    }
+    return first_error;
 }
 uint32_t sp_audio_output_take_device_event(SpAudioOutput *output) {
     if (output == NULL) return 0;
-    return atomic_exchange_explicit(&output->device_event, 0, memory_order_acq_rel);
+    return atomic_exchange_explicit(&output->device_event_pending, 0, memory_order_acq_rel);
 }
 
-SpAudioResult sp_audio_duplex_create(SpAudioOutput **output_result, uint32_t device,
-                                     uint32_t frames, uint8_t allow_reconfiguration,
-                                     void *renderer,
-                                     SpDuplexRenderCallback render) {
-    SpDeviceFormatReport report = {.sample_rate_hz = 48000.0, .channel_count = 2,
-        .current_frames_per_slice = frames, .supported_minimum_frames_per_slice = 128,
-        .supported_maximum_frames_per_slice = 256, .maximum_callback_frames_per_slice = frames};
+void sp_audio_test_signal_device_event(SpAudioOutput *output, uint32_t event) {
+    if (output == NULL || !output->fake_backend || event < 1 || event > 4) return;
+    atomic_store_explicit(&output->device_event, event, memory_order_release);
+    atomic_store_explicit(&output->device_event_pending, event, memory_order_release);
+}
+
+static OSStatus sp_device_uid(AudioDeviceID device, CFStringRef *uid) {
+    AudioObjectPropertyAddress address = {kAudioDevicePropertyDeviceUID,
+                                          kAudioObjectPropertyScopeGlobal,
+                                          kAudioObjectPropertyElementMain};
+    UInt32 size = sizeof(*uid);
+    *uid = NULL;
+    return AudioObjectGetPropertyData(device, &address, 0, NULL, &size, uid);
+}
+
+static OSStatus sp_create_private_aggregate(AudioDeviceID input, AudioDeviceID playback,
+                                            AudioDeviceID *aggregate) {
+    CFStringRef input_uid = NULL, output_uid = NULL;
+    OSStatus status = sp_device_uid(input, &input_uid);
+    if (status != noErr) return status;
+    status = sp_device_uid(playback, &output_uid);
+    if (status != noErr) {
+        CFRelease(input_uid);
+        return status;
+    }
+    CFUUIDRef uuid = CFUUIDCreate(kCFAllocatorDefault);
+    CFStringRef aggregate_uid = uuid != NULL ? CFUUIDCreateString(kCFAllocatorDefault, uuid) : NULL;
+    if (uuid != NULL) CFRelease(uuid);
+    CFMutableDictionaryRef description = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFMutableDictionaryRef output_entry = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFMutableDictionaryRef input_entry = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    int32_t enabled = 1;
+    CFNumberRef one = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &enabled);
+    if (aggregate_uid == NULL || description == NULL || output_entry == NULL ||
+        input_entry == NULL || one == NULL) {
+        status = kAudio_MemFullError;
+    } else {
+        // The output device leads the aggregate so its physical output channels start at zero.
+        CFDictionarySetValue(output_entry, CFSTR(kAudioSubDeviceUIDKey), output_uid);
+        CFDictionarySetValue(input_entry, CFSTR(kAudioSubDeviceUIDKey), input_uid);
+        CFDictionarySetValue(input_entry, CFSTR(kAudioSubDeviceDriftCompensationKey),
+                             one);
+        const void *entries[] = {output_entry, input_entry};
+        CFArrayRef subdevices = CFArrayCreate(kCFAllocatorDefault, entries, 2,
+                                              &kCFTypeArrayCallBacks);
+        if (subdevices == NULL) {
+            status = kAudio_MemFullError;
+        } else {
+            CFDictionarySetValue(description, CFSTR(kAudioAggregateDeviceUIDKey), aggregate_uid);
+            CFDictionarySetValue(description, CFSTR(kAudioAggregateDeviceNameKey),
+                                 CFSTR("Superposition private I/O"));
+            CFDictionarySetValue(description, CFSTR(kAudioAggregateDeviceSubDeviceListKey), subdevices);
+            CFDictionarySetValue(description, CFSTR(kAudioAggregateDeviceMainSubDeviceKey), output_uid);
+            CFDictionarySetValue(description, CFSTR(kAudioAggregateDeviceIsPrivateKey),
+                                 one);
+            status = AudioHardwareCreateAggregateDevice(description, aggregate);
+            CFRelease(subdevices);
+        }
+    }
+    if (input_entry != NULL) CFRelease(input_entry);
+    if (output_entry != NULL) CFRelease(output_entry);
+    if (description != NULL) CFRelease(description);
+    if (one != NULL) CFRelease(one);
+    if (aggregate_uid != NULL) CFRelease(aggregate_uid);
+    CFRelease(output_uid);
+    CFRelease(input_uid);
+    return status;
+}
+
+SpAudioResult sp_audio_multichannel_create(SpAudioOutput **output_result,
+                                            uint32_t input_device, uint32_t playback_device,
+                                            uint32_t frames, uint32_t output_channels,
+                                            uint8_t allow_reconfiguration, void *renderer,
+                                            SpMultichannelRenderCallback render) {
+    SpDeviceFormatReport report = {0};
     *output_result = NULL;
-    if ((frames != 128 && frames != 256) || renderer == NULL || render == NULL) {
+    if ((frames != 32 && frames != 64 && frames != 128 && frames != 256) ||
+        output_channels == 0 || output_channels > 64 || renderer == NULL || render == NULL ||
+        playback_device == kAudioObjectUnknown) {
         SpAudioResult result = sp_result_error(SP_AUDIO_STATUS_UNSUPPORTED_FORMAT,
             SP_AUDIO_OPERATION_VERIFY_DEVICE_FORMAT, report);
         result.renderer_retired = 1; result.native_releasable = 1; return result;
     }
+    uint32_t available_output = sp_channel_count(playback_device, kAudioDevicePropertyScopeOutput);
+    uint32_t available_input = input_device == kAudioObjectUnknown ? 0 :
+        sp_channel_count(input_device, kAudioDevicePropertyScopeInput);
+    if (available_output < output_channels ||
+        (input_device != kAudioObjectUnknown && available_input == 0)) {
+        SpAudioResult result = sp_result_error(SP_AUDIO_STATUS_UNSUPPORTED_FORMAT,
+            SP_AUDIO_OPERATION_READ_STREAM_CONFIGURATION, report);
+        result.renderer_retired = 1; result.native_releasable = 1; return result;
+    }
     SpAudioOutput *output = calloc(1, sizeof(*output));
     if (output == NULL) {
-        SpAudioResult result = sp_result_error(kAudio_MemFullError, SP_AUDIO_OPERATION_ALLOCATE_STATE, report);
+        SpAudioResult result = sp_result_error(kAudio_MemFullError,
+            SP_AUDIO_OPERATION_ALLOCATE_STATE, report);
         result.renderer_retired = 1; result.native_releasable = 1; return result;
     }
     sp_telemetry_init(&output->telemetry);
     atomic_init(&output->sample_rate_listener.generation, 0);
     atomic_init(&output->frame_count_listener.generation, 0);
     atomic_init(&output->device_event, 0);
-    output->device = (AudioDeviceID)device;
+    atomic_init(&output->device_event_pending, 0);
     output->frames = frames;
     output->renderer = renderer;
-    output->duplex_render = render;
-    output->duplex = 1;
+    output->multichannel_render = render;
+    output->multichannel = 1;
+    output->duplex = input_device != kAudioObjectUnknown;
+    output->input_device = input_device;
+    output->output_device = playback_device;
+    output->input_channels = available_input < 64 ? available_input : 64;
+    output->output_channels = output_channels;
+    output->device = playback_device;
+    if (input_device != kAudioObjectUnknown && input_device != playback_device) {
+        OSStatus status = sp_create_private_aggregate(input_device, playback_device,
+                                                       &output->aggregate_device);
+        if (status != noErr) {
+            free(output);
+            SpAudioResult result = sp_result_error(status, SP_AUDIO_OPERATION_CREATE_UNIT, report);
+            result.renderer_retired = 1; result.native_releasable = 1; return result;
+        }
+        output->device = output->aggregate_device;
+        output->input_channel_offset = sp_channel_count(playback_device,
+                                                         kAudioDevicePropertyScopeInput);
+        uint32_t aggregate_output = 0, aggregate_input = 0;
+        for (uint32_t attempt = 0; attempt < SP_PROPERTY_POLL_LIMIT; ++attempt) {
+            aggregate_output = sp_channel_count(output->aggregate_device,
+                                                 kAudioDevicePropertyScopeOutput);
+            aggregate_input = sp_channel_count(output->aggregate_device,
+                                                kAudioDevicePropertyScopeInput);
+            if (aggregate_output >= output_channels &&
+                aggregate_input >= output->input_channel_offset + output->input_channels) break;
+            sp_poll_delay();
+        }
+        if (aggregate_output < output_channels ||
+            aggregate_input < output->input_channel_offset + output->input_channels) {
+            *output_result = output;
+            return sp_finish_failed_create(output, sp_result_error(
+                SP_AUDIO_STATUS_UNSUPPORTED_FORMAT,
+                SP_AUDIO_OPERATION_READ_STREAM_CONFIGURATION, report));
+        }
+    }
     *output_result = output;
     return sp_create_core_audio_output(output, allow_reconfiguration);
 }

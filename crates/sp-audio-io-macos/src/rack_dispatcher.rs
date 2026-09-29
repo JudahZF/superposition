@@ -11,7 +11,7 @@ use std::{
 
 use sp_engine::{
     FallbackReason, GateOutcome, RackAudioSource, RackGate, RackGateState, RealtimeRackMixer,
-    WorkerObservation,
+    SidechainSources, WorkerObservation,
 };
 use sp_shared_memory::{
     BlockEvent, BlockRequest, BlockTicket, MAX_EVENTS, MAX_MIDI_EVENTS, MAX_RACKS, MidiEvent,
@@ -24,7 +24,12 @@ use sp_shared_memory_macos::{
 
 const STEREO_CHANNELS: u32 = 2;
 const MAX_SAMPLES: usize = sp_engine::MAX_MIX_FRAMES * sp_engine::MIX_CHANNELS;
-const MAX_IDLE_OBSERVATION_PASSES: u8 = 2;
+
+#[derive(Clone, Copy)]
+enum RackInputs<'a> {
+    Shared(&'a [f32]),
+    PerRack(&'a [[f32; MAX_SAMPLES]; MAX_RACKS]),
+}
 
 /// Fixed callback-owned automation payload for one product rack.
 #[derive(Clone, Copy)]
@@ -64,7 +69,7 @@ impl RackAutomationEvents {
         true
     }
 
-    fn as_slice(&self) -> &[BlockEvent] {
+    pub(crate) fn as_slice(&self) -> &[BlockEvent] {
         &self.events[..self.len]
     }
 }
@@ -78,75 +83,55 @@ impl Default for RackAutomationEvents {
 static EMPTY_RACK_AUTOMATION: [RackAutomationEvents; MAX_RACKS] =
     [RackAutomationEvents::new(); MAX_RACKS];
 
-/// Result of one bounded completion-observation sweep.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ObservationStop {
-    /// At least one request remains and another nonblocking sweep may be useful.
-    Continue,
-    /// No request remains observable.
-    NoLiveRequests,
-    /// The absolute callback deadline has been reached.
-    DeadlineReached,
-    /// Consecutive no-progress sweeps make another poll useless for this callback.
-    NoUsefulProgress,
-}
-
-/// Fixed adaptive policy for callback completion observation.
-///
-/// The policy never sleeps or blocks. Progress resets its short idle allowance; otherwise it
-/// exits after a bounded number of full sweeps even if the absolute deadline is further away.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct CompletionObservationBudget {
-    idle_passes: u8,
-}
-
-impl CompletionObservationBudget {
-    fn after_pass(
-        &mut self,
-        awaiting: bool,
-        made_progress: bool,
-        deadline_reached: bool,
-    ) -> ObservationStop {
-        if !awaiting {
-            return ObservationStop::NoLiveRequests;
-        }
-        if deadline_reached {
-            return ObservationStop::DeadlineReached;
-        }
-        if made_progress {
-            self.idle_passes = 0;
-            return ObservationStop::Continue;
-        }
-        self.idle_passes = self.idle_passes.saturating_add(1);
-        if self.idle_passes >= MAX_IDLE_OBSERVATION_PASSES {
-            ObservationStop::NoUsefulProgress
-        } else {
-            ObservationStop::Continue
-        }
-    }
-}
-
 /// Lock-free counters for one rack, suitable for control-plane polling.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RackDispatchTelemetry {
     /// Requests published to this rack bank.
     pub published: u64,
+    /// Failed kernel wake calls after publishing a request.
+    pub wake_failures: u64,
+    /// Longest observed kernel wake call in shared monotonic clock ticks.
+    pub max_wake_ticks: u64,
     /// Valid completions consumed from this rack bank.
     pub completed: u64,
     /// Requests that did not complete before the block deadline.
     pub deadline_misses: u64,
+    /// Deadline misses where the worker had not claimed the request.
+    pub missed_unclaimed: u64,
+    /// Deadline misses where the worker owned or was processing the request.
+    pub missed_in_progress: u64,
+    /// Deadline misses where completion became visible after the final sweep.
+    pub missed_completed_late: u64,
+    /// Callback block index of the most recent deadline miss.
+    pub last_miss_block_index: u64,
+    /// Request ticket sequence of the most recent deadline miss.
+    pub last_miss_sequence: u64,
+    /// Shared monotonic tick when the most recent missed request was published.
+    pub last_miss_request_tick: u64,
+    /// Shared monotonic tick when the worker claimed the most recent missed request, or zero.
+    pub last_miss_claimed_tick: u64,
+    /// Shared monotonic tick when the callback observed the most recent deadline miss.
+    pub last_miss_observed_tick: u64,
+    /// Worker loop phase observed at the last miss (0 scan, 1 control, 2 editor, 3 wait).
+    pub last_miss_worker_phase: u64,
+    /// Wake sequence last observed by the worker at the last miss.
+    pub last_miss_worker_wait_sequence: u64,
+    /// Producer wake sequence at the last miss.
+    pub last_miss_wake_sequence: u64,
+    /// Most recent worker loop start at the last miss.
+    pub last_miss_worker_loop_tick: u64,
     /// Malformed or otherwise invalid protocol observations.
     pub protocol_rejections: u64,
     /// Completion tickets that did not match the live ticket.
     pub stale_completions: u64,
     /// Transitions to rack-local fallback.
     pub fallback_activations: u64,
+    /// Callback blocks rendered while this rack's gate is closed.
+    pub gate_closed_blocks: u64,
     /// Completion-observation sweeps that inspected this rack.
     pub completion_observation_passes: u64,
     /// Observations that stopped because the absolute deadline was reached.
     pub completion_observation_deadline_stops: u64,
-    /// Observations that stopped because bounded polling made no useful progress.
-    pub completion_observation_no_progress_stops: u64,
     /// Timed-out requested slots explicitly marked abandoned and retained for retirement.
     pub abandoned_requests: u64,
 }
@@ -154,34 +139,86 @@ pub struct RackDispatchTelemetry {
 #[derive(Default)]
 struct AtomicRackDispatchTelemetry {
     published: AtomicU64,
+    wake_failures: AtomicU64,
+    max_wake_ticks: AtomicU64,
     completed: AtomicU64,
     deadline_misses: AtomicU64,
+    missed_unclaimed: AtomicU64,
+    missed_in_progress: AtomicU64,
+    missed_completed_late: AtomicU64,
+    last_miss_block_index: AtomicU64,
+    last_miss_sequence: AtomicU64,
+    last_miss_request_tick: AtomicU64,
+    last_miss_claimed_tick: AtomicU64,
+    last_miss_observed_tick: AtomicU64,
+    last_miss_worker_phase: AtomicU64,
+    last_miss_worker_wait_sequence: AtomicU64,
+    last_miss_wake_sequence: AtomicU64,
+    last_miss_worker_loop_tick: AtomicU64,
     protocol_rejections: AtomicU64,
     stale_completions: AtomicU64,
     fallback_activations: AtomicU64,
+    gate_closed_blocks: AtomicU64,
     completion_observation_passes: AtomicU64,
     completion_observation_deadline_stops: AtomicU64,
-    completion_observation_no_progress_stops: AtomicU64,
     abandoned_requests: AtomicU64,
 }
 
 impl AtomicRackDispatchTelemetry {
     fn snapshot(&self) -> RackDispatchTelemetry {
+        let deadline_misses = self.deadline_misses.load(Ordering::Relaxed);
+        let (
+            missed_unclaimed,
+            missed_in_progress,
+            missed_completed_late,
+            last_miss_block_index,
+            last_miss_sequence,
+            last_miss_request_tick,
+            last_miss_claimed_tick,
+            last_miss_observed_tick,
+        ) = if deadline_misses == 0 {
+            (0, 0, 0, 0, 0, 0, 0, 0)
+        } else {
+            (
+                self.missed_unclaimed.load(Ordering::Relaxed),
+                self.missed_in_progress.load(Ordering::Relaxed),
+                self.missed_completed_late.load(Ordering::Relaxed),
+                self.last_miss_block_index.load(Ordering::Relaxed),
+                self.last_miss_sequence.load(Ordering::Relaxed),
+                self.last_miss_request_tick.load(Ordering::Relaxed),
+                self.last_miss_claimed_tick.load(Ordering::Relaxed),
+                self.last_miss_observed_tick.load(Ordering::Relaxed),
+            )
+        };
         RackDispatchTelemetry {
             published: self.published.load(Ordering::Relaxed),
+            wake_failures: self.wake_failures.load(Ordering::Relaxed),
+            max_wake_ticks: self.max_wake_ticks.load(Ordering::Relaxed),
             completed: self.completed.load(Ordering::Relaxed),
-            deadline_misses: self.deadline_misses.load(Ordering::Relaxed),
+            deadline_misses,
+            missed_unclaimed,
+            missed_in_progress,
+            missed_completed_late,
+            last_miss_block_index,
+            last_miss_sequence,
+            last_miss_request_tick,
+            last_miss_claimed_tick,
+            last_miss_observed_tick,
+            last_miss_worker_phase: self.last_miss_worker_phase.load(Ordering::Relaxed),
+            last_miss_worker_wait_sequence: self
+                .last_miss_worker_wait_sequence
+                .load(Ordering::Relaxed),
+            last_miss_wake_sequence: self.last_miss_wake_sequence.load(Ordering::Relaxed),
+            last_miss_worker_loop_tick: self.last_miss_worker_loop_tick.load(Ordering::Relaxed),
             protocol_rejections: self.protocol_rejections.load(Ordering::Relaxed),
             stale_completions: self.stale_completions.load(Ordering::Relaxed),
             fallback_activations: self.fallback_activations.load(Ordering::Relaxed),
+            gate_closed_blocks: self.gate_closed_blocks.load(Ordering::Relaxed),
             completion_observation_passes: self
                 .completion_observation_passes
                 .load(Ordering::Relaxed),
             completion_observation_deadline_stops: self
                 .completion_observation_deadline_stops
-                .load(Ordering::Relaxed),
-            completion_observation_no_progress_stops: self
-                .completion_observation_no_progress_stops
                 .load(Ordering::Relaxed),
             abandoned_requests: self.abandoned_requests.load(Ordering::Relaxed),
         }
@@ -193,6 +230,7 @@ struct LiveRequest {
     bank_index: usize,
     ticket: BlockTicket,
     slot_index: usize,
+    request: BlockRequest,
 }
 
 struct RackDispatchState {
@@ -207,13 +245,87 @@ struct RackDispatchState {
     telemetry: AtomicRackDispatchTelemetry,
 }
 
+impl RackDispatchState {
+    fn new(
+        rack_index: usize,
+        banks: MappedRackBanks,
+        recovery: Option<Arc<RackRecoverySignal>>,
+    ) -> Self {
+        Self {
+            rack_index,
+            banks,
+            recovery,
+            gate: RackGate::new(),
+            live: None,
+            outcome: GateOutcome::DispatchAllowed,
+            wet: [0.0; MAX_SAMPLES],
+            wet_valid: false,
+            telemetry: AtomicRackDispatchTelemetry::default(),
+        }
+    }
+}
+
+/// One rack's dispatch lane, built on the control thread and moved into a running callback.
+///
+/// Dropping a lane unmaps its banks, so lanes the callback retires come back to the control
+/// thread before they are dropped. Boxed so the callback only moves a pointer.
+pub struct PreparedRackLane(Box<RackDispatchState>);
+
+impl PreparedRackLane {
+    /// Maps a live worker's two banks for callback dispatch.
+    ///
+    /// # Errors
+    /// Returns an error for an unfinished handoff or an invalid bank pair.
+    pub fn new(
+        regions: [SharedMemoryRegion; 2],
+        active_index: usize,
+        recovery: Arc<RackRecoverySignal>,
+    ) -> io::Result<Self> {
+        if recovery.state() != RackRecoveryState::Idle {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "finish the rack bank handoff before adding it to live audio",
+            ));
+        }
+        // SAFETY: the control plane supplies the index owned by the live worker; the opposite
+        // bank has no worker.
+        let banks = unsafe { MappedRackBanks::from_indexed_regions(regions, active_index) }?;
+        Ok(Self(Box::new(RackDispatchState::new(
+            0,
+            banks,
+            Some(recovery),
+        ))))
+    }
+
+    /// The worker recovery signal that identifies this lane's worker.
+    #[must_use]
+    pub fn recovery(&self) -> Option<&Arc<RackRecoverySignal>> {
+        self.0.recovery.as_ref()
+    }
+}
+
+/// Where one rack position gets its dispatch lane after a live topology change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LaneSource {
+    /// No worker: the rack passes dry audio, or has no rack at all.
+    Empty,
+    /// The lane previously at this position keeps its worker.
+    Keep(usize),
+    /// The next lane from the change's new lanes, in position order.
+    New,
+}
+
 /// Preallocated host-side dispatcher for two stable shared-memory banks per rack.
 ///
-/// It follows the same protocol sequence proven by `xtask phase1`: publish a timed request,
+/// It follows the shared-memory block protocol: publish a timed request,
 /// observe a completion through `completion_snapshot`, then consume only the exact live ticket.
 pub struct RackSharedMemoryDispatcher {
     clock: MonotonicClock,
-    racks: Vec<RackDispatchState>,
+    #[allow(
+        clippy::vec_box,
+        reason = "live layout changes move lanes on the callback; a box moves one pointer"
+    )]
+    racks: Vec<Box<RackDispatchState>>,
     block_index: u64,
 }
 
@@ -275,6 +387,41 @@ impl RackSharedMemoryDispatcher {
         )
     }
 
+    /// Installs the control plane's fixed-order bank pairs and current active indices.
+    ///
+    /// The control plane must supply the live worker's index after retiring the opposite
+    /// bank. Only one dispatcher may drive these mappings and recovery signals at a time.
+    /// Construction does not start an audio device or dispatch an audio block.
+    ///
+    /// # Errors
+    /// Returns an error for an unfinished handoff, invalid bank pair or rack index, or an
+    /// unavailable monotonic clock.
+    pub fn with_rack_banks(
+        mappings: Vec<(
+            usize,
+            [SharedMemoryRegion; 2],
+            usize,
+            Arc<RackRecoverySignal>,
+        )>,
+    ) -> io::Result<Self> {
+        let banks = mappings
+            .into_iter()
+            .map(|(rack_index, regions, active_index, recovery)| {
+                if recovery.state() != RackRecoveryState::Idle {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "finish the rack bank handoff before preparing a new renderer",
+                    ));
+                }
+                // SAFETY: the control plane supplies the fixed index owned by its live worker;
+                // the opposite bank has no worker and has completed any prior retirement.
+                unsafe { MappedRackBanks::from_indexed_regions(regions, active_index) }
+                    .map(|banks| (rack_index, banks, recovery))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Self::new_indexed_recoverable(banks)
+    }
+
     fn with_indexed_mapped_banks(banks: Vec<(usize, MappedRackBanks)>) -> io::Result<Self> {
         Self::with_recovery_mapped_banks(
             banks
@@ -309,19 +456,12 @@ impl RackSharedMemoryDispatcher {
             }
         }
         let clock = MonotonicClock::new()?;
-        let mut racks = Vec::with_capacity(banks.len());
+        // Full capacity up front: live topology changes push lanes on the callback.
+        let mut racks = Vec::with_capacity(MAX_RACKS);
         for (rack_index, banks, recovery) in banks {
-            racks.push(RackDispatchState {
-                rack_index,
-                banks,
-                recovery,
-                gate: RackGate::new(),
-                live: None,
-                outcome: GateOutcome::DispatchAllowed,
-                wet: [0.0; MAX_SAMPLES],
-                wet_valid: false,
-                telemetry: AtomicRackDispatchTelemetry::default(),
-            });
+            racks.push(Box::new(RackDispatchState::new(
+                rack_index, banks, recovery,
+            )));
         }
         Ok(Self {
             clock,
@@ -330,10 +470,60 @@ impl RackSharedMemoryDispatcher {
         })
     }
 
+    /// Moves lanes to their new positions, installs `new_lanes`, and moves every other lane
+    /// into `retired`, at a callback block boundary.
+    ///
+    /// This never allocates when `retired` has capacity for [`MAX_RACKS`] lanes. Retired lanes
+    /// release their live requests here; the caller returns them to the control thread.
+    pub fn apply_topology(
+        &mut self,
+        sources: &[LaneSource; MAX_RACKS],
+        new_lanes: &mut Vec<PreparedRackLane>,
+        retired: &mut Vec<PreparedRackLane>,
+    ) {
+        for rack in &mut self.racks {
+            let previous = rack.rack_index;
+            rack.rack_index = sources
+                .iter()
+                .position(|source| *source == LaneSource::Keep(previous))
+                .unwrap_or(usize::MAX);
+        }
+        while let Some(index) = self
+            .racks
+            .iter()
+            .position(|rack| rack.rack_index == usize::MAX)
+        {
+            let mut rack = self.racks.swap_remove(index);
+            abandon_live_request(&mut rack);
+            retired.push(PreparedRackLane(rack));
+        }
+        // New lanes were queued in position order; install them from the back.
+        for (position, source) in sources.iter().enumerate().rev() {
+            if *source == LaneSource::New
+                && let Some(PreparedRackLane(mut rack)) = new_lanes.pop()
+            {
+                rack.rack_index = position;
+                self.racks.push(rack);
+            }
+        }
+    }
+
     /// Returns the number of configured rack banks.
     #[must_use]
     pub fn rack_count(&self) -> usize {
         self.racks.len()
+    }
+
+    /// Advances only bank handshakes while the caller exclusively owns the stopped renderer.
+    pub(crate) fn service_stopped_recoveries(
+        &mut self,
+    ) -> [Option<Arc<RackRecoverySignal>>; MAX_RACKS] {
+        let mut attached = std::array::from_fn(|_| None);
+        for rack in &mut self.racks {
+            attached[rack.rack_index].clone_from(&rack.recovery);
+            service_recovery(rack, self.block_index);
+        }
+        attached
     }
 
     /// Returns a lock-free telemetry snapshot for one rack.
@@ -467,13 +657,54 @@ impl RackSharedMemoryDispatcher {
         frames: usize,
         deadline: Duration,
     ) {
-        self.process_block_with_events(input, midi, &EMPTY_RACK_AUTOMATION, frames, deadline);
+        self.process_block_with_events(input, None, midi, &EMPTY_RACK_AUTOMATION, frames, deadline);
     }
 
-    /// Dispatches audio, MIDI, and rack-targeted automation for one callback block.
+    /// Dispatches audio, sidechains, MIDI, and rack-targeted automation for one callback block.
     pub fn process_block_with_events(
         &mut self,
         input: &[f32],
+        sidechains: Option<&SidechainSources<'_>>,
+        midi: &[MidiEvent],
+        automation: &[RackAutomationEvents; MAX_RACKS],
+        frames: usize,
+        deadline: Duration,
+    ) {
+        self.process_block_inputs(
+            RackInputs::Shared(input),
+            sidechains,
+            midi,
+            automation,
+            frames,
+            deadline,
+        );
+    }
+
+    /// Dispatches a distinct stereo input to each rack in one callback batch. `sidechains`
+    /// fills the aux region of every sidechained plug-in slot; `None` sends no sidechain.
+    pub fn process_block_with_rack_inputs(
+        &mut self,
+        inputs: &[[f32; MAX_SAMPLES]; MAX_RACKS],
+        sidechains: Option<&SidechainSources<'_>>,
+        midi: &[MidiEvent],
+        automation: &[RackAutomationEvents; MAX_RACKS],
+        frames: usize,
+        deadline: Duration,
+    ) {
+        self.process_block_inputs(
+            RackInputs::PerRack(inputs),
+            sidechains,
+            midi,
+            automation,
+            frames,
+            deadline,
+        );
+    }
+
+    fn process_block_inputs(
+        &mut self,
+        inputs: RackInputs<'_>,
+        sidechains: Option<&SidechainSources<'_>>,
         midi: &[MidiEvent],
         automation: &[RackAutomationEvents; MAX_RACKS],
         frames: usize,
@@ -481,10 +712,11 @@ impl RackSharedMemoryDispatcher {
     ) {
         if frames == 0
             || frames > sp_engine::MAX_MIX_FRAMES
-            || input.len() < frames * 2
+            || matches!(inputs, RackInputs::Shared(input) if input.len() < frames * 2)
             || midi.len() > MAX_MIDI_EVENTS
         {
             self.close_all_invalid();
+            self.record_closed_gates();
             return;
         }
 
@@ -496,15 +728,38 @@ impl RackSharedMemoryDispatcher {
             .clock
             .now_ticks()
             .saturating_add(self.clock.duration_to_ticks(deadline));
-        self.observe_until(frames, deadline_tick);
-        self.dispatch_open(input, midi, automation, frames);
+        self.dispatch_open_inputs(inputs, sidechains, midi, automation, frames);
+        self.observe_until(deadline_tick);
+        self.record_closed_gates();
         self.block_index = self.block_index.wrapping_add(1);
     }
 
-    /// Applies the fixed gate outcomes to the existing realtime mixer.
+    /// Applies gate outcomes and the selected worker's published latency before mixing.
     pub fn apply_to_mixer(&self, mixer: &mut RealtimeRackMixer) {
         for rack in &self.racks {
             mixer.set_gate_outcome(rack.rack_index, rack.outcome);
+            if rack.recovery.as_ref().is_some_and(|recovery| {
+                matches!(
+                    recovery.state(),
+                    RackRecoveryState::QuiesceRequested
+                        | RackRecoveryState::Quiescent
+                        | RackRecoveryState::ReplacementReady { .. }
+                )
+            }) {
+                // The control plane may replace/reset banks after the quiescence acknowledgement.
+                continue;
+            }
+            let latency = rack
+                .banks
+                .active_bank()
+                .bank()
+                .header
+                .worker_latency_samples
+                .load(Ordering::Acquire);
+            mixer.set_dry_delay_frames(
+                rack.rack_index,
+                usize::try_from(latency).unwrap_or(usize::MAX),
+            );
         }
     }
 
@@ -520,11 +775,9 @@ impl RackSharedMemoryDispatcher {
         sources
     }
 
-    fn observe_until(&mut self, frames: usize, deadline_tick: u64) {
-        let mut budget = CompletionObservationBudget::default();
-        let stop = loop {
+    fn observe_until(&mut self, deadline_tick: u64) {
+        loop {
             let mut awaiting = false;
-            let mut made_progress = false;
             for rack in &mut self.racks {
                 if rack.live.is_none() {
                     continue;
@@ -533,20 +786,12 @@ impl RackSharedMemoryDispatcher {
                 rack.telemetry
                     .completion_observation_passes
                     .fetch_add(1, Ordering::Relaxed);
-                made_progress |= observe_rack(rack, self.block_index, frames);
+                observe_rack(rack, self.block_index);
             }
-            let stop = budget.after_pass(
-                awaiting,
-                made_progress,
-                self.clock.now_ticks() >= deadline_tick,
-            );
-            if stop != ObservationStop::Continue {
-                break stop;
+            if !awaiting || self.racks.iter().all(|rack| rack.live.is_none()) {
+                break;
             }
-        };
-
-        match stop {
-            ObservationStop::DeadlineReached => {
+            if self.clock.now_ticks() >= deadline_tick {
                 for rack in &self.racks {
                     if rack.live.is_some() {
                         rack.telemetry
@@ -554,21 +799,14 @@ impl RackSharedMemoryDispatcher {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                break;
             }
-            ObservationStop::NoUsefulProgress => {
-                for rack in &self.racks {
-                    if rack.live.is_some() {
-                        rack.telemetry
-                            .completion_observation_no_progress_stops
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-            ObservationStop::Continue | ObservationStop::NoLiveRequests => {}
+            std::hint::spin_loop();
         }
 
         for rack in &mut self.racks {
             if matches!(rack.gate.state(), RackGateState::Awaiting { .. }) {
+                record_deadline_diagnostics(rack, self.block_index, self.clock.now_ticks());
                 abandon_live_request(rack);
                 let prior = rack.gate.state();
                 // The abandoned slot can never be reused, so the miss closes the rack
@@ -579,9 +817,21 @@ impl RackSharedMemoryDispatcher {
         }
     }
 
+    #[cfg(test)]
     fn dispatch_open(
         &mut self,
         input: &[f32],
+        midi: &[MidiEvent],
+        automation: &[RackAutomationEvents; MAX_RACKS],
+        frames: usize,
+    ) {
+        self.dispatch_open_inputs(RackInputs::Shared(input), None, midi, automation, frames);
+    }
+
+    fn dispatch_open_inputs(
+        &mut self,
+        inputs: RackInputs<'_>,
+        sidechains: Option<&SidechainSources<'_>>,
         midi: &[MidiEvent],
         automation: &[RackAutomationEvents; MAX_RACKS],
         frames: usize,
@@ -614,6 +864,14 @@ impl RackSharedMemoryDispatcher {
                 continue;
             };
             let events = automation[rack.rack_index].as_slice();
+            let input = match inputs {
+                RackInputs::Shared(input) => input,
+                RackInputs::PerRack(inputs) => &inputs[rack.rack_index],
+            };
+            copy_interleaved_stereo_to_planar(input, frames, slot);
+            let sidechain_slots = sidechains.map_or(0, |sidechains| {
+                copy_sidechains(sidechains, rack.rack_index, frames, slot)
+            });
             let request = BlockRequest {
                 frame_count: u32::try_from(frames).unwrap_or(u32::MAX),
                 input_channel_count: STEREO_CHANNELS,
@@ -621,8 +879,8 @@ impl RackSharedMemoryDispatcher {
                 midi_event_count: u32::try_from(midi.len()).unwrap_or(u32::MAX),
                 event_count: u32::try_from(events.len()).unwrap_or(u32::MAX),
                 flags: 0,
+                sidechain_slots,
             };
-            copy_interleaved_stereo_to_planar(input, frames, slot);
             slot.midi_events[..midi.len()].copy_from_slice(midi);
             slot.events[..events.len()].copy_from_slice(events);
             match rack
@@ -641,8 +899,18 @@ impl RackSharedMemoryDispatcher {
                             bank_index,
                             ticket,
                             slot_index,
+                            request,
                         });
                         rack.telemetry.published.fetch_add(1, Ordering::Relaxed);
+                        let started = self.clock.now_ticks();
+                        let notified = rack.banks.active_bank().notify_request();
+                        let wake_ticks = self.clock.now_ticks().saturating_sub(started);
+                        rack.telemetry
+                            .max_wake_ticks
+                            .fetch_max(wake_ticks, Ordering::Relaxed);
+                        if !notified {
+                            rack.telemetry.wake_failures.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 Err(_) => close_dispatch(rack, self.block_index),
@@ -656,6 +924,70 @@ impl RackSharedMemoryDispatcher {
             close_dispatch(rack, self.block_index);
         }
     }
+
+    fn record_closed_gates(&self) {
+        for rack in &self.racks {
+            if matches!(rack.gate.state(), RackGateState::Closed { .. }) {
+                rack.telemetry
+                    .gate_closed_blocks
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+fn record_deadline_diagnostics(rack: &RackDispatchState, block_index: u64, observed_tick: u64) {
+    let live = rack.live.expect("awaiting rack has a live request");
+    let bank = rack
+        .banks
+        .bank(live.bank_index)
+        .expect("live request refers to one stable bank")
+        .bank();
+    rack.telemetry.last_miss_worker_phase.store(
+        u64::from(bank.header.worker_phase.load(Ordering::Acquire)),
+        Ordering::Relaxed,
+    );
+    rack.telemetry.last_miss_worker_wait_sequence.store(
+        u64::from(bank.header.worker_wait_sequence.load(Ordering::Acquire)),
+        Ordering::Relaxed,
+    );
+    rack.telemetry.last_miss_wake_sequence.store(
+        u64::from(bank.header.request_wake_sequence.load(Ordering::Acquire)),
+        Ordering::Relaxed,
+    );
+    rack.telemetry.last_miss_worker_loop_tick.store(
+        bank.header.worker_loop_tick.load(Ordering::Acquire),
+        Ordering::Relaxed,
+    );
+    let slot = bank
+        .slot(live.slot_index)
+        .expect("fixed slot index is in range");
+    let metadata = &slot.metadata;
+    let owner = metadata.owner.load(Ordering::Acquire);
+    let state = metadata.state();
+    let counter = match state {
+        Ok(SlotState::Requested) if owner == 0 => &rack.telemetry.missed_unclaimed,
+        Ok(SlotState::Complete) => &rack.telemetry.missed_completed_late,
+        _ => &rack.telemetry.missed_in_progress,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    rack.telemetry
+        .last_miss_block_index
+        .store(block_index, Ordering::Relaxed);
+    rack.telemetry
+        .last_miss_sequence
+        .store(live.ticket.sequence, Ordering::Relaxed);
+    rack.telemetry.last_miss_request_tick.store(
+        metadata.request_published_tick.load(Ordering::Acquire),
+        Ordering::Relaxed,
+    );
+    rack.telemetry.last_miss_claimed_tick.store(
+        metadata.worker_claimed_tick.load(Ordering::Acquire),
+        Ordering::Relaxed,
+    );
+    rack.telemetry
+        .last_miss_observed_tick
+        .store(observed_tick, Ordering::Relaxed);
 }
 
 fn service_recovery(rack: &mut RackDispatchState, block_index: u64) {
@@ -699,8 +1031,12 @@ fn service_recovery(rack: &mut RackDispatchState, block_index: u64) {
                 .banks
                 .acknowledge_external_retirement(bank_index, generation)
                 .is_ok()
+                && recovery.complete_retirement()
+                && matches!(rack.gate.state(), RackGateState::Closed { .. })
             {
-                let _ = recovery.complete_retirement();
+                // A replacement can itself miss its first deadline while the old
+                // bank is still retiring. Requeue recovery once this handshake is idle.
+                let _ = recovery.request_quiesce();
             }
         }
     }
@@ -715,6 +1051,22 @@ fn copy_interleaved_stereo_to_planar(
         slot.input_audio[0][frame] = input[frame * 2];
         slot.input_audio[1][frame] = input[frame * 2 + 1];
     }
+}
+
+/// Fills the aux region of each sidechained plug-in slot and returns their bitmask.
+fn copy_sidechains(
+    sidechains: &SidechainSources<'_>,
+    rack_index: usize,
+    frames: usize,
+    slot: &mut sp_shared_memory::BlockSlot,
+) -> u32 {
+    let mut sidechain_slots = 0;
+    for (plugin, audio) in slot.sidechain_audio.iter_mut().enumerate() {
+        if sidechains.fill(rack_index, plugin, frames, audio) {
+            sidechain_slots |= 1 << plugin;
+        }
+    }
+    sidechain_slots
 }
 
 fn free_slot_index(region: &SharedMemoryRegion) -> Result<Option<usize>, ProtocolError> {
@@ -754,8 +1106,8 @@ fn abandon_live_request(rack: &mut RackDispatchState) {
     }
 }
 
-/// Observes one nonblocking completion sweep and returns whether it made useful progress.
-fn observe_rack(rack: &mut RackDispatchState, block_index: u64, frames: usize) -> bool {
+/// Observes one nonblocking completion sweep for a live rack request.
+fn observe_rack(rack: &mut RackDispatchState, block_index: u64) {
     let live = rack.live.expect("live request checked before observation");
     let slot = rack
         .banks
@@ -768,10 +1120,12 @@ fn observe_rack(rack: &mut RackDispatchState, block_index: u64, frames: usize) -
         Ok(Some(snapshot)) if snapshot.ticket != live.ticket => {
             WorkerObservation::Completed(snapshot.ticket)
         }
-        Ok(Some(snapshot)) if !is_expected_stereo(snapshot.request, frames) => {
+        Ok(Some(snapshot)) if snapshot.request != live.request => {
             WorkerObservation::ProtocolFault(ProtocolError::MalformedCompletion)
         }
-        Ok(Some(_)) if !copy_finite_output(slot, &mut rack.wet, frames) => {
+        Ok(Some(_))
+            if !copy_finite_output(slot, &mut rack.wet, live.request.frame_count as usize) =>
+        {
             WorkerObservation::ProtocolFault(ProtocolError::MalformedCompletion)
         }
         Ok(Some(_)) => match slot.consume_completion_timing(live.ticket) {
@@ -791,9 +1145,8 @@ fn observe_rack(rack: &mut RackDispatchState, block_index: u64, frames: usize) -
             rack.live = None;
             rack.wet_valid = true;
             rack.telemetry.completed.fetch_add(1, Ordering::Relaxed);
-            true
         }
-        GateOutcome::Awaiting => false,
+        GateOutcome::Awaiting => {}
         GateOutcome::UseFallback(_) => {
             if matches!(observation, WorkerObservation::ProtocolFault(_)) {
                 rack.telemetry
@@ -807,19 +1160,9 @@ fn observe_rack(rack: &mut RackDispatchState, block_index: u64, frames: usize) -
             }
             abandon_live_request(rack);
             record_outcome(rack, prior, rack.outcome);
-            true
         }
         GateOutcome::DispatchAllowed => unreachable!("observation cannot open a dispatch gate"),
     }
-}
-
-fn is_expected_stereo(request: BlockRequest, frames: usize) -> bool {
-    request.frame_count == u32::try_from(frames).unwrap_or(u32::MAX)
-        && request.input_channel_count == STEREO_CHANNELS
-        && request.output_channel_count == STEREO_CHANNELS
-        && u32::try_from(sp_shared_memory::MAX_MIDI_EVENTS)
-            .is_ok_and(|maximum| request.midi_event_count <= maximum)
-        && request.event_count == 0
 }
 
 fn copy_finite_output(
@@ -863,11 +1206,9 @@ fn record_outcome(rack: &RackDispatchState, prior: RackGateState, outcome: GateO
                 .deadline_misses
                 .fetch_add(1, Ordering::Relaxed);
         }
-        // Deadline misses close the rack but never quiesce from the callback: replacing a
-        // slow-but-alive worker is a control-plane policy decision made off this thread.
-        if let Some(recovery) = &rack.recovery
-            && reason != FallbackReason::DeadlineMiss
-        {
+        // A hard deadline miss abandons the live slot and closes this gate. The stable
+        // bank must be retired before any further request can reach this rack.
+        if let Some(recovery) = &rack.recovery {
             let _ = recovery.request_quiesce();
         }
     }
@@ -880,16 +1221,13 @@ mod tests {
         time::Duration,
     };
 
-    use sp_shared_memory::SlotState;
+    use sp_shared_memory::{BLOCK_EVENT_PARAMETER, BlockEvent, MAX_RACKS, SlotState};
     use sp_shared_memory_macos::{
         MappedBankLifecycle, MappedRackBanks, RackRecoverySignal, RackRecoveryState,
         SharedMemoryRegion,
     };
 
-    use super::{
-        CompletionObservationBudget, MidiEvent, ObservationStop, RackAudioSource,
-        RackSharedMemoryDispatcher,
-    };
+    use super::{MidiEvent, RackAudioSource, RackAutomationEvents, RackSharedMemoryDispatcher};
 
     fn dispatcher(racks: usize) -> Option<RackSharedMemoryDispatcher> {
         let regions = match (0..racks)
@@ -934,54 +1272,32 @@ mod tests {
         .expect("complete");
     }
 
-    #[test]
-    fn observation_policy_has_deterministic_deadline_and_idle_bounds() {
-        let mut budget = CompletionObservationBudget::default();
-        assert_eq!(
-            budget.after_pass(true, false, false),
-            ObservationStop::Continue
-        );
-        assert_eq!(
-            budget.after_pass(true, false, false),
-            ObservationStop::NoUsefulProgress
-        );
-
-        let mut progress_budget = CompletionObservationBudget::default();
-        assert_eq!(
-            progress_budget.after_pass(true, true, false),
-            ObservationStop::Continue
-        );
-        assert_eq!(
-            progress_budget.after_pass(true, false, false),
-            ObservationStop::Continue
-        );
-        assert_eq!(
-            progress_budget.after_pass(true, false, true),
-            ObservationStop::DeadlineReached
-        );
-        assert_eq!(
-            progress_budget.after_pass(false, true, false),
-            ObservationStop::NoLiveRequests
-        );
+    fn publish(dispatcher: &mut RackSharedMemoryDispatcher, input: &[f32], midi: &[MidiEvent]) {
+        dispatcher.dispatch_open(input, midi, &super::EMPTY_RACK_AUTOMATION, 2);
     }
 
     #[test]
-    fn idle_observation_is_bounded_and_abandons_without_reusing_the_slot() {
+    fn observation_uses_deadline_before_abandoning_unfinished_request() {
         let Some(mut dispatcher) = dispatcher(1) else {
             return;
         };
         let input = [0.0; 4];
-        dispatcher.process_block(&input, &[], 2, Duration::ZERO);
+        publish(&mut dispatcher, &input, &[]);
         let live = dispatcher.racks[0].live.expect("request");
 
-        // A deliberately distant absolute deadline must not induce a busy wait after two
-        // complete no-progress sweeps.
-        dispatcher.process_block(&input, &[], 2, Duration::from_secs(1));
+        dispatcher.process_block(&input, &[], 2, Duration::from_millis(2));
         let telemetry = dispatcher.telemetry(0).expect("telemetry");
-        assert_eq!(telemetry.completion_observation_passes, 2);
-        assert_eq!(telemetry.completion_observation_no_progress_stops, 1);
-        assert_eq!(telemetry.completion_observation_deadline_stops, 0);
+        assert!(telemetry.completion_observation_passes > 2);
+        assert_eq!(telemetry.completion_observation_deadline_stops, 1);
         assert_eq!(telemetry.abandoned_requests, 1);
+        assert_eq!(telemetry.deadline_misses, 1);
+        assert_eq!(telemetry.missed_unclaimed, 1);
+        assert_eq!(telemetry.missed_in_progress, 0);
+        assert_eq!(telemetry.missed_completed_late, 0);
+        assert_eq!(telemetry.last_miss_sequence, live.ticket.sequence);
+        assert!(telemetry.last_miss_request_tick > 0);
+        assert_eq!(telemetry.last_miss_claimed_tick, 0);
+        assert!(telemetry.last_miss_observed_tick >= telemetry.last_miss_request_tick);
         assert!(dispatcher.racks[0].live.is_none());
         assert_eq!(
             dispatcher.racks[0]
@@ -998,6 +1314,38 @@ mod tests {
     }
 
     #[test]
+    fn deadline_diagnostics_distinguish_claimed_request() {
+        let Some(mut dispatcher) = dispatcher(1) else {
+            return;
+        };
+        let input = [0.0; 4];
+        publish(&mut dispatcher, &input, &[]);
+        let live = dispatcher.racks[0].live.expect("request");
+        let slot = dispatcher.racks[0]
+            .banks
+            .bank(live.bank_index)
+            .expect("live bank")
+            .bank()
+            .slot(live.slot_index)
+            .expect("slot");
+        slot.claim_for_processing_at(1, dispatcher.clock.now_ticks())
+            .expect("claim");
+
+        dispatcher.process_block(&input, &[], 2, Duration::ZERO);
+
+        let telemetry = dispatcher.telemetry(0).expect("telemetry");
+        assert_eq!(telemetry.deadline_misses, 1);
+        assert_eq!(telemetry.missed_unclaimed, 0);
+        assert_eq!(telemetry.missed_in_progress, 1);
+        assert_eq!(telemetry.missed_completed_late, 0);
+        assert_eq!(telemetry.abandoned_requests, 0);
+        assert_eq!(telemetry.last_miss_sequence, live.ticket.sequence);
+        assert!(telemetry.last_miss_request_tick > 0);
+        assert!(telemetry.last_miss_claimed_tick >= telemetry.last_miss_request_tick);
+        assert!(telemetry.last_miss_observed_tick >= telemetry.last_miss_claimed_tick);
+    }
+
+    #[test]
     fn sparse_product_rack_indices_are_preserved() {
         let region = match SharedMemoryRegion::create(1) {
             Ok(region) => region,
@@ -1007,7 +1355,7 @@ mod tests {
         let mut dispatcher =
             RackSharedMemoryDispatcher::new_indexed(vec![(3, region)]).expect("indexed dispatcher");
         let input = [0.0; 4];
-        dispatcher.process_block(&input, &[], 2, Duration::ZERO);
+        publish(&mut dispatcher, &input, &[]);
         complete(&mut dispatcher, 0, [1.0, 2.0, 3.0, 4.0]);
         dispatcher.process_block(&input, &[], 2, Duration::ZERO);
 
@@ -1033,7 +1381,7 @@ mod tests {
             data: [0x90, 60, 100],
             flags: 0,
         };
-        dispatcher.process_block(&[0.0; 4], &[event], 2, Duration::ZERO);
+        publish(&mut dispatcher, &[0.0; 4], &[event]);
 
         let live = dispatcher.racks[0].live.expect("live request");
         let slot = dispatcher.racks[0]
@@ -1060,8 +1408,8 @@ mod tests {
         assert_eq!(prepared.identity.generation, 11);
 
         let input = [0.0; 4];
+        publish(&mut dispatcher, &input, &[]);
         dispatcher.process_block(&input, &[], 2, Duration::ZERO);
-        dispatcher.process_block(&input, &[], 2, Duration::from_secs(1));
         let retiring = dispatcher
             .activate_prepared_replacement(0)
             .expect("activate replacement");
@@ -1129,11 +1477,128 @@ mod tests {
         unsafe { owners[0].reset_after_worker_exit(13) }.expect("reset retired bank");
         assert!(recovery.publish_retired_reset(0, 13));
         dispatcher.process_block(&[0.0; 4], &[], 2, Duration::ZERO);
-        assert_eq!(recovery.state(), RackRecoveryState::Idle);
+        assert_eq!(recovery.state(), RackRecoveryState::QuiesceRequested);
         assert_eq!(
             dispatcher.racks[0].banks.metadata()[0].lifecycle,
             MappedBankLifecycle::Inactive
         );
+    }
+
+    #[test]
+    fn hard_deadline_miss_requests_bank_replacement() {
+        let [active, inactive] = match [
+            SharedMemoryRegion::create(21),
+            SharedMemoryRegion::create(22),
+        ] {
+            [Ok(active), Ok(inactive)] => [active, inactive],
+            [Err(error), _] | [_, Err(error)]
+                if error.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                return;
+            }
+            [Err(error), _] | [_, Err(error)] => panic!("regions: {error}"),
+        };
+        // SAFETY: both mappings are fresh and no worker has been launched.
+        let banks =
+            unsafe { MappedRackBanks::from_regions(active, inactive) }.expect("mapped pair");
+        let recovery = Arc::new(RackRecoverySignal::new());
+        let mut dispatcher = RackSharedMemoryDispatcher::new_indexed_recoverable(vec![(
+            0,
+            banks,
+            Arc::clone(&recovery),
+        )])
+        .expect("dispatcher");
+        dispatcher.process_block(&[0.0; 4], &[], 2, Duration::ZERO);
+
+        assert_eq!(recovery.state(), RackRecoveryState::QuiesceRequested);
+        assert_eq!(
+            dispatcher.telemetry(0).expect("telemetry").deadline_misses,
+            1
+        );
+        assert_eq!(
+            dispatcher
+                .telemetry(0)
+                .expect("telemetry")
+                .gate_closed_blocks,
+            1
+        );
+        dispatcher.process_block(&[0.0; 4], &[], 2, Duration::ZERO);
+        assert_eq!(recovery.state(), RackRecoveryState::Quiescent);
+        assert_eq!(
+            dispatcher
+                .telemetry(0)
+                .expect("telemetry")
+                .gate_closed_blocks,
+            2
+        );
+    }
+
+    #[test]
+    fn stopped_dispatcher_updates_bank_selector_before_same_renderer_resume() {
+        let Some(mut dispatcher) = dispatcher(2) else {
+            return;
+        };
+        let recovery = Arc::new(RackRecoverySignal::new());
+        dispatcher.racks[0].recovery = Some(Arc::clone(&recovery));
+        let mut active_owner =
+            SharedMemoryRegion::open(dispatcher.racks[0].banks.bank(0).unwrap().name())
+                .expect("active owner mapping");
+        let mut inactive_owner =
+            SharedMemoryRegion::open(dispatcher.racks[0].banks.bank(1).unwrap().name())
+                .expect("inactive owner mapping");
+        let other_metadata = dispatcher.bank_metadata(1).unwrap();
+
+        assert!(recovery.request_quiesce());
+        let attached = dispatcher.service_stopped_recoveries();
+        assert!(
+            attached[0]
+                .as_ref()
+                .is_some_and(|signal| Arc::ptr_eq(signal, &recovery))
+        );
+        assert!(attached[1..].iter().all(Option::is_none));
+        assert_eq!(recovery.state(), RackRecoveryState::Quiescent);
+
+        // SAFETY: this test has no native callback or worker, and the dispatcher is quiescent.
+        unsafe { inactive_owner.reset_after_worker_exit(11) }.expect("replacement mapping");
+        assert!(recovery.publish_replacement(1, 11));
+        dispatcher.service_stopped_recoveries();
+        assert_eq!(dispatcher.racks[0].banks.active_index(), 1);
+        assert_eq!(
+            recovery.state(),
+            RackRecoveryState::ReplacementActive {
+                retiring_bank_index: 0
+            }
+        );
+        // SAFETY: no worker exists and the stopped dispatcher no longer selects this bank.
+        unsafe { active_owner.reset_after_worker_exit(13) }.expect("retired mapping reset");
+        assert!(recovery.publish_retired_reset(0, 13));
+        dispatcher.service_stopped_recoveries();
+        assert_eq!(recovery.state(), RackRecoveryState::Idle);
+        assert_eq!(dispatcher.bank_metadata(1).unwrap(), other_metadata);
+        assert_eq!(dispatcher.block_index, 0);
+        assert_eq!(dispatcher.telemetry(0).unwrap().deadline_misses, 0);
+        assert_eq!(dispatcher.telemetry(1).unwrap().fallback_activations, 0);
+
+        inactive_owner
+            .bank()
+            .header
+            .worker_latency_samples
+            .store(37, Ordering::Release);
+        let mut mixer = sp_engine::RealtimeRackMixer::new(sp_engine::PreparedGraph::empty());
+        dispatcher.apply_to_mixer(&mut mixer);
+        assert_eq!(mixer.rack_settings(0).unwrap().latency_frames, 37);
+        publish(&mut dispatcher, &[0.0; 4], &[]);
+        assert_eq!(dispatcher.racks[0].live.unwrap().ticket.generation, 11);
+        assert_eq!(dispatcher.racks[1].live.unwrap().bank_index, 0);
+        assert!(recovery.request_quiesce());
+        dispatcher.service_stopped_recoveries();
+        inactive_owner
+            .bank()
+            .header
+            .worker_latency_samples
+            .store(99, Ordering::Release);
+        dispatcher.apply_to_mixer(&mut mixer);
+        assert_eq!(mixer.rack_settings(0).unwrap().latency_frames, 37);
     }
 
     #[test]
@@ -1142,7 +1607,7 @@ mod tests {
             return;
         };
         let input = [0.25, -0.25, 0.5, -0.5];
-        dispatcher.process_block(&input, &[], 2, Duration::ZERO);
+        publish(&mut dispatcher, &input, &[]);
         let live = dispatcher.racks[0].live.expect("request");
         let slot = dispatcher.racks[0]
             .banks
@@ -1165,12 +1630,132 @@ mod tests {
     }
 
     #[test]
+    fn small_blocks_publish_and_consume_full_wet_output() {
+        for frames in [32, 64] {
+            let Some(mut dispatcher) = dispatcher(1) else {
+                return;
+            };
+            let input: Vec<f32> = (0..frames * 2)
+                .map(|sample| f32::from(u8::try_from(sample).expect("small block sample index")))
+                .collect();
+            dispatcher.dispatch_open(&input, &[], &super::EMPTY_RACK_AUTOMATION, frames);
+            let live = dispatcher.racks[0].live.expect("request");
+            assert_eq!(live.request.frame_count as usize, frames);
+            let slot = dispatcher.racks[0]
+                .banks
+                .bank_mut(live.bank_index)
+                .expect("bank")
+                .bank_mut()
+                .slot_mut(live.slot_index)
+                .expect("slot");
+            assert_eq!(
+                slot.input_audio[0][frames - 1].to_bits(),
+                input[(frames - 1) * 2].to_bits()
+            );
+            assert_eq!(
+                slot.input_audio[1][frames - 1].to_bits(),
+                input[(frames - 1) * 2 + 1].to_bits()
+            );
+            assert_eq!(
+                slot.claim_for_processing_at(1, dispatcher.clock.now_ticks())
+                    .unwrap(),
+                live.ticket
+            );
+            slot.output_audio[0][frames - 1] = 0.25;
+            slot.output_audio[1][frames - 1] = -0.25;
+            slot.publish_completion_at(1, live.ticket, dispatcher.clock.now_ticks())
+                .unwrap();
+
+            super::observe_rack(&mut dispatcher.racks[0], dispatcher.block_index);
+            let sources = dispatcher.sources();
+            let RackAudioSource::Wet(wet) = sources[0] else {
+                panic!("small completion must provide wet audio");
+            };
+            assert_eq!(&wet[(frames - 1) * 2..frames * 2], &[0.25, -0.25]);
+            assert_eq!(dispatcher.telemetry(0).unwrap().completed, 1);
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::large_stack_arrays,
+        reason = "the callback API uses fixed per-rack input arrays"
+    )]
+    fn per_rack_inputs_publish_distinct_audio_in_one_batch() {
+        let Some(mut dispatcher) = dispatcher(2) else {
+            return;
+        };
+        let mut inputs = [[0.0; super::MAX_SAMPLES]; MAX_RACKS];
+        inputs[0][0] = 0.25;
+        inputs[0][1] = -0.25;
+        inputs[1][0] = 0.75;
+        inputs[1][1] = -0.75;
+        dispatcher.process_block_with_rack_inputs(
+            &inputs,
+            None,
+            &[],
+            &super::EMPTY_RACK_AUTOMATION,
+            32,
+            Duration::ZERO,
+        );
+        for (rack_index, input) in inputs.iter().enumerate().take(2) {
+            let slot = dispatcher.racks[rack_index]
+                .banks
+                .active_bank()
+                .bank()
+                .slot(0)
+                .expect("first slot");
+            assert_eq!(slot.metadata.frame_count, 32);
+            assert_eq!(slot.input_audio[0][0].to_bits(), input[0].to_bits());
+            assert_eq!(slot.input_audio[1][0].to_bits(), input[1].to_bits());
+            assert_eq!(dispatcher.telemetry(rack_index).unwrap().published, 1);
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::large_stack_arrays,
+        reason = "test uses the same fixed rack automation array as the callback"
+    )]
+    fn accepts_completion_with_rack_automation() {
+        let Some(mut dispatcher) = dispatcher(1) else {
+            return;
+        };
+        let mut automation = [RackAutomationEvents::new(); MAX_RACKS];
+        let event = BlockEvent {
+            frame_offset: 0,
+            event_type: BLOCK_EVENT_PARAMETER,
+            key: 42,
+            value: 0.75,
+            flags: 1,
+        };
+        assert!(automation[0].push(event));
+        dispatcher.dispatch_open(&[0.0; 4], &[], &automation, 2);
+        let live = dispatcher.racks[0].live.expect("request");
+        let slot = dispatcher.racks[0]
+            .banks
+            .bank(live.bank_index)
+            .expect("bank")
+            .bank()
+            .slot(live.slot_index)
+            .expect("slot");
+        assert_eq!(slot.events[0], event);
+
+        complete(&mut dispatcher, 0, [0.25; 4]);
+        dispatcher.process_block(&[0.0; 4], &[], 2, Duration::ZERO);
+        assert!(matches!(dispatcher.sources()[0], RackAudioSource::Wet(_)));
+        let telemetry = dispatcher.telemetry(0).expect("telemetry");
+        assert_eq!(telemetry.completed, 1);
+        assert_eq!(telemetry.protocol_rejections, 0);
+    }
+
+    #[test]
     fn rejects_nonfinite_worker_output_without_poisoning_another_rack() {
         let Some(mut dispatcher) = dispatcher(2) else {
             return;
         };
         let input = [0.0; 4];
-        dispatcher.process_block(&input, &[], 2, Duration::ZERO);
+        publish(&mut dispatcher, &input, &[]);
         complete(&mut dispatcher, 0, [0.25, -0.25, 0.5, -0.5]);
 
         let live = dispatcher.racks[1].live.expect("live request");
@@ -1204,7 +1789,7 @@ mod tests {
             return;
         };
         let input = [0.0; 4];
-        dispatcher.process_block(&input, &[], 2, Duration::ZERO);
+        publish(&mut dispatcher, &input, &[]);
         complete(&mut dispatcher, 0, [0.25, -0.25, 0.5, -0.5]);
         complete(&mut dispatcher, 1, [0.0; 4]);
         let target = dispatcher.racks[1].live.expect("target live request");
@@ -1235,7 +1820,7 @@ mod tests {
             return;
         };
         let input = [0.0; 4];
-        dispatcher.process_block(&input, &[], 2, Duration::ZERO);
+        publish(&mut dispatcher, &input, &[]);
         let live = dispatcher.racks[0].live.expect("live request");
         complete(&mut dispatcher, 0, [0.0; 4]);
         dispatcher.racks[0]

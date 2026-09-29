@@ -3,11 +3,9 @@
 //! `cargo xtask doctor` is intentionally dependency-light so it can diagnose a newly
 //! bootstrapped workspace before the product crates are built.
 
-mod device_feasibility;
-mod phase0;
-mod phase1;
-mod phase_commands;
+mod outcome;
 mod scan_isolation;
+mod verification;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -17,6 +15,8 @@ use std::{
 };
 
 use serde_json::Value;
+
+use outcome::CommandError;
 
 const REQUIRED_DIRECTORIES: &[&str] = &[
     "apps/superposition",
@@ -33,11 +33,8 @@ const REQUIRED_DIRECTORIES: &[&str] = &[
     "crates/sp-session",
     "crates/sp-midi",
     "crates/sp-ui",
-    "crates/sp-test-support",
     "tools/xtask",
     "compatibility",
-    "docs/adr",
-    "docs/qualification",
 ];
 
 const REQUIRED_PATHS: &[&str] = &[
@@ -79,30 +76,8 @@ const REQUIRED_PATHS: &[&str] = &[
     "crates/sp-ui/Cargo.toml",
     "crates/sp-ui/src/design/tokens.rs",
     "crates/sp-ui/src/design/theme.rs",
-    "crates/sp-test-support/Cargo.toml",
-    "crates/sp-test-support/src/lib.rs",
     "tools/xtask/Cargo.toml",
     "tools/xtask/src/main.rs",
-    "tools/xtask/src/phase1.rs",
-    "docs/architecture.md",
-    "docs/realtime-safety.md",
-    "docs/session-format.md",
-    "docs/plugin-compatibility.md",
-    "docs/testing.md",
-    "docs/brand-assets.md",
-    "docs/macos-distribution.md",
-    "docs/adr/0001-rack-topology.md",
-    "docs/adr/0002-worker-per-rack-gate.md",
-    "docs/adr/0003-fixed-shared-memory.md",
-    "docs/adr/0004-vst3-adapter.md",
-    "docs/adr/0005-worker-owned-native-windows.md",
-    "docs/adr/0006-parameter-scenes-and-opaque-state.md",
-    "docs/adr/0007-no-general-pdc-or-splits.md",
-    "docs/adr/0008-helper-library-validation-entitlement.md",
-    "docs/adr/0009-brand-design-system.md",
-    "docs/adr/0010-direct-auhal-backend.md",
-    "docs/qualification/phase0-foundation.md",
-    "docs/qualification/phase1-m4pro.md",
 ];
 
 /// A dependency graph keyed by Cargo package name.
@@ -201,14 +176,14 @@ fn main() {
 #[derive(Debug)]
 enum XtaskError {
     Standard(String),
-    Phase1(phase1::Phase1Error),
+    Command(CommandError),
 }
 
 impl XtaskError {
-    fn exit_code(&self) -> u8 {
+    const fn exit_code(&self) -> u8 {
         match self {
             Self::Standard(_) => 1,
-            Self::Phase1(_) => phase1::Phase1Error::exit_code(),
+            Self::Command(_) => CommandError::EXIT_CODE,
         }
     }
 }
@@ -217,7 +192,7 @@ impl std::fmt::Display for XtaskError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Standard(error) => formatter.write_str(error),
-            Self::Phase1(error) => error.fmt(formatter),
+            Self::Command(error) => error.fmt(formatter),
         }
     }
 }
@@ -227,7 +202,7 @@ fn run(arguments: &[String]) -> Result<u8, XtaskError> {
         return Err(XtaskError::Standard(usage()));
     };
 
-    match command {
+    let verify = match command {
         "doctor" => {
             if arguments.len() != 1 {
                 return Err(XtaskError::Standard(
@@ -235,86 +210,41 @@ fn run(arguments: &[String]) -> Result<u8, XtaskError> {
                 ));
             }
             run_doctor(&workspace_root()).map_err(XtaskError::Standard)?;
-            Ok(0)
+            return Ok(0);
         }
-        "phase0-report" => phase0::run_foundation_report(&workspace_root(), &arguments[1..])
-            .map(|()| 0)
-            .map_err(XtaskError::Standard),
-        "phase1-report" => phase1::run_phase1_report(&workspace_root(), &arguments[1..])
-            .map(|outcome| outcome.exit_code)
-            .map_err(XtaskError::Phase1),
-        "vst3-smoke" => phase1::run_vst3_smoke(&workspace_root(), &arguments[1..])
-            .map(|outcome| outcome.exit_code)
-            .map_err(XtaskError::Phase1),
-        "ipc-feasibility" => phase1::run_ipc_feasibility(&workspace_root(), &arguments[1..])
-            .map(|outcome| outcome.exit_code)
-            .map_err(XtaskError::Phase1),
-        "ipc-matrix" => phase1::run_ipc_matrix(&workspace_root(), &arguments[1..])
-            .map(|outcome| outcome.exit_code)
-            .map_err(XtaskError::Phase1),
-        "fault-matrix" => phase1::run_fault_matrix(&workspace_root(), &arguments[1..])
-            .map(|outcome| outcome.exit_code)
-            .map_err(XtaskError::Phase1),
-        "device-feasibility" => {
-            device_feasibility::run_device_feasibility(&workspace_root(), &arguments[1..])
-                .map(|outcome| outcome.exit_code)
-                .map_err(XtaskError::Phase1)
-        }
-        "device-matrix" => {
-            device_feasibility::run_device_matrix(&workspace_root(), &arguments[1..])
-                .map(|outcome| outcome.exit_code)
-                .map_err(XtaskError::Phase1)
-        }
-        "host-checker" => phase_commands::run_host_checker(&workspace_root(), &arguments[1..])
-            .map(|outcome| outcome.exit_code)
-            .map_err(XtaskError::Phase1),
-        "compatibility" => phase_commands::run_compatibility(&workspace_root(), &arguments[1..])
-            .map(|outcome| outcome.exit_code)
-            .map_err(XtaskError::Phase1),
-        "loopback" => phase_commands::run_loopback(&workspace_root(), &arguments[1..])
-            .map(|outcome| outcome.exit_code)
-            .map_err(XtaskError::Phase1),
-        "click-test" => phase_commands::run_click_test(&workspace_root(), &arguments[1..])
-            .map(|outcome| outcome.exit_code)
-            .map_err(XtaskError::Phase1),
-        "midi-timing" => phase_commands::run_midi_timing(&workspace_root(), &arguments[1..])
-            .map(|outcome| outcome.exit_code)
-            .map_err(XtaskError::Phase1),
-        "soak" => phase_commands::run_soak(&workspace_root(), &arguments[1..])
-            .map(|outcome| outcome.exit_code)
-            .map_err(XtaskError::Phase1),
-        "bundle" => phase_commands::run_bundle(&workspace_root(), &arguments[1..])
-            .map(|outcome| outcome.exit_code)
-            .map_err(XtaskError::Phase1),
         "help" | "--help" | "-h" => {
             println!("{}", usage());
-            Ok(0)
+            return Ok(0);
         }
-        _ => Err(XtaskError::Standard(format!(
-            "unknown command `{command}`\n\n{}",
-            usage()
-        ))),
-    }
+        "host-checker" => verification::run_host_checker,
+        "compatibility" => verification::run_compatibility,
+        "loopback" => verification::run_loopback,
+        "click-test" => verification::run_click_test,
+        "midi-timing" => verification::run_midi_timing,
+        "soak" => verification::run_soak,
+        "bundle" => verification::run_bundle,
+        _ => {
+            return Err(XtaskError::Standard(format!(
+                "unknown command `{command}`\n\n{}",
+                usage()
+            )));
+        }
+    };
+    verify(&workspace_root(), &arguments[1..])
+        .map(|outcome| outcome.exit_code)
+        .map_err(XtaskError::Command)
 }
 
 fn usage() -> String {
     format!(
-        "Usage: cargo xtask <command>\n\nAvailable now:\n  doctor\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}",
-        phase0::foundation_report_usage(),
-        phase1::phase1_report_usage(),
-        phase1::vst3_smoke_usage(),
-        phase1::feasibility_usage(),
-        phase1::ipc_matrix_usage(),
-        phase1::fault_matrix_usage(),
-        device_feasibility::device_feasibility_usage(),
-        device_feasibility::device_matrix_usage(),
-        phase_commands::usage_host_checker(),
-        phase_commands::usage_compatibility(),
-        phase_commands::usage_loopback(),
-        phase_commands::usage_click_test(),
-        phase_commands::usage_midi_timing(),
-        phase_commands::usage_soak(),
-        phase_commands::usage_bundle(),
+        "Usage: cargo xtask <command>\n\nCommands:\n  doctor\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}",
+        verification::usage_host_checker(),
+        verification::usage_compatibility(),
+        verification::usage_loopback(),
+        verification::usage_click_test(),
+        verification::usage_midi_timing(),
+        verification::usage_soak(),
+        verification::usage_bundle(),
     )
 }
 
@@ -369,12 +299,12 @@ fn platform_check() -> CheckResult {
     let os = env::consts::OS;
     let architecture = env::consts::ARCH;
     if os == "macos" && architecture == "aarch64" {
-        CheckResult::pass("platform", "macOS/aarch64 is supported by Phase 0")
+        CheckResult::pass("platform", "macOS/aarch64 is supported")
     } else {
         CheckResult::fail(
             "platform",
-            format!("detected {os}/{architecture}; Phase 0 supports macOS/aarch64"),
-            "Use an Apple Silicon macOS host, or add and validate support for this target in a later phase.",
+            format!("detected {os}/{architecture}; only macOS/aarch64 is supported"),
+            "Use an Apple Silicon macOS host.",
         )
     }
 }
@@ -518,10 +448,10 @@ fn is_llvm_tools_component(component: &str) -> bool {
 fn print_hardware_certification_status() {
     println!("\nHardware certification (not evaluated by doctor):");
     println!(
-        "[PENDING] Phase 1 device qualification: no attached-device timing result is inspected or certified by `cargo xtask doctor`."
+        "[PENDING] Attached-device verification: doctor does not inspect loopback, click, MIDI timing, or soak results."
     );
     println!(
-        "          Action: run the documented 1/2/4/8-rack, 128/256-frame AUHAL `device-feasibility` matrix on the designated Apple Silicon host; collect the required long-run evidence separately."
+        "          Action: run `cargo xtask loopback`, `click-test`, `midi-timing`, and `soak` with captured evidence on the designated Apple Silicon host."
     );
 }
 
@@ -537,13 +467,13 @@ fn print_qualification_tooling() {
     let cmake = command_succeeds("cmake", &["--version"]);
     let xcodebuild = command_succeeds("xcodebuild", &["-version"]);
     println!(
-        "[OPTIONAL / PHASE-SPECIFIC] VST3 SDK HostChecker: VST3_SDK_DIR={}, cmake={}, xcodebuild={}; required only when running SDK sample or HostChecker qualification.",
+        "[OPTIONAL] VST3 SDK HostChecker: VST3_SDK_DIR={}, cmake={}, xcodebuild={}; required only when running SDK sample or HostChecker qualification.",
         availability(sdk),
         availability(cmake),
         availability(xcodebuild),
     );
     println!(
-        "[OPTIONAL / PHASE-SPECIFIC] Structured energy evidence, a selected MIDI source, and a licensed plug-in corpus are collected only for their corresponding hardware qualification runs."
+        "[OPTIONAL] A selected MIDI source and a licensed plug-in corpus are needed only for their corresponding hardware verification runs."
     );
 }
 
@@ -586,14 +516,14 @@ fn required_paths_check(workspace_root: &Path) -> CheckResult {
 
     if missing.is_empty() {
         CheckResult::pass(
-            "required scaffolding",
-            "all Phase 0 directories and files are present",
+            "required workspace layout",
+            "all required directories and files are present",
         )
     } else {
         CheckResult::fail(
-            "required scaffolding",
+            "required workspace layout",
             format!("missing {}", missing.join(", ")),
-            "Create the missing scaffold directories or files before continuing Phase 0.",
+            "Restore the missing directories or files.",
         )
     }
 }

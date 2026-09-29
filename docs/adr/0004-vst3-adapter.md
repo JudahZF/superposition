@@ -1,6 +1,6 @@
 # ADR 0004: VST3 adapter boundary
 
-- **Status:** Accepted (Phase 0 target)
+- **Status:** Accepted
 - **Date:** 2026-07-13
 
 ## Context
@@ -13,4 +13,4 @@ Start with VST3 behind `sp-vst3`. The adapter owns SDK translation for processin
 
 ## Consequences
 
-The core stays format-neutral and failures remain worker-local. AU/AAX and universal plug-in compatibility are not Phase 1 commitments. This ADR does not claim a working adapter today.
+The core stays format-neutral and failures remain worker-local. AU/AAX and universal plug-in compatibility are not alpha commitments. This ADR does not claim a working adapter today.

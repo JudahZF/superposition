@@ -61,15 +61,7 @@ jobs:
           mkdir -p target/llvm-cov
           cargo llvm-cov nextest --workspace --lcov --output-path target/llvm-cov/lcov.info
 
-      # Device feasibility, loopback, MIDI, plug-in corpus, and soak gates require controlled
-      # Apple Silicon hardware. Hosted CI runs only short synthetic smoke coverage.
-      - name: Smoke synthetic IPC preflight
-        run: cargo xtask ipc-feasibility --racks 2 --frames 128 --duration-seconds 2
-
-      - name: Smoke fault matrix
-        run: cargo xtask fault-matrix --racks 2 --frames 128 --output-dir target/ci-fault-matrix
-
-      - name: Smoke compatibility and bundle scaffolds
+      - name: Smoke compatibility corpus and app bundle
         run: |
           cargo xtask compatibility
           cargo xtask bundle --profile local-dev

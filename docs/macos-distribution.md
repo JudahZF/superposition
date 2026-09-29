@@ -2,14 +2,17 @@
 
 ## Product shape
 
+Live workers require Apple Silicon macOS 14.4 or later for public process-shared
+request wait/wake support. The app bundle declares this minimum version.
+
 The product is a signed, notarized macOS app bundle with narrowly scoped helper executables. The host app launches the worker/scanner through a versioned, authenticated control contract and verifies that an installed helper belongs to the same release. Helpers are not a generic plug-in execution service and do not expose a public IPC endpoint.
 
 ## Bundle profiles and resource manifests
 
 `cargo xtask bundle` has two deliberately separate profiles:
 
-- `local-dev` (the default) creates `target/phase9/local-dev/Superposition.app`. It is non-distributable and can remain unsigned or use `--sign` for ad-hoc signing. It must never be repackaged as a release.
-- `release` creates `target/phase9/release/Superposition.app`. It is blocked before compilation until `packaging/resources/release.json` records every required brand approval, source hash, and provenance field.
+- `local-dev` (the default) creates `target/bundle/local-dev/Superposition.app`. It is non-distributable and can remain unsigned or use `--sign` for ad-hoc signing. It must never be repackaged as a release.
+- `release` creates `target/bundle/release/Superposition.app`. It is blocked before compilation until `packaging/resources/release.json` records every required brand approval, source hash, and provenance field.
 
 Both profiles use a JSON resource manifest. Only entries declared in that manifest are copied to `Contents/Resources`; every staged entry is SHA-256 checked. The build additionally writes:
 
@@ -47,4 +50,4 @@ Plug-in discovery and loading are untrusted operations: scanning occurs in the s
 
 ## CI runner limitation
 
-The CI workflow targets GitHub-hosted `macos-14`, which is Apple Silicon where that runner class is available to the repository. Availability varies by GitHub plan, visibility, and organization policy. If it is unavailable, use a managed or self-hosted Apple Silicon runner with the same toolchain; do not silently replace feasibility or release checks with Intel. CI alone cannot prove real-time behavior: Phase 1 timing gates run on specified physical Apple Silicon hardware. See [ADR 0008](adr/0008-helper-library-validation-entitlement.md).
+The CI workflow targets GitHub-hosted `macos-14`, which is Apple Silicon where that runner class is available to the repository. Availability varies by GitHub plan, visibility, and organization policy. If it is unavailable, use a managed or self-hosted Apple Silicon runner with the same toolchain; do not silently replace release checks with Intel. CI alone cannot prove real-time behavior: timing checks run on physical Apple Silicon hardware. See [ADR 0008](adr/0008-helper-library-validation-entitlement.md).

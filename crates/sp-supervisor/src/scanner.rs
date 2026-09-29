@@ -8,10 +8,14 @@ use std::{
     env,
     fmt::Write as _,
     fs::{self, File},
-    io::Read,
+    io::{self, Read},
     path::{Path, PathBuf},
-    time::{Duration, UNIX_EPOCH},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,13 +25,15 @@ use sp_model::{
 };
 
 use crate::{
-    CapturedHelperOutput, HelperKind, HelperLaunch, ProcessSupervisor, TimedHelperResult,
+    HelperKind, HelperLaunch, ProcessSupervisor, TimedHelperResult,
     catalog::PluginCatalog,
     quarantine::{PersistentQuarantine, PluginFailureKind},
 };
 
 /// The bounded scanner deadline used when a deployment does not provide one.
 pub const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_SCAN_REPORT_BYTES: u64 = 4 * 1024 * 1024;
+static NEXT_REPORT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 /// Stable content identity used for catalog invalidation and quarantine.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -97,7 +103,7 @@ impl Scanner {
         }
     }
 
-    /// Creates a scanner with the Phase 2 ten-second helper deadline.
+    /// Creates a scanner with the default ten-second helper deadline.
     #[must_use]
     pub fn with_default_timeout(executable: impl Into<PathBuf>, catalog: PluginCatalog) -> Self {
         Self::new(executable, DEFAULT_SCAN_TIMEOUT, catalog)
@@ -116,7 +122,7 @@ impl Scanner {
         &self.catalog
     }
 
-    /// Compatibility accessor for callers migrating from the Phase 2 scan-cache name.
+    /// Compatibility accessor for callers that still use the older scan-cache name.
     #[must_use]
     pub const fn cache(&self) -> &ScanCache {
         &self.catalog
@@ -126,6 +132,11 @@ impl Scanner {
     #[must_use]
     pub fn quarantine(&self) -> Option<&PersistentQuarantine> {
         self.quarantine.as_ref()
+    }
+
+    /// Borrows the shared failure history for worker failures and explicit per-plug-in retries.
+    pub fn quarantine_mut(&mut self) -> Option<&mut PersistentQuarantine> {
+        self.quarantine.as_mut()
     }
 
     /// Fingerprints and scans one bundle, reusing an unchanged catalog result.
@@ -209,22 +220,33 @@ impl Scanner {
     fn scan_inner(&mut self, bundle: &Path, force: bool) -> std::io::Result<CachedScan> {
         let bundle = fs::canonicalize(bundle)?;
         let fingerprint = fingerprint_bundle(&bundle)?;
-        if !force && let Some(cached) = self.catalog.get(&bundle, &fingerprint) {
+        if !force
+            && let Some(cached) = self.catalog.get(&bundle, &fingerprint)
+            && cached.metadata.version == PLUGIN_SCAN_METADATA_VERSION
+        {
             return Ok(cached.clone());
         }
 
+        let report_path = TemporaryScanReport::create()?;
         let launch = HelperLaunch {
             kind: HelperKind::PluginScanner,
             executable: self.executable.clone(),
             arguments: vec![
                 "--bundle".to_owned(),
                 bundle.display().to_string(),
-                "--json".to_owned(),
                 "--sdk-enumerate".to_owned(),
+                "--report-path".to_owned(),
+                report_path.path().display().to_string(),
             ],
         };
-        let scan = match ProcessSupervisor::new().launch_and_wait_capturing(&launch, self.timeout) {
-            Ok(captured) => map_scan(bundle, fingerprint, &captured),
+        let scan = match ProcessSupervisor::new().launch_and_wait_silenced(&launch, self.timeout) {
+            Ok(result) => {
+                let report = match &result {
+                    TimedHelperResult::TimedOut { .. } => None,
+                    TimedHelperResult::Exited { .. } => Some(report_path.read_bounded()),
+                };
+                map_scan(bundle, fingerprint, &result, report)
+            }
             Err(error) => CachedScan {
                 bundle,
                 fingerprint,
@@ -258,6 +280,64 @@ impl Scanner {
             quarantine.record_failure(scan.fingerprint.clone(), kind)?;
         }
         Ok(())
+    }
+}
+
+/// A unique per-scan directory keeps helper output separate from plug-in stdout.
+struct TemporaryScanReport {
+    directory: PathBuf,
+}
+
+impl TemporaryScanReport {
+    fn create() -> io::Result<Self> {
+        for _ in 0..16 {
+            let sequence = NEXT_REPORT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let directory = env::temp_dir().join(format!(
+                "sp-plugin-scan-{}-{nanos}-{sequence}",
+                std::process::id()
+            ));
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            builder.mode(0o700);
+            match builder.create(&directory) {
+                Ok(()) => return Ok(Self { directory }),
+                Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+                Err(_) => {}
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique scanner report directory",
+        ))
+    }
+
+    fn path(&self) -> PathBuf {
+        self.directory.join("report.json")
+    }
+
+    fn read_bounded(&self) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        File::open(self.path())?
+            .take(MAX_SCAN_REPORT_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_SCAN_REPORT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "scanner report exceeds size limit",
+            ));
+        }
+        Ok(bytes)
+    }
+}
+
+impl Drop for TemporaryScanReport {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.path());
+        let _ = fs::remove_dir(&self.directory);
     }
 }
 
@@ -368,34 +448,48 @@ fn update_modified_time(hasher: &mut Sha256, metadata: &fs::Metadata) {
 fn map_scan(
     bundle: PathBuf,
     fingerprint: BundleFingerprint,
-    captured: &CapturedHelperOutput,
+    result: &TimedHelperResult,
+    report: Option<io::Result<Vec<u8>>>,
 ) -> CachedScan {
-    let parsed = serde_json::from_slice::<ChildReport>(&captured.stdout)
-        .ok()
-        .filter(|report| report.metadata.version == PLUGIN_SCAN_METADATA_VERSION)
-        .map(|report| report.metadata);
-    let metadata = match &captured.result {
+    let metadata = match result {
         TimedHelperResult::TimedOut { .. } => metadata_with_detail(
             PluginArchitecture::Unknown,
             PluginScanOutcome::TimedOut,
             "scanner exceeded its deadline".to_owned(),
         ),
-        TimedHelperResult::Exited { code, .. } => match parsed {
+        TimedHelperResult::Exited { code, .. } => match report {
             None => metadata_with_detail(
                 PluginArchitecture::Unknown,
                 PluginScanOutcome::Crashed,
-                format!("scanner exited with code {code} without valid metadata"),
+                format!("scanner exited with code {code} without a report"),
             ),
-            Some(mut metadata)
-                if *code != 0 && metadata.outcome == PluginScanOutcome::Supported =>
-            {
-                metadata.outcome = PluginScanOutcome::Crashed;
-                metadata.detail = Some(format!(
-                    "scanner exited with code {code} after reporting success"
-                ));
-                metadata
-            }
-            Some(metadata) => metadata,
+            Some(Err(error)) if error.kind() == io::ErrorKind::NotFound => metadata_with_detail(
+                PluginArchitecture::Unknown,
+                PluginScanOutcome::Crashed,
+                format!("scanner exited with code {code} without a report"),
+            ),
+            Some(Err(error)) => metadata_with_detail(
+                PluginArchitecture::Unknown,
+                PluginScanOutcome::InvalidReport,
+                format!("could not read scanner report: {error}"),
+            ),
+            Some(Ok(bytes)) => match parse_child_report(&bundle, &bytes) {
+                Err(detail) => metadata_with_detail(
+                    PluginArchitecture::Unknown,
+                    PluginScanOutcome::InvalidReport,
+                    detail,
+                ),
+                Ok(mut metadata)
+                    if *code != 0 && metadata.outcome == PluginScanOutcome::Supported =>
+                {
+                    metadata.outcome = PluginScanOutcome::Crashed;
+                    metadata.detail = Some(format!(
+                        "scanner exited with code {code} after reporting success"
+                    ));
+                    metadata
+                }
+                Ok(metadata) => metadata,
+            },
         },
     };
     CachedScan {
@@ -403,6 +497,21 @@ fn map_scan(
         fingerprint,
         metadata,
     }
+}
+
+fn parse_child_report(bundle: &Path, bytes: &[u8]) -> Result<PluginScanMetadata, String> {
+    let report = serde_json::from_slice::<ChildReport>(bytes)
+        .map_err(|error| format!("scanner returned malformed metadata: {error}"))?;
+    if report.bundle != bundle {
+        return Err("scanner report bundle does not match the requested bundle".to_owned());
+    }
+    if report.metadata.version != PLUGIN_SCAN_METADATA_VERSION {
+        return Err(format!(
+            "scanner report metadata version {} is unsupported",
+            report.metadata.version
+        ));
+    }
+    Ok(report.metadata)
 }
 
 fn metadata_with_detail(
@@ -417,6 +526,7 @@ fn metadata_with_detail(
 
 #[derive(Deserialize)]
 struct ChildReport {
+    bundle: PathBuf,
     #[serde(flatten)]
     metadata: PluginScanMetadata,
 }
@@ -426,19 +536,33 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        sync::atomic::{AtomicU64, Ordering},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     use sp_model::{PluginArchitecture, PluginScanMetadata, PluginScanOutcome};
 
-    use super::{CachedScan, ScanCache, discover_vst3_bundles, fingerprint_bundle};
+    use super::{
+        BundleFingerprint, CachedScan, ScanCache, Scanner, TemporaryScanReport,
+        discover_vst3_bundles, fingerprint_bundle, map_scan,
+    };
+    use crate::TimedHelperResult;
+
+    static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
 
     fn temporary_root() -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("sp-scan-catalog-{}-{unique}", std::process::id()))
+        let sequence = NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "sp-scan-catalog-{}-{unique}-{sequence}",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -479,6 +603,99 @@ mod tests {
     }
 
     #[test]
+    fn stale_metadata_version_rescans_one_bundle_without_clearing_catalog() {
+        let root = temporary_root();
+        let bundle = root.join("Example.vst3");
+        fs::create_dir_all(&bundle).expect("create bundle");
+        let bundle = fs::canonicalize(bundle).expect("canonical bundle");
+        let fingerprint = fingerprint_bundle(&bundle).expect("fingerprint bundle");
+        let mut catalog = ScanCache::open(root.join("catalog.json")).expect("open catalog");
+        let mut stale =
+            PluginScanMetadata::new(PluginArchitecture::Arm64, PluginScanOutcome::Supported);
+        stale.version = sp_model::PLUGIN_SCAN_METADATA_VERSION - 1;
+        catalog.insert(CachedScan {
+            bundle: bundle.clone(),
+            fingerprint: fingerprint.clone(),
+            metadata: stale,
+        });
+        catalog.save().expect("save stale catalog");
+
+        // A missing helper makes a fresh scan observable without loading third-party code.
+        let mut scanner = Scanner::new(
+            root.join("missing-scanner"),
+            Duration::from_secs(1),
+            catalog,
+        );
+        let refreshed = scanner.scan(&bundle).expect("attempt fresh scan");
+        assert_eq!(refreshed.outcome(), PluginScanOutcome::Crashed);
+        assert_eq!(
+            refreshed.metadata.version,
+            sp_model::PLUGIN_SCAN_METADATA_VERSION
+        );
+        assert_eq!(refreshed.fingerprint, fingerprint);
+        assert_eq!(scanner.catalog().entries().count(), 1);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn cached_failures_do_not_count_again_and_retry_clears_only_one_plugin() {
+        use crate::{PersistentQuarantine, PluginFailureKind};
+
+        let root = temporary_root();
+        let bundle = root.join("Example.vst3");
+        fs::create_dir_all(&bundle).expect("create bundle");
+        let quarantine_path = root.join("quarantine.json");
+        let quarantine = PersistentQuarantine::open(&quarantine_path, 2).expect("open quarantine");
+        let catalog = ScanCache::open(root.join("catalog.json")).expect("open catalog");
+        let mut scanner =
+            Scanner::new(root.join("missing-helper"), Duration::from_secs(1), catalog)
+                .with_quarantine(quarantine);
+        let first = scanner.scan(&bundle).expect("record failed launch");
+        assert_eq!(first.outcome(), PluginScanOutcome::Crashed);
+        scanner.scan(&bundle).expect("reuse cached failure");
+        assert_eq!(
+            scanner
+                .quarantine()
+                .unwrap()
+                .table()
+                .get(&first.fingerprint)
+                .unwrap()
+                .failure_count,
+            1
+        );
+        scanner
+            .rescan(&bundle)
+            .expect("explicit rescan counts a fresh failure");
+        assert!(
+            scanner
+                .quarantine()
+                .unwrap()
+                .ensure_launch_permitted(&first.fingerprint)
+                .is_err()
+        );
+
+        let other = BundleFingerprint {
+            algorithm: "sha256".to_owned(),
+            digest: "other-bundle".to_owned(),
+        };
+        for _ in 0..2 {
+            scanner
+                .quarantine_mut()
+                .unwrap()
+                .record_failure(other.clone(), PluginFailureKind::WorkerHang)
+                .unwrap();
+        }
+        scanner
+            .clear_quarantine(&first.fingerprint)
+            .expect("allow selected retry");
+        let reopened = PersistentQuarantine::open(quarantine_path, 2).expect("reopen quarantine");
+        assert!(reopened.ensure_launch_permitted(&first.fingerprint).is_ok());
+        assert!(reopened.ensure_launch_permitted(&other).is_err());
+        assert_eq!(reopened.table().get(&other).unwrap().failure_count, 2);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
     fn discovers_user_directory_without_scanning_a_bundle() {
         let root = temporary_root();
         let bundle = root.join("Library/Audio/Plug-Ins/VST3/Fixture.vst3");
@@ -486,5 +703,79 @@ mod tests {
         let discovered = discover_vst3_bundles(Some(&root));
         assert!(discovered.contains(&fs::canonicalize(&bundle).expect("canonical bundle")));
         fs::remove_dir_all(root).expect("remove temporary root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_stdout_does_not_corrupt_a_valid_report() {
+        let root = temporary_root();
+        let bundle = root.join("Example.vst3");
+        fs::create_dir_all(&bundle).expect("create bundle");
+        let bundle = fs::canonicalize(bundle).expect("canonical bundle");
+        let metadata =
+            PluginScanMetadata::new(PluginArchitecture::Arm64, PluginScanOutcome::Supported);
+        let report = serde_json::json!({
+            "bundle": bundle,
+            "version": metadata.version,
+            "architecture": metadata.architecture,
+            "outcome": metadata.outcome,
+            "classes": metadata.classes,
+        });
+        fs::write(
+            root.join("fixture.json"),
+            serde_json::to_vec(&report).expect("serialize report"),
+        )
+        .expect("write report fixture");
+        let helper = root.join("mock-scanner.sh");
+        fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '%s\\n' 'UA: loading plugin' 'more diagnostic output'\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --report-path) report_path=\"$2\"; shift 2;;\n    *) shift;;\n  esac\ndone\ncp \"$(dirname \"$0\")/fixture.json\" \"$report_path\"\n",
+        )
+        .expect("write mock helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700))
+            .expect("make mock helper executable");
+        let catalog = ScanCache::open(root.join("catalog.json")).expect("open catalog");
+        let mut scanner = Scanner::new(helper, Duration::from_secs(2), catalog);
+        let scan = scanner.scan(&bundle).expect("scan bundle");
+        assert_eq!(scan.outcome(), PluginScanOutcome::Supported);
+        fs::remove_dir_all(root).expect("remove temporary root");
+    }
+
+    #[test]
+    fn malformed_report_is_rejected() {
+        let result = TimedHelperResult::Exited {
+            process_id: 1,
+            code: 0,
+        };
+        let scan = map_scan(
+            PathBuf::from("/tmp/Example.vst3"),
+            BundleFingerprint {
+                algorithm: "sha256".to_owned(),
+                digest: "example".to_owned(),
+            },
+            &result,
+            Some(Ok(b"not json".to_vec())),
+        );
+        assert_eq!(scan.outcome(), PluginScanOutcome::InvalidReport);
+    }
+
+    #[test]
+    fn report_input_has_a_size_limit_and_is_cleaned_up() {
+        let report = TemporaryScanReport::create().expect("create report location");
+        let directory = report.directory.clone();
+        fs::write(
+            report.path(),
+            vec![b'x'; usize::try_from(super::MAX_SCAN_REPORT_BYTES).expect("size fits usize") + 1],
+        )
+        .expect("write oversized report");
+        assert_eq!(
+            report
+                .read_bounded()
+                .expect_err("oversized report must fail")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        drop(report);
+        assert!(!directory.exists());
     }
 }

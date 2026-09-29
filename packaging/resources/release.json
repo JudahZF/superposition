@@ -34,8 +34,8 @@
       }
     },
     {
-      "source": "packaging/fonts/Sora-Regular.ttf",
-      "destination": "Fonts/Sora-Regular.ttf",
+      "source": "packaging/fonts/IBMPlexMono-Regular.ttf",
+      "destination": "Fonts/IBMPlexMono-Regular.ttf",
       "sha256": null,
       "provenance": {
         "source": null,
@@ -46,8 +46,8 @@
       }
     },
     {
-      "source": "packaging/fonts/SpaceMono-Regular.ttf",
-      "destination": "Fonts/SpaceMono-Regular.ttf",
+      "source": "packaging/fonts/IBMPlexMono-Medium.ttf",
+      "destination": "Fonts/IBMPlexMono-Medium.ttf",
       "sha256": null,
       "provenance": {
         "source": null,

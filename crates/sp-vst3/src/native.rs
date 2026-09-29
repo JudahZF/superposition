@@ -32,6 +32,19 @@ struct RawBus {
     bus_type: u8,
     channels: u8,
 }
+
+/// Bus metadata returned by the native SDK component.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeBusInfo {
+    /// VST3 media type (`0` audio, `1` event).
+    pub media: u8,
+    /// VST3 direction (`0` input, `1` output).
+    pub direction: u8,
+    /// VST3 bus type (`0` main, `1` auxiliary).
+    pub bus_type: u8,
+    /// Number of channels reported by the component.
+    pub channels: u8,
+}
 #[repr(C)]
 struct Handle {
     _private: [u8; 0],
@@ -134,6 +147,10 @@ impl std::error::Error for NativeSdkError {}
 pub struct NativeSdkPlugin {
     handle: NonNull<Handle>,
 }
+#[allow(
+    clippy::missing_errors_doc,
+    reason = "each thin SDK call propagates a plug-in-defined diagnostic through NativeSdkError"
+)]
 impl NativeSdkPlugin {
     /// Loads the module and creates precisely `class_id`; it does not initialize it.
     pub fn load(
@@ -172,7 +189,7 @@ impl NativeSdkPlugin {
         let pointer = sp_vst3_native_error(self.handle.as_ptr());
         if pointer.is_null() {
             return NativeSdkError("native VST3 shim failed without a diagnostic".into());
-        };
+        }
         let message = unsafe { CStr::from_ptr(pointer) }
             .to_string_lossy()
             .into_owned();
@@ -194,6 +211,35 @@ impl NativeSdkPlugin {
     pub fn bus_count(&mut self, media: u8, direction: u8) -> Result<usize, NativeSdkError> {
         let count = sp_vst3_native_bus_count(self.handle.as_ptr(), media, direction);
         usize::try_from(count).map_err(|_| self.error())
+    }
+    /// Returns one bus descriptor from `IComponent::getBusInfo`.
+    pub fn bus_info(
+        &mut self,
+        media: u8,
+        direction: u8,
+        index: usize,
+    ) -> Result<NativeBusInfo, NativeSdkError> {
+        let index = i32::try_from(index)
+            .map_err(|_| NativeSdkError("VST3 bus index exceeds i32".into()))?;
+        let mut raw = RawBus {
+            media: 0,
+            direction: 0,
+            bus_type: 0,
+            channels: 0,
+        };
+        self.call(sp_vst3_native_bus_info(
+            self.handle.as_ptr(),
+            media,
+            direction,
+            index,
+            &raw mut raw,
+        ))?;
+        Ok(NativeBusInfo {
+            media: raw.media,
+            direction: raw.direction,
+            bus_type: raw.bus_type,
+            channels: raw.channels,
+        })
     }
     /// Sets main audio arrangements and invokes `IAudioProcessor::setupProcessing`.
     pub fn set_arrangements(&mut self, input: u8, output: u8) -> Result<(), NativeSdkError> {
@@ -246,7 +292,7 @@ impl NativeSdkPlugin {
                 self.handle.as_ptr(),
                 i32::try_from(index)
                     .map_err(|_| NativeSdkError("parameter index overflow".into()))?,
-                &mut raw,
+                &raw mut raw,
             ))?;
             values.push(Vst3ParameterInfo {
                 id: raw.id,
@@ -278,7 +324,7 @@ impl NativeSdkPlugin {
         self.call(sp_vst3_native_get_parameter(
             self.handle.as_ptr(),
             id,
-            &mut value,
+            &raw mut value,
         ))?;
         Ok(value)
     }
@@ -304,23 +350,40 @@ impl NativeSdkPlugin {
     fn state(&mut self, component: bool) -> Result<Vec<u8>, NativeSdkError> {
         let (mut pointer, mut size) = (std::ptr::null_mut(), 0);
         let status = if component {
-            sp_vst3_native_get_component_state(self.handle.as_ptr(), &mut pointer, &mut size)
+            sp_vst3_native_get_component_state(
+                self.handle.as_ptr(),
+                &raw mut pointer,
+                &raw mut size,
+            )
         } else {
-            sp_vst3_native_get_controller_state(self.handle.as_ptr(), &mut pointer, &mut size)
+            sp_vst3_native_get_controller_state(
+                self.handle.as_ptr(),
+                &raw mut pointer,
+                &raw mut size,
+            )
         };
         self.call(status)?;
         if size < 0 {
             return Err(NativeSdkError(
                 "native VST3 shim returned a negative state size".into(),
             ));
-        };
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                pointer,
-                usize::try_from(size).map_err(|_| NativeSdkError("state size overflow".into()))?,
-            )
         }
-        .to_vec();
+        let bytes = if size == 0 {
+            Vec::new()
+        } else if pointer.is_null() {
+            return Err(NativeSdkError(
+                "native VST3 shim returned a null state buffer".into(),
+            ));
+        } else {
+            unsafe {
+                std::slice::from_raw_parts(
+                    pointer,
+                    usize::try_from(size)
+                        .map_err(|_| NativeSdkError("state size overflow".into()))?,
+                )
+            }
+            .to_vec()
+        };
         sp_vst3_native_free_bytes(pointer);
         Ok(bytes)
     }
@@ -361,8 +424,8 @@ impl NativeSdkPlugin {
         self.call(sp_vst3_native_open_editor(
             self.handle.as_ptr(),
             parent,
-            &mut w,
-            &mut h,
+            &raw mut w,
+            &raw mut h,
         ))?;
         Ok((
             u32::try_from(w).map_err(|_| self.error())?,
@@ -390,7 +453,7 @@ impl Drop for NativeSdkPlugin {
 fn chars(chars: &[c_char]) -> String {
     let bytes = chars
         .iter()
-        .map(|byte| *byte as u8)
+        .map(|byte| byte.cast_unsigned())
         .take_while(|byte| *byte != 0)
         .collect::<Vec<_>>();
     String::from_utf8_lossy(&bytes).into_owned()

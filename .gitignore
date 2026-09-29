@@ -1,4 +1,7 @@
 /target
+/third-party/vst3-host/target
+/third-party/vst3-host/Cargo.lock
 .DS_Store
 *.profraw
 *.profdata
+/.claude/worktrees
