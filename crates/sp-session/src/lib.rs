@@ -13,8 +13,8 @@ use serde_json::Value;
 use sp_model::{PluginSlot, Session};
 use thiserror::Error;
 
-/// Current `session.json` document schema version.
-pub const SESSION_DOCUMENT_SCHEMA_VERSION: u32 = 1;
+/// Current `session.json` document schema version. Version 2 adds plug-in sidechains.
+pub const SESSION_DOCUMENT_SCHEMA_VERSION: u32 = 2;
 /// Current `manifest.json` package schema version.
 pub const SESSION_PACKAGE_SCHEMA_VERSION: u32 = 1;
 /// Compatibility alias for callers that predate separate schemas.
@@ -33,6 +33,10 @@ pub const MAX_JSON_COLLECTION_ITEMS: usize = 16 * 1024;
 pub const MAX_OPAQUE_STATE_BYTES: u64 = 32 * 1024 * 1024;
 /// Maximum bytes accepted for one plug-in instance identifier.
 pub const MAX_INSTANCE_ID_BYTES: usize = 128;
+/// Maximum bytes accepted for one stored editor picture.
+pub const MAX_EDITOR_PREVIEW_BYTES: u64 = 1024 * 1024;
+
+const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 /// The versioned `session.json` document holding the complete host-owned model.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -64,9 +68,13 @@ impl SessionDocument {
             });
         }
         self.model.validate_for_alpha()?;
+        let mut instance_ids = BTreeSet::new();
         for rack in &self.model.racks {
             for slot in &rack.slots {
                 validate_instance_id(&slot.id.0)?;
+                if !instance_ids.insert(&slot.id.0) {
+                    return Err(SessionError::DuplicateInstanceId(slot.id.0.clone()));
+                }
             }
         }
         Ok(())
@@ -99,6 +107,29 @@ pub struct PluginStateMetadata {
     #[serde(default)]
     /// Compatibility facts recorded when the capture was made.
     pub activation: PluginActivationMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The stored `preview.png`, if any. The store maintains it; saves ignore a caller's value.
+    pub preview: Option<EditorPreviewMetadata>,
+}
+
+/// Declaration of an instance's stored editor picture.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EditorPreviewMetadata {
+    /// Exact byte length of `preview.png`.
+    pub bytes: u64,
+    /// When the worker captured the picture, in Unix milliseconds.
+    pub captured_at_unix_ms: u64,
+}
+
+/// A PNG picture of one plug-in instance's editor as it last looked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditorPreviewFile {
+    /// Stable session instance identifier.
+    pub instance_id: String,
+    /// PNG bytes.
+    pub png: Vec<u8>,
+    /// When the worker captured the picture, in Unix milliseconds.
+    pub captured_at_unix_ms: u64,
 }
 
 /// Component stream, controller stream, and metadata loaded for one plug-in instance.
@@ -248,6 +279,15 @@ pub struct RecoveryMarker {
     pub clean_shutdown: bool,
 }
 
+/// Times shown in the recovery offer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryOffer {
+    /// When the recoverable (autosaved) document was written.
+    pub recovered_at_unix_ms: u64,
+    /// When the last explicit save was written, if one exists.
+    pub explicit_saved_at_unix_ms: Option<u64>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct TransactionMarker {
     revision: String,
@@ -292,6 +332,11 @@ impl PackageLayout {
         self.root.join("recovery").join("latest.json")
     }
     #[must_use]
+    /// Returns the copy of the last explicitly saved document, kept for discarding a recovery.
+    pub fn explicit_session_json(&self) -> PathBuf {
+        self.recovery_dir().join("explicit.json")
+    }
+    #[must_use]
     /// Returns the recovery metadata directory.
     pub fn recovery_dir(&self) -> PathBuf {
         self.root.join("recovery")
@@ -334,6 +379,12 @@ impl PackageLayout {
     /// Returns [`SessionError`] when the instance id is unsafe.
     pub fn plugin_metadata_json(&self, id: &str) -> Result<PathBuf, SessionError> {
         Ok(self.plugin_dir(id)?.join("metadata.json"))
+    }
+    /// Returns the editor picture path for a validated instance id.
+    /// # Errors
+    /// Returns [`SessionError`] when the instance id is unsafe.
+    pub fn editor_preview_png(&self, id: &str) -> Result<PathBuf, SessionError> {
+        Ok(self.plugin_dir(id)?.join("preview.png"))
     }
 }
 
@@ -388,12 +439,18 @@ pub enum SessionError {
     #[error("invalid plug-in identifier: {0}")]
     /// A plug-in instance identifier was invalid.
     InvalidPluginId(String),
+    #[error("plug-in instance identifier is used in more than one rack: {0}")]
+    /// Package state paths require instance identifiers to be unique across all racks.
+    DuplicateInstanceId(String),
     #[error("invalid plug-in-state metadata: {0}")]
     /// Persisted plug-in-state metadata was inconsistent or malformed.
     InvalidMetadata(String),
     #[error("no recoverable session package")]
     /// Neither the current package nor rollback package was usable.
     NoRecoverableSession,
+    #[error("there is no explicit save to return to; the recovered session is kept")]
+    /// Discarding a recovery needs a document from an explicit save.
+    NoExplicitSave,
 }
 
 /// File store with a staged full-package transaction. `manifest.json` is renamed last; if a
@@ -418,17 +475,34 @@ impl AtomicFileSessionStore {
         &self.layout
     }
 
+    fn has_saved_content(&self) -> bool {
+        [
+            self.layout.manifest_json(),
+            self.layout.session_json(),
+            self.layout.plugin_state_dir(),
+            self.layout.rollback_dir(),
+            self.layout.recovery_dir().join("transaction.json"),
+            self.layout.staging_dir(),
+        ]
+        .iter()
+        .any(|path| path.exists())
+    }
+
     /// Atomically publishes the package with rollback and recovery markers.
     /// # Errors
     /// Returns [`SessionError`] when validation or any staged filesystem step fails.
     pub fn save_atomic(&self, package: &SessionPackage) -> Result<(), SessionError> {
-        self.save_with_states(package, &[])
+        self.save_with_states(package, &[], None)
     }
 
+    /// `previews` is `Some` for an explicit save: it stores each valid picture of an instance
+    /// with saved state and drops pictures of instances no longer in the document. `None` keeps
+    /// every stored picture unchanged.
     fn save_with_states(
         &self,
         package: &SessionPackage,
         replacements: &[CapturedPluginState],
+        previews: Option<&[EditorPreviewFile]>,
     ) -> Result<(), SessionError> {
         package.validate()?;
         fs::create_dir_all(self.layout.root())?;
@@ -462,6 +536,11 @@ impl AtomicFileSessionStore {
                         .fingerprint
                         .clone_from(&metadata.activation.captured_fingerprint);
                 }
+                // Fresh state keeps the instance's stored picture.
+                metadata.preview = manifest
+                    .plugin_state
+                    .get(id)
+                    .and_then(|previous| previous.preview);
                 write_file(
                     &stage.join("plugin-state").join(id).join("component.bin"),
                     component,
@@ -470,13 +549,51 @@ impl AtomicFileSessionStore {
                     &stage.join("plugin-state").join(id).join("controller.bin"),
                     controller,
                 )?;
-                write_json(
-                    &stage.join("plugin-state").join(id).join("metadata.json"),
-                    &metadata,
-                )?;
                 manifest.plugin_state.insert(id.to_owned(), metadata);
             }
+            if let Some(previews) = previews {
+                for preview in previews {
+                    let Some(metadata) = manifest.plugin_state.get_mut(&preview.instance_id) else {
+                        continue;
+                    };
+                    if !is_editor_preview(&preview.png) {
+                        continue;
+                    }
+                    write_file(
+                        &stage
+                            .join("plugin-state")
+                            .join(&preview.instance_id)
+                            .join("preview.png"),
+                        &preview.png,
+                    )?;
+                    metadata.preview = Some(EditorPreviewMetadata {
+                        bytes: preview.png.len() as u64,
+                        captured_at_unix_ms: preview.captured_at_unix_ms,
+                    });
+                }
+                let instances: BTreeSet<&str> = package
+                    .session_json
+                    .model
+                    .racks
+                    .iter()
+                    .flat_map(|rack| &rack.slots)
+                    .map(|slot| slot.id.0.as_str())
+                    .collect();
+                for (id, metadata) in &mut manifest.plugin_state {
+                    if !instances.contains(id.as_str()) && metadata.preview.take().is_some() {
+                        let _ = fs::remove_file(
+                            stage.join("plugin-state").join(id).join("preview.png"),
+                        );
+                    }
+                }
+            }
             manifest.validate()?;
+            for (id, metadata) in &manifest.plugin_state {
+                write_json(
+                    &stage.join("plugin-state").join(id).join("metadata.json"),
+                    metadata,
+                )?;
+            }
             write_json(&stage.join("session.json"), &package.session_json)?;
             write_json(&stage.join("manifest.json"), &manifest)?;
             sync_tree(&stage)?;
@@ -655,6 +772,7 @@ impl AtomicFileSessionStore {
                 controller: controller.to_vec(),
                 metadata,
             }],
+            None,
         )
     }
     /// Loads the persisted component and controller streams for one plug-in instance.
@@ -739,7 +857,7 @@ pub struct SessionController {
     store: AtomicFileSessionStore,
     document: SessionDocument,
     dirty: bool,
-    recovery_offered: bool,
+    recovery_offer: Option<RecoveryOffer>,
 }
 impl SessionController {
     /// Opens the package at `root`, loading the current document and recovery state.
@@ -747,17 +865,23 @@ impl SessionController {
     /// Returns [`SessionError`] when no recoverable package exists or decoding fails.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, SessionError> {
         let store = AtomicFileSessionStore::new(root);
-        let recovery_offered = store.offer_recovery()?;
+        // An unclean marker was last written by the autosave (or save) that it announces.
+        let recovery_offer = store.offer_recovery()?.then(|| RecoveryOffer {
+            recovered_at_unix_ms: modified_unix_ms(&store.layout.recovery_json()).unwrap_or(0),
+            explicit_saved_at_unix_ms: modified_unix_ms(&store.layout.explicit_session_json()),
+        });
         let document = match store.load() {
             Ok(p) => p.session_json,
-            Err(SessionError::NoRecoverableSession) => SessionDocument::empty(),
+            Err(SessionError::NoRecoverableSession) if !store.has_saved_content() => {
+                SessionDocument::empty()
+            }
             Err(e) => return Err(e),
         };
         Ok(Self {
             store,
             document,
             dirty: false,
-            recovery_offered,
+            recovery_offer,
         })
     }
     #[must_use]
@@ -767,17 +891,48 @@ impl SessionController {
             store: AtomicFileSessionStore::new(root),
             document: SessionDocument::empty(),
             dirty: false,
-            recovery_offered: false,
+            recovery_offer: None,
         }
+    }
+    #[must_use]
+    /// Returns the session package directory.
+    pub fn root(&self) -> &Path {
+        self.store.layout().root()
     }
     #[must_use]
     /// Returns whether an unclean shutdown offer is pending a user decision.
     pub const fn recovery_offered(&self) -> bool {
-        self.recovery_offered
+        self.recovery_offer.is_some()
     }
-    /// Clears the pending recovery offer after the user has decided.
+    #[must_use]
+    /// Details for a pending recovery offer; `None` when no offer is pending.
+    pub const fn recovery_offer(&self) -> Option<RecoveryOffer> {
+        self.recovery_offer
+    }
+    /// Clears the pending recovery offer after the user has decided. Restoring keeps the loaded
+    /// (recovered) document.
     pub fn acknowledge_recovery_offer(&mut self) {
-        self.recovery_offered = false;
+        self.recovery_offer = None;
+    }
+    /// Replaces the loaded (recovered) document with the last explicit save and clears the offer.
+    /// The package is published again with that document; saved plug-in state and pictures stay.
+    /// # Errors
+    /// With no explicit save on disk, it keeps the recovered document and returns
+    /// [`SessionError::NoExplicitSave`]. Other errors report a failed read or publish.
+    pub fn discard_recovery(&mut self) -> Result<(), SessionError> {
+        let document = match decode_document(&self.store.layout.explicit_session_json()) {
+            Err(SessionError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SessionError::NoExplicitSave);
+            }
+            result => result?,
+        };
+        self.store
+            .save_atomic(&SessionPackage::new(document.clone()))?;
+        self.store.mark_clean_shutdown(true)?;
+        self.document = document;
+        self.dirty = false;
+        self.recovery_offer = None;
+        Ok(())
     }
     #[must_use]
     /// Returns the current document.
@@ -800,15 +955,38 @@ impl SessionController {
     pub fn save(&mut self) -> Result<(), SessionError> {
         self.save_with_plugin_states(&[])
     }
-    /// Atomically saves the model and every freshly captured opaque plug-in state.
+    /// Atomically saves the model and every freshly captured opaque plug-in state. Stored
+    /// editor pictures are kept as with no new pictures.
     /// # Errors
     /// Returns [`SessionError`] when validation, capture limits, or the atomic publish fail.
     pub fn save_with_plugin_states(
         &mut self,
         states: &[CapturedPluginState],
     ) -> Result<(), SessionError> {
-        self.store
-            .save_with_states(&SessionPackage::new(self.document.clone()), states)?;
+        self.save_with_plugin_states_and_previews(states, &[])
+    }
+    /// Explicit save with fresh opaque state and the newest editor pictures.
+    ///
+    /// A picture is stored only for an instance with saved state, and only when it is a PNG of
+    /// at most [`MAX_EDITOR_PREVIEW_BYTES`]; others are skipped. Instances without a new picture
+    /// keep their stored one, and instances no longer in the document drop theirs.
+    /// # Errors
+    /// Returns [`SessionError`] when validation, capture limits, or the atomic publish fail.
+    pub fn save_with_plugin_states_and_previews(
+        &mut self,
+        states: &[CapturedPluginState],
+        previews: &[EditorPreviewFile],
+    ) -> Result<(), SessionError> {
+        self.store.save_with_states(
+            &SessionPackage::new(self.document.clone()),
+            states,
+            Some(previews),
+        )?;
+        // Discarding a later recovery returns to this document.
+        let explicit = self.store.layout.explicit_session_json();
+        let staged = explicit.with_extension("next");
+        write_json(&staged, &self.document)?;
+        fs::rename(staged, explicit)?;
         self.store.mark_clean_shutdown(true)?;
         self.dirty = false;
         Ok(())
@@ -844,6 +1022,40 @@ impl SessionController {
             }
             Err(error) => Err(error),
         }
+    }
+    /// The stored editor picture for one plug-in instance, if any. It reads from disk, so it
+    /// works before any worker starts and for missing plug-ins. A missing, oversized, or corrupt
+    /// picture reads as `None` and never fails the session.
+    /// # Errors
+    /// Returns [`SessionError`] when the instance id is invalid.
+    pub fn load_editor_preview(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<EditorPreviewFile>, SessionError> {
+        validate_instance_id(instance_id)?;
+        let directory = self
+            .store
+            .readable_root()
+            .join("plugin-state")
+            .join(instance_id);
+        let Some(declared) = read_json::<PluginStateMetadata>(&directory.join("metadata.json"))
+            .ok()
+            .and_then(|metadata| metadata.preview)
+        else {
+            return Ok(None);
+        };
+        Ok(read_limited(
+            &directory.join("preview.png"),
+            MAX_EDITOR_PREVIEW_BYTES,
+            "editor preview bytes",
+        )
+        .ok()
+        .filter(|png| png.len() as u64 == declared.bytes && is_editor_preview(png))
+        .map(|png| EditorPreviewFile {
+            instance_id: instance_id.to_owned(),
+            png,
+            captured_at_unix_ms: declared.captured_at_unix_ms,
+        }))
     }
     #[must_use]
     /// Lists slots whose plug-ins are not installed, preserving their saved configuration.
@@ -961,6 +1173,7 @@ fn migrate_document(mut value: Value) -> Result<Value, SessionError> {
         }
         value = match version {
             0 => migrate_document_v0_to_v1(value),
+            1 => migrate_document_v1_to_v2(value),
             _ => unreachable!(),
         };
     }
@@ -976,6 +1189,11 @@ fn migrate_package_v0_to_v1(mut value: Value) -> Value {
 }
 fn migrate_document_v0_to_v1(mut value: Value) -> Value {
     value["schema_version"] = Value::from(1);
+    value
+}
+/// Version 1 slots have no sidechain field, which decodes as none.
+fn migrate_document_v1_to_v2(mut value: Value) -> Value {
+    value["schema_version"] = Value::from(2);
     value
 }
 fn schema_version(value: &Value, kind: &'static str) -> Result<u32, SessionError> {
@@ -1011,6 +1229,18 @@ fn read_limited(path: &Path, maximum: u64, limit: &'static str) -> Result<Vec<u8
 }
 fn read_opaque(path: &Path) -> Result<Vec<u8>, SessionError> {
     read_limited(path, MAX_OPAQUE_STATE_BYTES, "opaque state bytes")
+}
+fn is_editor_preview(png: &[u8]) -> bool {
+    png.len() as u64 <= MAX_EDITOR_PREVIEW_BYTES && png.starts_with(PNG_SIGNATURE)
+}
+fn modified_unix_ms(path: &Path) -> Option<u64> {
+    let elapsed = fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?;
+    u64::try_from(elapsed.as_millis()).ok()
 }
 fn validate_opaque(length: u64) -> Result<(), SessionError> {
     if length > MAX_OPAQUE_STATE_BYTES {
@@ -1201,6 +1431,11 @@ fn revision_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sp_model::{
+        ChannelLayout, Endpoint, EndpointId, GainDb, NormalizedParameters, PluginDescriptor,
+        PluginFingerprint, PluginIdentity, PluginInstanceId, Rack, RackId, RackTopology, Source,
+        SourceId,
+    };
     use std::{
         fs,
         sync::atomic::{AtomicU64, Ordering},
@@ -1276,7 +1511,11 @@ mod tests {
             },
         ];
         store
-            .save_with_states(&SessionPackage::new(SessionDocument::empty()), &captures)
+            .save_with_states(
+                &SessionPackage::new(SessionDocument::empty()),
+                &captures,
+                None,
+            )
             .expect("atomic state save");
 
         let package = store.load().expect("package");
@@ -1289,6 +1528,42 @@ mod tests {
             store.load_plugin_state("slot-2").expect("slot 2"),
             (vec![3], vec![4])
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn autosave_recovers_host_edits_and_retains_last_opaque_capture() {
+        let root = root();
+        let mut controller = SessionController::empty(&root);
+        controller
+            .save_with_plugin_states(&[CapturedPluginState {
+                instance_id: "saved-effect".into(),
+                component: vec![1, 2],
+                controller: vec![3],
+                metadata: PluginStateMetadata::default(),
+            }])
+            .expect("explicit capture");
+        controller.document_mut().model.sources.push(Source {
+            id: SourceId("input".into()),
+            name: "Unsaved input edit".into(),
+            layout: ChannelLayout::Stereo,
+        });
+        assert!(controller.is_dirty());
+        controller.autosave().expect("host-only autosave");
+        assert!(!controller.is_dirty());
+        let expected = controller.document().clone();
+        // Simulate process loss: do not mark a clean exit before reopening.
+        drop(controller);
+
+        let recovered = SessionController::open(&root).expect("recover autosave");
+        assert!(recovered.recovery_offered());
+        assert_eq!(recovered.document(), &expected);
+        let (component, controller, _) = recovered
+            .load_plugin_state("saved-effect")
+            .expect("saved state")
+            .expect("capture retained");
+        assert_eq!(component, [1, 2]);
+        assert_eq!(controller, [3]);
         fs::remove_dir_all(root).expect("cleanup");
     }
     #[test]
@@ -1330,6 +1605,14 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
     #[test]
+    fn version_one_documents_migrate_to_the_sidechain_schema() {
+        let mut legacy = serde_json::to_value(SessionDocument::empty()).expect("document");
+        legacy["schema_version"] = Value::from(1);
+        let migrated: SessionDocument =
+            serde_json::from_value(migrate_document(legacy).expect("migrate")).expect("decode");
+        assert_eq!(migrated, SessionDocument::empty());
+    }
+    #[test]
     fn unsafe_ids_and_oversized_opaque_bytes_are_rejected() {
         assert!(
             AtomicFileSessionStore::new(root())
@@ -1345,5 +1628,230 @@ mod tests {
             plugin_activation_state("expected", Some("changed"), false),
             PluginActivationState::Changed
         );
+    }
+
+    /// A stereo document whose racks hold plug-in slots with the given instance IDs.
+    fn rack_document(racks: &[(&str, &[&str])]) -> SessionDocument {
+        let mut document = SessionDocument::empty();
+        document.model.sources.push(Source {
+            id: SourceId("input".into()),
+            name: "Input".into(),
+            layout: ChannelLayout::Stereo,
+        });
+        document.model.endpoints.push(Endpoint {
+            id: EndpointId("output".into()),
+            name: "Output".into(),
+            layout: ChannelLayout::Stereo,
+        });
+        for (rack, slots) in racks {
+            document.model.racks.push(Rack {
+                id: RackId((*rack).into()),
+                name: (*rack).into(),
+                source_id: SourceId("input".into()),
+                endpoint_id: EndpointId("output".into()),
+                topology: RackTopology::Serial,
+                gain_db: GainDb::default(),
+                muted: false,
+                bypassed: false,
+                slots: slots
+                    .iter()
+                    .map(|id| PluginSlot {
+                        id: PluginInstanceId((*id).into()),
+                        plugin: PluginDescriptor {
+                            identity: PluginIdentity {
+                                vendor: "Vendor".into(),
+                                name: "Effect".into(),
+                                unique_id: "class".into(),
+                            },
+                            fingerprint: PluginFingerprint {
+                                algorithm: "sha256".into(),
+                                digest: "digest".into(),
+                                plugin_version: "1".into(),
+                            },
+                        },
+                        bypassed: false,
+                        parameters: NormalizedParameters::default(),
+                        sidechain: None,
+                    })
+                    .collect(),
+            });
+        }
+        document
+    }
+
+    fn captured_state(id: &str) -> CapturedPluginState {
+        CapturedPluginState {
+            instance_id: id.into(),
+            component: vec![1, 2],
+            controller: vec![3],
+            metadata: PluginStateMetadata::default(),
+        }
+    }
+
+    fn picture(id: &str, tag: u8) -> EditorPreviewFile {
+        EditorPreviewFile {
+            instance_id: id.into(),
+            png: [PNG_SIGNATURE, &[tag]].concat(),
+            captured_at_unix_ms: u64::from(tag),
+        }
+    }
+
+    #[test]
+    fn explicit_saves_store_carry_and_drop_editor_previews() {
+        let root = root();
+        let mut controller = SessionController::empty(&root);
+        *controller.document_mut() = rack_document(&[("rack-1", &["kept", "removed"])]);
+        controller
+            .save_with_plugin_states_and_previews(
+                &[captured_state("kept"), captured_state("removed")],
+                &[
+                    picture("kept", 1),
+                    picture("removed", 2),
+                    picture("stateless", 3),
+                ],
+            )
+            .expect("explicit save with pictures");
+        assert_eq!(
+            controller.load_editor_preview("kept").unwrap(),
+            Some(picture("kept", 1))
+        );
+        assert_eq!(controller.load_editor_preview("stateless").unwrap(), None);
+
+        // Fresh state, a rejected non-PNG picture, and autosave keep the stored picture.
+        controller
+            .save_with_plugin_states_and_previews(
+                &[captured_state("kept")],
+                &[EditorPreviewFile {
+                    png: b"GIF89a".to_vec(),
+                    ..picture("kept", 4)
+                }],
+            )
+            .expect("state-only save");
+        controller.autosave().expect("autosave");
+        assert_eq!(
+            controller.load_editor_preview("kept").unwrap(),
+            Some(picture("kept", 1))
+        );
+
+        *controller.document_mut() = rack_document(&[("rack-1", &["kept"])]);
+        controller
+            .save()
+            .expect("save without the removed instance");
+        assert_eq!(controller.load_editor_preview("removed").unwrap(), None);
+        assert_eq!(
+            SessionController::open(&root)
+                .expect("reopen")
+                .load_editor_preview("kept")
+                .unwrap(),
+            Some(picture("kept", 1))
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn missing_or_corrupt_preview_never_fails_session_load() {
+        let root = root();
+        let mut controller = SessionController::empty(&root);
+        *controller.document_mut() = rack_document(&[("rack-1", &["effect"])]);
+        controller
+            .save_with_plugin_states_and_previews(
+                &[captured_state("effect")],
+                &[picture("effect", 1)],
+            )
+            .expect("explicit save");
+        let document = controller.document().clone();
+        let preview = AtomicFileSessionStore::new(&root)
+            .layout()
+            .editor_preview_png("effect")
+            .expect("valid ID");
+        fs::write(&preview, [PNG_SIGNATURE, b"torn"].concat()).expect("corrupt picture");
+        let reopened = SessionController::open(&root).expect("session still loads");
+        assert_eq!(reopened.document(), &document);
+        assert_eq!(reopened.load_editor_preview("effect").unwrap(), None);
+        fs::remove_file(&preview).expect("remove picture");
+        assert_eq!(reopened.load_editor_preview("effect").unwrap(), None);
+        assert!(reopened.load_plugin_state("effect").unwrap().is_some());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn discard_recovery_returns_to_the_explicit_save() {
+        let root = root();
+        let mut controller = SessionController::empty(&root);
+        assert!(matches!(
+            controller.discard_recovery(),
+            Err(SessionError::NoExplicitSave)
+        ));
+        *controller.document_mut() = rack_document(&[("rack-1", &["effect"])]);
+        controller
+            .save_with_plugin_states(&[captured_state("effect")])
+            .expect("explicit save");
+        let explicit = controller.document().clone();
+        controller.document_mut().model.racks[0].muted = true;
+        controller.autosave().expect("autosave");
+        // Simulate process loss: do not mark a clean exit before reopening.
+        drop(controller);
+
+        let mut recovered = SessionController::open(&root).expect("recover autosave");
+        let offer = recovered.recovery_offer().expect("recovery offered");
+        assert!(
+            offer
+                .explicit_saved_at_unix_ms
+                .is_some_and(|saved| saved <= offer.recovered_at_unix_ms)
+        );
+        assert_ne!(recovered.document(), &explicit);
+        recovered.discard_recovery().expect("discard recovery");
+        assert!(!recovered.recovery_offered());
+        assert_eq!(recovered.document(), &explicit);
+        let reopened = SessionController::open(&root).expect("reopen");
+        assert!(!reopened.recovery_offered());
+        assert_eq!(reopened.document(), &explicit);
+        assert!(reopened.load_plugin_state("effect").unwrap().is_some());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn package_rejects_duplicate_instance_ids_across_racks() {
+        let document = rack_document(&[("rack-1", &["shared-slot"]), ("rack-2", &["shared-slot"])]);
+        document
+            .model
+            .validate_for_alpha()
+            .expect("model allows rack-local IDs");
+        assert!(matches!(
+            document.validate(),
+            Err(SessionError::DuplicateInstanceId(id)) if id == "shared-slot"
+        ));
+    }
+
+    #[test]
+    fn orphaned_session_file_does_not_open_as_a_new_session() {
+        let root = root();
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("session.json"),
+            serde_json::to_vec(&SessionDocument::empty()).expect("document"),
+        )
+        .expect("orphaned document");
+        assert!(matches!(
+            SessionController::open(&root),
+            Err(SessionError::NoRecoverableSession)
+        ));
+        assert!(root.join("session.json").exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn clean_marker_without_saved_package_still_opens_empty() {
+        let root = root();
+        AtomicFileSessionStore::new(&root)
+            .mark_clean_shutdown(true)
+            .expect("marker");
+        assert_eq!(
+            SessionController::open(&root)
+                .expect("fresh session")
+                .document(),
+            &SessionDocument::empty()
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }

@@ -1,18 +1,22 @@
-//! `CoreAudio` output boundary for Superposition on macOS.
+//! Direct AUHAL `CoreAudio` backend for Superposition on macOS.
 //!
-//! Phase 1 harness APIs (`ActiveOutput`, `PhaseOneRenderer`) remain available for xtask
-//! evidence. The product path implements [`sp_audio_io::AudioEndpoint`] in [`product`].
+//! [`MacOsAudioEndpoint`] implements [`sp_audio_io::AudioEndpoint`] for the app. It starts an
+//! [`ActiveMultiChannelDuplex`] stream for a selected route, or an [`ActiveOutput`] stereo stream
+//! on the default output device, and drives the rack workers through
+//! [`RackSharedMemoryDispatcher`]. Every stream runs at 48 kHz with a fixed [`BlockFrames`]
+//! callback size and verifies the device format before it starts.
 
 mod product;
 mod rack_dispatcher;
 
 pub use product::{
-    MacOsAudioEndpoint, PreparedProductScene, ProductControl, ProductControlReceiver,
-    ProductRackDiagnostics, ProductRenderer, ProductTelemetry, current_product_parameters,
-    prepare_product_scenes, product_midi_mappings,
+    LaneWorker, MacOsAudioEndpoint, PreparedProductScene, ProductControl, ProductControlReceiver,
+    ProductRackDiagnostics, ProductRenderer, ProductTelemetry, StoppedRecoveryAccess, TopologyLane,
+    current_product_parameters, prepare_product_scenes, product_midi_mappings,
 };
 pub use rack_dispatcher::{
-    RackAutomationEvents, RackDispatchTelemetry, RackSharedMemoryDispatcher,
+    LaneSource, PreparedRackLane, RackAutomationEvents, RackDispatchTelemetry,
+    RackSharedMemoryDispatcher,
 };
 
 use std::{
@@ -35,20 +39,26 @@ use std::sync::{
 const STATUS_UNSUPPORTED_FORMAT: i32 = -70_000;
 const RENDERED: u32 = 1;
 
-/// The only callback sizes supported by the Phase 1 output harness.
+/// Supported fixed callback sizes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PhaseOneFrames {
+pub enum BlockFrames {
+    /// A callback contains 32 frames.
+    Frames32,
+    /// A callback contains 64 frames.
+    Frames64,
     /// A callback contains 128 stereo frames.
     Frames128,
     /// A callback contains 256 stereo frames.
     Frames256,
 }
 
-impl PhaseOneFrames {
+impl BlockFrames {
     /// Returns this callback size as a frame count.
     #[must_use]
     pub const fn as_u32(self) -> u32 {
         match self {
+            Self::Frames32 => 32,
+            Self::Frames64 => 64,
             Self::Frames128 => 128,
             Self::Frames256 => 256,
         }
@@ -56,6 +66,8 @@ impl PhaseOneFrames {
 
     fn from_u32(frames: u32) -> Option<Self> {
         match frames {
+            32 => Some(Self::Frames32),
+            64 => Some(Self::Frames64),
             128 => Some(Self::Frames128),
             256 => Some(Self::Frames256),
             _ => None,
@@ -64,33 +76,35 @@ impl PhaseOneFrames {
 
     const fn interleaved_sample_count(self) -> usize {
         match self {
+            Self::Frames32 => 64,
+            Self::Frames64 => 128,
             Self::Frames128 => 256,
             Self::Frames256 => 512,
         }
     }
 }
 
-/// Fixed Phase 1 output settings and an explicit device-reconfiguration choice.
+/// Fixed stereo output settings and an explicit device-reconfiguration choice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PhaseOneConfig {
-    frames: PhaseOneFrames,
+pub struct OutputConfig {
+    frames: BlockFrames,
     allow_device_reconfiguration: bool,
 }
 
-impl PhaseOneConfig {
+impl OutputConfig {
     /// Creates a verify-only configuration for 48 kHz interleaved stereo output.
     ///
     /// The device is never reconfigured unless [`Self::allow_device_reconfiguration`] is
     /// called on this value.
     #[must_use]
-    pub const fn new(frames: PhaseOneFrames) -> Self {
+    pub const fn new(frames: BlockFrames) -> Self {
         Self {
             frames,
             allow_device_reconfiguration: false,
         }
     }
 
-    /// Explicitly permits requesting the fixed Phase 1 sample rate and frame count.
+    /// Explicitly permits requesting the fixed 48 kHz sample rate and frame count.
     ///
     /// Immutable constraints, including stereo output, frame-size range, and fixed-size
     /// callback behavior, are checked before either mutable property is changed. A failed
@@ -104,7 +118,7 @@ impl PhaseOneConfig {
 
     /// Returns the required callback size.
     #[must_use]
-    pub const fn frames(self) -> PhaseOneFrames {
+    pub const fn frames(self) -> BlockFrames {
         self.frames
     }
 
@@ -127,11 +141,11 @@ pub enum RenderDisposition {
 /// A validated mutable interleaved stereo `f32` output buffer.
 pub struct InterleavedStereoF32<'a> {
     samples: &'a mut [f32],
-    frames: PhaseOneFrames,
+    frames: BlockFrames,
 }
 
 impl<'a> InterleavedStereoF32<'a> {
-    /// Validates an interleaved sample slice for the supplied Phase 1 callback size.
+    /// Validates an interleaved sample slice for the supplied callback size.
     ///
     /// # Errors
     ///
@@ -139,7 +153,7 @@ impl<'a> InterleavedStereoF32<'a> {
     /// samples for every requested frame.
     pub fn new(
         samples: &'a mut [f32],
-        frames: PhaseOneFrames,
+        frames: BlockFrames,
     ) -> Result<Self, InterleavedStereoF32Error> {
         let expected_samples = frames.interleaved_sample_count();
         if samples.len() != expected_samples {
@@ -153,7 +167,7 @@ impl<'a> InterleavedStereoF32<'a> {
 
     /// Returns the validated callback size.
     #[must_use]
-    pub const fn frames(&self) -> PhaseOneFrames {
+    pub const fn frames(&self) -> BlockFrames {
         self.frames
     }
 
@@ -188,52 +202,65 @@ impl fmt::Display for InterleavedStereoF32Error {
 
 impl Error for InterleavedStereoF32Error {}
 
-/// Supplies samples to the Phase 1 real-time render callback.
+/// Supplies samples to the [`ActiveOutput`] real-time render callback.
 ///
 /// Implementations execute on `CoreAudio`'s real-time thread. They must not allocate, lock,
 /// log, wait, panic, or otherwise perform an operation that can block. Returning
 /// [`RenderDisposition::Rendered`] promises that every sample in `output` has been written.
 /// A panic cannot unwind across this non-unwinding C callback boundary and aborts the process;
-/// the harness deliberately does not run panic recovery machinery on the real-time thread.
-pub trait PhaseOneRenderer: Send + 'static {
+/// the backend deliberately does not run panic recovery machinery on the real-time thread.
+pub trait OutputRenderer: Send + 'static {
     /// Renders a single validated interleaved stereo callback buffer.
     fn render(&mut self, output: InterleavedStereoF32<'_>) -> RenderDisposition;
 }
 
-/// A fixed borrowed duplex callback block. The AUHAL shim owns the preallocated capture
-/// scratch buffer and converts the selected device format to interleaved product stereo before
-/// this value is constructed.
-pub struct DuplexStereoF32<'a> {
+/// One borrowed frame-interleaved hardware callback block.
+pub struct MultiChannelDuplexF32<'a> {
     input: &'a [f32],
-    output: InterleavedStereoF32<'a>,
+    output: &'a mut [f32],
+    input_channels: u16,
+    output_channels: u16,
+    frames: BlockFrames,
 }
 
-impl DuplexStereoF32<'_> {
-    /// Captured interleaved product-stereo input for this exact block.
-    #[must_use]
+impl<'a> MultiChannelDuplexF32<'a> {
+    /// Captured samples in frame-major channel order. Empty on an output-only route.
     pub fn input(&self) -> &[f32] {
         self.input
     }
-
-    /// Mutable interleaved product-stereo output for this exact block.
+    /// Playback samples in frame-major channel order.
     pub fn output_mut(&mut self) -> &mut [f32] {
-        self.output.samples_mut()
+        self.output
     }
-
-    /// Fixed frame count shared by input and output.
-    #[must_use]
-    pub const fn frames(&self) -> PhaseOneFrames {
-        self.output.frames()
+    /// The number of channels in each captured frame.
+    pub const fn input_channels(&self) -> u16 {
+        self.input_channels
+    }
+    /// The number of channels in each playback frame.
+    pub const fn output_channels(&self) -> u16 {
+        self.output_channels
+    }
+    /// The number of frames in this callback.
+    pub const fn frames(&self) -> BlockFrames {
+        self.frames
+    }
+    /// Splits the block for renderers that need simultaneous input and output access.
+    pub fn into_parts(self) -> (&'a [f32], &'a mut [f32], u16, u16, BlockFrames) {
+        (
+            self.input,
+            self.output,
+            self.input_channels,
+            self.output_channels,
+            self.frames,
+        )
     }
 }
 
-/// Product renderer contract for the duplex AUHAL path.
-///
-/// This method is called by the `CoreAudio` thread. It receives only borrowed preallocated
-/// buffers, and therefore must not allocate, lock, wait, or make control-plane calls.
-pub trait DuplexRenderer: Send + 'static {
-    /// Processes one fixed-size captured block and writes its playback block.
-    fn render(&mut self, block: DuplexStereoF32<'_>) -> RenderDisposition;
+/// Renders all requested physical playback channels from captured hardware channels.
+/// Called on the `CoreAudio` thread; implementations must not allocate, lock, or block.
+pub trait MultiChannelDuplexRenderer: Send + 'static {
+    /// Processes one fixed-size block.
+    fn render(&mut self, block: MultiChannelDuplexF32<'_>) -> RenderDisposition;
 }
 
 /// `CoreAudio` device metadata with the stable identifier and directional capabilities needed to
@@ -293,6 +320,8 @@ pub fn enumerate_devices() -> Result<Vec<MacOsAudioDevice>, CoreAudioError> {
 
 fn supported_buffer_frames(raw: &RawEnumeratedDevice) -> Vec<u32> {
     [
+        (raw.supports_32_frames != 0).then_some(32),
+        (raw.supports_64_frames != 0).then_some(64),
         (raw.supports_128_frames != 0).then_some(128),
         (raw.supports_256_frames != 0).then_some(256),
     ]
@@ -301,60 +330,91 @@ fn supported_buffer_frames(raw: &RawEnumeratedDevice) -> Vec<u32> {
     .collect()
 }
 
-/// A started same-device AUHAL capture/playback stream. It mutes immediately after `CoreAudio`
-/// signals device loss or a relevant format/topology change; recovery is control-plane work.
-pub struct ActiveDuplex<R: DuplexRenderer> {
+/// A selected hardware stream with independent capture and playback channel counts.
+pub struct ActiveMultiChannelDuplex<R: MultiChannelDuplexRenderer> {
     output: Option<NonNull<RawAudioOutput>>,
     renderer: Option<Box<R>>,
     route: AudioRouteConfig,
     last_telemetry: CallbackTelemetry,
 }
 
-impl<R: DuplexRenderer> ActiveDuplex<R> {
-    /// Starts a selected same-device route after validating the fixed 48 kHz/128-or-256 contract.
+impl<R: MultiChannelDuplexRenderer> ActiveMultiChannelDuplex<R> {
+    /// Starts a route. Distinct devices use a process-private aggregate clocked by the output.
     ///
     /// # Errors
-    /// Returns [`CoreAudioError`] when the route is unsupported or the unit cannot start.
+    ///
+    /// Returns [`CoreAudioError`] if the route is invalid or the device cannot start.
     pub fn start(
         route: AudioRouteConfig,
         renderer: R,
         allow_device_reconfiguration: bool,
     ) -> Result<Self, CoreAudioError> {
+        Self::start_boxed(route, Box::new(renderer), allow_device_reconfiguration)
+            .map_err(|(error, _)| error)
+    }
+
+    /// Starts a route with an owned renderer that can be retried after a safely retired failure.
+    /// The error contains `Some(renderer)` only if native code confirms that no callback can
+    /// access it. An uncertain native failure leaks the renderer and returns `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the start failure and any renderer proven safe to reuse.
+    pub fn start_boxed(
+        route: AudioRouteConfig,
+        mut renderer: Box<R>,
+        allow_device_reconfiguration: bool,
+    ) -> Result<Self, (CoreAudioError, Option<Box<R>>)> {
         let format = route.format;
-        if !format.is_product_format() {
-            return Err(CoreAudioError::UnsupportedRoute);
+        if format.sample_rate_hz != 48_000
+            || !matches!(format.max_frames_per_callback, 32 | 64 | 128 | 256)
+            || !(1..=64).contains(&format.channel_count)
+        {
+            return Err((CoreAudioError::UnsupportedRoute, Some(renderer)));
         }
-        let input = route.input.as_ref().ok_or(CoreAudioError::InputRequired)?;
-        let input_id = parse_core_audio_device_id(input)?;
-        let output_id = parse_core_audio_device_id(&route.output)?;
-        if input_id != output_id {
-            return Err(CoreAudioError::SeparateDuplexDevicesUnsupported);
-        }
-        let mut renderer = Box::new(renderer);
+        let input_id = match route
+            .input
+            .as_ref()
+            .map(parse_core_audio_device_id)
+            .transpose()
+        {
+            Ok(input) => input.unwrap_or(0),
+            Err(error) => return Err((error, Some(renderer))),
+        };
+        let output_id = match parse_core_audio_device_id(&route.output) {
+            Ok(output) => output,
+            Err(error) => return Err((error, Some(renderer))),
+        };
         let mut output = std::ptr::null_mut();
         let result = unsafe {
-            sp_audio_duplex_create(
+            sp_audio_multichannel_create(
                 &raw mut output,
                 input_id,
+                output_id,
                 format.max_frames_per_callback,
+                u32::from(format.channel_count),
                 u8::from(allow_device_reconfiguration),
                 std::ptr::from_mut(renderer.as_mut()).cast::<c_void>(),
-                duplex_render_trampoline::<R>,
+                multichannel_render_trampoline::<R>,
             )
         };
         let output = NonNull::new(output);
         if result.status != 0 {
-            if let Some(native) = output {
-                if result.renderer_retired != 0 && result.native_releasable != 0 {
+            if result.renderer_retired != 0 && result.native_releasable != 0 {
+                if let Some(native) = output {
                     unsafe { sp_audio_output_release(native.as_ptr()) };
-                } else {
-                    mem::forget(renderer);
                 }
+                return Err((core_audio_error(result), Some(renderer)));
             }
-            return Err(core_audio_error(result));
+            mem::forget(renderer);
+            return Err((core_audio_error(result), None));
         }
         let Some(output) = output else {
-            return Err(CoreAudioError::NativeInvariant);
+            if result.renderer_retired != 0 && result.native_releasable != 0 {
+                return Err((CoreAudioError::NativeInvariant, Some(renderer)));
+            }
+            mem::forget(renderer);
+            return Err((CoreAudioError::NativeInvariant, None));
         };
         Ok(Self {
             output: Some(output),
@@ -364,59 +424,125 @@ impl<R: DuplexRenderer> ActiveDuplex<R> {
         })
     }
 
-    /// The selected route.
-    #[must_use]
+    /// The selected source and playback device IDs.
     pub fn route(&self) -> &AudioRouteConfig {
         &self.route
     }
 
-    /// Non-blocking device-loss/change notification. Once an event is observed, the native
-    /// callback stays muted until this stream is stopped and a newly validated stream is started.
+    /// Takes one pending device event without waiting.
     pub fn poll_event(&mut self) -> Option<AudioEndpointEvent> {
         let output = self.output?;
         let event = unsafe { sp_audio_output_take_device_event(output.as_ptr()) };
+        let device = if event >= 3 {
+            self.route.input.as_ref().unwrap_or(&self.route.output)
+        } else {
+            &self.route.output
+        };
         match event {
-            1 => Some(AudioEndpointEvent::DeviceLost {
-                device: self.route.output.clone(),
+            1 | 3 => Some(AudioEndpointEvent::DeviceLost {
+                device: device.clone(),
             }),
-            2 => Some(AudioEndpointEvent::DeviceConfigurationChanged {
-                device: self.route.output.clone(),
+            2 | 4 => Some(AudioEndpointEvent::DeviceConfigurationChanged {
+                device: device.clone(),
             }),
             _ => None,
         }
     }
 
-    /// A coherent callback telemetry snapshot.
-    #[must_use]
+    /// Returns coherent callback counters.
     pub fn telemetry(&self) -> CallbackTelemetry {
         self.output.map_or(self.last_telemetry, |o| unsafe {
             sp_audio_output_telemetry(o.as_ptr()).into()
         })
     }
 
-    /// Retires the callback and native unit before dropping the renderer.
+    /// Stops and releases the callback, unit, and private aggregate.
     ///
     /// # Errors
-    /// Returns [`CoreAudioError`] when the native unit cannot be destroyed cleanly.
+    ///
+    /// Returns [`CoreAudioError`] if native teardown cannot prove callback retirement.
     pub fn stop(&mut self) -> Result<(), CoreAudioError> {
+        drop(self.stop_and_take_renderer()?);
+        Ok(())
+    }
+
+    /// Stops the stream and returns its renderer after native callback retirement.
+    /// Returns `None` if the stream was already stopped. On uncertain teardown the renderer
+    /// stays allocated with the native state and is never returned to another callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreAudioError`] if native teardown cannot prove callback retirement.
+    pub fn stop_and_take_renderer(&mut self) -> Result<Option<Box<R>>, CoreAudioError> {
         let Some(output) = self.output else {
-            return Ok(());
+            return Ok(None);
         };
         let result = unsafe { sp_audio_output_destroy(output.as_ptr()) };
         if result.status != 0 || result.renderer_retired == 0 || result.native_releasable == 0 {
-            return Err(core_audio_error(result));
+            let error = if result.status == 0 {
+                CoreAudioError::NativeInvariant
+            } else {
+                core_audio_error(result)
+            };
+            self.output = None;
+            if let Some(renderer) = self.renderer.take() {
+                mem::forget(renderer);
+            }
+            return Err(error);
         }
         self.last_telemetry = unsafe { sp_audio_output_telemetry(output.as_ptr()).into() };
         self.output = None;
         unsafe { sp_audio_output_release(output.as_ptr()) };
-        drop(self.renderer.take());
-        Ok(())
+        Ok(self.renderer.take())
     }
 }
 
-impl<R: DuplexRenderer> Drop for ActiveDuplex<R> {
+impl<R: MultiChannelDuplexRenderer> Drop for ActiveMultiChannelDuplex<R> {
     fn drop(&mut self) {
-        let _ = self.stop();
+        if self.stop().is_err() && self.output.is_some() {
+            mem::forget(self.renderer.take());
+        }
+    }
+}
+
+unsafe extern "C" fn multichannel_render_trampoline<R: MultiChannelDuplexRenderer>(
+    renderer: *mut c_void,
+    input: *const f32,
+    input_channels: u32,
+    output: *mut f32,
+    output_channels: u32,
+    frames: u32,
+) -> u32 {
+    let Some(frames) = BlockFrames::from_u32(frames) else {
+        return 0;
+    };
+    if renderer.is_null()
+        || output.is_null()
+        || input.is_null()
+        || input_channels > 64
+        || !(1..=64).contains(&output_channels)
+    {
+        return 0;
+    }
+    let Ok(input_channels) = u16::try_from(input_channels) else {
+        return 0;
+    };
+    let Ok(output_channels) = u16::try_from(output_channels) else {
+        return 0;
+    };
+    let input_len = frames.as_u32() as usize * usize::from(input_channels);
+    let output_len = frames.as_u32() as usize * usize::from(output_channels);
+    let block = MultiChannelDuplexF32 {
+        input: unsafe { std::slice::from_raw_parts(input, input_len) },
+        output: unsafe { std::slice::from_raw_parts_mut(output, output_len) },
+        input_channels,
+        output_channels,
+        frames,
+    };
+    let renderer = unsafe { &mut *renderer.cast::<R>() };
+    match renderer.render(block) {
+        RenderDisposition::Rendered => RENDERED,
+        RenderDisposition::Silence => 0,
     }
 }
 
@@ -425,31 +551,6 @@ fn parse_core_audio_device_id(id: &AudioDeviceId) -> Result<u32, CoreAudioError>
         .strip_prefix("coreaudio:")
         .and_then(|raw| raw.parse().ok())
         .ok_or(CoreAudioError::InvalidDeviceId)
-}
-
-unsafe extern "C" fn duplex_render_trampoline<R: DuplexRenderer>(
-    renderer: *mut c_void,
-    input: *const f32,
-    output: *mut f32,
-    frames: u32,
-) -> u32 {
-    let Some(frames) = PhaseOneFrames::from_u32(frames) else {
-        return 0;
-    };
-    if renderer.is_null() || input.is_null() || output.is_null() {
-        return 0;
-    }
-    let samples = frames.interleaved_sample_count();
-    let input = unsafe { std::slice::from_raw_parts(input, samples) };
-    let output = unsafe { std::slice::from_raw_parts_mut(output, samples) };
-    let Ok(output) = InterleavedStereoF32::new(output, frames) else {
-        return 0;
-    };
-    let renderer = unsafe { &mut *renderer.cast::<R>() };
-    match renderer.render(DuplexStereoF32 { input, output }) {
-        RenderDisposition::Rendered => RENDERED,
-        RenderDisposition::Silence => 0,
-    }
 }
 
 /// A strictly observed device and audio-unit format report.
@@ -480,9 +581,9 @@ pub struct DeviceFormatReport {
 }
 
 impl DeviceFormatReport {
-    /// Returns whether this report supports the selected fixed stereo Phase 1 client format.
+    /// Returns whether this report supports fixed 48 kHz stereo callbacks of `frames` frames.
     #[must_use]
-    pub const fn matches_phase_one(self, frames: PhaseOneFrames) -> bool {
+    pub const fn matches_output_format(self, frames: BlockFrames) -> bool {
         self.sample_rate_hz.to_bits() == 48_000.0_f64.to_bits()
             && self.channel_count >= 2
             && self.current_frames_per_slice == frames.as_u32()
@@ -567,6 +668,8 @@ pub enum CoreAudioOperation {
     AddFrameCountListener,
     /// Removing the frame-count property listener.
     RemoveFrameCountListener,
+    /// Removing a device-change property listener.
+    RemoveDeviceChangeListener,
     /// An operation code the Rust boundary does not recognize.
     Unknown,
 }
@@ -609,6 +712,7 @@ impl CoreAudioOperation {
             38 => Self::RemoveSampleRateListener,
             39 => Self::AddFrameCountListener,
             40 => Self::RemoveFrameCountListener,
+            42 => Self::RemoveDeviceChangeListener,
             _ => Self::Unknown,
         }
     }
@@ -651,6 +755,7 @@ impl CoreAudioOperation {
             Self::RemoveSampleRateListener => 38,
             Self::AddFrameCountListener => 39,
             Self::RemoveFrameCountListener => 40,
+            Self::RemoveDeviceChangeListener => 42,
             Self::Unknown => 0,
         }
     }
@@ -668,7 +773,7 @@ pub struct CoreAudioFailure {
 /// A typed failure reported while configuring or controlling `CoreAudio`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CoreAudioError {
-    /// The output device did not strictly satisfy the Phase 1 format requirements.
+    /// The output device did not strictly satisfy the fixed output format requirements.
     UnsupportedDeviceFormat {
         /// The exact format observed after any acknowledged mutation.
         report: DeviceFormatReport,
@@ -708,12 +813,8 @@ pub enum CoreAudioError {
     NativeInvariant,
     /// The route did not use the fixed product format.
     UnsupportedRoute,
-    /// Duplex capture requires an explicit input device.
-    InputRequired,
     /// A persisted ID was not issued by this `CoreAudio` backend.
     InvalidDeviceId,
-    /// This direct AUHAL backend intentionally does not clock two separate devices.
-    SeparateDuplexDevicesUnsupported,
 }
 
 impl fmt::Display for CoreAudioError {
@@ -721,7 +822,7 @@ impl fmt::Display for CoreAudioError {
         match self {
             Self::UnsupportedDeviceFormat { report } => write!(
                 formatter,
-                "Phase 1 requires exact 48 kHz fixed-size stereo client callbacks; device reported \
+                "output requires exact 48 kHz fixed-size stereo client callbacks; device reported \
                  {} Hz, {} physical output channels, current/supported/callback-max {}/{}/{}/{} frames, variable={}",
                 report.sample_rate_hz,
                 report.channel_count,
@@ -759,13 +860,10 @@ impl fmt::Display for CoreAudioError {
             Self::NativeInvariant => {
                 formatter.write_str("C shim returned invalid native ownership")
             }
-            Self::UnsupportedRoute => {
-                formatter.write_str("route must use fixed 48 kHz stereo with 128 or 256 frames")
-            }
-            Self::InputRequired => formatter.write_str("duplex route requires an input device"),
+            Self::UnsupportedRoute => formatter.write_str(
+                "route requires 48 kHz, 1–64 output channels, and 32, 64, 128, or 256 frames",
+            ),
             Self::InvalidDeviceId => formatter.write_str("invalid CoreAudio device identifier"),
-            Self::SeparateDuplexDevicesUnsupported => formatter
-                .write_str("separate input/output devices are not supported by direct AUHAL"),
         }
     }
 }
@@ -796,6 +894,10 @@ pub struct CallbackTelemetry {
     pub invalid_channels: u64,
     /// Number of callbacks rejected for a non-exact byte count.
     pub invalid_bytes: u64,
+    /// Valid 32-frame callback count.
+    pub frame_histogram_32: u64,
+    /// Valid 64-frame callback count.
+    pub frame_histogram_64: u64,
     /// Valid 128-frame callback count.
     pub frame_histogram_128: u64,
     /// Valid 256-frame callback count.
@@ -815,7 +917,9 @@ impl CallbackTelemetry {
                 .wrapping_add(self.invalid_channels)
                 .wrapping_add(self.invalid_bytes)
             && self
-                .frame_histogram_128
+                .frame_histogram_32
+                .wrapping_add(self.frame_histogram_64)
+                .wrapping_add(self.frame_histogram_128)
                 .wrapping_add(self.frame_histogram_256)
                 == self.rendered.wrapping_add(self.silenced)
     }
@@ -831,6 +935,8 @@ impl From<RawCallbackTelemetry> for CallbackTelemetry {
             invalid_buffers: raw.invalid_buffers,
             invalid_channels: raw.invalid_channels,
             invalid_bytes: raw.invalid_bytes,
+            frame_histogram_32: raw.frame_histogram_32,
+            frame_histogram_64: raw.frame_histogram_64,
             frame_histogram_128: raw.frame_histogram_128,
             frame_histogram_256: raw.frame_histogram_256,
         }
@@ -838,7 +944,7 @@ impl From<RawCallbackTelemetry> for CallbackTelemetry {
 }
 
 /// A started AUHAL output whose renderer remains alive until C confirms callback retirement.
-pub struct ActiveOutput<R: PhaseOneRenderer> {
+pub struct ActiveOutput<R: OutputRenderer> {
     output: Option<NonNull<RawAudioOutput>>,
     renderer: Option<Box<R>>,
     device_format: DeviceFormatReport,
@@ -847,8 +953,8 @@ pub struct ActiveOutput<R: PhaseOneRenderer> {
     test_hook: Option<Arc<TestHook>>,
 }
 
-impl<R: PhaseOneRenderer> ActiveOutput<R> {
-    /// Resolves the default device, checks the requested Phase 1 format, and starts AUHAL.
+impl<R: OutputRenderer> ActiveOutput<R> {
+    /// Resolves the default device, checks the requested format, and starts AUHAL.
     ///
     /// Call this only from a control thread. Explicit device changes wait for bounded
     /// property notifications and are intentionally not real-time operations.
@@ -858,8 +964,19 @@ impl<R: PhaseOneRenderer> ActiveOutput<R> {
     /// Returns a typed `CoreAudio` failure when the device cannot be verified or started. If
     /// cleanup cannot prove callback retirement, the native state, renderer, and any callback
     /// observer are deliberately leaked together rather than risking a use-after-free.
-    pub fn start(config: PhaseOneConfig, renderer: R) -> Result<Self, CoreAudioError> {
+    pub fn start(config: OutputConfig, renderer: R) -> Result<Self, CoreAudioError> {
         Self::start_inner(config, renderer, &StartBackend::Device)
+    }
+
+    /// Starts output with a renderer that can be reused after a safely retired start failure.
+    ///
+    /// # Errors
+    /// Returns the failure and `Some(renderer)` only when native callback retirement is proven.
+    pub fn start_boxed(
+        config: OutputConfig,
+        renderer: Box<R>,
+    ) -> Result<Self, (CoreAudioError, Option<Box<R>>)> {
+        Self::start_inner_boxed(config, renderer, &StartBackend::Device)
     }
 
     /// Returns the exact format observed after setup.
@@ -892,8 +1009,20 @@ impl<R: PhaseOneRenderer> ActiveOutput<R> {
     /// Any uncertainty disables this value and deliberately leaks the complete native/Rust
     /// ownership cluster so the teardown error cannot be masked by user `Drop` code.
     pub fn stop(&mut self) -> Result<(), CoreAudioError> {
+        drop(self.stop_and_take_renderer()?);
+        Ok(())
+    }
+
+    /// Stops the stream and returns its renderer after native callback retirement.
+    /// Returns `None` if the stream was already stopped. On uncertain teardown the renderer
+    /// stays allocated with the native state and is never returned to another callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreAudioError`] if native teardown cannot prove callback retirement.
+    pub fn stop_and_take_renderer(&mut self) -> Result<Option<Box<R>>, CoreAudioError> {
         let Some(output) = self.output else {
-            return Ok(());
+            return Ok(None);
         };
         // SAFETY: this value exclusively owns the native state until release or abandonment.
         let result = unsafe { sp_audio_output_destroy(output.as_ptr()) };
@@ -901,11 +1030,18 @@ impl<R: PhaseOneRenderer> ActiveOutput<R> {
     }
 
     fn start_inner(
-        config: PhaseOneConfig,
+        config: OutputConfig,
         renderer: R,
         backend: &StartBackend,
     ) -> Result<Self, CoreAudioError> {
-        let mut renderer = Box::new(renderer);
+        Self::start_inner_boxed(config, Box::new(renderer), backend).map_err(|(error, _)| error)
+    }
+
+    fn start_inner_boxed(
+        config: OutputConfig,
+        mut renderer: Box<R>,
+        backend: &StartBackend,
+    ) -> Result<Self, (CoreAudioError, Option<Box<R>>)> {
         let mut output = std::ptr::null_mut();
         #[cfg(test)]
         let test_hook = backend.test_hook();
@@ -950,7 +1086,8 @@ impl<R: PhaseOneRenderer> ActiveOutput<R> {
                     // SAFETY: C reported the full quiescence sequence and native disposal.
                     unsafe { sp_audio_output_release(native.as_ptr()) };
                 }
-                (Some(_), _, _) | (None, false, _) => {
+                (None, true, true) => {}
+                _ => {
                     // Cleanup did not establish full quiescence. The native pointer, renderer,
                     // and observer clone are deliberately leaked as one ownership cluster.
                     mem::forget(renderer);
@@ -958,11 +1095,10 @@ impl<R: PhaseOneRenderer> ActiveOutput<R> {
                     if let Some(hook) = test_hook {
                         mem::forget(hook);
                     }
-                    return Err(error);
+                    return Err((error, None));
                 }
-                (None, true, _) => {}
             }
-            return Err(error);
+            return Err((error, Some(renderer)));
         }
 
         let Some(output) = native else {
@@ -971,7 +1107,7 @@ impl<R: PhaseOneRenderer> ActiveOutput<R> {
             if let Some(hook) = test_hook {
                 mem::forget(hook);
             }
-            return Err(CoreAudioError::NativeInvariant);
+            return Err((CoreAudioError::NativeInvariant, None));
         };
         Ok(Self {
             output: Some(output),
@@ -983,7 +1119,10 @@ impl<R: PhaseOneRenderer> ActiveOutput<R> {
         })
     }
 
-    fn apply_destroy_result(&mut self, result: RawAudioResult) -> Result<(), CoreAudioError> {
+    fn apply_destroy_result(
+        &mut self,
+        result: RawAudioResult,
+    ) -> Result<Option<Box<R>>, CoreAudioError> {
         if result.status != 0 {
             let error = core_audio_error(result);
             // Teardown errors take precedence over user destructors. Full quiescence was not
@@ -1007,9 +1146,7 @@ impl<R: PhaseOneRenderer> ActiveOutput<R> {
         unsafe { sp_audio_output_release(output.as_ptr()) };
         #[cfg(test)]
         drop(test_hook);
-        // User destructor runs only after no dangling native pointer remains in `self`.
-        drop(renderer);
-        Ok(())
+        Ok(renderer)
     }
 
     fn leak_ownership_cluster(&mut self) {
@@ -1027,7 +1164,7 @@ impl<R: PhaseOneRenderer> ActiveOutput<R> {
 
     #[cfg(test)]
     fn start_test(
-        config: PhaseOneConfig,
+        config: OutputConfig,
         renderer: R,
         fake: TestFakeConfig,
         hook: Arc<TestHook>,
@@ -1089,7 +1226,7 @@ impl<R: PhaseOneRenderer> ActiveOutput<R> {
     }
 }
 
-impl<R: PhaseOneRenderer> Drop for ActiveOutput<R> {
+impl<R: OutputRenderer> Drop for ActiveOutput<R> {
     fn drop(&mut self) {
         let Some(output) = self.output else {
             return;
@@ -1192,12 +1329,12 @@ fn core_audio_error(result: RawAudioResult) -> CoreAudioError {
     }
 }
 
-unsafe extern "C" fn render_trampoline<R: PhaseOneRenderer>(
+unsafe extern "C" fn render_trampoline<R: OutputRenderer>(
     renderer: *mut c_void,
     samples: *mut f32,
     frames: u32,
 ) -> u32 {
-    let Some(frames) = PhaseOneFrames::from_u32(frames) else {
+    let Some(frames) = BlockFrames::from_u32(frames) else {
         return 0;
     };
     if renderer.is_null() || samples.is_null() {
@@ -1253,6 +1390,8 @@ struct RawEnumeratedDevice {
     output_channels: u32,
     is_default_input: u32,
     is_default_output: u32,
+    supports_32_frames: u32,
+    supports_64_frames: u32,
     supports_128_frames: u32,
     supports_256_frames: u32,
     name: [c_char; 256],
@@ -1266,6 +1405,8 @@ impl Default for RawEnumeratedDevice {
             output_channels: 0,
             is_default_input: 0,
             is_default_output: 0,
+            supports_32_frames: 0,
+            supports_64_frames: 0,
             supports_128_frames: 0,
             supports_256_frames: 0,
             name: [0; 256],
@@ -1283,6 +1424,8 @@ struct RawCallbackTelemetry {
     invalid_buffers: u64,
     invalid_channels: u64,
     invalid_bytes: u64,
+    frame_histogram_32: u64,
+    frame_histogram_64: u64,
     frame_histogram_128: u64,
     frame_histogram_256: u64,
 }
@@ -1357,13 +1500,15 @@ unsafe extern "C" {
     fn sp_audio_device_count() -> u32;
     fn sp_audio_device_at(index: u32, device: *mut RawEnumeratedDevice) -> i32;
     fn sp_audio_output_take_device_event(output: *mut RawAudioOutput) -> u32;
-    fn sp_audio_duplex_create(
+    fn sp_audio_multichannel_create(
         output: *mut *mut RawAudioOutput,
-        device: u32,
+        input_device: u32,
+        output_device: u32,
         frames: u32,
+        output_channels: u32,
         allow_reconfiguration: u8,
         renderer: *mut c_void,
-        render: unsafe extern "C" fn(*mut c_void, *const f32, *mut f32, u32) -> u32,
+        render: unsafe extern "C" fn(*mut c_void, *const f32, u32, *mut f32, u32, u32) -> u32,
     ) -> RawAudioResult;
 
     #[cfg(test)]
@@ -1376,6 +1521,8 @@ unsafe extern "C" {
         samples: *mut f32,
         data_capacity_bytes: u32,
     ) -> i32;
+    #[cfg(test)]
+    fn sp_audio_test_signal_device_event(output: *mut RawAudioOutput, event: u32);
 }
 
 #[cfg(test)]
@@ -1457,7 +1604,7 @@ struct TestFakeConfig {
 
 #[cfg(test)]
 impl TestFakeConfig {
-    fn new(frames: PhaseOneFrames) -> Self {
+    fn new(frames: BlockFrames) -> Self {
         Self {
             raw: RawFakeConfig {
                 enabled: 1,
@@ -1511,10 +1658,10 @@ enum TestInvokeError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveOutput, CallbackTelemetry, CoreAudioError, CoreAudioFailure, CoreAudioOperation,
-        InterleavedStereoF32, PhaseOneConfig, PhaseOneFrames, PhaseOneRenderer,
-        RawEnumeratedDevice, RenderDisposition, TestFakeConfig, TestHook, TestInvokeError,
-        supported_buffer_frames,
+        ActiveMultiChannelDuplex, ActiveOutput, BlockFrames, CallbackTelemetry, CoreAudioError,
+        CoreAudioFailure, CoreAudioOperation, InterleavedStereoF32, MultiChannelDuplexF32,
+        MultiChannelDuplexRenderer, OutputConfig, OutputRenderer, RawEnumeratedDevice,
+        RenderDisposition, TestFakeConfig, TestHook, TestInvokeError, supported_buffer_frames,
     };
 
     use std::{
@@ -1541,6 +1688,160 @@ mod tests {
         assert_eq!(supported_buffer_frames(&raw), [256]);
     }
 
+    #[test]
+    fn multichannel_trampoline_preserves_channel_order_and_rejects_invalid_dimensions() {
+        struct CopyInput;
+        impl MultiChannelDuplexRenderer for CopyInput {
+            fn render(&mut self, block: MultiChannelDuplexF32<'_>) -> RenderDisposition {
+                let (input, output, inputs, outputs, frames) = block.into_parts();
+                assert_eq!((inputs, outputs, frames), (3, 4, BlockFrames::Frames32));
+                for frame in 0..32 {
+                    output[frame * 4..frame * 4 + 3]
+                        .copy_from_slice(&input[frame * 3..frame * 3 + 3]);
+                    output[frame * 4 + 3] = 0.0;
+                }
+                RenderDisposition::Rendered
+            }
+        }
+        let mut renderer = CopyInput;
+        let input: Vec<f32> = (0_u16..96).map(f32::from).collect();
+        let mut output = [f32::NAN; 128];
+        let disposition = unsafe {
+            super::multichannel_render_trampoline::<CopyInput>(
+                std::ptr::from_mut(&mut renderer).cast::<c_void>(),
+                input.as_ptr(),
+                3,
+                output.as_mut_ptr(),
+                4,
+                32,
+            )
+        };
+        assert_eq!(disposition, super::RENDERED);
+        assert_eq!(&output[4..8], &[3.0, 4.0, 5.0, 0.0]);
+        assert_eq!(
+            unsafe {
+                super::multichannel_render_trampoline::<CopyInput>(
+                    std::ptr::from_mut(&mut renderer).cast::<c_void>(),
+                    input.as_ptr(),
+                    65,
+                    output.as_mut_ptr(),
+                    4,
+                    32,
+                )
+            },
+            0
+        );
+    }
+
+    #[test]
+    fn failed_multichannel_retirement_keeps_renderer_alive() {
+        struct Probe(Arc<AtomicBool>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        impl MultiChannelDuplexRenderer for Probe {
+            fn render(&mut self, _: MultiChannelDuplexF32<'_>) -> RenderDisposition {
+                RenderDisposition::Silence
+            }
+        }
+        unsafe extern "C" fn silent(_: *mut c_void, _: *mut f32, _: u32) -> u32 {
+            0
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut renderer = Box::new(Probe(Arc::clone(&dropped)));
+        let fake =
+            TestFakeConfig::new(BlockFrames::Frames128).fail_cleanup(CoreAudioOperation::Stop, -1);
+        let mut raw = std::ptr::null_mut();
+        let result = unsafe {
+            super::sp_audio_output_create(
+                &raw mut raw,
+                128,
+                0,
+                std::ptr::from_mut(renderer.as_mut()).cast(),
+                silent,
+                &raw const fake.raw,
+                std::ptr::null_mut(),
+                None,
+                None,
+            )
+        };
+        assert_eq!(result.status, 0);
+        let mut stream = ActiveMultiChannelDuplex {
+            output: std::ptr::NonNull::new(raw),
+            renderer: Some(renderer),
+            route: sp_audio_io::AudioRouteConfig {
+                input: None,
+                output: sp_audio_io::AudioDeviceId::new("coreaudio:1"),
+                format: sp_audio_io::AudioFormat::product_stereo(128).unwrap(),
+            },
+            last_telemetry: CallbackTelemetry::default(),
+        };
+        assert!(stream.stop_and_take_renderer().is_err());
+        assert!(stream.output.is_none());
+        drop(stream);
+        assert!(!dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn multichannel_stop_returns_original_renderer_after_retirement() {
+        struct Probe(Arc<AtomicBool>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        impl MultiChannelDuplexRenderer for Probe {
+            fn render(&mut self, _: MultiChannelDuplexF32<'_>) -> RenderDisposition {
+                RenderDisposition::Silence
+            }
+        }
+        unsafe extern "C" fn silent(_: *mut c_void, _: *mut f32, _: u32) -> u32 {
+            0
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut renderer = Box::new(Probe(Arc::clone(&dropped)));
+        let identity = std::ptr::from_ref(renderer.as_ref());
+        let fake = TestFakeConfig::new(BlockFrames::Frames128);
+        let mut raw = std::ptr::null_mut();
+        let result = unsafe {
+            super::sp_audio_output_create(
+                &raw mut raw,
+                128,
+                0,
+                std::ptr::from_mut(renderer.as_mut()).cast(),
+                silent,
+                &raw const fake.raw,
+                std::ptr::null_mut(),
+                None,
+                None,
+            )
+        };
+        assert_eq!(result.status, 0);
+        let mut stream = ActiveMultiChannelDuplex {
+            output: std::ptr::NonNull::new(raw),
+            renderer: Some(renderer),
+            route: sp_audio_io::AudioRouteConfig {
+                input: None,
+                output: sp_audio_io::AudioDeviceId::new("coreaudio:1"),
+                format: sp_audio_io::AudioFormat::product_stereo(128).unwrap(),
+            },
+            last_telemetry: CallbackTelemetry::default(),
+        };
+        let returned = stream
+            .stop_and_take_renderer()
+            .expect("fake stream retires")
+            .expect("renderer is returned once");
+        assert_eq!(std::ptr::from_ref(returned.as_ref()), identity);
+        assert!(!dropped.load(Ordering::Acquire));
+        assert!(stream.stop_and_take_renderer().unwrap().is_none());
+        drop(stream);
+        assert!(!dropped.load(Ordering::Acquire));
+        drop(returned);
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
     unsafe extern "C" {
         fn pipe(file_descriptors: *mut i32) -> i32;
         #[link_name = "write"]
@@ -1554,7 +1855,7 @@ mod tests {
         disposition: RenderDisposition,
     }
 
-    impl PhaseOneRenderer for TestRenderer {
+    impl OutputRenderer for TestRenderer {
         fn render(&mut self, mut output: InterleavedStereoF32<'_>) -> RenderDisposition {
             self.calls.fetch_add(1, Ordering::Relaxed);
             for sample in output.samples_mut() {
@@ -1568,7 +1869,7 @@ mod tests {
         drops: Arc<AtomicUsize>,
     }
 
-    impl PhaseOneRenderer for DropCounterRenderer {
+    impl OutputRenderer for DropCounterRenderer {
         fn render(&mut self, _output: InterleavedStereoF32<'_>) -> RenderDisposition {
             RenderDisposition::Silence
         }
@@ -1586,7 +1887,7 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
-    impl PhaseOneRenderer for BlockingRenderer {
+    impl OutputRenderer for BlockingRenderer {
         fn render(&mut self, mut output: InterleavedStereoF32<'_>) -> RenderDisposition {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.entered.store(true, Ordering::Release);
@@ -1605,32 +1906,57 @@ mod tests {
         }
     }
 
-    fn start_test<R: PhaseOneRenderer>(
-        frames: PhaseOneFrames,
+    fn start_test<R: OutputRenderer>(
+        frames: BlockFrames,
         renderer: R,
         fake: TestFakeConfig,
     ) -> (ActiveOutput<R>, Arc<TestHook>) {
         let hook = Arc::new(TestHook::new());
-        let output = ActiveOutput::start_test(
-            PhaseOneConfig::new(frames),
-            renderer,
-            fake,
-            Arc::clone(&hook),
-        )
-        .expect("fake backend starts");
+        let output =
+            ActiveOutput::start_test(OutputConfig::new(frames), renderer, fake, Arc::clone(&hook))
+                .expect("fake backend starts");
         (output, hook)
     }
 
     #[test]
+    fn polling_device_event_keeps_callback_muted_until_restart() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut output, _) = start_test(
+            BlockFrames::Frames128,
+            TestRenderer {
+                calls: Arc::clone(&calls),
+                disposition: RenderDisposition::Rendered,
+            },
+            TestFakeConfig::new(BlockFrames::Frames128),
+        );
+        let native = output.output.unwrap();
+        unsafe { super::sp_audio_test_signal_device_event(native.as_ptr(), 2) };
+        assert_eq!(
+            unsafe { super::sp_audio_output_take_device_event(native.as_ptr()) },
+            2
+        );
+        assert_eq!(
+            unsafe { super::sp_audio_output_take_device_event(native.as_ptr()) },
+            0
+        );
+        let mut samples = [1.0; 256];
+        output
+            .invoke_test_callback(128, 1, 2, 1024, &mut samples)
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(samples.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
     fn fixed_stereo_client_accepts_a_multichannel_output_device() {
-        let mut fake = TestFakeConfig::new(PhaseOneFrames::Frames128);
+        let mut fake = TestFakeConfig::new(BlockFrames::Frames128);
         fake.raw.channel_count = 64;
-        let (mut output, _) = start_test(PhaseOneFrames::Frames128, renderer(), fake);
+        let (mut output, _) = start_test(BlockFrames::Frames128, renderer(), fake);
         assert_eq!(output.device_format().channel_count, 64);
         assert!(
             output
                 .device_format()
-                .matches_phase_one(PhaseOneFrames::Frames128)
+                .matches_output_format(BlockFrames::Frames128)
         );
 
         let mut samples = vec![0.0; 256];
@@ -1645,12 +1971,12 @@ mod tests {
     fn valid_callback_renders_and_reports_a_coherent_snapshot() {
         let calls = Arc::new(AtomicUsize::new(0));
         let (mut output, _) = start_test(
-            PhaseOneFrames::Frames128,
+            BlockFrames::Frames128,
             TestRenderer {
                 calls: Arc::clone(&calls),
                 disposition: RenderDisposition::Rendered,
             },
-            TestFakeConfig::new(PhaseOneFrames::Frames128),
+            TestFakeConfig::new(BlockFrames::Frames128),
         );
         let mut samples = vec![1.0; 256];
         output
@@ -1675,9 +2001,9 @@ mod tests {
     #[test]
     fn live_telemetry_snapshots_remain_coherent_during_callbacks() {
         let (output, _) = start_test(
-            PhaseOneFrames::Frames128,
+            BlockFrames::Frames128,
             renderer(),
-            TestFakeConfig::new(PhaseOneFrames::Frames128),
+            TestFakeConfig::new(BlockFrames::Frames128),
         );
         let output_pointer = output
             .output
@@ -1723,13 +2049,13 @@ mod tests {
         let release = Arc::new(AtomicBool::new(false));
         let calls = Arc::new(AtomicUsize::new(0));
         let (output, _) = start_test(
-            PhaseOneFrames::Frames128,
+            BlockFrames::Frames128,
             BlockingRenderer {
                 entered: Arc::clone(&entered),
                 release: Arc::clone(&release),
                 calls: Arc::clone(&calls),
             },
-            TestFakeConfig::new(PhaseOneFrames::Frames128),
+            TestFakeConfig::new(BlockFrames::Frames128),
         );
         let pointer = output
             .output
@@ -1777,12 +2103,12 @@ mod tests {
     fn silence_disposition_rezeros_renderer_output() {
         let calls = Arc::new(AtomicUsize::new(0));
         let (mut output, _) = start_test(
-            PhaseOneFrames::Frames128,
+            BlockFrames::Frames128,
             TestRenderer {
                 calls: Arc::clone(&calls),
                 disposition: RenderDisposition::Silence,
             },
-            TestFakeConfig::new(PhaseOneFrames::Frames128),
+            TestFakeConfig::new(BlockFrames::Frames128),
         );
         let mut samples = vec![1.0; 256];
         output
@@ -1798,9 +2124,9 @@ mod tests {
     #[test]
     fn lifecycle_orders_initialize_start_stop_detach_uninitialize_dispose() {
         let (mut output, hook) = start_test(
-            PhaseOneFrames::Frames128,
+            BlockFrames::Frames128,
             renderer(),
-            TestFakeConfig::new(PhaseOneFrames::Frames128),
+            TestFakeConfig::new(BlockFrames::Frames128),
         );
         assert_eq!(hook.lifecycle(), [1, 2]);
         output.stop().expect("fake output stops");
@@ -1816,12 +2142,12 @@ mod tests {
     fn invalid_callback_shapes_are_silent_and_classified() {
         let calls = Arc::new(AtomicUsize::new(0));
         let (mut output, _) = start_test(
-            PhaseOneFrames::Frames128,
+            BlockFrames::Frames128,
             TestRenderer {
                 calls: Arc::clone(&calls),
                 disposition: RenderDisposition::Rendered,
             },
-            TestFakeConfig::new(PhaseOneFrames::Frames128),
+            TestFakeConfig::new(BlockFrames::Frames128),
         );
         let mut large = vec![1.0; 512];
         output
@@ -1855,9 +2181,9 @@ mod tests {
     #[test]
     fn safe_fake_helper_rejects_byte_size_beyond_slice_capacity() {
         let (mut output, _) = start_test(
-            PhaseOneFrames::Frames128,
+            BlockFrames::Frames128,
             renderer(),
-            TestFakeConfig::new(PhaseOneFrames::Frames128),
+            TestFakeConfig::new(BlockFrames::Frames128),
         );
         let mut samples = vec![1.0; 16];
         assert_eq!(
@@ -1888,9 +2214,9 @@ mod tests {
             let status = -100 - i32::try_from(index).expect("small index");
             let hook = Arc::new(TestHook::new());
             let result = ActiveOutput::start_test(
-                PhaseOneConfig::new(PhaseOneFrames::Frames128),
+                OutputConfig::new(BlockFrames::Frames128),
                 renderer(),
-                TestFakeConfig::new(PhaseOneFrames::Frames128).fail(operation, status),
+                TestFakeConfig::new(BlockFrames::Frames128).fail(operation, status),
                 hook,
             );
             assert!(matches!(
@@ -1906,13 +2232,13 @@ mod tests {
     #[test]
     fn variable_frame_devices_are_rejected_before_reconfiguration() {
         let hook = Arc::new(TestHook::new());
-        let mut fake = TestFakeConfig::new(PhaseOneFrames::Frames128);
+        let mut fake = TestFakeConfig::new(BlockFrames::Frames128);
         fake.raw.uses_variable_buffer_frame_sizes = 1;
         fake.raw.current_frames_per_slice = 256;
         fake.raw.maximum_callback_frames_per_slice = 256;
         fake.raw.maximum_callback_frames_per_slice = 260;
         let result = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128).allow_device_reconfiguration(),
+            OutputConfig::new(BlockFrames::Frames128).allow_device_reconfiguration(),
             renderer(),
             fake,
             Arc::clone(&hook),
@@ -1930,21 +2256,21 @@ mod tests {
     #[test]
     fn report_distinguishes_current_device_maximum_and_audio_unit_maximum() {
         let (output, _) = start_test(
-            PhaseOneFrames::Frames128,
+            BlockFrames::Frames128,
             renderer(),
-            TestFakeConfig::new(PhaseOneFrames::Frames128),
+            TestFakeConfig::new(BlockFrames::Frames128),
         );
         let report = output.device_format();
         assert_eq!(report.current_frames_per_slice, 128);
         assert_eq!(report.supported_maximum_frames_per_slice, 1_024);
         assert_eq!(report.maximum_callback_frames_per_slice, 128);
         assert_eq!(report.audio_unit_maximum_frames_per_slice, 128);
-        assert!(report.matches_phase_one(PhaseOneFrames::Frames128));
+        assert!(report.matches_output_format(BlockFrames::Frames128));
     }
 
     #[test]
     fn fake_models_delayed_property_convergence_and_operation_timeouts() {
-        let mut delayed = TestFakeConfig::new(PhaseOneFrames::Frames128);
+        let mut delayed = TestFakeConfig::new(BlockFrames::Frames128);
         delayed.raw.sample_rate_hz = 44_100.0;
         delayed.raw.current_frames_per_slice = 256;
         delayed.raw.maximum_callback_frames_per_slice = 256;
@@ -1952,7 +2278,7 @@ mod tests {
         delayed.raw.frame_count_notification_polls = 4;
         let hook = Arc::new(TestHook::new());
         let mut output = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128).allow_device_reconfiguration(),
+            OutputConfig::new(BlockFrames::Frames128).allow_device_reconfiguration(),
             renderer(),
             delayed,
             Arc::clone(&hook),
@@ -1961,17 +2287,17 @@ mod tests {
         assert!(
             output
                 .device_format()
-                .matches_phase_one(PhaseOneFrames::Frames128)
+                .matches_output_format(BlockFrames::Frames128)
         );
         assert_eq!(hook.lifecycle(), [9, 7, 10, 12, 8, 13, 11, 14, 1, 2]);
         output.stop().expect("delayed setup output stops");
 
-        let mut sample_timeout = TestFakeConfig::new(PhaseOneFrames::Frames128);
+        let mut sample_timeout = TestFakeConfig::new(BlockFrames::Frames128);
         sample_timeout.raw.sample_rate_hz = 44_100.0;
         sample_timeout.raw.sample_rate_notification_polls = u32::MAX;
         let hook = Arc::new(TestHook::new());
         let result = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128).allow_device_reconfiguration(),
+            OutputConfig::new(BlockFrames::Frames128).allow_device_reconfiguration(),
             renderer(),
             sample_timeout,
             Arc::clone(&hook),
@@ -1989,12 +2315,12 @@ mod tests {
         ));
         assert_eq!(hook.lifecycle(), [9, 7, 11]);
 
-        let mut frame_timeout = TestFakeConfig::new(PhaseOneFrames::Frames128);
+        let mut frame_timeout = TestFakeConfig::new(BlockFrames::Frames128);
         frame_timeout.raw.current_frames_per_slice = 256;
         frame_timeout.raw.maximum_callback_frames_per_slice = 256;
         frame_timeout.raw.frame_count_notification_polls = u32::MAX;
         let result = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128).allow_device_reconfiguration(),
+            OutputConfig::new(BlockFrames::Frames128).allow_device_reconfiguration(),
             renderer(),
             frame_timeout,
             Arc::new(TestHook::new()),
@@ -2016,12 +2342,12 @@ mod tests {
     fn failed_setup_retains_acknowledged_mutations_without_rollback() {
         let hook = Arc::new(TestHook::new());
         let mut fake =
-            TestFakeConfig::new(PhaseOneFrames::Frames128).fail(CoreAudioOperation::Start, -4_242);
+            TestFakeConfig::new(BlockFrames::Frames128).fail(CoreAudioOperation::Start, -4_242);
         fake.raw.sample_rate_hz = 44_100.0;
         fake.raw.current_frames_per_slice = 256;
         fake.raw.maximum_callback_frames_per_slice = 256;
         let result = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128).allow_device_reconfiguration(),
+            OutputConfig::new(BlockFrames::Frames128).allow_device_reconfiguration(),
             renderer(),
             fake,
             Arc::clone(&hook),
@@ -2043,14 +2369,14 @@ mod tests {
     #[test]
     fn sample_rate_notification_can_couple_a_fresh_frame_size_request() {
         let hook = Arc::new(TestHook::new());
-        let mut fake = TestFakeConfig::new(PhaseOneFrames::Frames128);
+        let mut fake = TestFakeConfig::new(BlockFrames::Frames128);
         fake.raw.sample_rate_hz = 44_100.0;
         // Already at the target frame count until the rate notification couples a new size.
         fake.raw.current_frames_per_slice = 128;
         fake.raw.maximum_callback_frames_per_slice = 128;
         fake.raw.sample_rate_coupled_frame_count = 256;
         let mut output = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128).allow_device_reconfiguration(),
+            OutputConfig::new(BlockFrames::Frames128).allow_device_reconfiguration(),
             renderer(),
             fake,
             Arc::clone(&hook),
@@ -2059,7 +2385,7 @@ mod tests {
         assert!(
             output
                 .device_format()
-                .matches_phase_one(PhaseOneFrames::Frames128)
+                .matches_output_format(BlockFrames::Frames128)
         );
         assert_eq!(hook.lifecycle(), [9, 7, 10, 12, 8, 13, 11, 14, 1, 2]);
         output.stop().expect("coupled reconfiguration output stops");
@@ -2068,12 +2394,12 @@ mod tests {
     #[test]
     fn final_device_state_read_failure_is_preserved_on_setup_error() {
         let mut fake =
-            TestFakeConfig::new(PhaseOneFrames::Frames128).fail(CoreAudioOperation::Start, -91);
+            TestFakeConfig::new(BlockFrames::Frames128).fail(CoreAudioOperation::Start, -91);
         fake.raw.sample_rate_hz = 44_100.0;
         fake.raw.final_state_failure_operation = CoreAudioOperation::ReadDeviceFormat.as_raw();
         fake.raw.final_state_failure_status = -92;
         let result = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128).allow_device_reconfiguration(),
+            OutputConfig::new(BlockFrames::Frames128).allow_device_reconfiguration(),
             renderer(),
             fake,
             Arc::new(TestHook::new()),
@@ -2099,7 +2425,7 @@ mod tests {
     #[test]
     fn failed_start_cleanup_reports_live_native_ownership_and_leaks_renderer() {
         struct CountDrop(Arc<AtomicUsize>);
-        impl PhaseOneRenderer for CountDrop {
+        impl OutputRenderer for CountDrop {
             fn render(&mut self, _output: InterleavedStereoF32<'_>) -> RenderDisposition {
                 RenderDisposition::Silence
             }
@@ -2112,11 +2438,11 @@ mod tests {
 
         let drops = Arc::new(AtomicUsize::new(0));
         let hook = Arc::new(TestHook::new());
-        let fake = TestFakeConfig::new(PhaseOneFrames::Frames128)
+        let fake = TestFakeConfig::new(BlockFrames::Frames128)
             .fail(CoreAudioOperation::Start, -51)
             .fail_cleanup(CoreAudioOperation::DetachCallback, -52);
         let result = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128),
+            OutputConfig::new(BlockFrames::Frames128),
             CountDrop(Arc::clone(&drops)),
             fake,
             Arc::clone(&hook),
@@ -2155,11 +2481,11 @@ mod tests {
             let drops = Arc::new(AtomicUsize::new(0));
             let hook = Arc::new(TestHook::new());
             let mut output = ActiveOutput::start_test(
-                PhaseOneConfig::new(PhaseOneFrames::Frames128),
+                OutputConfig::new(BlockFrames::Frames128),
                 DropCounterRenderer {
                     drops: Arc::clone(&drops),
                 },
-                TestFakeConfig::new(PhaseOneFrames::Frames128).fail_cleanup(operation, status),
+                TestFakeConfig::new(BlockFrames::Frames128).fail_cleanup(operation, status),
                 Arc::clone(&hook),
             )
             .expect("fake output starts");
@@ -2194,11 +2520,11 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let hook = Arc::new(TestHook::new());
         let output = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128),
+            OutputConfig::new(BlockFrames::Frames128),
             DropCounterRenderer {
                 drops: Arc::clone(&drops),
             },
-            TestFakeConfig::new(PhaseOneFrames::Frames128)
+            TestFakeConfig::new(BlockFrames::Frames128)
                 .fail_cleanup(CoreAudioOperation::Dispose, -84),
             Arc::clone(&hook),
         )
@@ -2214,10 +2540,10 @@ mod tests {
     fn callback_quiescence_timeout_leaks_cluster_and_disables_test_invoke() {
         let drops = Arc::new(AtomicUsize::new(0));
         let hook = Arc::new(TestHook::new());
-        let mut fake = TestFakeConfig::new(PhaseOneFrames::Frames128);
+        let mut fake = TestFakeConfig::new(BlockFrames::Frames128);
         fake.raw.quiescence_convergence_polls = u32::MAX;
         let mut output = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128),
+            OutputConfig::new(BlockFrames::Frames128),
             DropCounterRenderer {
                 drops: Arc::clone(&drops),
             },
@@ -2252,13 +2578,13 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let hook = Arc::new(TestHook::new());
         let mut output = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128),
+            OutputConfig::new(BlockFrames::Frames128),
             BlockingRenderer {
                 entered: Arc::clone(&entered),
                 release: Arc::clone(&release),
                 calls: Arc::clone(&calls),
             },
-            TestFakeConfig::new(PhaseOneFrames::Frames128),
+            TestFakeConfig::new(BlockFrames::Frames128),
             Arc::clone(&hook),
         )
         .expect("fake output starts");
@@ -2299,7 +2625,7 @@ mod tests {
     #[test]
     fn teardown_error_precedes_panicking_renderer_drop() {
         struct PanicDrop;
-        impl PhaseOneRenderer for PanicDrop {
+        impl OutputRenderer for PanicDrop {
             fn render(&mut self, _output: InterleavedStereoF32<'_>) -> RenderDisposition {
                 RenderDisposition::Silence
             }
@@ -2311,9 +2637,9 @@ mod tests {
         }
 
         let mut output = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128),
+            OutputConfig::new(BlockFrames::Frames128),
             PanicDrop,
-            TestFakeConfig::new(PhaseOneFrames::Frames128)
+            TestFakeConfig::new(BlockFrames::Frames128)
                 .fail_cleanup(CoreAudioOperation::Uninitialize, -83),
             Arc::new(TestHook::new()),
         )
@@ -2333,11 +2659,11 @@ mod tests {
 
     #[test]
     fn final_telemetry_is_captured_after_callback_retirement() {
-        let mut fake = TestFakeConfig::new(PhaseOneFrames::Frames128);
+        let mut fake = TestFakeConfig::new(BlockFrames::Frames128);
         fake.raw.callback_on_stop = 1;
         let calls = Arc::new(AtomicUsize::new(0));
         let (mut output, hook) = start_test(
-            PhaseOneFrames::Frames128,
+            BlockFrames::Frames128,
             TestRenderer {
                 calls: Arc::clone(&calls),
                 disposition: RenderDisposition::Rendered,
@@ -2358,7 +2684,7 @@ mod tests {
             hook: Arc<TestHook>,
             drops: Arc<AtomicUsize>,
         }
-        impl PhaseOneRenderer for ObserveDrop {
+        impl OutputRenderer for ObserveDrop {
             fn render(&mut self, _output: InterleavedStereoF32<'_>) -> RenderDisposition {
                 RenderDisposition::Silence
             }
@@ -2373,12 +2699,12 @@ mod tests {
         let hook = Arc::new(TestHook::new());
         let drops = Arc::new(AtomicUsize::new(0));
         let mut output = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128),
+            OutputConfig::new(BlockFrames::Frames128),
             ObserveDrop {
                 hook: Arc::clone(&hook),
                 drops: Arc::clone(&drops),
             },
-            TestFakeConfig::new(PhaseOneFrames::Frames128),
+            TestFakeConfig::new(BlockFrames::Frames128),
             Arc::clone(&hook),
         )
         .expect("fake backend starts");
@@ -2387,9 +2713,97 @@ mod tests {
     }
 
     #[test]
+    fn failed_boxed_start_returns_renderer_only_after_safe_retirement() {
+        for uncertain in [false, true] {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let renderer = Box::new(DropCounterRenderer {
+                drops: Arc::clone(&drops),
+            });
+            let identity = std::ptr::from_ref(renderer.as_ref());
+            let hook = Arc::new(TestHook::new());
+            let mut fake =
+                TestFakeConfig::new(BlockFrames::Frames128).fail(CoreAudioOperation::Start, -91);
+            if uncertain {
+                fake = fake.fail_cleanup(CoreAudioOperation::DetachCallback, -92);
+            }
+            let failure = ActiveOutput::start_inner_boxed(
+                OutputConfig::new(BlockFrames::Frames128),
+                renderer,
+                &super::StartBackend::Fake {
+                    config: fake.raw,
+                    hook: Arc::clone(&hook),
+                },
+            );
+            let Err((_, returned)) = failure else {
+                panic!("fake start failure was not exercised");
+            };
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+            if uncertain {
+                assert!(returned.is_none());
+                assert!(!hook.renderer_retired.load(Ordering::Acquire));
+            } else {
+                let returned = returned.expect("safe cleanup permits retry");
+                assert_eq!(std::ptr::from_ref(returned.as_ref()), identity);
+                assert!(hook.renderer_retired.load(Ordering::Acquire));
+                drop(returned);
+                assert_eq!(drops.load(Ordering::Relaxed), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn output_stop_returns_original_renderer_only_after_retirement() {
+        let hook = Arc::new(TestHook::new());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut output = ActiveOutput::start_test(
+            OutputConfig::new(BlockFrames::Frames128),
+            DropCounterRenderer {
+                drops: Arc::clone(&drops),
+            },
+            TestFakeConfig::new(BlockFrames::Frames128),
+            Arc::clone(&hook),
+        )
+        .expect("fake output starts");
+        let identity = std::ptr::from_ref(output.renderer.as_ref().unwrap().as_ref());
+        let returned = output
+            .stop_and_take_renderer()
+            .expect("fake output retires")
+            .expect("renderer is returned once");
+        assert!(hook.renderer_retired.load(Ordering::Acquire));
+        assert_eq!(std::ptr::from_ref(returned.as_ref()), identity);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert!(output.stop_and_take_renderer().unwrap().is_none());
+        drop(output);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        drop(returned);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn output_failed_retirement_never_returns_or_drops_renderer() {
+        let hook = Arc::new(TestHook::new());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut output = ActiveOutput::start_test(
+            OutputConfig::new(BlockFrames::Frames128),
+            DropCounterRenderer {
+                drops: Arc::clone(&drops),
+            },
+            TestFakeConfig::new(BlockFrames::Frames128).fail_cleanup(CoreAudioOperation::Stop, -70),
+            Arc::clone(&hook),
+        )
+        .expect("fake output starts");
+        assert!(output.stop_and_take_renderer().is_err());
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert!(!hook.renderer_retired.load(Ordering::Acquire));
+        assert!(output.stop_and_take_renderer().unwrap().is_none());
+        drop(output);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn panicking_renderer_drop_cannot_leave_a_dangling_native_owner() {
         struct PanicDrop;
-        impl PhaseOneRenderer for PanicDrop {
+        impl OutputRenderer for PanicDrop {
             fn render(&mut self, _output: InterleavedStereoF32<'_>) -> RenderDisposition {
                 RenderDisposition::Silence
             }
@@ -2401,9 +2815,9 @@ mod tests {
         }
 
         let (mut output, _) = start_test(
-            PhaseOneFrames::Frames128,
+            BlockFrames::Frames128,
             PanicDrop,
-            TestFakeConfig::new(PhaseOneFrames::Frames128),
+            TestFakeConfig::new(BlockFrames::Frames128),
         );
         let panic = catch_unwind(AssertUnwindSafe(|| {
             let _ = output.stop();
@@ -2415,7 +2829,7 @@ mod tests {
     #[test]
     fn allocation_failure_returns_renderer_ownership_without_leaking() {
         struct CountDrop(Arc<AtomicUsize>);
-        impl PhaseOneRenderer for CountDrop {
+        impl OutputRenderer for CountDrop {
             fn render(&mut self, _output: InterleavedStereoF32<'_>) -> RenderDisposition {
                 RenderDisposition::Silence
             }
@@ -2428,10 +2842,10 @@ mod tests {
 
         let drops = Arc::new(AtomicUsize::new(0));
         let hook = Arc::new(TestHook::new());
-        let mut fake = TestFakeConfig::new(PhaseOneFrames::Frames128);
+        let mut fake = TestFakeConfig::new(BlockFrames::Frames128);
         fake.raw.fail_allocation = 1;
         let result = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128),
+            OutputConfig::new(BlockFrames::Frames128),
             CountDrop(Arc::clone(&drops)),
             fake,
             hook,
@@ -2448,11 +2862,11 @@ mod tests {
 
     #[test]
     fn fractional_sample_rate_is_reported_exactly_and_reconfigured_when_allowed() {
-        let mut fake = TestFakeConfig::new(PhaseOneFrames::Frames128);
+        let mut fake = TestFakeConfig::new(BlockFrames::Frames128);
         fake.raw.sample_rate_hz = 47_999.5;
         let hook = Arc::new(TestHook::new());
         let result = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128),
+            OutputConfig::new(BlockFrames::Frames128),
             renderer(),
             fake,
             hook,
@@ -2465,7 +2879,7 @@ mod tests {
 
         let hook = Arc::new(TestHook::new());
         let output = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128).allow_device_reconfiguration(),
+            OutputConfig::new(BlockFrames::Frames128).allow_device_reconfiguration(),
             renderer(),
             fake,
             Arc::clone(&hook),
@@ -2480,14 +2894,14 @@ mod tests {
 
     #[test]
     fn both_reconfiguration_request_failures_are_injectable() {
-        let mut fake = TestFakeConfig::new(PhaseOneFrames::Frames128)
+        let mut fake = TestFakeConfig::new(BlockFrames::Frames128)
             .fail(CoreAudioOperation::RequestSampleRate, -61);
         fake.raw.sample_rate_hz = 44_100.0;
         fake.raw.current_frames_per_slice = 256;
         fake.raw.maximum_callback_frames_per_slice = 256;
         let hook = Arc::new(TestHook::new());
         let result = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128).allow_device_reconfiguration(),
+            OutputConfig::new(BlockFrames::Frames128).allow_device_reconfiguration(),
             renderer(),
             fake,
             Arc::clone(&hook),
@@ -2501,14 +2915,14 @@ mod tests {
         ));
         assert_eq!(hook.lifecycle(), [9, 11]);
 
-        let mut fake = TestFakeConfig::new(PhaseOneFrames::Frames128)
+        let mut fake = TestFakeConfig::new(BlockFrames::Frames128)
             .fail(CoreAudioOperation::RequestFrameCount, -62);
         fake.raw.sample_rate_hz = 44_100.0;
         fake.raw.current_frames_per_slice = 256;
         fake.raw.maximum_callback_frames_per_slice = 256;
         let hook = Arc::new(TestHook::new());
         let result = ActiveOutput::start_test(
-            PhaseOneConfig::new(PhaseOneFrames::Frames128).allow_device_reconfiguration(),
+            OutputConfig::new(BlockFrames::Frames128).allow_device_reconfiguration(),
             renderer(),
             fake,
             Arc::clone(&hook),
@@ -2531,7 +2945,7 @@ mod tests {
         marker_file_descriptor: i32,
     }
 
-    impl PhaseOneRenderer for PanicRenderer {
+    impl OutputRenderer for PanicRenderer {
         fn render(&mut self, _output: InterleavedStereoF32<'_>) -> RenderDisposition {
             const MARKER: [u8; 1] = [0xa5];
             // SAFETY: the parent passes an inherited writable pipe descriptor. The one-byte
@@ -2560,11 +2974,11 @@ mod tests {
                 .parse::<i32>()
                 .expect("marker descriptor is numeric");
             let (mut output, _) = start_test(
-                PhaseOneFrames::Frames128,
+                BlockFrames::Frames128,
                 PanicRenderer {
                     marker_file_descriptor,
                 },
-                TestFakeConfig::new(PhaseOneFrames::Frames128),
+                TestFakeConfig::new(BlockFrames::Frames128),
             );
             let mut samples = vec![0.0; 256];
             let _ = output.invoke_test_callback(128, 1, 2, 1_024, &mut samples);

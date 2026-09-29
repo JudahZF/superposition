@@ -1,218 +1,137 @@
-//! Audio meter models with a UI-owned, deterministic 30 Hz repaint cadence.
+//! Meter ballistics and the segmented LED meter.
 
-use std::{fmt, time::Duration};
-
-use crate::design::{
-    AccessibilityNode, AccessibilityRange, AccessibilityRole, AccessibilityState, FocusOrder,
-    MotionKind, MotionPreference,
-};
+use std::time::Duration;
 
 /// UI repaint frequency for live meters. This is deliberately independent of audio callbacks.
 pub const METER_REPAINT_HZ: u32 = 30;
 /// Interval derived from [`METER_REPAINT_HZ`].
 pub const METER_REPAINT_INTERVAL: Duration =
     Duration::from_nanos(1_000_000_000 / METER_REPAINT_HZ as u64);
+/// Segments in one LED meter column.
+pub const LED_SEGMENTS: usize = 16;
+/// Topmost segments that light in the fault colour.
+pub const LED_FAULT_SEGMENTS: usize = 2;
 
-/// The severity band of a [`MeterLevel`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MeterState {
-    /// Normal signal level.
-    Nominal,
-    /// Signal is approaching clipping.
-    Warning,
-    /// Signal has clipped.
-    Clipping,
-}
+const METER_FLOOR_DBFS: f32 = -60.0;
+const METER_DECAY_DB_PER_SECOND: f32 = 24.0;
+const PEAK_HOLD: Duration = Duration::from_millis(250);
+const CLIP_HOLD: Duration = Duration::from_millis(500);
 
-impl MeterState {
-    /// Returns the short UI label for this state.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Nominal => "Nominal",
-            Self::Warning => "Warning",
-            Self::Clipping => "Clipping",
-        }
-    }
-}
-
-impl fmt::Display for MeterState {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.label())
-    }
-}
-
-/// Audio meter reading and its derived severity state.
+/// UI-only ballistics for the latest stereo peak snapshot.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MeterLevel {
-    /// Peak level in decibels relative to full scale.
-    pub peak_dbfs: f32,
-    /// Derived severity state.
-    pub state: MeterState,
+pub struct MeterBallistics {
+    displayed_dbfs: [f32; 2],
+    held_dbfs: f32,
+    peak_hold_until: Duration,
+    clip_hold_until: Duration,
+    last_update: Option<Duration>,
 }
 
-impl MeterLevel {
-    /// Creates a finite level and derives its severity from the peak value.
-    #[must_use]
-    pub fn from_peak_dbfs(peak_dbfs: f32) -> Self {
-        let peak_dbfs = sanitize_peak(peak_dbfs);
+impl Default for MeterBallistics {
+    fn default() -> Self {
         Self {
-            peak_dbfs,
-            state: Self::state_for(peak_dbfs),
+            displayed_dbfs: [METER_FLOOR_DBFS; 2],
+            held_dbfs: METER_FLOOR_DBFS,
+            peak_hold_until: Duration::ZERO,
+            clip_hold_until: Duration::ZERO,
+            last_update: None,
+        }
+    }
+}
+
+impl MeterBallistics {
+    /// Updates the visual reading using monotonically increasing UI elapsed time.
+    pub fn update(&mut self, peak: [f32; 2], clipped: bool, elapsed: Duration) {
+        let dt = self
+            .last_update
+            .map_or(0.0, |last| elapsed.saturating_sub(last).as_secs_f32());
+        self.last_update = Some(elapsed);
+        for (displayed, sample) in self.displayed_dbfs.iter_mut().zip(peak) {
+            let sample_dbfs = if sample.is_finite() && sample > 0.0 {
+                (20.0 * sample.log10()).max(METER_FLOOR_DBFS)
+            } else {
+                METER_FLOOR_DBFS
+            };
+            *displayed = sample_dbfs.max(*displayed - METER_DECAY_DB_PER_SECOND * dt);
+        }
+        let peak_dbfs = self.displayed_dbfs[0].max(self.displayed_dbfs[1]);
+        if peak_dbfs >= self.held_dbfs {
+            self.held_dbfs = peak_dbfs;
+            self.peak_hold_until = elapsed.saturating_add(PEAK_HOLD);
+        } else if elapsed >= self.peak_hold_until {
+            self.held_dbfs = peak_dbfs.max(self.held_dbfs - METER_DECAY_DB_PER_SECOND * dt);
+        }
+        if clipped {
+            self.clip_hold_until = elapsed.saturating_add(CLIP_HOLD);
         }
     }
 
-    /// Updates a peak reading and derived state. Non-finite samples become the meter floor.
-    pub fn set_peak_dbfs(&mut self, peak_dbfs: f32) {
-        self.peak_dbfs = sanitize_peak(peak_dbfs);
-        self.state = Self::state_for(self.peak_dbfs);
+    /// Returns the smoothed left and right peaks in dBFS.
+    #[must_use]
+    pub fn displayed_dbfs(self) -> [f32; 2] {
+        self.displayed_dbfs
     }
 
-    /// Returns the clamped `0.0..=1.0` fill fraction for a `-120..=0 dBFS` meter.
+    /// Returns the louder channel's fill fraction for a −60 to 0 dBFS track.
     #[must_use]
     pub fn fill_fraction(self) -> f32 {
-        ((self.peak_dbfs + 120.0) / 120.0).clamp(0.0, 1.0)
+        fraction(self.displayed_dbfs[0].max(self.displayed_dbfs[1]))
     }
 
-    fn state_for(peak_dbfs: f32) -> MeterState {
-        if peak_dbfs >= 0.0 {
-            MeterState::Clipping
-        } else if peak_dbfs >= -6.0 {
-            MeterState::Warning
+    /// Returns one channel's fill fraction on the same track. Channel 1 is right.
+    #[must_use]
+    pub fn channel_fraction(self, channel: usize) -> f32 {
+        fraction(self.displayed_dbfs[channel.min(1)])
+    }
+
+    /// Returns the recent held peak position on the same track.
+    #[must_use]
+    pub fn held_fraction(self) -> f32 {
+        fraction(self.held_dbfs)
+    }
+
+    /// Reports clipping for a short time after an observed clipped block.
+    #[must_use]
+    pub fn clipping(self, elapsed: Duration) -> bool {
+        self.clip_hold_until > elapsed
+    }
+}
+
+fn fraction(dbfs: f32) -> f32 {
+    ((dbfs - METER_FLOOR_DBFS) / -METER_FLOOR_DBFS).clamp(0.0, 1.0)
+}
+
+/// How one LED segment is drawn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Segment {
+    /// Unlit.
+    Off,
+    /// Lit in the text colour.
+    Lit,
+    /// Lit in the fault colour: one of the top [`LED_FAULT_SEGMENTS`].
+    Hot,
+}
+
+/// Returns segment `index` (0 is the bottom) of a [`LED_SEGMENTS`]-tall meter showing `level`
+/// with the peak hold at `held`, both as fill fractions.
+#[must_use]
+pub fn led_segment(level: f32, held: f32, index: usize) -> Segment {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "fractions are clamped to 0..=1 and the meter has 16 segments"
+    )]
+    let lit = |fraction: f32| (fraction.clamp(0.0, 1.0) * LED_SEGMENTS as f32).round() as usize;
+    let held_index = lit(held).checked_sub(1);
+    if index < lit(level) || Some(index) == held_index {
+        if index >= LED_SEGMENTS - LED_FAULT_SEGMENTS {
+            Segment::Hot
         } else {
-            MeterState::Nominal
+            Segment::Lit
         }
-    }
-}
-
-fn sanitize_peak(peak_dbfs: f32) -> f32 {
-    if peak_dbfs.is_finite() {
-        peak_dbfs.clamp(-120.0, 0.0)
     } else {
-        -120.0
-    }
-}
-
-/// UI-owned cadence controller for a live meter.
-///
-/// Call [`Self::repaint_due`] with monotonically increasing UI elapsed time. The audio engine
-/// publishes values whenever it needs to; it never calls this scheduler or controls UI repaint.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct MeterRepaintScheduler {
-    next_repaint: Option<Duration>,
-}
-
-impl MeterRepaintScheduler {
-    /// Returns whether the UI should repaint now, then schedules the next 30 Hz repaint.
-    pub fn repaint_due(&mut self, elapsed: Duration) -> bool {
-        let Some(next_repaint) = self.next_repaint else {
-            self.next_repaint = Some(elapsed.saturating_add(METER_REPAINT_INTERVAL));
-            return true;
-        };
-        if elapsed < next_repaint {
-            return false;
-        }
-
-        let elapsed_intervals = elapsed
-            .saturating_sub(next_repaint)
-            .as_nanos()
-            .saturating_div(METER_REPAINT_INTERVAL.as_nanos());
-        let skipped = u32::try_from(elapsed_intervals).unwrap_or(u32::MAX);
-        self.next_repaint = Some(
-            next_repaint
-                .saturating_add(METER_REPAINT_INTERVAL.saturating_mul(skipped.saturating_add(1))),
-        );
-        true
-    }
-
-    /// Returns the amount of time until the next repaint, if the meter has been scheduled.
-    #[must_use]
-    pub fn until_next_repaint(&self, elapsed: Duration) -> Option<Duration> {
-        self.next_repaint.map(|next| next.saturating_sub(elapsed))
-    }
-
-    /// Clears the schedule, causing the next call to [`Self::repaint_due`] to repaint immediately.
-    pub fn reset(&mut self) {
-        self.next_repaint = None;
-    }
-}
-
-/// Renderer-facing stereo meter model.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct StereoMeter {
-    /// Left-channel peak.
-    pub left: MeterLevel,
-    /// Right-channel peak.
-    pub right: MeterLevel,
-    /// UI-owned repaint policy.
-    pub repaint: MeterRepaintScheduler,
-}
-
-impl crate::design::AccessibleComponent for MeterLevel {
-    fn accessibility(&self, _focus_order: FocusOrder) -> AccessibilityNode {
-        let mut node = AccessibilityNode::named(AccessibilityRole::ProgressBar, "Audio level");
-        node.value = Some(format!(
-            "{:.1} dBFS, {}",
-            self.peak_dbfs,
-            self.state.label()
-        ));
-        node.range = Some(AccessibilityRange {
-            minimum: -120.0,
-            maximum: 0.0,
-            step: 0.1,
-        });
-        node.state = AccessibilityState {
-            fault: self.state == MeterState::Clipping,
-            ..AccessibilityState::default()
-        };
-        node
-    }
-}
-
-impl StereoMeter {
-    /// Creates a silent stereo meter.
-    #[must_use]
-    pub fn silent() -> Self {
-        Self {
-            left: MeterLevel::from_peak_dbfs(-120.0),
-            right: MeterLevel::from_peak_dbfs(-120.0),
-            repaint: MeterRepaintScheduler::default(),
-        }
-    }
-
-    /// Accepts the latest audio-engine values without scheduling a repaint.
-    pub fn set_peaks_dbfs(&mut self, left: f32, right: f32) {
-        self.left.set_peak_dbfs(left);
-        self.right.set_peak_dbfs(right);
-    }
-
-    /// Returns UI repaint eligibility. Meters remain live in reduced-motion mode.
-    pub fn repaint_due(&mut self, elapsed: Duration, preference: MotionPreference) -> bool {
-        crate::design::motion_allowed(preference, MotionKind::Meter)
-            && self.repaint.repaint_due(elapsed)
-    }
-
-    /// Returns accessibility semantics for both channels.
-    #[must_use]
-    pub fn accessibility(&self, focus_order: FocusOrder) -> AccessibilityNode {
-        let peak = self.left.peak_dbfs.max(self.right.peak_dbfs);
-        let mut node =
-            AccessibilityNode::named(AccessibilityRole::ProgressBar, "Stereo output level");
-        node.value = Some(format!(
-            "{peak:.1} dBFS, {}",
-            MeterLevel::state_for(peak).label()
-        ));
-        node.range = Some(AccessibilityRange {
-            minimum: -120.0,
-            maximum: 0.0,
-            step: 0.1,
-        });
-        node.state = AccessibilityState {
-            fault: peak >= 0.0,
-            ..AccessibilityState::default()
-        };
-        node.focus_order = Some(focus_order);
-        node
+        Segment::Off
     }
 }
 
@@ -220,23 +139,39 @@ impl StereoMeter {
 mod tests {
     use std::time::Duration;
 
-    use super::{METER_REPAINT_INTERVAL, MeterLevel, MeterRepaintScheduler, MeterState};
+    use super::{LED_SEGMENTS, MeterBallistics, Segment, led_segment};
 
     #[test]
-    fn meter_state_tracks_peak_and_rejects_non_finite_input() {
-        let mut meter = MeterLevel::from_peak_dbfs(-12.0);
-        meter.set_peak_dbfs(0.0);
-        assert_eq!(meter.state, MeterState::Clipping);
-        meter.set_peak_dbfs(f32::NAN);
-        assert!((meter.peak_dbfs - -120.0).abs() < f32::EPSILON);
+    fn meter_ballistics_attack_decay_hold_and_clip() {
+        let mut meter = MeterBallistics::default();
+        meter.update([1.0, 0.5], true, Duration::ZERO);
+        assert!(meter.displayed_dbfs()[0].abs() < f32::EPSILON);
+        assert!(meter.clipping(Duration::from_millis(499)));
+
+        meter.update([0.0; 2], false, Duration::from_millis(100));
+        assert!((meter.displayed_dbfs()[0] + 2.4).abs() < 0.001);
+        assert!((meter.held_fraction() - 1.0).abs() < f32::EPSILON);
+
+        meter.update([0.0; 2], false, Duration::from_millis(300));
+        assert!(meter.held_fraction() < 1.0);
+        assert!(!meter.clipping(Duration::from_millis(500)));
     }
 
     #[test]
-    fn repaint_schedule_is_independent_and_capped_at_thirty_hz() {
-        let mut scheduler = MeterRepaintScheduler::default();
-        assert!(scheduler.repaint_due(Duration::ZERO));
-        assert!(!scheduler.repaint_due(METER_REPAINT_INTERVAL / 2));
-        assert!(scheduler.repaint_due(METER_REPAINT_INTERVAL));
-        assert!(!scheduler.repaint_due(METER_REPAINT_INTERVAL + Duration::from_nanos(1)));
+    fn led_meter_lights_from_the_bottom_with_a_hot_top_and_a_held_peak() {
+        let lit = |level, held| {
+            (0..LED_SEGMENTS)
+                .map(|index| led_segment(level, held, index))
+                .collect::<Vec<_>>()
+        };
+        assert!(lit(0.0, 0.0).iter().all(|segment| *segment == Segment::Off));
+        let half = lit(0.5, 0.75);
+        assert_eq!(half[7], Segment::Lit);
+        assert_eq!(half[8], Segment::Off);
+        assert_eq!(half[11], Segment::Lit, "the held peak stays lit");
+        let full = lit(1.0, 1.0);
+        assert_eq!(full[LED_SEGMENTS - 3], Segment::Lit);
+        assert_eq!(full[LED_SEGMENTS - 2], Segment::Hot);
+        assert_eq!(full[LED_SEGMENTS - 1], Segment::Hot);
     }
 }

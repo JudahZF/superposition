@@ -14,18 +14,16 @@ sdk = ["sp-vst3/sdk", "sp-vst3/editor-window"]
 native-sdk = ["sdk", "sp-vst3/native-sdk"]
 # Select the old vst3-host backend explicitly when native SDK hosting is unavailable.
 high-level-sdk = ["sdk"]
-feasibility-fault-injection = ["sp-shared-memory/test-hooks"]
 
 [dependencies]
 rtrb.workspace = true
 sp-protocol = { path = "../../crates/sp-protocol" }
 sp-shared-memory = { path = "../../crates/sp-shared-memory" }
 sp-shared-memory-macos = { path = "../../crates/sp-shared-memory-macos" }
-sp-test-support = { path = "../../crates/sp-test-support" }
 sp-vst3 = { path = "../../crates/sp-vst3" }
 
 [dev-dependencies]
-sp-shared-memory = { path = "../../crates/sp-shared-memory", features = ["test-hooks"] }
+sp-supervisor = { path = "../../crates/sp-supervisor" }
 
 [lints]
 workspace = true

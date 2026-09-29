@@ -1,6 +1,6 @@
 # ADR 0003: Fixed shared-memory audio exchange
 
-- **Status:** Accepted (Phase 0 target)
+- **Status:** Accepted
 - **Date:** 2026-07-13
 
 ## Context

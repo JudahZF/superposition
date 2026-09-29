@@ -1,4 +1,4 @@
-//! Builds the `CoreAudio` harness shim.
+//! Builds the `CoreAudio` AUHAL C shim.
 
 fn main() {
     println!("cargo:rerun-if-changed=src/audio_io.c");

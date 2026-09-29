@@ -1,6 +1,6 @@
 # ADR 0006: Parameter scenes and opaque state
 
-- **Status:** Accepted (Phase 0 target)
+- **Status:** Accepted
 - **Date:** 2026-07-13
 
 ## Context

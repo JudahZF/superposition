@@ -55,6 +55,7 @@ fn valid_session() -> Session {
                 },
                 bypassed: false,
                 parameters: NormalizedParameters { values: parameters },
+                sidechain: None,
             }],
         }],
         ..Session::new()

@@ -1,6 +1,6 @@
 # ADR 0002: One worker per rack with a gate
 
-- **Status:** Accepted (Phase 0 target)
+- **Status:** Accepted
 - **Date:** 2026-07-13
 
 ## Context

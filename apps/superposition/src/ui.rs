@@ -1,223 +1,171 @@
-//! egui live-rack shell assembled from `sp-ui` component models and design tokens.
+//! The film-strip show screen: an egui renderer over the session, engine, and worker runtime.
+//!
+//! The screen is an instrument panel, not a mixer: a head of readout cells, one hairline column
+//! per rack with its editor previews, gain, meters, and state, and a foot line of scenes. All
+//! parameter editing happens in each plug-in's own editor window; there is no master bus.
 
-use crate::{CatalogPlugin, GenericParameter, ProductRuntime};
-use eframe::egui::{
-    self, Color32, CornerRadius, FontData, FontDefinitions, FontId, Frame, Margin, RichText,
-    Stroke, Ui, Vec2,
-};
+mod overlays;
+mod previews;
+mod scenes;
+mod setup;
+mod show;
+mod style;
+
+pub use style::install_style;
+
+#[cfg(target_os = "macos")]
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant, SystemTime};
+
+#[cfg(target_os = "macos")]
+use crate::RackPlan;
+use crate::{CatalogPlugin, MirroredParameterUpdate, ProductRuntime, SlotEdit};
+use eframe::egui;
+use previews::PreviewCache;
+use scenes::SceneEditor;
 #[cfg(target_os = "macos")]
 use sp_audio_io::{AudioEndpoint, AudioEndpointEvent, AudioFormat, AudioRouteConfig};
-#[cfg(target_os = "macos")]
-use sp_engine::PreparedGraph;
 #[cfg(target_os = "macos")]
 use sp_midi::{
     MidiCcMonitor, MidiLearnController, MidiMappingPublisher, MidiMappingTarget, MidiPortId,
     MidiPortInfo, MidirInput, map_controller_to_target,
 };
 use sp_model::{
-    ChannelLayout, Endpoint, EndpointId, MAX_RACKS, MAX_SCENE_PARAMETER_VALUES, MAX_SLOTS_PER_RACK,
-    MidiController, MidiMapping, MidiMappingId, NormalizedValue, ParameterAddress, ParameterId,
-    PluginInstanceId, PluginSlot, Rack, RackGain, RackId, RackMute, RackTopology, Scene, SceneId,
+    AudioDeviceSelection, AudioDeviceSettings, ChannelLayout, Endpoint, EndpointId, MAX_RACKS,
+    MAX_SCENE_PARAMETER_VALUES, MAX_SLOTS_PER_RACK, MidiController, MidiMapping, MidiMappingId,
+    NormalizedValue, ParameterAddress, ParameterId, PhysicalChannels, PluginInstanceId, PluginSlot,
+    Rack, RackBypass, RackChannelRoute, RackGain, RackId, RackMute, RackTopology, Scene, SceneId,
     SceneParameterValue, SlotBypass, Source, SourceId,
 };
 use sp_session::CapturedPluginState;
 use sp_session::SessionController;
-use sp_ui::{
-    component_gallery::ComponentGallery,
-    components::{
-        FaultBannerModel, FaultBannerState, ParameterControlState, PluginSlotState,
-        PluginSlotStatus, RackCardState, RackCardStatus, ScenePadState, ScenePadStatus,
-        SystemStatus, SystemStatusState, WorkerHealth, WorkerHealthState,
-    },
-    design::{
-        BorderWidth, ButtonKind, ColorToken, Control, DARK, FontFamily as BrandFontFamily,
-        FontWeight, Interaction, Layout, Radius, Spacing, Status, Surface, TextColor,
-        TypographyRole, fonts,
-    },
-};
+use sp_ui::components::{StateToken, SystemStatus, SystemStatusState};
+use sp_ui::design::MotionPreference;
 
 #[cfg(target_os = "macos")]
 use sp_audio_io_macos::{
-    MacOsAudioDevice, MacOsAudioEndpoint, ProductControl, ProductRenderer, ProductTelemetry,
-    current_product_parameters, enumerate_devices, prepare_product_scenes, product_midi_mappings,
+    MacOsAudioDevice, MacOsAudioEndpoint, ProductControl, ProductTelemetry, enumerate_devices,
 };
+#[cfg(target_os = "macos")]
+use sp_ui::components::MeterBallistics;
 
-fn space(spacing: Spacing) -> f32 {
-    f32::from(spacing.pixels())
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(target_os = "macos")]
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
+/// Fade steps and range for scene transitions.
+const FADE_STEP_MS: u32 = 50;
+const FADE_MAX_MS: u32 = 10_000;
+const DEFAULT_FADE_MS: u32 = 250;
+/// Recent callback-load bars in the foot and how often one is added.
+const LOAD_BARS: usize = 12;
+const LOAD_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+/// ⌘0 shows all racks; ⌘1–⌘9 show pages 1–9.
+const PAGE_KEYS: [egui::Key; 10] = [
+    egui::Key::Num0,
+    egui::Key::Num1,
+    egui::Key::Num2,
+    egui::Key::Num3,
+    egui::Key::Num4,
+    egui::Key::Num5,
+    egui::Key::Num6,
+    egui::Key::Num7,
+    egui::Key::Num8,
+    egui::Key::Num9,
+];
+/// More racks than fit across 1920 px bring up the page line even before any page exists.
+const PAGE_LINE_RACKS: usize = 8;
+/// Reduced motion holds meters still, refreshing them this rarely.
+const REDUCED_MOTION_METER_INTERVAL: Duration = Duration::from_secs(1);
+
+fn mirror_update_matches(model: &sp_model::Session, update: &MirroredParameterUpdate) -> bool {
+    model
+        .racks
+        .get(update.rack_index)
+        .filter(|rack| rack.id == update.rack_id)
+        .and_then(|rack| rack.slots.get(update.slot_index))
+        .is_some_and(|slot| {
+            slot.id == update.slot_id
+                && slot.plugin.fingerprint.digest == update.fingerprint
+                && slot.plugin.identity.unique_id == update.class_id
+        })
 }
 
-fn dimension(layout: Layout) -> f32 {
-    f32::from(layout.pixels())
-}
-
-fn text_size(role: TypographyRole) -> f32 {
-    f32::from(role.typography().size())
-}
-
-fn font_family(family: BrandFontFamily, weight: FontWeight) -> egui::FontFamily {
-    match family {
-        BrandFontFamily::Monospace => egui::FontFamily::Monospace,
-        BrandFontFamily::Interface | BrandFontFamily::Display => match weight {
-            FontWeight::Regular => egui::FontFamily::Proportional,
-            FontWeight::Medium => egui::FontFamily::Name("sora-medium".into()),
-            FontWeight::Semibold => egui::FontFamily::Name("sora-semibold".into()),
-            FontWeight::Bold => egui::FontFamily::Name("sora-bold".into()),
-        },
-    }
-}
-
-fn font_id(role: TypographyRole) -> FontId {
-    let typography = role.typography();
-    FontId::new(
-        f32::from(typography.size()),
-        font_family(typography.family(), typography.weight()),
-    )
-}
-
-fn margin(horizontal: Spacing, vertical: Spacing) -> Margin {
-    Margin::symmetric(
-        i8::try_from(horizontal.pixels()).expect("spacing fits i8"),
-        i8::try_from(vertical.pixels()).expect("spacing fits i8"),
-    )
-}
-
-fn radius(radius: Radius) -> CornerRadius {
-    CornerRadius::same(radius.pixels())
-}
-
-fn stroke(width: BorderWidth, color: Color32) -> Stroke {
-    Stroke::new(f32::from(width.pixels()), color)
-}
-
-fn interaction_colors(interaction: Interaction) -> (Color32, Color32) {
-    let colors = DARK.interaction_colors(interaction);
-    (
-        token_color(colors.foreground_token()),
-        token_color(colors.background_token()),
-    )
-}
-
-fn meter_fraction(peak: f32) -> f32 {
-    if peak <= 0.0 || !peak.is_finite() {
-        return 0.0;
-    }
-    ((20.0 * peak.log10() + 60.0) / 60.0).clamp(0.0, 1.0)
-}
-
-/// Installs the bundled OFL Sora/Space Mono families and the token-driven widget style.
-pub fn install_style(ctx: &egui::Context) {
-    let mut definitions = FontDefinitions::default();
-    for (name, bytes) in [
-        ("sora", fonts::SORA_REGULAR),
-        ("sora-medium", fonts::SORA_MEDIUM),
-        ("sora-semibold", fonts::SORA_SEMIBOLD),
-        ("sora-bold", fonts::SORA_BOLD),
-        ("space-mono", fonts::SPACE_MONO_REGULAR),
-    ] {
-        definitions.font_data.insert(
-            name.to_owned(),
-            std::sync::Arc::new(FontData::from_static(bytes)),
-        );
-    }
-    if let Some(family) = definitions
-        .families
-        .get_mut(&egui::FontFamily::Proportional)
-    {
-        family.insert(0, "sora".to_owned());
-    }
-    if let Some(family) = definitions.families.get_mut(&egui::FontFamily::Monospace) {
-        family.insert(0, "space-mono".to_owned());
-    }
-    for name in ["sora-medium", "sora-semibold", "sora-bold"] {
-        definitions.families.insert(
-            egui::FontFamily::Name(name.into()),
-            vec![name.to_owned(), "sora".to_owned()],
-        );
-    }
-    ctx.set_fonts(definitions);
-
-    let mut style = (*ctx.style()).clone();
-    let canvas = token_color(ColorToken::Surface(Surface::Canvas));
-    let panel = token_color(ColorToken::Surface(Surface::Panel));
-    let raised = token_color(ColorToken::Surface(Surface::Raised));
-    let steel = token_color(ColorToken::Surface(Surface::Steel));
-    let primary = token_color(ColorToken::Text(TextColor::Primary));
-    let secondary = token_color(ColorToken::Text(TextColor::Secondary));
-    let focus = token_color(DARK.focus_color());
-    let selected_boundary = token_color(DARK.selected_boundary_color());
-    let (inactive_foreground, inactive_background) = interaction_colors(Interaction::Inactive);
-    let (hovered_foreground, hovered_background) = interaction_colors(Interaction::Hovered);
-    let (active_foreground, active_background) = interaction_colors(Interaction::Active);
-    let (_, selected_background) = interaction_colors(Interaction::Selected);
-    style.visuals = egui::Visuals::dark();
-    style.spacing.item_spacing = Vec2::splat(space(Spacing::Sm));
-    style.spacing.button_padding = Vec2::new(space(Spacing::Md), space(Spacing::Sm));
-    style.spacing.interact_size.y = 28.0;
-    let widget_radius = radius(Radius::Medium);
-    style.visuals.widgets.noninteractive.corner_radius = widget_radius;
-    style.visuals.widgets.inactive.corner_radius = widget_radius;
-    style.visuals.widgets.hovered.corner_radius = widget_radius;
-    style.visuals.widgets.active.corner_radius = widget_radius;
-    style.visuals.widgets.open.corner_radius = widget_radius;
-    style.visuals.slider_trailing_fill = true;
-    style.visuals.panel_fill = panel;
-    style.visuals.window_fill = raised;
-    style.visuals.extreme_bg_color = canvas;
-    style.visuals.faint_bg_color = panel;
-    style.visuals.widgets.noninteractive.fg_stroke = stroke(BorderWidth::Thin, secondary);
-    style.visuals.widgets.inactive.fg_stroke = stroke(BorderWidth::Thin, inactive_foreground);
-    style.visuals.widgets.inactive.bg_fill = inactive_background;
-    style.visuals.widgets.inactive.bg_stroke = stroke(BorderWidth::Thin, steel);
-    style.visuals.widgets.hovered.fg_stroke = stroke(BorderWidth::Thin, hovered_foreground);
-    style.visuals.widgets.hovered.bg_fill = hovered_background;
-    style.visuals.widgets.hovered.bg_stroke = stroke(BorderWidth::Thin, focus);
-    style.visuals.widgets.active.fg_stroke = stroke(BorderWidth::Thin, active_foreground);
-    style.visuals.widgets.active.bg_fill = active_background;
-    style.visuals.widgets.active.bg_stroke = stroke(BorderWidth::Thick, selected_boundary);
-    style.visuals.selection.bg_fill = selected_background;
-    style.visuals.selection.stroke = stroke(BorderWidth::Thick, selected_boundary);
-    style.visuals.override_text_color = Some(primary);
-    style
-        .text_styles
-        .insert(egui::TextStyle::Body, font_id(TypographyRole::Body));
-    style
-        .text_styles
-        .insert(egui::TextStyle::Button, font_id(TypographyRole::Label));
-    style
-        .text_styles
-        .insert(egui::TextStyle::Small, font_id(TypographyRole::BodySmall));
-    style
-        .text_styles
-        .insert(egui::TextStyle::Heading, font_id(TypographyRole::Section));
-    style
-        .text_styles
-        .insert(egui::TextStyle::Monospace, font_id(TypographyRole::Code));
-    ctx.set_style(style);
-}
-
-fn token_color(token: ColorToken) -> Color32 {
-    let [r, g, b] = DARK.color(token).channels();
-    Color32::from_rgb(r, g, b)
+/// The column area shows racks or the setup page; head and foot stay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Screen {
+    Show,
+    Setup,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Screen {
-    LiveRack,
-    ComponentGallery,
+enum SetupTab {
+    Audio,
+    Midi,
+    Plugins,
+    Diagnostics,
 }
 
-#[derive(Clone, Copy)]
-enum RackAction {
-    Select(usize),
-    MoveUp,
-    MoveDown,
-    Remove,
-    Add,
+/// The one popover, menu, picker, or modal open above the columns.
+#[derive(Debug, PartialEq)]
+enum Overlay {
+    None,
+    RackMenu {
+        rack: usize,
+        at: egui::Pos2,
+    },
+    SlotMenu {
+        rack: usize,
+        slot: usize,
+        at: egui::Pos2,
+    },
+    Route {
+        rack: usize,
+        at: egui::Pos2,
+    },
+    Sidechain {
+        rack: usize,
+        slot: usize,
+        at: egui::Pos2,
+    },
+    /// Which pages one rack is on.
+    RackPages {
+        rack: usize,
+        at: egui::Pos2,
+    },
+    PageMenu {
+        page: usize,
+        at: egui::Pos2,
+    },
+    PageRename {
+        page: usize,
+        at: egui::Pos2,
+        draft: String,
+    },
+    Picker(Picker),
+    Modal(Modal),
+}
+
+/// The plug-in picker for one rack: a search query and the keyboard cursor.
+#[derive(Debug, PartialEq)]
+struct Picker {
+    rack: usize,
+    query: String,
+    cursor: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Modal {
+    /// Stop the running engine.
+    StopEngine,
+    /// Quit while the engine runs: save, stop, then close.
+    Quit,
+    RemoveRack(usize),
+    /// Offer the recovery package after an unclean shutdown.
+    Recovery,
 }
 
 #[derive(Clone, Copy)]
 enum SlotAction {
-    Parameters(usize),
     Bypass(usize),
     Editor(usize),
     MoveUp(usize),
@@ -225,139 +173,52 @@ enum SlotAction {
     Remove(usize),
 }
 
-#[derive(Clone, Copy)]
-struct Palette {
-    canvas: Color32,
-    panel: Color32,
-    raised: Color32,
-    steel: Color32,
-    primary: Color32,
-    secondary: Color32,
-    on_accent: Color32,
-    focus: Color32,
-}
-
-fn palette() -> Palette {
-    Palette {
-        canvas: token_color(ColorToken::Surface(Surface::Canvas)),
-        panel: token_color(ColorToken::Surface(Surface::Panel)),
-        raised: token_color(ColorToken::Surface(Surface::Raised)),
-        steel: token_color(ColorToken::Surface(Surface::Steel)),
-        primary: token_color(ColorToken::Text(TextColor::Primary)),
-        secondary: token_color(ColorToken::Text(TextColor::Secondary)),
-        on_accent: token_color(ColorToken::Text(TextColor::OnAccent)),
-        focus: token_color(DARK.focus_color()),
-    }
-}
-
-impl Palette {
-    fn brand() -> Color32 {
-        token_color(DARK.brand_foreground())
-    }
-
-    fn status(status: Status) -> Color32 {
-        token_color(DARK.status_foreground(status))
-    }
-
-    fn interaction(interaction: Interaction) -> Color32 {
-        token_color(DARK.interaction_colors(interaction).background_token())
-    }
-}
-
-fn themed_button(text: impl Into<String>, kind: ButtonKind) -> egui::Button<'static> {
-    let colors = DARK.control_colors(Control::Button(kind));
-    egui::Button::new(
-        RichText::new(text.into())
-            .font(font_id(TypographyRole::Label))
-            .color(token_color(colors.foreground_token())),
-    )
-    .fill(token_color(colors.background_token()))
-    .corner_radius(radius(Radius::Medium))
-}
-
-fn section_header(ui: &mut Ui, palette: Palette, title: &str) {
-    ui.add_space(space(Spacing::Md));
-    ui.label(
-        RichText::new(title)
-            .font(font_id(TypographyRole::Meta))
-            .color(palette.secondary),
-    );
-    ui.separator();
-}
-
-fn status_pill(ui: &mut Ui, palette: Palette, label: &str, color: Color32) {
-    Frame::new()
-        .fill(palette.raised)
-        .stroke(stroke(BorderWidth::Thin, palette.steel))
-        .corner_radius(radius(Radius::Pill))
-        .inner_margin(margin(Spacing::Sm, Spacing::Xs))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = space(Spacing::Xs);
-                ui.label(
-                    RichText::new("●")
-                        .color(color)
-                        .size(text_size(TypographyRole::Meta)),
-                );
-                ui.label(
-                    RichText::new(label)
-                        .font(font_id(TypographyRole::Label))
-                        .color(palette.primary),
-                );
-            });
-        });
-}
-
-/// Paints a thin dBFS level meter: steel track, cyan fill, lime tip above −6 dBFS.
-fn dbfs_meter(ui: &mut Ui, palette: Palette, fraction: f32) {
-    const HOT_FRACTION: f32 = 0.9;
-    let desired = Vec2::new(
-        ui.available_width(),
-        f32::from(Layout::MeterHeight.pixels()),
-    );
-    let (rect, _response) = ui.allocate_exact_size(desired, egui::Sense::hover());
-    if !ui.is_rect_visible(rect) {
-        return;
-    }
-    let corner = radius(Radius::Small);
-    ui.painter().rect_filled(rect, corner, palette.steel);
-    let fraction = fraction.clamp(0.0, 1.0);
-    if fraction <= 0.0 {
-        return;
-    }
-    let mut fill = rect;
-    fill.set_right(rect.left() + rect.width() * fraction);
-    ui.painter().rect_filled(fill, corner, Palette::brand());
-    if fraction > HOT_FRACTION {
-        let mut tip = fill;
-        tip.set_left(rect.left() + rect.width() * HOT_FRACTION);
-        ui.painter()
-            .rect_filled(tip, corner, Palette::status(Status::Success));
-    }
-}
-
-/// Root egui application state for the live-rack surface.
+/// Root egui application state for the film-strip show screen.
 pub struct LiveRackApp {
     controller: SessionController,
     product: Result<ProductRuntime, String>,
-    racks: Vec<RackCardState>,
-    slots: Vec<PluginSlotState>,
-    selected_slot: Option<usize>,
-    parameters: Vec<GenericParameter>,
     catalog_plugins: Vec<CatalogPlugin>,
-    selected_catalog_plugin: Option<usize>,
-    scenes: Vec<ScenePadState>,
     selected_rack: usize,
+    /// Keyboard slot selection within the selected rack.
+    selected_slot: Option<usize>,
     system: SystemStatus,
-    worker: WorkerHealth,
-    fault: FaultBannerModel,
-    inspector_open: bool,
+    fault: Option<String>,
     status_line: String,
+    /// When the last explicit save succeeded, for "Session saved, 4 s ago".
+    saved_at: Option<Instant>,
     screen: Screen,
-    gallery: ComponentGallery,
+    setup_tab: SetupTab,
+    overlay: Overlay,
+    /// The page shown, or `None` for all racks.
+    page: Option<usize>,
+    /// Scroll the selected rack's column into view on the next frame.
+    scroll_to_selected: bool,
+    /// Rack being renamed inline, with its draft name.
+    rename: Option<(usize, String)>,
     current_scene: Option<usize>,
+    scene_editor: Option<SceneEditor>,
+    /// Transition for new scenes, and the active scene's transition while one is active.
+    fade_ms: u32,
+    previews: PreviewCache,
+    last_scan: Option<SystemTime>,
+    /// Recent callback loads, oldest first, as fractions of the block period.
+    load_history: [f32; LOAD_BARS],
+    load_sampled_at: Instant,
+    motion: MotionPreference,
+    next_autosave_at: Instant,
     last_product_diagnostic: Option<String>,
     last_rack_latency: [u32; MAX_RACKS],
+    /// After a device loss, the next time to look for the saved route and restart audio.
+    #[cfg(target_os = "macos")]
+    reconnect_at: Option<Instant>,
+    #[cfg(target_os = "macos")]
+    meter_clock: Instant,
+    #[cfg(target_os = "macos")]
+    meters_updated_at: Option<Instant>,
+    #[cfg(target_os = "macos")]
+    rack_input_meters: [MeterBallistics; MAX_RACKS],
+    #[cfg(target_os = "macos")]
+    rack_output_meters: [MeterBallistics; MAX_RACKS],
     #[cfg(target_os = "macos")]
     audio: MacOsAudioEndpoint,
     #[cfg(target_os = "macos")]
@@ -373,19 +234,31 @@ pub struct LiveRackApp {
     #[cfg(target_os = "macos")]
     product_control: Option<ProductControl>,
     #[cfg(target_os = "macos")]
+    pending_parameter_observations: BTreeMap<(usize, usize, u32), f32>,
+    #[cfg(target_os = "macos")]
     midi_mapping_publisher: Option<MidiMappingPublisher>,
     #[cfg(target_os = "macos")]
     midi_learn: MidiLearnController,
     #[cfg(target_os = "macos")]
     midi_cc_monitor: Option<MidiCcMonitor>,
+    /// MIDI Learn waits for a touched editor control, then for one CC.
+    #[cfg(target_os = "macos")]
+    midi_learn_armed: bool,
     #[cfg(target_os = "macos")]
     midi_learn_target: Option<MidiMappingTarget>,
     #[cfg(target_os = "macos")]
     telemetry: Option<std::sync::Arc<ProductTelemetry>>,
+    /// Snapshot fixtures draw racks as if their workers were loaded.
+    #[cfg(test)]
+    test_workers_running: bool,
 }
 
 impl LiveRackApp {
-    /// Creates the shell from session + presentation models.
+    /// Creates the show screen over a session and the worker runtime.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "initializes live handles and presentation state together"
+    )]
     pub fn new(
         controller: SessionController,
         recovery_offered: bool,
@@ -394,20 +267,21 @@ impl LiveRackApp {
         #[cfg(target_os = "macos")]
         let audio = MacOsAudioEndpoint::new().allow_device_reconfiguration();
         #[cfg(target_os = "macos")]
-        let audio_devices = duplex_devices().unwrap_or_default();
+        let audio_devices = route_devices().unwrap_or_default();
         #[cfg(target_os = "macos")]
-        let buffer_frames = audio_devices
-            .first()
-            .and_then(|device| device.supported_buffer_frames.first())
-            .copied()
-            .unwrap_or(128);
+        let buffer_frames = controller
+            .document()
+            .model
+            .audio_settings
+            .as_ref()
+            .map_or(128, |settings| settings.buffer_frames);
         #[cfg(target_os = "macos")]
-        let selected_route = audio_devices.first().map(|device| AudioRouteConfig {
-            input: Some(device.info.id.clone()),
-            output: device.info.id.clone(),
-            format: AudioFormat::product_stereo(buffer_frames)
-                .expect("discovery only returns product buffer sizes"),
-        });
+        let selected_route = controller
+            .document()
+            .model
+            .audio_settings
+            .as_ref()
+            .and_then(|settings| saved_route(&audio_devices, settings));
         #[cfg(target_os = "macos")]
         let midi_ports = MidirInput::enumerate_ports().unwrap_or_default();
         #[cfg(target_os = "macos")]
@@ -415,45 +289,52 @@ impl LiveRackApp {
         let catalog_plugins = product
             .as_ref()
             .map_or_else(|_| Vec::new(), ProductRuntime::catalog_plugins);
-        let mut app = Self {
+        let status_line = if controller.document().model.racks.is_empty() {
+            "No session yet".to_owned()
+        } else {
+            "Session loaded".to_owned()
+        };
+        Self {
             controller,
             product,
-            racks: Vec::new(),
-            slots: Vec::new(),
-            selected_slot: None,
-            parameters: Vec::new(),
-            selected_catalog_plugin: (!catalog_plugins.is_empty()).then_some(0),
             catalog_plugins,
-            scenes: Vec::new(),
             selected_rack: 0,
+            selected_slot: None,
             system: SystemStatus::new(SystemStatusState::Offline),
-            worker: WorkerHealth {
-                state: sp_ui::components::WorkerHealthState::Healthy,
-            },
-            fault: FaultBannerModel {
-                state: if recovery_offered {
-                    FaultBannerState::Visible
-                } else {
-                    FaultBannerState::Hidden
-                },
-                message: if recovery_offered {
-                    "Unclean shutdown detected. Review the recovery package before going live."
-                        .to_owned()
-                } else {
-                    String::new()
-                },
-            },
-            inspector_open: true,
-            status_line: format!("Engine stopped · 48 kHz · {buffer_frames} frames"),
-            screen: if std::env::var_os("SUPERPOSITION_COMPONENT_GALLERY").is_some() {
-                Screen::ComponentGallery
+            fault: None,
+            status_line,
+            saved_at: None,
+            screen: Screen::Show,
+            setup_tab: SetupTab::Audio,
+            overlay: if recovery_offered {
+                Overlay::Modal(Modal::Recovery)
             } else {
-                Screen::LiveRack
+                Overlay::None
             },
-            gallery: ComponentGallery::fixtures(),
+            page: None,
+            scroll_to_selected: false,
+            rename: None,
             current_scene: None,
+            scene_editor: None,
+            fade_ms: DEFAULT_FADE_MS,
+            previews: PreviewCache::default(),
+            last_scan: None,
+            load_history: [0.0; LOAD_BARS],
+            load_sampled_at: Instant::now(),
+            motion: reduced_motion_preference(),
+            next_autosave_at: Instant::now() + AUTOSAVE_INTERVAL,
             last_product_diagnostic: None,
             last_rack_latency: [u32::MAX; MAX_RACKS],
+            #[cfg(target_os = "macos")]
+            reconnect_at: None,
+            #[cfg(target_os = "macos")]
+            meter_clock: Instant::now(),
+            #[cfg(target_os = "macos")]
+            meters_updated_at: None,
+            #[cfg(target_os = "macos")]
+            rack_input_meters: [MeterBallistics::default(); MAX_RACKS],
+            #[cfg(target_os = "macos")]
+            rack_output_meters: [MeterBallistics::default(); MAX_RACKS],
             #[cfg(target_os = "macos")]
             audio,
             #[cfg(target_os = "macos")]
@@ -469,139 +350,482 @@ impl LiveRackApp {
             #[cfg(target_os = "macos")]
             product_control: None,
             #[cfg(target_os = "macos")]
+            pending_parameter_observations: BTreeMap::new(),
+            #[cfg(target_os = "macos")]
             midi_mapping_publisher: None,
             #[cfg(target_os = "macos")]
             midi_learn: MidiLearnController::new(),
             #[cfg(target_os = "macos")]
             midi_cc_monitor: None,
             #[cfg(target_os = "macos")]
+            midi_learn_armed: false,
+            #[cfg(target_os = "macos")]
             midi_learn_target: None,
             #[cfg(target_os = "macos")]
             telemetry: None,
-        };
-        app.refresh_models();
-        app
+            #[cfg(test)]
+            test_workers_running: false,
+        }
     }
 
     fn set_status(&mut self, message: &str) {
         message.clone_into(&mut self.status_line);
+        self.saved_at = None;
     }
 
-    fn save_session(&mut self) {
-        let model = self.controller.document().model.clone();
-        let captures = match self.product.as_mut() {
-            Ok(product) => match product.capture_plugin_states(&model) {
-                Ok(captures) => captures,
-                Err(error) => {
-                    self.show_fault(format!("Plug-in state capture failed: {error}"));
-                    return;
-                }
-            },
-            Err(_) => Vec::new(),
+    fn show_fault(&mut self, message: String) {
+        self.fault = Some(message);
+    }
+
+    fn online(&self) -> bool {
+        self.system.state == SystemStatusState::Online
+    }
+
+    #[cfg(target_os = "macos")]
+    fn persist_audio_settings(&mut self) {
+        let Some(route) = &self.selected_route else {
+            return;
         };
-        match self.controller.save_with_plugin_states(&captures) {
-            Ok(()) => self.set_status("Session saved"),
-            Err(error) => {
-                self.fault = FaultBannerModel {
-                    state: FaultBannerState::Visible,
-                    message: format!("Save failed: {error}"),
-                };
-            }
-        }
-    }
-
-    fn autosave_session(&mut self) {
-        match self.controller.autosave() {
-            Ok(()) => self.set_status("Autosave written"),
-            Err(error) => {
-                self.fault = FaultBannerModel {
-                    state: FaultBannerState::Visible,
-                    message: format!("Autosave failed: {error}"),
-                };
-            }
-        }
-    }
-
-    fn acknowledge_recovery(&mut self) {
-        self.controller.acknowledge_recovery_offer();
-        self.fault.dismiss();
-        self.set_status("Recovery offer dismissed");
-    }
-
-    fn refresh_models(&mut self) {
-        let session = &self.controller.document().model;
-        self.selected_rack = self
-            .selected_rack
-            .min(session.racks.len().saturating_sub(1));
-        self.worker.state = if self
-            .product
-            .as_ref()
-            .is_ok_and(|product| product.worker_recovering(self.selected_rack))
-        {
-            WorkerHealthState::Recovering
-        } else if self
-            .product
-            .as_ref()
-            .is_ok_and(|product| product.worker_running(self.selected_rack))
-        {
-            WorkerHealthState::Healthy
-        } else {
-            WorkerHealthState::Unavailable
-        };
-        self.racks = session
-            .racks
+        let Some(output) = self
+            .audio_devices
             .iter()
-            .enumerate()
-            .map(|(rack_index, rack)| RackCardState {
-                name: rack.name.clone(),
-                status: if self
+            .find(|device| device.info.id == route.output)
+        else {
+            return;
+        };
+        let input = route
+            .input
+            .as_ref()
+            .and_then(|id| {
+                self.audio_devices
+                    .iter()
+                    .find(|device| &device.info.id == id)
+            })
+            .map(|device| AudioDeviceSelection {
+                id: device.info.id.as_str().to_owned(),
+                name: device.info.name.clone(),
+            });
+        self.controller.document_mut().model.audio_settings = Some(AudioDeviceSettings {
+            input,
+            output: AudioDeviceSelection {
+                id: output.info.id.as_str().to_owned(),
+                name: output.info.name.clone(),
+            },
+            buffer_frames: self.buffer_frames,
+        });
+    }
+
+    fn sync_worker_parameters(&mut self) -> Result<(), String> {
+        let Ok(product) = self.product.as_mut() else {
+            return Ok(());
+        };
+        let mut model = self.controller.document().model.clone();
+        product.sync_worker_parameters(&mut model)?;
+        if model != self.controller.document().model {
+            self.controller.document_mut().model = model;
+        }
+        Ok(())
+    }
+
+    /// Applies parameter changes made in native editors to the session. While MIDI Learn is
+    /// armed, the last touched parameter becomes its target.
+    fn poll_parameter_mirror(&mut self) {
+        let updates = self
+            .product
+            .as_mut()
+            .map_or_else(|_| Vec::new(), ProductRuntime::take_parameter_updates);
+        if updates.is_empty() {
+            #[cfg(target_os = "macos")]
+            self.flush_parameter_observations();
+            return;
+        }
+        let model = &self.controller.document().model;
+        #[cfg(target_os = "macos")]
+        let scene_targets: BTreeSet<(usize, usize, u32)> = if self.product_control.is_some() {
+            model
+                .scenes
+                .iter()
+                .flat_map(|scene| &scene.parameter_values)
+                .filter_map(|target| {
+                    let rack_index = model
+                        .racks
+                        .iter()
+                        .position(|rack| rack.id == target.rack_id)?;
+                    let slot_index = model.racks[rack_index]
+                        .slots
+                        .iter()
+                        .position(|slot| slot.id == target.slot_id)?;
+                    let parameter_id = target.parameter_id.0.parse().ok()?;
+                    Some((rack_index, slot_index, parameter_id))
+                })
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        let mut changed = Vec::new();
+        for update in updates {
+            if !mirror_update_matches(model, &update) {
+                continue;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                if scene_targets.contains(&(
+                    update.rack_index,
+                    update.slot_index,
+                    update.parameter_id,
+                )) {
+                    self.pending_parameter_observations.insert(
+                        (update.rack_index, update.slot_index, update.parameter_id),
+                        update.value.get(),
+                    );
+                }
+                if self.midi_learn_armed {
+                    let target = MidiMappingTarget {
+                        rack_index: update.rack_index,
+                        slot_index: update.slot_index,
+                        parameter_id: update.parameter_id,
+                        minimum: 0.0,
+                        maximum: 1.0,
+                    };
+                    self.midi_learn.arm(target);
+                    self.midi_learn_target = Some(target);
+                }
+            }
+            let slot = &model.racks[update.rack_index].slots[update.slot_index];
+            if slot
+                .parameters
+                .values
+                .get(&ParameterId(update.parameter_id.to_string()))
+                != Some(&update.value)
+            {
+                changed.push(update);
+            }
+        }
+        if !changed.is_empty() {
+            let model = &mut self.controller.document_mut().model;
+            for update in changed {
+                model.racks[update.rack_index].slots[update.slot_index]
+                    .parameters
+                    .values
+                    .insert(ParameterId(update.parameter_id.to_string()), update.value);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        self.flush_parameter_observations();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn flush_parameter_observations(&mut self) {
+        let model = &self.controller.document().model;
+        let Some(control) = self.product_control.as_mut() else {
+            return;
+        };
+        let mut sent = Vec::new();
+        for (&(rack, slot, parameter_id), &value) in
+            self.pending_parameter_observations.iter().take(64)
+        {
+            let current = model
+                .racks
+                .get(rack)
+                .and_then(|rack| rack.slots.get(slot))
+                .and_then(|slot| {
+                    slot.parameters
+                        .values
+                        .get(&ParameterId(parameter_id.to_string()))
+                })
+                .map(|current| current.get().to_bits());
+            if current != Some(value.to_bits()) {
+                sent.push((rack, slot, parameter_id));
+                continue;
+            }
+            if !control.observe_parameter(rack, slot, parameter_id, value) {
+                break;
+            }
+            sent.push((rack, slot, parameter_id));
+        }
+        for key in sent {
+            self.pending_parameter_observations.remove(&key);
+        }
+    }
+
+    fn saved_states(&self, rack: &Rack) -> Result<Vec<Option<CapturedPluginState>>, String> {
+        rack.slots
+            .iter()
+            .map(|slot| {
+                self.controller.load_plugin_state(&slot.id.0).map(|state| {
+                    state.map(|(component, controller, metadata)| CapturedPluginState {
+                        instance_id: slot.id.0.clone(),
+                        component,
+                        controller,
+                        metadata,
+                    })
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Saved plug-in state is unreadable: {error}"))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn load_unloaded_racks(&mut self) -> Result<(), String> {
+        let racks = self.controller.document().model.racks.clone();
+        for (rack_index, rack) in racks.iter().enumerate() {
+            if rack.slots.is_empty()
+                || self
                     .product
                     .as_ref()
                     .is_ok_and(|product| product.worker_running(rack_index))
-                {
-                    RackCardStatus::Active
-                } else if rack.slots.is_empty() {
-                    RackCardStatus::Empty
-                } else {
-                    RackCardStatus::Bypassed
-                },
-            })
-            .collect();
-        self.slots = session
-            .racks
+            {
+                continue;
+            }
+            let saved_states = self.saved_states(rack)?;
+            self.product_mut()?
+                .load_rack(rack_index, rack, &saved_states)
+                .map_err(|error| format!("Rack {} could not load: {error}", rack_index + 1))?;
+        }
+        Ok(())
+    }
+
+    fn autosave_session(&mut self) {
+        self.next_autosave_at = Instant::now() + AUTOSAVE_INTERVAL;
+        if let Err(error) = self.controller.autosave() {
+            self.show_fault(format!("Autosave failed: {error}"));
+        }
+    }
+
+    fn autosave_if_due(&mut self, now: Instant) {
+        if now < self.next_autosave_at {
+            return;
+        }
+        self.next_autosave_at = now + AUTOSAVE_INTERVAL;
+        if self.controller.is_dirty() {
+            self.autosave_session();
+        }
+    }
+
+    /// Saves the session, every plug-in's opaque state, and the newest editor pictures while
+    /// audio keeps running.
+    fn save_session(&mut self) {
+        let result = (|| {
+            self.sync_worker_parameters()?;
+            let model = self.controller.document().model.clone();
+            let captures = match self.product.as_mut() {
+                Ok(product) => product.capture_plugin_states(&model)?,
+                Err(_) => Vec::new(),
+            };
+            let previews = self.previews.files(&model);
+            self.controller
+                .save_with_plugin_states_and_previews(&captures, &previews)
+                .map_err(|error| error.to_string())
+        })();
+        match result {
+            Ok(()) => {
+                self.next_autosave_at = Instant::now() + AUTOSAVE_INTERVAL;
+                self.set_status("Session saved");
+                self.saved_at = Some(Instant::now());
+            }
+            Err(error) => self.show_fault(format!("Save failed: {error}")),
+        }
+    }
+
+    /// Keeps the recovered document and clears the offer.
+    fn restore_recovery(&mut self) {
+        self.controller.acknowledge_recovery_offer();
+        self.set_status("Recovered session loaded");
+    }
+
+    /// Returns to the last explicit save.
+    fn discard_recovery(&mut self) {
+        match self.controller.discard_recovery() {
+            Ok(()) => {
+                self.previews = PreviewCache::default();
+                self.clamp_selection();
+                self.set_status("Recovery discarded. The last explicit save is loaded.");
+            }
+            Err(error) => self.show_fault(format!("Could not discard recovery: {error}")),
+        }
+    }
+
+    fn clamp_selection(&mut self) {
+        let pages = self.controller.document().model.pages.len();
+        self.page = self.page.filter(|page| *page < pages);
+        let racks = &self.controller.document().model.racks;
+        self.selected_rack = self.selected_rack.min(racks.len().saturating_sub(1));
+        let slots = racks
             .get(self.selected_rack)
-            .map(|rack| {
-                rack.slots
-                    .iter()
-                    .enumerate()
-                    .map(|(slot_index, slot)| PluginSlotState {
-                        name: slot.plugin.identity.name.clone(),
-                        status: if !self.product.as_ref().is_ok_and(|product| {
-                            product.slot_running(self.selected_rack, slot_index)
-                        }) {
-                            PluginSlotStatus::Missing
-                        } else if slot.bypassed {
-                            PluginSlotStatus::Bypassed
-                        } else {
-                            PluginSlotStatus::Ready
-                        },
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.scenes = session
-            .scenes
+            .map_or(0, |rack| rack.slots.len());
+        self.selected_slot = self.selected_slot.filter(|slot| *slot < slots);
+    }
+
+    fn select_rack(&mut self, rack: usize) {
+        if self.selected_rack != rack {
+            self.selected_rack = rack;
+            self.selected_slot = None;
+        }
+    }
+
+    /// Rack indices the show screen lists: every rack, or the current page's racks, in session
+    /// rack order.
+    fn visible_racks(&self) -> Vec<usize> {
+        let model = &self.controller.document().model;
+        let page = self.page.and_then(|page| model.pages.get(page));
+        model
+            .racks
             .iter()
             .enumerate()
-            .map(|(scene_index, scene)| ScenePadState {
-                name: scene.name.clone(),
-                status: if self.current_scene == Some(scene_index) {
-                    ScenePadStatus::Active
-                } else {
-                    ScenePadStatus::Idle
-                },
+            .filter(|(_, rack)| page.is_none_or(|page| page.racks.contains(&rack.id)))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Shows a page, or all racks, keeping the selected rack when it is visible there.
+    fn show_page(&mut self, page: Option<usize>) {
+        self.page = page;
+        let visible = self.visible_racks();
+        if !visible.contains(&self.selected_rack)
+            && let Some(&first) = visible.first()
+        {
+            self.select_rack(first);
+        }
+        self.scroll_to_selected = true;
+    }
+
+    /// Adds a page named `Page n`, holding `rack` if given, and shows it.
+    fn new_page(&mut self, rack: Option<usize>) {
+        let model = &self.controller.document().model;
+        if model.pages.len() >= sp_model::MAX_PAGES {
+            self.set_status("Page limit reached (16)");
+            return;
+        }
+        let number = (1..=sp_model::MAX_PAGES)
+            .find(|number| {
+                !model
+                    .pages
+                    .iter()
+                    .any(|page| page.id.0 == format!("page-{number}"))
             })
-            .collect();
+            .expect("finite page list");
+        let racks = rack
+            .and_then(|rack| model.racks.get(rack))
+            .map(|rack| vec![rack.id.clone()])
+            .unwrap_or_default();
+        let pages = &mut self.controller.document_mut().model.pages;
+        pages.push(sp_model::RackPage {
+            id: sp_model::PageId(format!("page-{number}")),
+            name: format!("Page {}", pages.len() + 1),
+            racks,
+        });
+        let index = pages.len() - 1;
+        self.show_page(Some(index));
+        self.set_status("Page added. Choose its racks from each rack's menu, Pages.");
+    }
+
+    /// Adds `rack` to `page`, or takes it off. Audio and routing do not change.
+    fn toggle_rack_page(&mut self, rack: usize, page: usize) {
+        let model = &mut self.controller.document_mut().model;
+        let Some(rack_id) = model.racks.get(rack).map(|rack| rack.id.clone()) else {
+            return;
+        };
+        let Some(page) = model.pages.get_mut(page) else {
+            return;
+        };
+        if let Some(position) = page.racks.iter().position(|id| *id == rack_id) {
+            page.racks.remove(position);
+        } else {
+            page.racks.push(rack_id);
+        }
+    }
+
+    fn remove_page(&mut self, page: usize) {
+        let pages = &mut self.controller.document_mut().model.pages;
+        if page >= pages.len() {
+            return;
+        }
+        pages.remove(page);
+        self.page = match self.page {
+            Some(shown) if shown == page => None,
+            Some(shown) if shown > page => Some(shown - 1),
+            shown => shown,
+        };
+        self.set_status("Page removed. Its racks stay in the session.");
+    }
+
+    /// Whether the catalog on this machine has the plug-in a slot names.
+    fn plugin_installed(&self, slot: &PluginSlot) -> bool {
+        self.catalog_plugins
+            .iter()
+            .any(|plugin| plugin.descriptor.identity.unique_id == slot.plugin.identity.unique_id)
+    }
+
+    fn worker_running(&self, rack: usize) -> bool {
+        #[cfg(test)]
+        if self.test_workers_running {
+            return true;
+        }
+        self.product
+            .as_ref()
+            .is_ok_and(|product| product.worker_running(rack))
+    }
+
+    fn slot_running(&self, rack: usize, slot: usize) -> bool {
+        #[cfg(test)]
+        if self.test_workers_running {
+            return true;
+        }
+        self.product
+            .as_ref()
+            .is_ok_and(|product| product.slot_running(rack, slot))
+    }
+
+    /// The state token shown for one plug-in slot.
+    fn slot_token(&self, rack: usize, slot: usize) -> StateToken {
+        let Some(model_slot) = self
+            .controller
+            .document()
+            .model
+            .racks
+            .get(rack)
+            .and_then(|rack| rack.slots.get(slot))
+        else {
+            return StateToken::Unloaded;
+        };
+        let product = self.product.as_ref().ok();
+        let running = self.worker_running(rack);
+        if !self.plugin_installed(model_slot) || (running && !self.slot_running(rack, slot)) {
+            StateToken::Missing
+        } else if product.is_some_and(|product| product.worker_recovery_failed(rack)) {
+            StateToken::Faulted
+        } else if product.is_some_and(|product| product.worker_recovering(rack)) {
+            StateToken::Loading
+        } else if !self.online() || !running {
+            StateToken::Unloaded
+        } else if model_slot.bypassed {
+            StateToken::Bypassed
+        } else {
+            StateToken::Ready
+        }
+    }
+
+    /// The state token shown under a rack column.
+    fn rack_token(&self, rack: usize) -> StateToken {
+        let Some(model_rack) = self.controller.document().model.racks.get(rack) else {
+            return StateToken::Unloaded;
+        };
+        let product = self.product.as_ref().ok();
+        if product.is_some_and(|product| product.worker_recovery_failed(rack)) {
+            StateToken::Faulted
+        } else if product.is_some_and(|product| product.worker_recovering(rack)) {
+            StateToken::Recovering
+        } else if !self.online() || (!model_rack.slots.is_empty() && !self.worker_running(rack)) {
+            StateToken::Unloaded
+        } else if model_rack.bypassed {
+            StateToken::Bypassed
+        } else if (0..model_rack.slots.len())
+            .any(|slot| self.slot_token(rack, slot) == StateToken::Missing)
+        {
+            StateToken::Missing
+        } else {
+            StateToken::Ready
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -615,10 +839,7 @@ impl LiveRackApp {
                 Ok(()) => {
                     self.clear_live_handles();
                     self.system.set_state(SystemStatusState::Offline);
-                    self.set_status(&format!(
-                        "Engine stopped · 48 kHz · {} frames",
-                        self.buffer_frames
-                    ));
+                    self.set_status("Audio engine stopped");
                 }
                 Err(error) => {
                     self.show_fault(format!("Audio engine did not stop cleanly: {error}"));
@@ -627,69 +848,38 @@ impl LiveRackApp {
             return;
         }
 
-        let graph = match PreparedGraph::compile(&self.controller.document().model) {
-            Ok(graph) => graph,
-            Err(error) => {
-                self.show_fault(format!("Rack graph is not ready: {error}"));
-                return;
-            }
-        };
-        let banks = match self
-            .product_mut()
-            .and_then(|product| product.audio_bank_mappings())
-        {
-            Ok(banks) => banks,
-            Err(error) => {
-                self.show_fault(format!("Rack shared-memory setup failed: {error}"));
-                return;
-            }
-        };
-        let mut renderer = match ProductRenderer::with_rack_banks(graph, banks) {
-            Ok(renderer) => renderer,
-            Err(error) => {
-                self.show_fault(format!("Rack dispatcher setup failed: {error}"));
-                return;
-            }
-        };
-        for (rack_index, rack) in self.controller.document().model.racks.iter().enumerate() {
-            let dry_fallback = self
-                .product
-                .as_ref()
-                .is_ok_and(|product| product.rack_dry_fallback_available(rack));
-            renderer
-                .mixer_mut()
-                .set_dry_fallback_available(rack_index, dry_fallback);
-            if let Some(latency) = self
-                .product
-                .as_ref()
-                .ok()
-                .and_then(|product| product.rack_latency_samples(rack_index))
-            {
-                renderer.mixer_mut().set_dry_delay_frames(
-                    rack_index,
-                    usize::try_from(latency).unwrap_or(usize::MAX),
-                );
-            }
-            renderer
-                .mixer_mut()
-                .set_rack_gain(rack_index, 10.0_f32.powf(rack.gain_db.get() / 20.0));
-            renderer.mixer_mut().set_rack_muted(rack_index, rack.muted);
-            renderer
-                .mixer_mut()
-                .set_rack_bypassed(rack_index, rack.bypassed);
+        if let Err(error) = self.validate_selected_audio_route() {
+            self.show_fault(error);
+            return;
         }
-        let mappings = product_midi_mappings(&self.controller.document().model);
-        let scenes = prepare_product_scenes(&self.controller.document().model);
-        let current_parameters = current_product_parameters(&self.controller.document().model);
-        let (product_control, control_receiver) = ProductControl::new();
-        let (mapping_publisher, mapping_receiver) = MidiMappingPublisher::new();
-        renderer = renderer.with_live_control(
-            control_receiver,
-            mapping_receiver,
+
+        if let Err(error) = self
+            .sync_worker_parameters()
+            .and_then(|()| self.load_unloaded_racks())
+        {
+            self.show_fault(error);
+            return;
+        }
+
+        let prepared = self
+            .product
+            .as_mut()
+            .map_err(|error| error.clone())
+            .and_then(|product| {
+                crate::engine::prepare_audio(product, &self.controller.document().model)
+            });
+        let crate::engine::PreparedAudio {
+            mut renderer,
+            control: product_control,
+            mapping_publisher,
             mappings,
-            scenes,
-            current_parameters,
-        );
+        } = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.show_fault(error);
+                return;
+            }
+        };
         let telemetry = renderer.telemetry();
         let mut midi_cc_monitor = None;
         if let Some(selected) = self.selected_midi.as_ref() {
@@ -705,27 +895,41 @@ impl LiveRackApp {
         self.audio = MacOsAudioEndpoint::with_renderer(renderer).allow_device_reconfiguration();
         let Some(mut route) = self.selected_route.clone() else {
             self.system.set_state(SystemStatusState::Offline);
-            self.show_fault("No stereo input/output device is available".to_owned());
+            self.show_fault("Choose an audio output device before starting".to_owned());
             return;
         };
         route.format = AudioFormat::product_stereo(self.buffer_frames)
             .expect("fixed product buffer choice is valid");
+        let Some(output_device) = self
+            .audio_devices
+            .iter()
+            .find(|device| device.info.id == route.output)
+        else {
+            self.system.set_state(SystemStatusState::Offline);
+            self.show_fault("Selected audio output is unavailable. Refresh devices.".to_owned());
+            return;
+        };
+        route.format.channel_count = output_device.capabilities.max_output_channels.min(64);
+        if !available_buffer_frames(&self.audio_devices, &route).contains(&self.buffer_frames) {
+            self.system.set_state(SystemStatusState::Offline);
+            self.show_fault("Selected input and output do not share this buffer size".to_owned());
+            return;
+        }
         match self.audio.start_route(route.clone()) {
             Ok(()) => {
+                self.meter_clock = Instant::now();
+                self.rack_input_meters = [MeterBallistics::default(); MAX_RACKS];
+                self.rack_output_meters = [MeterBallistics::default(); MAX_RACKS];
                 self.product_control = Some(product_control);
                 self.midi_mapping_publisher = Some(mapping_publisher);
                 self.midi_learn = MidiLearnController::from_table(mappings);
                 self.midi_cc_monitor = midi_cc_monitor;
                 self.telemetry = Some(telemetry);
                 self.system.set_state(SystemStatusState::Online);
-                let device = self
-                    .audio_devices
-                    .iter()
-                    .find(|device| device.info.id == route.output)
-                    .map_or("CoreAudio", |device| device.info.name.as_str());
+                let racks = self.controller.document().model.racks.len();
                 self.set_status(&format!(
-                    "Engine online · {device} · 48 kHz · {} frames",
-                    self.buffer_frames
+                    "Audio engine online, {racks} {} loaded",
+                    if racks == 1 { "rack" } else { "racks" }
                 ));
             }
             Err(error) => {
@@ -735,33 +939,99 @@ impl LiveRackApp {
         }
     }
 
+    /// Channel count of the selected input or output device, capped at 64.
+    #[cfg(target_os = "macos")]
+    fn device_channels(&self, input: bool) -> u16 {
+        self.selected_route
+            .as_ref()
+            .and_then(|route| {
+                if input {
+                    route.input.as_ref()
+                } else {
+                    Some(&route.output)
+                }
+            })
+            .and_then(|id| {
+                self.audio_devices
+                    .iter()
+                    .find(|device| &device.info.id == id)
+            })
+            .map_or(0, |device| {
+                if input {
+                    device.capabilities.max_input_channels.min(64)
+                } else {
+                    device.capabilities.max_output_channels.min(64)
+                }
+            })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[allow(clippy::unused_self, reason = "matches the macOS signature")]
+    fn device_channels(&self, _input: bool) -> u16 {
+        0
+    }
+
+    /// Whether a rack's route only uses channels the selected devices have.
+    fn route_fits(&self, route: RackChannelRoute) -> bool {
+        physical_channels_fit(route.output, self.device_channels(false))
+            && route
+                .input
+                .is_none_or(|input| physical_channels_fit(input, self.device_channels(true)))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn validate_selected_audio_route(&self) -> Result<(), String> {
+        let route = self
+            .selected_route
+            .as_ref()
+            .ok_or("Choose an audio output device before starting")?;
+        if self.device_channels(false) == 0 {
+            return Err("Selected audio output is unavailable. Refresh devices.".to_owned());
+        }
+        if route.input.is_some() && self.device_channels(true) == 0 {
+            return Err("Selected audio input is unavailable. Refresh devices.".to_owned());
+        }
+        if !available_buffer_frames(&self.audio_devices, route).contains(&self.buffer_frames) {
+            return Err("Selected input and output do not share this buffer size".to_owned());
+        }
+        let session = &self.controller.document().model;
+        for rack in &session.racks {
+            if !self.route_fits(rack_route(session, rack)) {
+                return Err(format!(
+                    "{} uses channels the selected devices do not have. Change its route.",
+                    rack.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(target_os = "macos")]
     fn refresh_audio_devices(&mut self) {
-        match duplex_devices() {
+        match route_devices() {
             Ok(devices) => {
                 self.audio_devices = devices;
-                if self.selected_route.as_ref().is_none_or(|route| {
-                    !self
+                if let Some(route) = &mut self.selected_route {
+                    if self
                         .audio_devices
                         .iter()
                         .any(|device| device.info.id == route.output)
-                }) {
-                    self.selected_route = self.audio_devices.first().map(|device| {
-                        self.buffer_frames = device.supported_buffer_frames[0];
-                        AudioRouteConfig {
-                            input: Some(device.info.id.clone()),
-                            output: device.info.id.clone(),
-                            format: AudioFormat::product_stereo(self.buffer_frames)
-                                .expect("discovery only returns product buffer sizes"),
+                    {
+                        if route.input.as_ref().is_some_and(|input| {
+                            !self
+                                .audio_devices
+                                .iter()
+                                .any(|device| &device.info.id == input)
+                        }) {
+                            route.input = None;
                         }
-                    });
-                } else if let Some(device) = self.audio_devices.iter().find(|device| {
-                    self.selected_route
-                        .as_ref()
-                        .is_some_and(|route| route.output == device.info.id)
-                }) && !device.supported_buffer_frames.contains(&self.buffer_frames)
-                {
-                    self.buffer_frames = device.supported_buffer_frames[0];
+                        let buffers = available_buffer_frames(&self.audio_devices, route);
+                        if !buffers.contains(&self.buffer_frames) {
+                            self.buffer_frames = buffers.first().copied().unwrap_or(128);
+                        }
+                    } else {
+                        self.selected_route = None;
+                    }
                 }
                 self.set_status("Audio device list refreshed");
             }
@@ -774,11 +1044,9 @@ impl LiveRackApp {
         match MidirInput::enumerate_ports() {
             Ok(ports) => {
                 self.midi_ports = ports;
-                if self
-                    .selected_midi
-                    .as_ref()
-                    .is_none_or(|selected| !self.midi_ports.iter().any(|port| &port.id == selected))
-                {
+                if self.selected_midi.as_ref().is_some_and(|selected| {
+                    !self.midi_ports.iter().any(|port| &port.id == selected)
+                }) {
                     self.selected_midi = self.midi_ports.first().map(|port| port.id.clone());
                 }
                 self.set_status("MIDI port list refreshed");
@@ -799,9 +1067,51 @@ impl LiveRackApp {
         let _ = self.audio.stop();
         self.clear_live_handles();
         self.system.set_state(SystemStatusState::Offline);
+        self.reconnect_at = Some(Instant::now() + RECONNECT_INTERVAL);
         self.show_fault(format!(
-            "Audio device {device} changed or disconnected. Output is muted; refresh the route before restarting."
+            "Audio device {device} changed or disconnected. The engine reconnects when it returns."
         ));
+    }
+
+    /// Restarts audio on the saved route once its devices are present again. A manual start or
+    /// stop cancels the attempt.
+    #[cfg(target_os = "macos")]
+    fn poll_reconnect(&mut self, now: Instant) {
+        let Some(due) = self.reconnect_at else {
+            return;
+        };
+        if self.system.state != SystemStatusState::Offline {
+            self.reconnect_at = None;
+            return;
+        }
+        if now < due {
+            return;
+        }
+        self.reconnect_at = Some(now + RECONNECT_INTERVAL);
+        let Ok(devices) = route_devices() else {
+            return;
+        };
+        let Some(route) = self
+            .controller
+            .document()
+            .model
+            .audio_settings
+            .as_ref()
+            .and_then(|settings| saved_route(&devices, settings))
+        else {
+            return;
+        };
+        self.audio_devices = devices;
+        self.selected_route = Some(route);
+        if self.validate_selected_audio_route().is_err() {
+            return;
+        }
+        self.toggle_engine();
+        if self.online() {
+            self.reconnect_at = None;
+            self.fault = None;
+            self.set_status("Audio device returned. The engine reconnected.");
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -809,21 +1119,34 @@ impl LiveRackApp {
         self.show_fault("The live audio engine requires Apple Silicon macOS".to_owned());
     }
 
-    fn show_fault(&mut self, message: String) {
-        self.fault = FaultBannerModel {
-            state: FaultBannerState::Visible,
-            message,
-        };
+    /// Starts the engine, or asks before stopping a running one.
+    fn request_engine_toggle(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            self.reconnect_at = None;
+        }
+        if self.online() {
+            self.overlay = Overlay::Modal(Modal::StopEngine);
+        } else {
+            self.toggle_engine();
+        }
     }
 
     #[cfg(target_os = "macos")]
     fn clear_live_handles(&mut self) {
+        if let Ok(product) = self.product.as_mut() {
+            product.stop_retiring_workers();
+        }
+        self.system.set_state(SystemStatusState::Offline);
         self.product_control = None;
+        self.pending_parameter_observations.clear();
         self.midi_mapping_publisher = None;
         self.midi_cc_monitor = None;
         self.telemetry = None;
-        self.midi_learn.cancel();
-        self.midi_learn_target = None;
+        self.rack_input_meters = [MeterBallistics::default(); MAX_RACKS];
+        self.rack_output_meters = [MeterBallistics::default(); MAX_RACKS];
+        self.load_history = [0.0; LOAD_BARS];
+        self.cancel_midi_learn();
         self.last_rack_latency = [u32::MAX; MAX_RACKS];
     }
 
@@ -849,21 +1172,30 @@ impl LiveRackApp {
         {
             index += 1;
         }
+        let position = session.racks.len();
+        let route = new_rack_route(
+            position,
+            self.device_channels(true),
+            self.device_channels(false),
+        );
+        let before = self.rack_ids();
         let source_id = SourceId(format!("input-{index}"));
         let endpoint_id = EndpointId(format!("output-{index}"));
+        let rack_id = RackId(format!("rack-{index}"));
         let document = self.controller.document_mut();
         document.model.sources.push(Source {
             id: source_id.clone(),
             name: format!("Input {index}"),
-            layout: ChannelLayout::Stereo,
+            layout: ChannelLayout::Mono,
         });
         document.model.endpoints.push(Endpoint {
             id: endpoint_id.clone(),
             name: format!("Output {index}"),
             layout: ChannelLayout::Stereo,
         });
+        document.model.rack_routes.insert(rack_id.clone(), route);
         document.model.racks.push(Rack {
-            id: RackId(format!("rack-{index}")),
+            id: rack_id,
             name: format!("Rack {index}"),
             source_id,
             endpoint_id,
@@ -873,26 +1205,40 @@ impl LiveRackApp {
             bypassed: false,
             slots: Vec::new(),
         });
-        self.selected_rack = self.controller.document().model.racks.len() - 1;
-        self.rebuild_all_workers();
-        self.set_status("Rack added; choose a plug-in after scanning");
+        if let Some(page) = self
+            .page
+            .and_then(|page| self.controller.document_mut().model.pages.get_mut(page))
+        {
+            page.racks.push(RackId(format!("rack-{index}")));
+        }
+        self.select_rack(position);
+        self.scroll_to_selected = true;
+        self.apply_rack_edit(&before, &[]);
+        self.set_status("Rack added. Choose a plug-in after scanning.");
     }
 
+    /// Moves the selected rack past its visible neighbour, so it moves on screen even when
+    /// the current page hides the racks between them.
     fn move_selected_rack(&mut self, offset: isize) {
-        let len = self.controller.document().model.racks.len();
-        let Some(target) = self.selected_rack.checked_add_signed(offset) else {
+        let visible = self.visible_racks();
+        let Some(neighbour) = visible
+            .iter()
+            .position(|rack| *rack == self.selected_rack)
+            .and_then(|position| position.checked_add_signed(offset))
+            .and_then(|position| visible.get(position).copied())
+        else {
             return;
         };
-        if target >= len || target == self.selected_rack {
-            return;
-        }
-        self.controller
-            .document_mut()
-            .model
-            .racks
-            .swap(self.selected_rack, target);
-        self.selected_rack = target;
-        self.rebuild_all_workers();
+        let before = self.rack_ids();
+        // Taking the rack out shifts a right-hand neighbour down one, so inserting at the
+        // neighbour's old index lands on its far side in both directions.
+        let racks = &mut self.controller.document_mut().model.racks;
+        let moved = racks.remove(self.selected_rack);
+        racks.insert(neighbour, moved);
+        self.selected_rack = neighbour;
+        self.scroll_to_selected = true;
+        self.apply_rack_edit(&before, &[]);
+        self.set_status("Rack order updated");
     }
 
     fn remove_selected_rack(&mut self) {
@@ -900,6 +1246,7 @@ impl LiveRackApp {
         if self.selected_rack >= model.racks.len() {
             return;
         }
+        let before: Vec<RackId> = model.racks.iter().map(|rack| rack.id.clone()).collect();
         let rack = model.racks.remove(self.selected_rack);
         if model
             .racks
@@ -920,6 +1267,7 @@ impl LiveRackApp {
         model.scenes.iter_mut().for_each(|scene| {
             scene.gains.retain(|value| value.rack_id != rack.id);
             scene.mutes.retain(|value| value.rack_id != rack.id);
+            scene.rack_bypasses.retain(|value| value.rack_id != rack.id);
             scene.bypasses.retain(|value| value.rack_id != rack.id);
             scene
                 .parameter_values
@@ -928,48 +1276,166 @@ impl LiveRackApp {
         model
             .midi_mappings
             .retain(|mapping| mapping.target.rack_id != rack.id);
+        model.rack_routes.remove(&rack.id);
+        for page in &mut model.pages {
+            page.racks.retain(|id| *id != rack.id);
+        }
+        // Slots keyed by the removed rack lose their sidechain; their racks reload.
+        let removed_source = Some(sp_model::SlotSidechain::RackOutput(rack.id.clone()));
+        let mut rebuilt = Vec::new();
+        for other in &mut model.racks {
+            for slot in &mut other.slots {
+                if slot.sidechain == removed_source {
+                    slot.sidechain = None;
+                    rebuilt.push(other.id.clone());
+                }
+            }
+        }
+        rebuilt.dedup();
         self.selected_rack = self.selected_rack.min(model.racks.len().saturating_sub(1));
         self.selected_slot = None;
-        self.parameters.clear();
-        self.rebuild_all_workers();
+        self.apply_rack_edit(&before, &rebuilt);
+        self.set_status("Rack removed. Other racks kept playing.");
     }
 
-    fn rebuild_all_workers(&mut self) {
+    /// Applies a rack layout edit already made to the model. `before` lists rack IDs in their
+    /// previous order and `rebuilt` names racks whose plug-in chain changed.
+    ///
+    /// While audio runs, untouched racks keep playing and only `rebuilt` or new racks restart;
+    /// stopped audio uses the ordinary rebuild.
+    fn apply_rack_edit(&mut self, before: &[RackId], rebuilt: &[RackId]) {
         #[cfg(target_os = "macos")]
-        if self.audio.active_format().is_some() {
-            let _ = self.audio.stop();
+        if self.product_control.is_some() {
+            if let Err(error) = self.apply_rack_edit_live(before, rebuilt) {
+                self.show_fault(error);
+            }
+            return;
+        }
+        let _ = (before, rebuilt);
+        self.with_audio_paused(Self::rebuild_all_workers_stopped);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn apply_rack_edit_live(
+        &mut self,
+        before: &[RackId],
+        rebuilt: &[RackId],
+    ) -> Result<(), String> {
+        self.sync_worker_parameters()?;
+        let model = self.controller.document().model.clone();
+        let plan: Vec<RackPlan> = model
+            .racks
+            .iter()
+            .map(|rack| {
+                let from = before.iter().position(|id| *id == rack.id);
+                match from {
+                    Some(from) if !rebuilt.contains(&rack.id) => RackPlan::Keep(from),
+                    from => RackPlan::Rebuild(from),
+                }
+            })
+            .collect();
+        let mut saved_states = Vec::with_capacity(model.racks.len());
+        for (rack, step) in model.racks.iter().zip(&plan) {
+            let mut states = self.saved_states(rack)?;
+            // A rebuilt rack keeps each surviving plug-in's live state.
+            if let RackPlan::Rebuild(Some(from)) = step {
+                let live = self.product_mut()?.capture_rack_states(*from)?;
+                for (slot, state) in rack.slots.iter().zip(&mut states) {
+                    if let Some(captured) = live.iter().find(|live| {
+                        live.instance_id == slot.id.0
+                            && live.metadata.fingerprint == slot.plugin.fingerprint.digest
+                    }) {
+                        *state = Some(captured.clone());
+                    }
+                }
+            }
+            saved_states.push(states);
+        }
+        let control = self
+            .product_control
+            .as_mut()
+            .ok_or("Live control is unavailable")?;
+        let product = self.product.as_mut().map_err(|error| error.clone())?;
+        product.publish_live_topology(control, &model, &plan, &saved_states)?;
+        self.midi_learn =
+            MidiLearnController::from_table(sp_audio_io_macos::product_midi_mappings(&model));
+        self.last_rack_latency = [u32::MAX; MAX_RACKS];
+        self.rack_input_meters = [MeterBallistics::default(); MAX_RACKS];
+        self.rack_output_meters = [MeterBallistics::default(); MAX_RACKS];
+        self.clamp_selection();
+        Ok(())
+    }
+
+    /// Runs a topology change that needs stopped audio, then restarts audio if it was running,
+    /// so a rack edit during a show causes a short gap instead of lasting silence.
+    fn with_audio_paused(&mut self, change: impl FnOnce(&mut Self)) {
+        #[cfg(target_os = "macos")]
+        let resume = self.audio.active_format().is_some();
+        #[cfg(target_os = "macos")]
+        if resume {
+            if let Err(error) = self.audio.stop() {
+                self.show_fault(format!(
+                    "Audio did not stop before the rack change: {error}"
+                ));
+                return;
+            }
             self.clear_live_handles();
-            self.system.set_state(SystemStatusState::Offline);
+        }
+        change(self);
+        #[cfg(target_os = "macos")]
+        if resume {
+            let status = self.status_line.clone();
+            self.toggle_engine();
+            if self.online() {
+                self.set_status(&format!("{status}. Audio resumed."));
+            }
+        }
+    }
+
+    fn rebuild_all_workers_stopped(&mut self) {
+        if let Err(error) = self.sync_worker_parameters() {
+            self.show_fault(format!("Could not preserve plug-in parameters: {error}"));
+            return;
+        }
+        let mut live_states = Vec::new();
+        if let Ok(product) = self.product.as_mut() {
+            for rack_index in 0..MAX_RACKS {
+                match product.capture_rack_states(rack_index) {
+                    Ok(states) => live_states.extend(states),
+                    Err(error) => {
+                        self.show_fault(format!("Could not preserve plug-in state: {error}"));
+                        return;
+                    }
+                }
+            }
         }
         let racks = self.controller.document().model.racks.clone();
         let saved_states = racks
             .iter()
-            .map(|rack| {
-                rack.slots
-                    .iter()
-                    .map(|slot| {
-                        self.controller.load_plugin_state(&slot.id.0).map(|state| {
-                            state.map(|(component, controller, metadata)| CapturedPluginState {
-                                instance_id: slot.id.0.clone(),
-                                component,
-                                controller,
-                                metadata,
-                            })
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
+            .map(|rack| self.saved_states(rack))
             .collect::<Result<Vec<_>, _>>();
-        let Ok(saved_states) = saved_states else {
-            self.show_fault("Could not read saved plug-in state while rebuilding racks".to_owned());
-            return;
+        let mut saved_states = match saved_states {
+            Ok(states) => states,
+            Err(error) => {
+                self.show_fault(error);
+                return;
+            }
         };
-        if self.product.is_err() {
-            self.refresh_models();
-            return;
+        for (rack, states) in racks.iter().zip(&mut saved_states) {
+            for (slot, state) in rack.slots.iter().zip(states) {
+                if let Some(live) = live_states.iter().find(|live| {
+                    live.instance_id == slot.id.0
+                        && live.metadata.fingerprint == slot.plugin.fingerprint.digest
+                }) {
+                    *state = Some(live.clone());
+                }
+            }
         }
         let reload_error = {
-            let product = self.product.as_mut().expect("product checked");
+            let Ok(product) = self.product.as_mut() else {
+                self.clamp_selection();
+                return;
+            };
             product.unload_all_racks();
             racks.iter().zip(saved_states.iter()).enumerate().find_map(
                 |(rack_index, (rack, states))| {
@@ -984,13 +1450,44 @@ impl LiveRackApp {
             self.show_fault(format!("Rack {} could not reload: {error}", rack_index + 1));
             return;
         }
-        self.refresh_models();
-        self.set_status("Rack order updated; restart the engine when ready");
+        self.clamp_selection();
     }
 
-    fn snapshot_scene(&self, id: SceneId, name: String, transition_ms: u32) -> Scene {
-        let model = &self.controller.document().model;
-        Scene {
+    fn snapshot_scene(
+        model: &sp_model::Session,
+        id: SceneId,
+        name: String,
+        transition_ms: u32,
+        scope: &[SceneParameterValue],
+    ) -> Result<Scene, String> {
+        if scope.len() > MAX_SCENE_PARAMETER_VALUES {
+            return Err(format!(
+                "Scene has {} selected parameters; maximum is {MAX_SCENE_PARAMETER_VALUES}",
+                scope.len()
+            ));
+        }
+        let parameter_values = scope
+            .iter()
+            .map(|target| {
+                let value = model
+                    .racks
+                    .iter()
+                    .find(|rack| rack.id == target.rack_id)
+                    .and_then(|rack| rack.slots.iter().find(|slot| slot.id == target.slot_id))
+                    .and_then(|slot| slot.parameters.values.get(&target.parameter_id))
+                    .ok_or_else(|| {
+                        format!(
+                            "Scene parameter {} is no longer available",
+                            target.parameter_id.0
+                        )
+                    })?;
+                Ok(SceneParameterValue {
+                    value: *value,
+                    ..target.clone()
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Scene {
             id,
             name,
             gains: model
@@ -1009,6 +1506,14 @@ impl LiveRackApp {
                     muted: rack.muted,
                 })
                 .collect(),
+            rack_bypasses: model
+                .racks
+                .iter()
+                .map(|rack| RackBypass {
+                    rack_id: rack.id.clone(),
+                    bypassed: rack.bypassed,
+                })
+                .collect(),
             bypasses: model
                 .racks
                 .iter()
@@ -1019,39 +1524,47 @@ impl LiveRackApp {
                         bypassed: slot.bypassed,
                     })
                 })
-                .take(MAX_SCENE_PARAMETER_VALUES)
                 .collect(),
-            parameter_values: model
-                .racks
-                .iter()
-                .flat_map(|rack| {
-                    rack.slots.iter().flat_map(|slot| {
-                        slot.parameters.values.iter().map(|(parameter_id, value)| {
-                            SceneParameterValue {
-                                rack_id: rack.id.clone(),
-                                slot_id: slot.id.clone(),
-                                parameter_id: parameter_id.clone(),
-                                value: *value,
-                            }
-                        })
-                    })
-                })
-                .collect(),
+            parameter_values,
             transition_ms,
-        }
+        })
     }
 
+    /// Opens the scene picker for a new scene with the default parameter selection.
     fn capture_scene(&mut self) {
-        let sequence = self.controller.document().model.scenes.len() + 1;
-        let scene = self.snapshot_scene(
+        let model = &self.controller.document().model;
+        if model.scenes.len() >= sp_model::MAX_SCENES {
+            self.show_fault(format!(
+                "A session supports at most {} scenes",
+                sp_model::MAX_SCENES
+            ));
+            return;
+        }
+        let sequence = (1..=model.scenes.len() + 1)
+            .find(|number| {
+                !model
+                    .scenes
+                    .iter()
+                    .any(|scene| scene.id.0 == format!("scene-{number}"))
+            })
+            .expect("finite scene list");
+        let scene = Self::snapshot_scene(
+            model,
             SceneId(format!("scene-{sequence}")),
-            format!("Scene {sequence}"),
-            250,
-        );
-        self.controller.document_mut().model.scenes.push(scene);
-        self.current_scene = Some(sequence - 1);
-        self.refresh_models();
-        self.set_status("Scene captured from current rack and parameter values");
+            format!("Scene {}", model.scenes.len() + 1),
+            self.fade_ms,
+            &[],
+        )
+        .expect("empty parameter scope is valid");
+        self.open_scene_editor(scene, None);
+    }
+
+    fn open_scene_editor(&mut self, scene: Scene, scene_index: Option<usize>) {
+        let model = &self.controller.document().model;
+        let product = self.product.as_ref().ok();
+        self.scene_editor = Some(SceneEditor::new(model, scene, scene_index, |slot| {
+            product.map_or(&[], |product| product.scene_parameter_metadata(slot))
+        }));
     }
 
     fn update_current_scene(&mut self) {
@@ -1059,53 +1572,120 @@ impl LiveRackApp {
             self.set_status("Recall or capture a scene before updating it");
             return;
         };
-        let Some(existing) = self.controller.document().model.scenes.get(index) else {
+        let Some(existing) = self.controller.document().model.scenes.get(index).cloned() else {
             return;
         };
-        let updated = self.snapshot_scene(
-            existing.id.clone(),
-            existing.name.clone(),
-            existing.transition_ms,
-        );
-        self.controller.document_mut().model.scenes[index] = updated;
-        self.refresh_models();
-        self.set_status("Current scene updated");
+        let name = existing.name.clone();
+        if self.commit_scene(existing, Some(index)) {
+            self.set_status(&format!("Scene {name} updated from current values"));
+        }
     }
 
-    #[cfg(target_os = "macos")]
-    fn set_rack_controls(&mut self, gain_db: f32, muted: bool, bypassed: bool) {
-        let rack_index = self.selected_rack;
-        let Some(rack) = self
+    fn commit_scene(&mut self, scope: Scene, index: Option<usize>) -> bool {
+        let mut staged_model = self.controller.document().model.clone();
+        let result = (|| {
+            let mut scene = Self::snapshot_scene(
+                &staged_model,
+                scope.id,
+                scope.name,
+                scope.transition_ms,
+                &scope.parameter_values,
+            )?;
+            if !scene.parameter_values.is_empty() {
+                let product = self.product.as_mut().map_err(
+                    |_| "Plug-in workers are unavailable; cannot capture current parameter values",
+                )?;
+                product.capture_scene_parameters(&mut staged_model, &mut scene)?;
+            }
+            let scene_index = index.unwrap_or(staged_model.scenes.len());
+            if let Some(index) = index {
+                *staged_model
+                    .scenes
+                    .get_mut(index)
+                    .ok_or("Scene no longer exists")? = scene;
+            } else {
+                staged_model.scenes.push(scene);
+            }
+            staged_model.validate().map_err(|error| error.to_string())?;
+            Ok::<usize, String>(scene_index)
+        })();
+        let scene_index = match result {
+            Ok(index) => index,
+            Err(error) => {
+                self.show_fault(format!("Could not capture scene: {error}"));
+                return false;
+            }
+        };
+        self.controller.document_mut().model = staged_model;
+        self.current_scene = Some(scene_index);
+        if self.publish_live_scenes() {
+            self.set_status("Scene captured. Only the selected plug-in parameters are recalled.");
+        }
+        true
+    }
+
+    /// Sends the session's scenes to the running engine. Returns false after reporting a fault.
+    fn publish_live_scenes(&mut self) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Some(control) = self.product_control.as_mut()
+            && !control.publish_scenes(&self.controller.document().model)
+        {
+            self.show_fault(
+                "The scene change is saved but not live yet. The engine is still applying the last one; try again."
+                    .to_owned(),
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Steps the fade by `steps` × 50 ms. The active scene's transition follows it.
+    fn step_fade(&mut self, steps: i32) {
+        let fade = i64::from(self.fade_ms) + i64::from(steps) * i64::from(FADE_STEP_MS);
+        self.fade_ms = u32::try_from(fade.clamp(0, i64::from(FADE_MAX_MS))).unwrap_or(0);
+        if let Some(index) = self.current_scene
+            && let Some(scene) = self.controller.document_mut().model.scenes.get_mut(index)
+        {
+            scene.transition_ms = self.fade_ms;
+            self.publish_live_scenes();
+        }
+    }
+
+    /// Sends new rack output controls to the engine, then commits them to the session.
+    fn set_rack_controls(&mut self, rack_index: usize, gain_db: f32, muted: bool, bypassed: bool) {
+        if self
             .controller
-            .document_mut()
+            .document()
             .model
             .racks
-            .get_mut(rack_index)
-        else {
+            .get(rack_index)
+            .is_none()
+        {
+            return;
+        }
+        let Ok(gain_db) = sp_model::GainDb::new(gain_db) else {
+            self.show_fault("Rack gain is invalid".to_owned());
             return;
         };
-        rack.gain_db = sp_model::GainDb::new(gain_db).unwrap_or_default();
-        rack.muted = muted;
-        rack.bypassed = bypassed;
-        let snapshot = rack.clone();
-        if let Ok(product) = self.product.as_mut() {
-            product.update_rack_snapshot(rack_index, &snapshot);
-        }
-        if self.system.state == SystemStatusState::Online {
+        #[cfg(target_os = "macos")]
+        if self.online() {
             let Some(control) = self.product_control.as_mut() else {
                 self.show_fault("Rack control queue is unavailable".to_owned());
                 return;
             };
-            let gain = 10.0_f32.powf(gain_db / 20.0);
-            if !(control.set_rack_gain(rack_index, gain)
-                && control.set_rack_muted(rack_index, muted)
-                && control.set_rack_bypassed(rack_index, bypassed))
-            {
+            let gain = 10.0_f32.powf(gain_db.get() / 20.0);
+            if !control.set_rack_controls(rack_index, gain, muted, bypassed) {
                 self.show_fault("Rack control queue is full".to_owned());
                 return;
             }
         }
-        self.set_status("Rack output controls updated");
+        let rack = &mut self.controller.document_mut().model.racks[rack_index];
+        rack.gain_db = gain_db;
+        rack.muted = muted;
+        rack.bypassed = bypassed;
+        if let Ok(product) = self.product.as_mut() {
+            product.update_rack_snapshot(rack_index, rack);
+        }
     }
 
     fn scan_plugins(&mut self) {
@@ -1118,22 +1698,16 @@ impl LiveRackApp {
                     .product
                     .as_ref()
                     .map_or_else(|_| Vec::new(), ProductRuntime::catalog_plugins);
-                self.selected_catalog_plugin = (!self.catalog_plugins.is_empty()).then_some(0);
-                self.set_status(&format!("Scan complete · {count} bundles cataloged"));
+                self.last_scan = Some(SystemTime::now());
+                self.set_status(&format!("Scan complete, {count} bundles cataloged"));
             }
             Err(error) => self.show_fault(format!("Plug-in scan unavailable: {error}")),
         }
     }
 
-    fn add_selected_plugin(&mut self) {
-        let Some(plugin) = self
-            .selected_catalog_plugin
-            .and_then(|index| self.catalog_plugins.get(index))
-            .cloned()
-        else {
-            self.show_fault("Scan and select a supported plug-in first".to_owned());
-            return;
-        };
+    /// Appends a catalog plug-in to the selected rack and reloads that rack.
+    fn add_plugin(&mut self, plugin: CatalogPlugin) {
+        let name = plugin.descriptor.identity.name.clone();
         let Some(rack) = self
             .controller
             .document_mut()
@@ -1155,14 +1729,20 @@ impl LiveRackApp {
             }
             sequence += 1;
         };
+        let rack_name = rack.name.clone();
         rack.slots.push(PluginSlot {
             id,
             plugin: plugin.descriptor,
             bypassed: false,
             parameters: plugin.parameters,
+            sidechain: None,
         });
-        self.selected_slot = Some(rack.slots.len() - 1);
-        self.reload_selected_rack_after_edit();
+        let slot = rack.slots.len() - 1;
+        self.selected_slot = Some(slot);
+        self.reload_selected_rack_after_edit(SlotEdit::Add(slot));
+        if self.fault.is_none() {
+            self.set_status(&format!("{name} added to {rack_name}. The rack reloaded."));
+        }
     }
 
     fn move_slot(&mut self, from: usize, to: usize) {
@@ -1180,29 +1760,80 @@ impl LiveRackApp {
         }
         rack.slots.swap(from, to);
         self.selected_slot = Some(to);
-        self.reload_selected_rack_after_edit();
+        self.reload_selected_rack_after_edit(SlotEdit::Swap(from, to));
     }
 
     fn remove_slot(&mut self, slot: usize) {
-        let Some(rack) = self
-            .controller
-            .document_mut()
-            .model
-            .racks
-            .get_mut(self.selected_rack)
-        else {
+        let model = &mut self.controller.document_mut().model;
+        let Some(rack) = model.racks.get_mut(self.selected_rack) else {
             return;
         };
         if slot >= rack.slots.len() {
             return;
         }
-        rack.slots.remove(slot);
+        let removed = rack.slots.remove(slot);
+        let rack_id = rack.id.clone();
+        for scene in &mut model.scenes {
+            scene
+                .bypasses
+                .retain(|value| value.rack_id != rack_id || value.slot_id != removed.id);
+            scene
+                .parameter_values
+                .retain(|value| value.rack_id != rack_id || value.slot_id != removed.id);
+        }
+        model.midi_mappings.retain(|mapping| {
+            mapping.target.rack_id != rack_id || mapping.target.slot_id != removed.id
+        });
         self.selected_slot = None;
-        self.parameters.clear();
-        self.reload_selected_rack_after_edit();
+        self.reload_selected_rack_after_edit(SlotEdit::Remove(slot));
     }
 
-    fn reload_selected_rack_after_edit(&mut self) {
+    /// Applies a slot edit already made to the model. While audio runs, the rack's worker
+    /// changes in place so its other plug-ins keep playing; if it cannot, only this rack's
+    /// worker restarts.
+    fn reload_selected_rack_after_edit(&mut self, edit: SlotEdit) {
+        #[cfg(target_os = "macos")]
+        if let Some(control) = self.product_control.as_mut() {
+            if !control.changes_applied() {
+                self.show_fault(
+                    "The previous rack change is still being applied. Try again.".to_owned(),
+                );
+                return;
+            }
+            let rack_index = self.selected_rack;
+            let Some(rack) = self
+                .controller
+                .document()
+                .model
+                .racks
+                .get(rack_index)
+                .cloned()
+            else {
+                return;
+            };
+            let before = self.rack_ids();
+            let in_place = match self
+                .product_mut()
+                .and_then(|product| product.edit_slot_live(rack_index, &rack, edit))
+            {
+                Ok(in_place) => in_place,
+                Err(error) => {
+                    self.show_fault(error);
+                    return;
+                }
+            };
+            // Every rack is kept after an in-place edit; the graph and scenes pick up the new
+            // slot layout at the next block.
+            let rebuilt: Vec<RackId> = (!in_place).then(|| rack.id.clone()).into_iter().collect();
+            self.apply_rack_edit(&before, &rebuilt);
+            self.set_status(if in_place {
+                "Rack updated. Its other plug-ins kept playing."
+            } else {
+                "Rack reloaded. Other racks kept playing."
+            });
+            return;
+        }
+        let _ = edit;
         let empty = self
             .controller
             .document()
@@ -1211,35 +1842,60 @@ impl LiveRackApp {
             .get(self.selected_rack)
             .is_none_or(|rack| rack.slots.is_empty());
         if empty {
-            #[cfg(target_os = "macos")]
-            if self.audio.active_format().is_some() {
-                if let Err(error) = self.audio.stop() {
-                    self.show_fault(format!("Audio engine did not stop cleanly: {error}"));
-                    return;
+            self.with_audio_paused(|app| {
+                if let Ok(product) = app.product.as_mut() {
+                    product.unload_rack(app.selected_rack);
                 }
-                self.clear_live_handles();
-            }
-            if let Ok(product) = self.product.as_mut() {
-                product.unload_rack(self.selected_rack);
-            }
-            self.refresh_models();
-            self.set_status("Rack topology updated");
+                app.clamp_selection();
+                app.set_status("Rack updated");
+            });
         } else {
             self.load_selected_rack();
         }
     }
 
+    /// Reloads the selected rack's worker with its current topology.
     fn load_selected_rack(&mut self) {
         #[cfg(target_os = "macos")]
-        if self.audio.active_format().is_some() {
-            if let Err(error) = self.audio.stop() {
-                self.show_fault(format!(
-                    "Audio engine did not stop before the rack change: {error}"
-                ));
-                return;
-            }
-            self.clear_live_handles();
+        if self.product_control.is_some() {
+            let before = self.rack_ids();
+            let rebuilt: Vec<RackId> = before
+                .get(self.selected_rack)
+                .cloned()
+                .into_iter()
+                .collect();
+            self.apply_rack_edit(&before, &rebuilt);
+            self.set_status("Rack reloaded. Other racks kept playing.");
+            return;
         }
+        self.with_audio_paused(Self::load_selected_rack_stopped);
+    }
+
+    fn rack_ids(&self) -> Vec<RackId> {
+        self.controller
+            .document()
+            .model
+            .racks
+            .iter()
+            .map(|rack| rack.id.clone())
+            .collect()
+    }
+
+    fn load_selected_rack_stopped(&mut self) {
+        if let Err(error) = self.sync_worker_parameters() {
+            self.show_fault(format!("Could not preserve plug-in parameters: {error}"));
+            return;
+        }
+        let live_states = match self.product.as_mut() {
+            Ok(product) => match product.capture_rack_states(self.selected_rack) {
+                Ok(states) => states,
+                Err(error) => {
+                    self.show_fault(format!("Could not preserve plug-in state: {error}"));
+                    return;
+                }
+            },
+            Err(_) => Vec::new(),
+        };
         let Some(rack) = self
             .controller
             .document()
@@ -1248,205 +1904,125 @@ impl LiveRackApp {
             .get(self.selected_rack)
             .cloned()
         else {
-            self.show_fault("Select a rack before loading a worker".to_owned());
             return;
         };
-        let saved_states = match rack
-            .slots
-            .iter()
-            .map(|slot| {
-                self.controller.load_plugin_state(&slot.id.0).map(|state| {
-                    state.map(|(component, controller, metadata)| CapturedPluginState {
-                        instance_id: slot.id.0.clone(),
-                        component,
-                        controller,
-                        metadata,
-                    })
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()
-        {
+        let mut saved_states = match self.saved_states(&rack) {
             Ok(states) => states,
             Err(error) => {
-                self.show_fault(format!("Saved plug-in state is unreadable: {error}"));
+                self.show_fault(error);
                 return;
             }
         };
+        for (slot, state) in rack.slots.iter().zip(&mut saved_states) {
+            if let Some(live) = live_states.iter().find(|live| {
+                live.instance_id == slot.id.0
+                    && live.metadata.fingerprint == slot.plugin.fingerprint.digest
+            }) {
+                *state = Some(live.clone());
+            }
+        }
         let rack_index = self.selected_rack;
         match self
             .product_mut()
             .and_then(|product| product.load_rack(rack_index, &rack, &saved_states))
         {
-            Ok(()) => {
-                self.set_status("Rack worker ready · transactional topology installed");
-                if !rack.slots.is_empty() {
-                    self.select_parameters(0);
-                }
-            }
+            Ok(()) => self.set_status("Rack worker ready"),
             Err(error) => self.show_fault(format!("Rack load failed: {error}")),
         }
     }
 
-    fn slot_action(&mut self, action: SlotAction) {
-        let rack_index = self.selected_rack;
-        let result = match action {
-            SlotAction::Parameters(slot) => {
-                self.select_parameters(slot);
-                return;
-            }
-            SlotAction::Editor(slot) => self
-                .product_mut()
-                .and_then(|product| product.open_native_editor(rack_index, slot)),
-            SlotAction::Bypass(slot) => self
-                .controller
-                .document()
-                .model
-                .racks
-                .get(rack_index)
-                .and_then(|rack| rack.slots.get(slot))
-                .map(|slot| !slot.bypassed)
-                .ok_or_else(|| "slot is unavailable".to_owned())
-                .and_then(|enabled| {
-                    self.product_mut()
-                        .and_then(|product| product.set_slot_bypass(rack_index, slot, enabled))?;
-                    if let Some(model_slot) = self
-                        .controller
-                        .document_mut()
-                        .model
-                        .racks
-                        .get_mut(rack_index)
-                        .and_then(|rack| rack.slots.get_mut(slot))
-                    {
-                        model_slot.bypassed = enabled;
-                    }
-                    Ok(())
-                }),
-            SlotAction::MoveUp(slot) => {
-                self.move_slot(slot, slot.saturating_sub(1));
-                return;
-            }
-            SlotAction::MoveDown(slot) => {
-                self.move_slot(slot, slot.saturating_add(1));
-                return;
-            }
-            SlotAction::Remove(slot) => {
-                self.remove_slot(slot);
-                return;
-            }
-        };
-        match result {
-            Ok(()) if matches!(action, SlotAction::Editor(_)) => {
-                self.set_status("Native editor toggled in its worker-owned window");
-            }
-            Ok(()) => self.set_status("Slot bypass toggled"),
-            Err(error) => self.show_fault(if matches!(action, SlotAction::Editor(_)) {
-                format!("Native editor unavailable: {error}")
-            } else {
-                format!("Bypass failed: {error}")
-            }),
+    /// Opens a slot's native editor beside its column, or brings an open one to front.
+    fn open_editor(&mut self, ctx: &egui::Context, rack: usize, slot: usize) {
+        self.select_rack(rack);
+        self.selected_slot = Some(slot);
+        if self.slot_token(rack, slot) == StateToken::Missing {
+            let name = self.controller.document().model.racks[rack].slots[slot]
+                .plugin
+                .identity
+                .name
+                .clone();
+            self.show_fault(format!(
+                "{name} is not available on this machine. The slot keeps its saved state until you replace it."
+            ));
+            return;
+        }
+        let placement = editor_placement(ctx, rack, slot);
+        let running = self.online();
+        match self
+            .product_mut()
+            .and_then(|product| product.begin_native_editor(rack, slot, running, placement))
+        {
+            Ok(()) => self.set_status("Opening the plug-in editor"),
+            Err(error) => self.show_fault(error),
         }
     }
 
-    fn select_parameters(&mut self, slot: usize) {
+    fn slot_action(&mut self, ctx: &egui::Context, action: SlotAction) {
         let rack_index = self.selected_rack;
-        match self
-            .product
-            .as_mut()
-            .map_err(|error| error.clone())
-            .and_then(|product| product.generic_parameters(rack_index, slot))
-        {
-            Ok(mut parameters) => {
-                if let Some(model_slot) = self
+        match action {
+            SlotAction::Editor(slot) => self.open_editor(ctx, rack_index, slot),
+            SlotAction::Bypass(slot) => {
+                let result = self
                     .controller
                     .document()
                     .model
                     .racks
-                    .get(self.selected_rack)
+                    .get(rack_index)
                     .and_then(|rack| rack.slots.get(slot))
-                {
-                    for parameter in &mut parameters {
-                        if let Some(value) = model_slot
-                            .parameters
-                            .values
-                            .get(&ParameterId(parameter.id.to_string()))
+                    .map(|slot| !slot.bypassed)
+                    .ok_or_else(|| "slot is unavailable".to_owned())
+                    .and_then(|bypassed| {
+                        if let Ok(product) = self.product.as_mut()
+                            && product.worker_running(rack_index)
                         {
-                            parameter.normalized = f64::from(value.0);
+                            product.set_slot_bypass(rack_index, slot, bypassed)?;
                         }
-                    }
+                        if let Some(model_slot) = self
+                            .controller
+                            .document_mut()
+                            .model
+                            .racks
+                            .get_mut(rack_index)
+                            .and_then(|rack| rack.slots.get_mut(slot))
+                        {
+                            model_slot.bypassed = bypassed;
+                        }
+                        Ok(bypassed)
+                    });
+                match result {
+                    Ok(true) => self.set_status("Plug-in bypassed"),
+                    Ok(false) => self.set_status("Plug-in enabled"),
+                    Err(error) => self.show_fault(format!("Bypass failed: {error}")),
                 }
-                self.selected_slot = Some(slot);
-                self.parameters = parameters;
-                self.set_status("Generic parameter editor ready");
             }
-            Err(error) => self.show_fault(format!("Parameters unavailable: {error}")),
+            SlotAction::MoveUp(slot) => self.move_slot(slot, slot.saturating_sub(1)),
+            SlotAction::MoveDown(slot) => self.move_slot(slot, slot.saturating_add(1)),
+            SlotAction::Remove(slot) => self.remove_slot(slot),
         }
     }
 
-    fn write_parameter(&mut self, parameter_index: usize) {
-        let Some(slot) = self.selected_slot else {
-            return;
-        };
-        let Some(parameter) = self.parameters.get(parameter_index) else {
-            return;
-        };
-        let (id, normalized) = (parameter.id, parameter.normalized);
-        let rack_index = self.selected_rack;
-        match self
-            .product_mut()
-            .and_then(|product| product.write_parameter(rack_index, slot, id, normalized))
-        {
-            Ok(formatted) => {
-                if let Some(parameter) = self.parameters.get_mut(parameter_index) {
-                    parameter.formatted = formatted;
-                }
-                if let Some(model_slot) = self
-                    .controller
-                    .document_mut()
-                    .model
-                    .racks
-                    .get_mut(self.selected_rack)
-                    .and_then(|rack| rack.slots.get_mut(slot))
-                {
-                    #[allow(
-                        clippy::cast_possible_truncation,
-                        reason = "normalized parameter values are bounded to 0.0..=1.0"
-                    )]
-                    let value = NormalizedValue(normalized as f32);
-                    model_slot
-                        .parameters
-                        .values
-                        .insert(ParameterId(id.to_string()), value);
-                }
-                self.set_status("Parameter updated");
-            }
-            Err(error) => self.show_fault(format!("Parameter write failed: {error}")),
-        }
-    }
-
+    /// Arms MIDI Learn: the next CC maps to the parameter last touched in any plug-in editor.
     #[cfg(target_os = "macos")]
-    fn arm_midi_learn(&mut self, parameter_index: usize) {
-        let Some(slot) = self.selected_slot else {
-            return;
-        };
-        let Some(parameter) = self.parameters.get(parameter_index) else {
-            return;
-        };
-        if self.system.state != SystemStatusState::Online || self.midi_cc_monitor.is_none() {
+    fn arm_midi_learn(&mut self) {
+        if !self.online() || self.midi_cc_monitor.is_none() {
             self.show_fault(
                 "Start the engine with a MIDI input before arming MIDI Learn".to_owned(),
             );
             return;
         }
-        let target = MidiMappingTarget {
-            rack_index: self.selected_rack,
-            slot_index: slot,
-            parameter_id: parameter.id,
-            minimum: 0.0,
-            maximum: 1.0,
-        };
-        self.midi_learn.arm(target);
-        self.midi_learn_target = Some(target);
-        self.set_status("MIDI Learn armed · move one CC control");
+        self.midi_learn.cancel();
+        self.midi_learn_target = None;
+        self.midi_learn_armed = true;
+        self.set_status("MIDI Learn armed. Touch a control in a plug-in editor, then move one CC.");
+    }
+
+    fn cancel_midi_learn(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            self.midi_learn.cancel();
+            self.midi_learn_target = None;
+            self.midi_learn_armed = false;
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1488,18 +2064,17 @@ impl LiveRackApp {
         let Some(target) = self.midi_learn_target.take() else {
             return;
         };
-        let Some(rack) = self
-            .controller
-            .document()
-            .model
+        self.midi_learn_armed = false;
+        let model = &self.controller.document().model;
+        let Some((rack, slot)) = model
             .racks
             .get(target.rack_index)
+            .and_then(|rack| Some((rack, rack.slots.get(target.slot_index)?)))
         else {
             return;
         };
-        let Some(slot) = rack.slots.get(target.slot_index) else {
-            return;
-        };
+        let parameter_id = ParameterId(target.parameter_id.to_string());
+        let described = self.parameter_label(rack, slot, &parameter_id);
         let mapping = MidiMapping {
             id: MidiMappingId(format!("midi-{channel}-{controller}")),
             source: MidiController {
@@ -1509,7 +2084,7 @@ impl LiveRackApp {
             target: ParameterAddress {
                 rack_id: rack.id.clone(),
                 slot_id: slot.id.clone(),
-                parameter_id: ParameterId(target.parameter_id.to_string()),
+                parameter_id,
             },
             minimum: NormalizedValue::new(target.minimum).expect("learn range is normalized"),
             maximum: NormalizedValue::new(target.maximum).expect("learn range is normalized"),
@@ -1524,16 +2099,61 @@ impl LiveRackApp {
             .as_mut()
             .is_some_and(|publisher| publisher.publish(table).is_ok());
         if published {
-            self.set_status("MIDI Learn captured and published");
+            self.set_status(&format!("Mapped CC {controller} to {described}"));
         } else {
             self.show_fault(
-                "MIDI mapping queue is full; restart the engine to apply it".to_owned(),
+                "The MIDI mapping queue is full. Restart the engine to apply the mapping."
+                    .to_owned(),
             );
         }
     }
 
+    /// Removes one MIDI mapping and republishes the table.
+    fn remove_midi_mapping(&mut self, index: usize) {
+        let model = &mut self.controller.document_mut().model;
+        if index >= model.midi_mappings.len() {
+            return;
+        }
+        model.midi_mappings.remove(index);
+        #[cfg(target_os = "macos")]
+        {
+            let table = sp_audio_io_macos::product_midi_mappings(&self.controller.document().model);
+            self.midi_learn = MidiLearnController::from_table(table);
+            if let Some(publisher) = self.midi_mapping_publisher.as_mut()
+                && publisher.publish(table).is_err()
+            {
+                self.show_fault(
+                    "The MIDI mapping queue is full. Restart the engine to apply the change."
+                        .to_owned(),
+                );
+                return;
+            }
+        }
+        self.set_status("MIDI mapping removed");
+    }
+
+    /// "Rack, Plug-in, Parameter" for a parameter address.
+    fn parameter_label(&self, rack: &Rack, slot: &PluginSlot, parameter: &ParameterId) -> String {
+        let name = self
+            .product
+            .as_ref()
+            .ok()
+            .and_then(|product| {
+                product
+                    .scene_parameter_metadata(slot)
+                    .iter()
+                    .find(|metadata| metadata.id.to_string() == parameter.0)
+                    .map(|metadata| metadata.name.clone())
+            })
+            .unwrap_or_else(|| format!("Parameter {}", parameter.0));
+        format!("{}, {}, {name}", rack.name, slot.plugin.identity.name)
+    }
+
     #[cfg(target_os = "macos")]
     fn recall_scene(&mut self, scene_index: usize) {
+        if !self.online() {
+            return;
+        }
         let triggered = self
             .product_control
             .as_mut()
@@ -1543,7 +2163,17 @@ impl LiveRackApp {
             return;
         }
         self.apply_scene_snapshot(scene_index);
+        if let Some(scene) = self.controller.document().model.scenes.get(scene_index) {
+            let message = format!(
+                "Scene {} recalled over {} ms",
+                scene.name, scene.transition_ms
+            );
+            self.set_status(&message);
+        }
     }
+
+    #[cfg(not(target_os = "macos"))]
+    fn recall_scene(&mut self, _scene_index: usize) {}
 
     #[cfg(target_os = "macos")]
     fn apply_scene_snapshot(&mut self, scene_index: usize) {
@@ -1557,6 +2187,7 @@ impl LiveRackApp {
         else {
             return;
         };
+        self.fade_ms = scene.transition_ms;
         let model = &mut self.controller.document_mut().model;
         for gain in scene.gains {
             if let Some(rack) = model.racks.iter_mut().find(|rack| rack.id == gain.rack_id) {
@@ -1566,6 +2197,15 @@ impl LiveRackApp {
         for mute in scene.mutes {
             if let Some(rack) = model.racks.iter_mut().find(|rack| rack.id == mute.rack_id) {
                 rack.muted = mute.muted;
+            }
+        }
+        for bypass in scene.rack_bypasses {
+            if let Some(rack) = model
+                .racks
+                .iter_mut()
+                .find(|rack| rack.id == bypass.rack_id)
+            {
+                rack.bypassed = bypass.bypassed;
             }
         }
         for bypass in scene.bypasses {
@@ -1600,7 +2240,6 @@ impl LiveRackApp {
             }
         }
         self.current_scene = Some(scene_index);
-        self.set_status("Scene recalled · deterministic parameter ramp active");
     }
 
     #[cfg(target_os = "macos")]
@@ -1616,13 +2255,24 @@ impl LiveRackApp {
         }
     }
 
-    fn clear_quarantine(&mut self) {
+    fn retry_quarantined_plugin(&mut self, fingerprint: &sp_supervisor::BundleFingerprint) {
         match self
             .product_mut()
-            .and_then(ProductRuntime::clear_quarantine)
+            .and_then(|product| product.retry_quarantined_plugin(fingerprint))
         {
-            Ok(()) => self.set_status("Plug-in quarantine cleared"),
-            Err(error) => self.show_fault(format!("Could not clear quarantine: {error}")),
+            Ok(()) => self.set_status("Quarantine cleared. Load its rack or start the engine."),
+            Err(error) => self.show_fault(format!("Could not allow plug-in retry: {error}")),
+        }
+    }
+
+    /// Retries a rack whose worker restart failed, with fresh plug-in state.
+    fn retry_rack_restart(&mut self, rack: usize) {
+        match self
+            .product_mut()
+            .and_then(|product| product.retry_planned_maintenance(rack))
+        {
+            Ok(()) => self.set_status("Retrying the rack restart with fresh plug-in state"),
+            Err(error) => self.show_fault(format!("Rack restart retry failed: {error}")),
         }
     }
 
@@ -1640,7 +2290,9 @@ impl LiveRackApp {
         if let Some(message) = latest
             && (message.contains("fault")
                 || message.contains("fallback")
-                || message.contains("failed"))
+                || message.contains("failed")
+                || message.contains("remains dry")
+                || message.contains("mirror is incomplete"))
         {
             self.show_fault(message);
         }
@@ -1648,7 +2300,7 @@ impl LiveRackApp {
 
     #[cfg(target_os = "macos")]
     fn publish_latency_changes(&mut self) {
-        if self.system.state != SystemStatusState::Online {
+        if !self.online() {
             return;
         }
         for rack in 0..MAX_RACKS {
@@ -1673,876 +2325,244 @@ impl LiveRackApp {
         }
     }
 
-    fn handle_live_keyboard(&mut self, ctx: &egui::Context) {
-        if self.screen != Screen::LiveRack || ctx.wants_keyboard_input() {
+    /// Closes the topmost overlay in the brief's order: menus and popovers, modals, an editor
+    /// window, the fault line, then the setup page. Returns false when nothing was open.
+    fn close_topmost(&mut self) -> bool {
+        if self.overlay != Overlay::None {
+            if self.overlay == Overlay::Modal(Modal::Recovery) {
+                self.restore_recovery();
+            }
+            self.overlay = Overlay::None;
+        } else if self.scene_editor.is_some() {
+            self.scene_editor = None;
+        } else if self.close_open_editor() {
+        } else if self.fault.is_some() {
+            self.fault = None;
+        } else if self.screen == Screen::Setup {
+            self.screen = Screen::Show;
+        } else {
+            return false;
+        }
+        true
+    }
+
+    /// Closes one open native editor window. Returns false when none is open.
+    fn close_open_editor(&mut self) -> bool {
+        let racks = self.controller.document().model.racks.len();
+        let running = self.online();
+        let Ok(product) = self.product.as_mut() else {
+            return false;
+        };
+        let open = (0..racks).find_map(|rack| {
+            (0..MAX_SLOTS_PER_RACK)
+                .find(|&slot| product.editor_open(rack, slot))
+                .map(|slot| (rack, slot))
+        });
+        let Some((rack, slot)) = open else {
+            return false;
+        };
+        if let Err(error) = product.set_native_editor_open(rack, slot, false, running) {
+            self.show_fault(error);
+        }
+        true
+    }
+
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        use egui::{Key, Modifiers};
+        if self.rename.is_none()
+            && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            self.close_topmost();
             return;
         }
-        let (up, down, activate, toggle, escape, shift) = ctx.input(|input| {
-            (
-                input.key_pressed(egui::Key::ArrowUp),
-                input.key_pressed(egui::Key::ArrowDown),
-                input.key_pressed(egui::Key::Enter),
-                input.key_pressed(egui::Key::Space),
-                input.key_pressed(egui::Key::Escape),
-                input.modifiers.shift,
-            )
-        });
-        let slot_count = self
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        let command = |key| ctx.input_mut(|input| input.consume_key(Modifiers::COMMAND, key));
+        if command(Key::S) {
+            self.save_session();
+        }
+        if command(Key::Comma) {
+            self.screen = match self.screen {
+                Screen::Show => Screen::Setup,
+                Screen::Setup => Screen::Show,
+            };
+        }
+        if ctx.input_mut(|input| input.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::C))
+            && self.online()
+            && self.overlay == Overlay::None
+        {
+            self.capture_scene();
+        }
+        if command(Key::N) {
+            self.add_rack();
+        }
+        if let Some(key) = PAGE_KEYS.iter().position(|key| command(*key)) {
+            let pages = self.controller.document().model.pages.len();
+            match key {
+                0 => self.show_page(None),
+                page if page <= pages => self.show_page(Some(page - 1)),
+                _ => {}
+            }
+        }
+        let blocked = self.overlay != Overlay::None
+            || self.scene_editor.is_some()
+            || self.screen != Screen::Show
+            || ctx.memory(|memory| memory.focused().is_some());
+        if blocked {
+            return;
+        }
+        if command(Key::ArrowLeft) {
+            self.move_selected_rack(-1);
+        }
+        if command(Key::ArrowRight) {
+            self.move_selected_rack(1);
+        }
+        self.handle_show_keys(ctx);
+    }
+
+    /// Scene numbers and slot keys, which only act on the show screen with nothing open.
+    fn handle_show_keys(&mut self, ctx: &egui::Context) {
+        use egui::{Key, Modifiers};
+        const SCENE_KEYS: [Key; 8] = [
+            Key::Num1,
+            Key::Num2,
+            Key::Num3,
+            Key::Num4,
+            Key::Num5,
+            Key::Num6,
+            Key::Num7,
+            Key::Num8,
+        ];
+        let plain = |key| ctx.input_mut(|input| input.consume_key(Modifiers::NONE, key));
+        if let Some(scene) = SCENE_KEYS.iter().position(|key| plain(*key))
+            && scene < self.controller.document().model.scenes.len()
+        {
+            self.recall_scene(scene);
+        }
+        let slots = self
             .controller
             .document()
             .model
             .racks
             .get(self.selected_rack)
             .map_or(0, |rack| rack.slots.len());
-        if escape {
-            self.selected_slot = None;
-            self.parameters.clear();
-        } else if let Some(slot) = self.selected_slot {
-            if shift && up && slot > 0 {
-                self.move_slot(slot, slot - 1);
-            } else if shift && down && slot + 1 < slot_count {
-                self.move_slot(slot, slot + 1);
-            } else if up {
-                self.select_parameters(slot.saturating_sub(1));
-            } else if down && slot + 1 < slot_count {
-                self.select_parameters(slot + 1);
-            } else if activate {
-                self.select_parameters(slot);
-            } else if toggle {
-                self.slot_action(SlotAction::Bypass(slot));
+        if slots == 0 {
+            return;
+        }
+        if plain(Key::ArrowDown) {
+            self.selected_slot = Some(
+                self.selected_slot
+                    .map_or(0, |slot| (slot + 1).min(slots - 1)),
+            );
+        }
+        if plain(Key::ArrowUp) {
+            self.selected_slot = Some(self.selected_slot.map_or(0, |slot| slot.saturating_sub(1)));
+        }
+        if let Some(slot) = self.selected_slot {
+            if plain(Key::Enter) {
+                self.slot_action(ctx, SlotAction::Editor(slot));
             }
-        } else if down && !self.racks.is_empty() {
-            self.selected_rack = (self.selected_rack + 1).min(self.racks.len() - 1);
-        } else if up && !self.racks.is_empty() {
-            self.selected_rack = self.selected_rack.saturating_sub(1);
-        } else if activate && slot_count > 0 {
-            self.select_parameters(0);
+            if plain(Key::B) {
+                self.slot_action(ctx, SlotAction::Bypass(slot));
+            }
         }
     }
 
     fn product_mut(&mut self) -> Result<&mut ProductRuntime, String> {
         self.product.as_mut().map_err(|error| error.clone())
     }
+
+    #[cfg(target_os = "macos")]
+    fn update_meters(&mut self) {
+        let Some(telemetry) = &self.telemetry else {
+            return;
+        };
+        let now = Instant::now();
+        if self.motion == MotionPreference::Reduced
+            && self
+                .meters_updated_at
+                .is_some_and(|at| now.duration_since(at) < REDUCED_MOTION_METER_INTERVAL)
+        {
+            return;
+        }
+        self.meters_updated_at = Some(now);
+        let elapsed = self.meter_clock.elapsed();
+        for rack in 0..self.controller.document().model.racks.len() {
+            if let Some(input) = telemetry.take_rack_input_meter(rack) {
+                self.rack_input_meters[rack].update(input.peak, input.clipped, elapsed);
+            }
+            if let Some(output) = telemetry.take_rack_output_meter(rack) {
+                self.rack_output_meters[rack].update(output.peak, output.clipped, elapsed);
+            }
+        }
+        if now.duration_since(self.load_sampled_at) >= LOAD_SAMPLE_INTERVAL {
+            self.load_sampled_at = now;
+            let load = telemetry.take_callback_load().unwrap_or(0.0);
+            self.load_history.rotate_left(1);
+            self.load_history[LOAD_BARS - 1] = load;
+        }
+    }
+
+    /// The latest callback load, or `None` while offline.
+    fn callback_load(&self) -> Option<f32> {
+        self.online().then(|| self.load_history[LOAD_BARS - 1])
+    }
+
+    /// Total deadline misses across racks, or `None` while offline.
+    fn deadline_misses(&self) -> Option<u64> {
+        #[cfg(target_os = "macos")]
+        if let Some(telemetry) = &self.telemetry {
+            return Some(
+                (0..MAX_RACKS)
+                    .filter_map(|rack| telemetry.rack_diagnostics(rack))
+                    .map(|diagnostics| diagnostics.deadline_misses)
+                    .sum(),
+            );
+        }
+        None
+    }
+
+    fn session_name(&self) -> String {
+        self.controller.root().file_stem().map_or_else(
+            || "Untitled".to_owned(),
+            |stem| stem.to_string_lossy().into_owned(),
+        )
+    }
+
+    /// Ingests new editor pictures and, once, the pictures stored in the session.
+    fn poll_previews(&mut self, ctx: &egui::Context) {
+        if !self.previews.loaded() {
+            let ids: Vec<String> = self
+                .controller
+                .document()
+                .model
+                .racks
+                .iter()
+                .flat_map(|rack| rack.slots.iter().map(|slot| slot.id.0.clone()))
+                .collect();
+            for id in ids {
+                match self.controller.load_editor_preview(&id) {
+                    Ok(Some(file)) => self.previews.insert(ctx, file),
+                    Ok(None) => {}
+                    Err(error) => self.show_fault(format!("Editor picture unreadable: {error}")),
+                }
+            }
+            self.previews.mark_loaded();
+        }
+        let updates = self
+            .product
+            .as_mut()
+            .map_or_else(|_| Vec::new(), ProductRuntime::take_editor_previews);
+        for preview in updates {
+            self.previews.insert(ctx, preview);
+        }
+    }
 }
 
 impl eframe::App for LiveRackApp {
-    #[allow(clippy::too_many_lines)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Ok(product) = self.product.as_mut() {
-            product.poll();
-        }
-        self.poll_product_diagnostic();
-        #[cfg(target_os = "macos")]
-        self.publish_latency_changes();
-        #[cfg(target_os = "macos")]
-        self.poll_audio_event();
-        #[cfg(target_os = "macos")]
-        self.poll_midi_learn();
-        #[cfg(target_os = "macos")]
-        self.poll_realtime_scene();
-        if self.system.state == SystemStatusState::Online {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
-        }
-        self.refresh_models();
-        let palette = palette();
-        if ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::G)) {
-            self.screen = match self.screen {
-                Screen::LiveRack => Screen::ComponentGallery,
-                Screen::ComponentGallery => Screen::LiveRack,
-            };
-        }
-        if self.screen == Screen::ComponentGallery
-            && ctx.input(|input| input.key_pressed(egui::Key::Escape))
-        {
-            self.screen = Screen::LiveRack;
-        }
-        self.handle_live_keyboard(ctx);
-
-        egui::TopBottomPanel::top("system_bar")
-            .exact_height(dimension(Layout::SystemBarHeight))
-            .frame(
-                Frame::new()
-                    .fill(palette.panel)
-                    .inner_margin(margin(Spacing::Md, Spacing::Sm)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.label(
-                        RichText::new("SUPERPOSITION")
-                            .font(font_id(TypographyRole::Brand))
-                            .color(Palette::brand()),
-                    );
-                    ui.add_space(space(Spacing::Sm));
-                    let (transport_label, transport_kind) = match self.system.state {
-                        SystemStatusState::Online => ("Stop engine", ButtonKind::Secondary),
-                        SystemStatusState::Connecting | SystemStatusState::Offline => {
-                            ("Start engine", ButtonKind::Primary)
-                        }
-                    };
-                    if ui
-                        .add(
-                            themed_button(transport_label, transport_kind).min_size(Vec2::new(
-                                dimension(Layout::TransportButtonWidth),
-                                dimension(Layout::TransportButtonHeight),
-                            )),
-                        )
-                        .clicked()
-                    {
-                        self.toggle_engine();
-                    }
-                    let engine = match self.system.state {
-                        SystemStatusState::Online => ("ONLINE", Palette::status(Status::Success)),
-                        SystemStatusState::Connecting => {
-                            ("CONNECTING", Palette::status(Status::Info))
-                        }
-                        SystemStatusState::Offline => ("OFFLINE", Palette::status(Status::Warning)),
-                    };
-                    status_pill(ui, palette, engine.0, engine.1);
-                    ui.separator();
-                    ui.label(
-                        RichText::new(self.status_line.clone())
-                            .font(font_id(TypographyRole::Code))
-                            .color(palette.secondary),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(themed_button("Save", ButtonKind::Secondary))
-                            .clicked()
-                        {
-                            self.save_session();
-                        }
-                        if ui
-                            .add(themed_button("Autosave", ButtonKind::Quiet))
-                            .clicked()
-                        {
-                            self.autosave_session();
-                        }
-                        if ui
-                            .add(themed_button("Rescan plug-ins", ButtonKind::Quiet))
-                            .clicked()
-                        {
-                            self.scan_plugins();
-                        }
-                        let gallery_label = match self.screen {
-                            Screen::LiveRack => "Gallery",
-                            Screen::ComponentGallery => "Live rack",
-                        };
-                        if ui
-                            .add(themed_button(gallery_label, ButtonKind::Quiet))
-                            .clicked()
-                        {
-                            self.screen = match self.screen {
-                                Screen::LiveRack => Screen::ComponentGallery,
-                                Screen::ComponentGallery => Screen::LiveRack,
-                            };
-                        }
-                        ui.label(
-                            RichText::new(format!("MIDI · worker {}", self.worker.state))
-                                .font(font_id(TypographyRole::Code))
-                                .color(palette.secondary),
-                        );
-                    });
-                });
-            });
-
-        if self.screen == Screen::ComponentGallery {
-            draw_component_gallery(ctx, &mut self.gallery, palette);
-            return;
-        }
-
-        egui::TopBottomPanel::bottom("scene_dock")
-            .exact_height(dimension(Layout::SceneDockHeight))
-            .frame(
-                Frame::new()
-                    .fill(palette.panel)
-                    .inner_margin(margin(Spacing::Md, Spacing::Sm)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.label(
-                        RichText::new("SCENES")
-                            .font(font_id(TypographyRole::Meta))
-                            .color(palette.secondary),
-                    );
-                    ui.add_space(space(Spacing::Xs));
-                    let mut recalled_scene = None;
-                    for (scene_index, scene) in self.scenes.iter().enumerate() {
-                        let selected = matches!(scene.status, ScenePadStatus::Active);
-                        let fill = if selected {
-                            Palette::interaction(Interaction::Selected)
-                        } else {
-                            palette.raised
-                        };
-                        if ui
-                            .add_enabled(
-                                self.system.state == SystemStatusState::Online,
-                                egui::Button::new(
-                                    RichText::new(&scene.name)
-                                        .font(FontId::monospace(text_size(TypographyRole::Card)))
-                                        .color(if selected {
-                                            palette.on_accent
-                                        } else {
-                                            palette.primary
-                                        }),
-                                )
-                                .fill(fill)
-                                .stroke(stroke(
-                                    if selected {
-                                        BorderWidth::Thick
-                                    } else {
-                                        BorderWidth::Thin
-                                    },
-                                    if selected {
-                                        palette.on_accent
-                                    } else {
-                                        palette.steel
-                                    },
-                                ))
-                                .min_size(Vec2::new(
-                                    dimension(Layout::SceneControlWidth),
-                                    dimension(Layout::ScenePadHeight),
-                                ))
-                                .corner_radius(radius(Radius::Large)),
-                            )
-                            .clicked()
-                        {
-                            recalled_scene = Some(scene_index);
-                        }
-                    }
-                    if let Some(scene_index) = recalled_scene {
-                        #[cfg(target_os = "macos")]
-                        self.recall_scene(scene_index);
-                    }
-                    let scene_editable = self.system.state == SystemStatusState::Offline;
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let Some(scene_index) = self.current_scene
-                            && let Some(scene) = self
-                                .controller
-                                .document_mut()
-                                .model
-                                .scenes
-                                .get_mut(scene_index)
-                        {
-                            ui.add_enabled(
-                                scene_editable,
-                                egui::DragValue::new(&mut scene.transition_ms)
-                                    .range(0..=10_000)
-                                    .suffix(" ms"),
-                            )
-                            .on_hover_text("Scene transition time");
-                        }
-                        if ui
-                            .add_enabled(scene_editable, themed_button("Update", ButtonKind::Quiet))
-                            .clicked()
-                        {
-                            self.update_current_scene();
-                        }
-                        if ui
-                            .add_enabled(
-                                scene_editable,
-                                themed_button("Capture", ButtonKind::Secondary),
-                            )
-                            .clicked()
-                        {
-                            self.capture_scene();
-                        }
-                    });
-                });
-            });
-
-        egui::SidePanel::left("rack_navigator")
-            .exact_width(dimension(Layout::NavigatorWidth))
-            .frame(
-                Frame::new()
-                    .fill(palette.panel)
-                    .inner_margin(margin(Spacing::Md, Spacing::Md)),
-            )
-            .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("RACKS")
-                        .font(font_id(TypographyRole::Meta))
-                        .color(palette.secondary),
-                );
-                ui.add_space(space(Spacing::Sm));
-                let mut rack_action = None;
-                let rack_count = self.racks.len();
-                for (index, rack) in self.racks.iter().enumerate() {
-                    let selected = index == self.selected_rack;
-                    let fill = if selected {
-                        palette.raised
-                    } else {
-                        palette.panel
-                    };
-                    let status_color = match rack.status {
-                        RackCardStatus::Active => Palette::status(Status::Success),
-                        RackCardStatus::Bypassed | RackCardStatus::Empty => {
-                            Palette::status(Status::Warning)
-                        }
-                    };
-                    let card = Frame::new()
-                        .fill(fill)
-                        .stroke(stroke(BorderWidth::Thin, palette.steel))
-                        .corner_radius(radius(Radius::Large))
-                        .inner_margin(margin(Spacing::Md, Spacing::Md))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("●")
-                                        .color(status_color)
-                                        .size(text_size(TypographyRole::Meta)),
-                                );
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new(&rack.name)
-                                                .font(font_id(TypographyRole::Card))
-                                                .color(palette.primary),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .clicked()
-                                {
-                                    rack_action = Some(RackAction::Select(index));
-                                }
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            RichText::new(rack.status.label())
-                                                .font(font_id(TypographyRole::Caption))
-                                                .color(status_color),
-                                        );
-                                    },
-                                );
-                            });
-                            #[cfg(target_os = "macos")]
-                            if let Some(meter) = self
-                                .telemetry
-                                .as_ref()
-                                .and_then(|telemetry| telemetry.rack_meter(index))
-                            {
-                                ui.add_space(space(Spacing::Xs));
-                                dbfs_meter(
-                                    ui,
-                                    palette,
-                                    meter_fraction(meter.peak[0].max(meter.peak[1])),
-                                );
-                            }
-                            if selected {
-                                ui.add_space(space(Spacing::Xs));
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .add_enabled(
-                                            index > 0,
-                                            themed_button("↑", ButtonKind::Quiet),
-                                        )
-                                        .clicked()
-                                    {
-                                        rack_action = Some(RackAction::MoveUp);
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            index + 1 < rack_count,
-                                            themed_button("↓", ButtonKind::Quiet),
-                                        )
-                                        .clicked()
-                                    {
-                                        rack_action = Some(RackAction::MoveDown);
-                                    }
-                                    if ui.add(themed_button("Remove", ButtonKind::Quiet)).clicked()
-                                    {
-                                        rack_action = Some(RackAction::Remove);
-                                    }
-                                });
-                            }
-                        });
-                    if selected {
-                        let rect = card.response.rect;
-                        let bar = egui::Rect::from_min_max(
-                            rect.left_top(),
-                            egui::pos2(rect.left() + 3.0, rect.bottom()),
-                        );
-                        ui.painter()
-                            .rect_filled(bar, radius(Radius::Small), palette.focus);
-                    }
-                    ui.add_space(space(Spacing::Sm));
-                }
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    if ui
-                        .add_sized(
-                            Vec2::new(
-                                ui.available_width(),
-                                dimension(Layout::TransportButtonHeight),
-                            ),
-                            themed_button("Add rack", ButtonKind::Quiet),
-                        )
-                        .clicked()
-                    {
-                        rack_action = Some(RackAction::Add);
-                    }
-                });
-                match rack_action {
-                    Some(RackAction::Select(index)) => self.selected_rack = index,
-                    Some(RackAction::MoveUp) => self.move_selected_rack(-1),
-                    Some(RackAction::MoveDown) => self.move_selected_rack(1),
-                    Some(RackAction::Remove) => self.remove_selected_rack(),
-                    Some(RackAction::Add) => self.add_rack(),
-                    None => {}
-                }
-            });
-
-        if self.inspector_open {
-            egui::SidePanel::right("inspector")
-                .exact_width(dimension(Layout::InspectorWidth))
-                .frame(
-                    Frame::new()
-                        .fill(palette.panel)
-                        .inner_margin(margin(Spacing::Md, Spacing::Md)),
-                )
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("INSPECTOR")
-                                .font(font_id(TypographyRole::Meta))
-                                .color(palette.secondary),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add(themed_button("Collapse", ButtonKind::Quiet))
-                                .clicked()
-                            {
-                                self.inspector_open = false;
-                            }
-                        });
-                    });
-                    section_header(ui, palette, "AUDIO");
-                    #[cfg(target_os = "macos")]
-                    {
-                        let selected = self
-                            .selected_route
-                            .as_ref()
-                            .and_then(|route| {
-                                self.audio_devices
-                                    .iter()
-                                    .find(|device| device.info.id == route.output)
-                            })
-                            .map_or_else(
-                                || "No duplex device".to_owned(),
-                                |device| device.info.name.clone(),
-                            );
-                        let available_buffers = self
-                            .selected_route
-                            .as_ref()
-                            .and_then(|route| {
-                                self.audio_devices
-                                    .iter()
-                                    .find(|device| device.info.id == route.output)
-                            })
-                            .map_or_else(Vec::new, |device| device.supported_buffer_frames.clone());
-                        ui.add_enabled_ui(self.system.state == SystemStatusState::Offline, |ui| {
-                            egui::ComboBox::from_id_salt("audio_route")
-                                .selected_text(selected)
-                                .show_ui(ui, |ui| {
-                                    for device in &self.audio_devices {
-                                        let is_selected = self
-                                            .selected_route
-                                            .as_ref()
-                                            .is_some_and(|route| route.output == device.info.id);
-                                        if ui
-                                            .selectable_label(is_selected, &device.info.name)
-                                            .clicked()
-                                        {
-                                            self.buffer_frames = device.supported_buffer_frames[0];
-                                            self.selected_route = Some(AudioRouteConfig {
-                                                input: Some(device.info.id.clone()),
-                                                output: device.info.id.clone(),
-                                                format: AudioFormat::product_stereo(
-                                                    self.buffer_frames,
-                                                )
-                                                .expect(
-                                                    "discovery only returns product buffer sizes",
-                                                ),
-                                            });
-                                        }
-                                    }
-                                });
-                            if ui.button("Refresh devices").clicked() {
-                                self.refresh_audio_devices();
-                            }
-                            ui.horizontal(|ui| {
-                                ui.label("Buffer");
-                                for frames in available_buffers {
-                                    ui.radio_value(
-                                        &mut self.buffer_frames,
-                                        frames,
-                                        frames.to_string(),
-                                    );
-                                }
-                            });
-                        });
-                    }
-                    ui.label(
-                        RichText::new("Input 1–2 → rack workers → output 1–2")
-                            .color(palette.secondary),
-                    );
-                    section_header(ui, palette, "MIDI");
-                    #[cfg(target_os = "macos")]
-                    ui.add_enabled_ui(self.system.state == SystemStatusState::Offline, |ui| {
-                        let selected = self
-                            .selected_midi
-                            .as_ref()
-                            .and_then(|selected| {
-                                self.midi_ports.iter().find(|port| &port.id == selected)
-                            })
-                            .map_or_else(|| "No MIDI input".to_owned(), |port| port.name.clone());
-                        egui::ComboBox::from_id_salt("midi_input")
-                            .selected_text(selected)
-                            .show_ui(ui, |ui| {
-                                if ui
-                                    .selectable_label(self.selected_midi.is_none(), "No MIDI input")
-                                    .clicked()
-                                {
-                                    self.selected_midi = None;
-                                }
-                                for port in &self.midi_ports {
-                                    let is_selected = self.selected_midi.as_ref() == Some(&port.id);
-                                    if ui.selectable_label(is_selected, &port.name).clicked() {
-                                        self.selected_midi = Some(port.id.clone());
-                                    }
-                                }
-                            });
-                        if ui.button("Refresh MIDI").clicked() {
-                            self.refresh_midi_ports();
-                        }
-                    });
-                    ui.label(
-                        RichText::new("Armed mappings apply normalized values only.")
-                            .font(font_id(TypographyRole::Caption))
-                            .color(palette.secondary),
-                    );
-                    section_header(ui, palette, "PLUG-INS");
-                    let selected_plugin = self
-                        .selected_catalog_plugin
-                        .and_then(|index| self.catalog_plugins.get(index))
-                        .map_or("No supported plug-ins", |plugin| {
-                            plugin.descriptor.identity.name.as_str()
-                        });
-                    egui::ComboBox::from_id_salt("plugin_browser")
-                        .selected_text(selected_plugin)
-                        .show_ui(ui, |ui| {
-                            for (index, plugin) in self.catalog_plugins.iter().enumerate() {
-                                ui.selectable_value(
-                                    &mut self.selected_catalog_plugin,
-                                    Some(index),
-                                    format!(
-                                        "{} · {}",
-                                        plugin.descriptor.identity.name,
-                                        plugin.descriptor.identity.vendor
-                                    ),
-                                );
-                            }
-                        });
-                    if ui
-                        .add(themed_button(
-                            "Add plug-in to selected rack",
-                            ButtonKind::Secondary,
-                        ))
-                        .clicked()
-                    {
-                        self.add_selected_plugin();
-                    }
-                    if ui
-                        .add(themed_button(
-                            "Load / preload selected rack",
-                            ButtonKind::Quiet,
-                        ))
-                        .clicked()
-                    {
-                        self.load_selected_rack();
-                    }
-                    let catalog_count = self
-                        .product
-                        .as_ref()
-                        .map_or(0, ProductRuntime::catalog_count);
-                    let quarantined_count = self
-                        .product
-                        .as_ref()
-                        .map_or(0, ProductRuntime::quarantined_count);
-                    ui.label(
-                        RichText::new(format!(
-                            "Catalog · {catalog_count} bundles  ·  quarantine · {quarantined_count}"
-                        ))
-                        .font(font_id(TypographyRole::Code))
-                        .color(palette.secondary),
-                    );
-                    if ui
-                        .add(themed_button("Clear quarantine", ButtonKind::Quiet))
-                        .clicked()
-                    {
-                        self.clear_quarantine();
-                    }
-                    section_header(ui, palette, "DIAGNOSTICS");
-                    let worker_color = Palette::status(match self.worker.state {
-                        WorkerHealthState::Healthy => Status::Success,
-                        WorkerHealthState::Recovering => Status::Info,
-                        WorkerHealthState::Unavailable => Status::Warning,
-                    });
-                    status_pill(ui, palette, self.worker.state.label(), worker_color);
-                    if let Some(latency) = self
-                        .product
-                        .as_ref()
-                        .ok()
-                        .and_then(|product| product.rack_latency_samples(self.selected_rack))
-                    {
-                        ui.label(
-                            RichText::new(format!("Latency · {latency} samples"))
-                                .font(font_id(TypographyRole::Code))
-                                .color(palette.secondary),
-                        );
-                    }
-                    if self
-                        .product
-                        .as_ref()
-                        .is_ok_and(|product| product.rack_restart_requested(self.selected_rack))
-                    {
-                        ui.label(
-                            RichText::new("!  Plug-in requested a rack restart")
-                                .color(Palette::status(Status::Warning)),
-                        );
-                    }
-                    #[cfg(target_os = "macos")]
-                    if let Some(diagnostics) = self
-                        .telemetry
-                        .as_ref()
-                        .and_then(|telemetry| telemetry.rack_diagnostics(self.selected_rack))
-                    {
-                        ui.label(
-                            RichText::new(format!(
-                                "Blocks {} · misses {} · protocol {}",
-                                diagnostics.completed,
-                                diagnostics.deadline_misses,
-                                diagnostics.protocol_rejections
-                            ))
-                            .font(font_id(TypographyRole::Code))
-                            .color(palette.secondary),
-                        );
-                    }
-                    if let Some(message) = self
-                        .product
-                        .as_ref()
-                        .ok()
-                        .and_then(|product| product.diagnostics().last())
-                    {
-                        ui.label(
-                            RichText::new(message)
-                                .font(font_id(TypographyRole::Code))
-                                .color(palette.secondary),
-                        );
-                    }
-                });
-        }
-        let mut requested_rack_controls = None;
-        egui::CentralPanel::default()
-            .frame(
-                Frame::new()
-                    .fill(palette.canvas)
-                    .inner_margin(margin(Spacing::Lg, Spacing::Lg)),
-            )
-            .show(ctx, |ui| {
-                if matches!(self.fault.state, FaultBannerState::Visible) {
-                    Frame::new()
-                        .fill(palette.raised)
-                        .stroke(stroke(BorderWidth::Thick, palette.steel))
-                        .corner_radius(radius(Radius::Large))
-                        .inner_margin(margin(Spacing::Md, Spacing::Md))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("!  FAULT")
-                                        .font(font_id(TypographyRole::Card))
-                                        .color(Palette::status(Status::Error)),
-                                );
-                                ui.label(
-                                    RichText::new(&self.fault.message)
-                                        .color(Palette::status(Status::Error)),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .add(themed_button("Dismiss", ButtonKind::Quiet))
-                                            .clicked()
-                                        {
-                                            self.acknowledge_recovery();
-                                        }
-                                    },
-                                );
-                            });
-                        });
-                    ui.add_space(space(Spacing::Md));
-                }
-
-                let rack_name = self
-                    .racks
-                    .get(self.selected_rack)
-                    .map_or("Rack", |rack| rack.name.as_str());
-                ui.label(
-                    RichText::new(rack_name)
-                        .font(font_id(TypographyRole::Section))
-                        .color(palette.primary),
-                );
-                ui.label(
-                    RichText::new("Serial plug-in chain")
-                        .color(palette.secondary)
-                        .font(font_id(TypographyRole::Supporting)),
-                );
-                #[cfg(target_os = "macos")]
-                if let Some(rack) = self
-                    .controller
-                    .document()
-                    .model
-                    .racks
-                    .get(self.selected_rack)
-                {
-                    let mut gain_db = rack.gain_db.get();
-                    let mut muted = rack.muted;
-                    let mut bypassed = rack.bypassed;
-                    ui.horizontal(|ui| {
-                        let gain_changed = ui
-                            .add(
-                                egui::Slider::new(&mut gain_db, -120.0..=24.0)
-                                    .text("Gain dB")
-                                    .fixed_decimals(1),
-                            )
-                            .changed();
-                        let mute_changed = ui.checkbox(&mut muted, "Mute").changed();
-                        let bypass_changed = ui.checkbox(&mut bypassed, "Rack bypass").changed();
-                        if gain_changed || mute_changed || bypass_changed {
-                            requested_rack_controls = Some((gain_db, muted, bypassed));
-                        }
-                    });
-                }
-                ui.add_space(space(Spacing::Md));
-
-                let mut requested_slot_action = None;
-                for (slot_index, slot) in self.slots.iter().enumerate() {
-                    if slot_index > 0 {
-                        chain_connector(ui, palette);
-                    }
-                    requested_slot_action = draw_slot(
-                        ui,
-                        slot,
-                        slot_index,
-                        self.slots.len(),
-                        self.selected_slot == Some(slot_index),
-                        palette,
-                    )
-                    .or(requested_slot_action);
-                }
-                if let Some(action) = requested_slot_action {
-                    self.slot_action(action);
-                }
-
-                if let Some(slot) = self.selected_slot {
-                    ui.add_space(space(Spacing::Lg));
-                    ui.separator();
-                    ui.label(
-                        RichText::new(format!("Generic editor · Slot {}", slot + 1))
-                            .font(font_id(TypographyRole::Section))
-                            .color(palette.primary),
-                    );
-                    ui.add_space(space(Spacing::Sm));
-                    let mut changed = None;
-                    let mut learn_requested = None;
-                    egui::ScrollArea::vertical()
-                        .max_height(dimension(Layout::ParameterEditorHeight))
-                        .show(ui, |ui| {
-                            egui::Grid::new("generic_parameters")
-                                .num_columns(4)
-                                .spacing(Vec2::new(space(Spacing::Md), space(Spacing::Sm)))
-                                .show(ui, |ui| {
-                                    for (index, parameter) in self.parameters.iter_mut().enumerate()
-                                    {
-                                        ui.label(
-                                            RichText::new(&parameter.name)
-                                                .font(font_id(TypographyRole::Label))
-                                                .color(palette.primary),
-                                        );
-                                        let mut slider =
-                                            egui::Slider::new(&mut parameter.normalized, 0.0..=1.0)
-                                                .show_value(false);
-                                        if parameter.step_count > 0 {
-                                            slider = slider
-                                                .step_by(1.0 / f64::from(parameter.step_count));
-                                        }
-                                        let response = ui.add_enabled(!parameter.read_only, slider);
-                                        if response.double_clicked() && !parameter.read_only {
-                                            parameter.normalized = parameter.default_normalized;
-                                            changed = Some(index);
-                                        } else if response.changed() {
-                                            changed = Some(index);
-                                        }
-                                        let value = if parameter.unit.is_empty() {
-                                            parameter.formatted.clone()
-                                        } else {
-                                            format!("{} {}", parameter.formatted, parameter.unit)
-                                        };
-                                        ui.label(
-                                            RichText::new(value)
-                                                .font(font_id(TypographyRole::Code))
-                                                .color(palette.primary),
-                                        );
-                                        ui.horizontal(|ui| {
-                                            #[cfg(target_os = "macos")]
-                                            {
-                                                let meta = if parameter.read_only {
-                                                    Some("READ ONLY")
-                                                } else if parameter.discrete {
-                                                    Some("DISCRETE")
-                                                } else {
-                                                    None
-                                                };
-                                                if let Some(meta) = meta {
-                                                    ui.label(
-                                                        RichText::new(meta)
-                                                            .font(font_id(TypographyRole::Meta))
-                                                            .color(palette.secondary),
-                                                    );
-                                                }
-                                                if parameter.automatable
-                                                    && ui
-                                                        .add(themed_button(
-                                                            "Learn",
-                                                            ButtonKind::Quiet,
-                                                        ))
-                                                        .clicked()
-                                                {
-                                                    learn_requested = Some(index);
-                                                }
-                                            }
-                                        });
-                                        ui.end_row();
-                                    }
-                                });
-                        });
-                    if let Some(index) = changed {
-                        self.write_parameter(index);
-                    }
-                    #[cfg(target_os = "macos")]
-                    if let Some(index) = learn_requested {
-                        self.arm_midi_learn(index);
-                    }
-                }
-
-                if !self.inspector_open && ui.button("Show inspector").clicked() {
-                    self.inspector_open = true;
-                }
-            });
-        #[cfg(target_os = "macos")]
-        if let Some((gain_db, muted, bypassed)) = requested_rack_controls {
-            self.set_rack_controls(gain_db, muted, bypassed);
-        }
+        self.frame(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -2555,471 +2575,288 @@ impl eframe::App for LiveRackApp {
     }
 }
 
-/// Paints a short vertical connector between slot cards so the rack reads as a serial chain.
-fn chain_connector(ui: &mut Ui, palette: Palette) {
-    let desired = Vec2::new(ui.available_width(), space(Spacing::Md));
-    let (rect, _response) = ui.allocate_exact_size(desired, egui::Sense::hover());
-    if !ui.is_rect_visible(rect) {
-        return;
+impl LiveRackApp {
+    /// Runs one UI frame. Kept separate from `eframe::App` so tests can drive it headlessly.
+    fn frame(&mut self, ctx: &egui::Context) {
+        let online = self.online();
+        while let Some(result) = self
+            .product
+            .as_mut()
+            .ok()
+            .and_then(|product| product.poll_native_editor_result(online))
+        {
+            match result {
+                Ok(()) => self.set_status("Plug-in editor open"),
+                Err(error) => self.show_fault(error),
+            }
+        }
+        #[cfg(target_os = "macos")]
+        let stopped_dispatcher_racks = self.audio.service_stopped_recoveries();
+        if let Ok(product) = self.product.as_mut() {
+            #[cfg(target_os = "macos")]
+            product.poll_with_stopped_dispatcher(stopped_dispatcher_racks.as_ref());
+            #[cfg(not(target_os = "macos"))]
+            product.poll();
+            if product.native_editor_pending() || product.maintenance_pending() {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+        }
+        self.poll_parameter_mirror();
+        self.poll_product_diagnostic();
+        #[cfg(target_os = "macos")]
+        {
+            self.publish_latency_changes();
+            if let (Ok(product), Some(control)) =
+                (self.product.as_mut(), self.product_control.as_mut())
+            {
+                product.finish_live_topology(control);
+            }
+            self.poll_audio_event();
+            self.poll_reconnect(Instant::now());
+            if self.reconnect_at.is_some() {
+                ctx.request_repaint_after(RECONNECT_INTERVAL);
+            }
+            self.poll_midi_learn();
+            self.poll_realtime_scene();
+            self.update_meters();
+        }
+        self.poll_previews(ctx);
+        self.autosave_if_due(Instant::now());
+        ctx.request_repaint_after(
+            self.next_autosave_at
+                .saturating_duration_since(Instant::now()),
+        );
+        // Preview captions and "saved 4 s ago" age once a second; meters repaint at 30 Hz.
+        ctx.request_repaint_after(Duration::from_secs(1));
+        if self.online() {
+            ctx.request_repaint_after(match self.motion {
+                MotionPreference::Full => sp_ui::components::METER_REPAINT_INTERVAL,
+                MotionPreference::Reduced => REDUCED_MOTION_METER_INTERVAL,
+            });
+        }
+        self.clamp_selection();
+        self.handle_keys(ctx);
+        if ctx.input(|input| input.viewport().close_requested()) && self.online() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.overlay = Overlay::Modal(Modal::Quit);
+        }
+
+        self.draw_head(ctx);
+        if self.fault.is_some() {
+            self.draw_fault_line(ctx);
+        }
+        let model = &self.controller.document().model;
+        if self.screen == Screen::Show
+            && (!model.pages.is_empty() || model.racks.len() > PAGE_LINE_RACKS)
+        {
+            self.draw_page_line(ctx);
+        }
+        self.draw_foot(ctx);
+        match self.screen {
+            Screen::Show => self.draw_columns(ctx),
+            Screen::Setup => self.draw_setup(ctx),
+        }
+        self.draw_overlay(ctx);
+        self.draw_scene_editor(ctx);
     }
-    let x = rect.left() + space(Spacing::Xl);
-    ui.painter().line_segment(
-        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-        stroke(BorderWidth::Thick, palette.steel),
-    );
 }
 
-#[allow(clippy::too_many_lines)]
-fn draw_slot(
-    ui: &mut Ui,
-    slot: &PluginSlotState,
-    slot_index: usize,
-    slot_count: usize,
-    selected: bool,
-    palette: Palette,
-) -> Option<SlotAction> {
-    let mut action = None;
-    let accent = match slot.status {
-        PluginSlotStatus::Ready => Palette::status(Status::Success),
-        PluginSlotStatus::Loading => Palette::status(Status::Info),
-        PluginSlotStatus::Bypassed | PluginSlotStatus::Missing | PluginSlotStatus::Faulted => {
-            Palette::status(Status::Warning)
-        }
-    };
-    let card_stroke = if selected {
-        stroke(BorderWidth::Thick, palette.focus)
+/// Reads the system's reduced-motion preference once at startup.
+fn reduced_motion_preference() -> MotionPreference {
+    #[cfg(target_os = "macos")]
+    if objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion() {
+        return MotionPreference::Reduced;
+    }
+    MotionPreference::Full
+}
+
+/// Screen position for a new editor window: beside its column, stepping down per slot.
+fn editor_placement(
+    ctx: &egui::Context,
+    rack: usize,
+    slot: usize,
+) -> Option<crate::EditorPlacement> {
+    const LEFT: f32 = 520.0;
+    const TOP: f32 = 180.0;
+    const RACK_STEP: f32 = 40.0;
+    const SLOT_STEP: f32 = 20.0;
+    let window = ctx.input(|input| input.viewport().inner_rect)?;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "rack and slot indices are below 8"
+    )]
+    let (rack, slot) = (rack as f32, slot as f32);
+    Some(crate::EditorPlacement {
+        left: window.left() + LEFT + rack * RACK_STEP,
+        top: window.top() + TOP + slot * SLOT_STEP,
+    })
+}
+
+/// A new rack's default route: the next mono input and the next stereo output pair the
+/// device has, wrapping to the first ones.
+fn new_rack_route(position: usize, inputs: u16, outputs: u16) -> RackChannelRoute {
+    let position = u16::try_from(position).unwrap_or(0);
+    let input = if position < inputs { position } else { 0 };
+    let pair = if position * 2 + 1 < outputs {
+        position * 2
     } else {
-        stroke(BorderWidth::Thin, palette.steel)
+        0
     };
-    Frame::new()
-        .fill(palette.raised)
-        .stroke(card_stroke)
-        .corner_radius(radius(Radius::Medium))
-        .inner_margin(margin(Spacing::Md, Spacing::Sm))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                Frame::new()
-                    .fill(palette.panel)
-                    .corner_radius(radius(Radius::Small))
-                    .inner_margin(margin(Spacing::Sm, Spacing::Xs))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(format!("{:02}", slot_index + 1))
-                                .font(FontId::monospace(text_size(TypographyRole::Label)))
-                                .color(palette.secondary),
-                        );
-                    });
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(&slot.name)
-                                .font(font_id(TypographyRole::Card))
-                                .color(palette.primary),
-                        )
-                        .frame(false),
-                    )
-                    .on_hover_text("Open generic parameter editor")
-                    .clicked()
-                {
-                    action = Some(SlotAction::Parameters(slot_index));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(slot_index > 0, themed_button("↑", ButtonKind::Quiet))
-                        .clicked()
-                    {
-                        action = Some(SlotAction::MoveUp(slot_index));
-                    }
-                    if ui
-                        .add_enabled(
-                            slot_index + 1 < slot_count,
-                            themed_button("↓", ButtonKind::Quiet),
-                        )
-                        .clicked()
-                    {
-                        action = Some(SlotAction::MoveDown(slot_index));
-                    }
-                    if ui.add(themed_button("Remove", ButtonKind::Quiet)).clicked() {
-                        action = Some(SlotAction::Remove(slot_index));
-                    }
-                    if ui
-                        .add_enabled(
-                            !matches!(slot.status, PluginSlotStatus::Missing),
-                            themed_button("Editor", ButtonKind::Quiet),
-                        )
-                        .clicked()
-                    {
-                        action = Some(SlotAction::Editor(slot_index));
-                    }
-                    if ui
-                        .add_enabled(
-                            !matches!(slot.status, PluginSlotStatus::Missing),
-                            themed_button(
-                                if matches!(slot.status, PluginSlotStatus::Bypassed) {
-                                    "Enable"
-                                } else {
-                                    "Bypass"
-                                },
-                                ButtonKind::Quiet,
-                            ),
-                        )
-                        .clicked()
-                    {
-                        action = Some(SlotAction::Bypass(slot_index));
-                    }
-                    status_pill(ui, palette, slot.status.label(), accent);
-                });
-            });
-            if matches!(slot.status, PluginSlotStatus::Missing) {
-                ui.label(
-                    RichText::new("Placeholder — plug-in unavailable; opaque state not restored.")
-                        .color(palette.secondary)
-                        .font(font_id(TypographyRole::BodySmall)),
-                );
-            }
-        });
-    action
+    let channel = |value: u16| u8::try_from(value).unwrap_or(0);
+    RackChannelRoute {
+        input: Some(PhysicalChannels::Mono {
+            channel: channel(input),
+        }),
+        output: PhysicalChannels::Stereo {
+            left: channel(pair),
+            right: channel(pair + 1),
+        },
+    }
+}
+
+/// A rack's hardware route, falling back to its source and endpoint layouts.
+fn rack_route(model: &sp_model::Session, rack: &sp_model::Rack) -> RackChannelRoute {
+    model.rack_routes.get(&rack.id).copied().unwrap_or_else(|| {
+        let layout =
+            |found: Option<&ChannelLayout>| found.unwrap_or(&ChannelLayout::Stereo).clone();
+        let input = layout(
+            model
+                .sources
+                .iter()
+                .find(|source| source.id == rack.source_id)
+                .map(|source| &source.layout),
+        );
+        let output = layout(
+            model
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.id == rack.endpoint_id)
+                .map(|endpoint| &endpoint.layout),
+        );
+        RackChannelRoute {
+            input: Some(default_physical_channels(&input)),
+            output: default_physical_channels(&output),
+        }
+    })
+}
+
+/// `1`, `1-2`, or `1/4` for a channel selection.
+fn channels_label(channels: PhysicalChannels) -> String {
+    match channels {
+        PhysicalChannels::Mono { channel } => format!("{}", u16::from(channel) + 1),
+        PhysicalChannels::Stereo { left, right } if u16::from(right) == u16::from(left) + 1 => {
+            format!("{}-{}", u16::from(left) + 1, u16::from(right) + 1)
+        }
+        PhysicalChannels::Stereo { left, right } => {
+            format!("{}/{}", u16::from(left) + 1, u16::from(right) + 1)
+        }
+    }
+}
+
+/// `-3.0 dB`, `+2.0 dB`, or `-inf dB`.
+fn gain_label(gain_db: f32) -> String {
+    if gain_db <= show::GAIN_MIN_DB {
+        "-inf dB".to_owned()
+    } else if gain_db > 0.0 {
+        format!("+{gain_db:.1} dB")
+    } else {
+        format!("{gain_db:.1} dB")
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn duplex_devices() -> Result<Vec<MacOsAudioDevice>, Box<dyn std::error::Error + Send + Sync>> {
+fn route_devices() -> Result<Vec<MacOsAudioDevice>, Box<dyn std::error::Error + Send + Sync>> {
     Ok(enumerate_devices()?
         .into_iter()
         .filter(|device| {
-            device.capabilities.max_input_channels >= 2
-                && device.capabilities.max_output_channels >= 2
+            (device.capabilities.max_input_channels > 0
+                || device.capabilities.max_output_channels > 0)
                 && !device.supported_buffer_frames.is_empty()
         })
         .collect())
 }
 
-#[allow(clippy::too_many_lines)]
-fn draw_component_gallery(ctx: &egui::Context, gallery: &mut ComponentGallery, palette: Palette) {
-    egui::CentralPanel::default()
-        .frame(
-            Frame::new()
-                .fill(palette.canvas)
-                .inner_margin(margin(Spacing::Lg, Spacing::Lg)),
-        )
-        .show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("COMPONENT GALLERY")
-                                .size(text_size(TypographyRole::BodySmall))
-                                .color(Palette::brand())
-                                .strong(),
-                        );
-                        ui.label(
-                            RichText::new("Operational states, under pressure")
-                                .size(text_size(TypographyRole::Gallery))
-                                .color(palette.primary)
-                                .strong(),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        ui.label(
-                            RichText::new("⌘G TOGGLE  ·  ESC CLOSE")
-                                .monospace()
-                                .color(palette.secondary),
-                        );
-                    });
-                });
-                ui.add_space(space(Spacing::Lg));
-
-                gallery_section(ui, "SYSTEM + WORKERS", palette, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for system in &gallery.systems {
-                            let color = match system.state {
-                                SystemStatusState::Online => Palette::status(Status::Success),
-                                SystemStatusState::Connecting => Palette::status(Status::Info),
-                                SystemStatusState::Offline => Palette::status(Status::Warning),
-                            };
-                            status_pill(ui, palette, system.state.label(), color);
-                        }
-                        ui.separator();
-                        for worker in &gallery.workers {
-                            let color = match worker.state {
-                                sp_ui::components::WorkerHealthState::Healthy => {
-                                    Palette::status(Status::Success)
-                                }
-                                sp_ui::components::WorkerHealthState::Recovering => {
-                                    Palette::status(Status::Info)
-                                }
-                                sp_ui::components::WorkerHealthState::Unavailable => {
-                                    Palette::status(Status::Warning)
-                                }
-                            };
-                            status_pill(ui, palette, worker.state.label(), color);
-                        }
-                    });
-                });
-
-                gallery_section(ui, "RACK CARDS", palette, |ui| {
-                    ui.columns(3, |columns| {
-                        for (column, rack) in columns.iter_mut().zip(&gallery.racks) {
-                            let accent = match rack.status {
-                                RackCardStatus::Active => Palette::status(Status::Success),
-                                RackCardStatus::Bypassed => Palette::status(Status::Info),
-                                RackCardStatus::Empty => Palette::status(Status::Warning),
-                            };
-                            Frame::new()
-                                .fill(palette.raised)
-                                .stroke(stroke(BorderWidth::Thin, palette.steel))
-                                .corner_radius(radius(Radius::Large))
-                                .inner_margin(margin(Spacing::Md, Spacing::Md))
-                                .show(column, |ui| {
-                                    ui.label(
-                                        RichText::new(&rack.name)
-                                            .size(text_size(TypographyRole::Card))
-                                            .color(palette.primary)
-                                            .strong(),
-                                    );
-                                    ui.label(
-                                        RichText::new(format!("●  {}", rack.status.label()))
-                                            .color(accent),
-                                    );
-                                    ui.add_space(space(Spacing::Xs));
-                                    dbfs_meter(
-                                        ui,
-                                        palette,
-                                        match rack.status {
-                                            RackCardStatus::Active => 0.72,
-                                            RackCardStatus::Bypassed => 0.18,
-                                            RackCardStatus::Empty => 0.0,
-                                        },
-                                    );
-                                });
-                        }
-                    });
-                });
-
-                gallery_section(ui, "PLUG-IN SLOTS", palette, |ui| {
-                    for (slot_index, slot) in gallery.slots.iter().enumerate() {
-                        if slot_index > 0 {
-                            chain_connector(ui, palette);
-                        }
-                        let _ = draw_slot(
-                            ui,
-                            slot,
-                            slot_index,
-                            gallery.slots.len(),
-                            slot_index == 0,
-                            palette,
-                        );
-                    }
-                });
-
-                gallery_section(ui, "METERS + CONTROLS", palette, |ui| {
-                    ui.columns(2, |columns| {
-                        columns[0].label(
-                            RichText::new("StereoMeter")
-                                .color(palette.secondary)
-                                .monospace(),
-                        );
-                        for meter in &gallery.meters {
-                            let fraction = ((meter.peak_dbfs + 60.0) / 60.0).clamp(0.0, 1.0);
-                            columns[0].label(
-                                RichText::new(format!(
-                                    "{:>6.1} dBFS · {}",
-                                    meter.peak_dbfs, meter.state
-                                ))
-                                .monospace()
-                                .color(palette.primary),
-                            );
-                            dbfs_meter(&mut columns[0], palette, fraction);
-                            columns[0].add_space(space(Spacing::Xs));
-                        }
-
-                        columns[1].label(
-                            RichText::new("GainFader")
-                                .color(palette.secondary)
-                                .monospace(),
-                        );
-                        columns[1].horizontal(|ui| {
-                            let response = ui.add(
-                                egui::Slider::new(&mut gallery.gain.gain_db, -120.0..=24.0)
-                                    .suffix(" dB")
-                                    .fixed_decimals(1),
-                            );
-                            if response.double_clicked() {
-                                gallery.gain.reset();
-                            }
-                            ui.checkbox(&mut gallery.gain.muted, "Mute");
-                        });
-                        columns[1].label(
-                            RichText::new("Double-click resets · Shift for fine adjustment")
-                                .size(text_size(TypographyRole::Caption))
-                                .color(palette.secondary),
-                        );
-                    });
-                });
-
-                gallery_section(ui, "PARAMETERS", palette, |ui| {
-                    for parameter in &mut gallery.parameters {
-                        draw_parameter(ui, parameter, palette);
-                    }
-                });
-
-                gallery_section(ui, "SEGMENTS + SCENES", palette, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(&gallery.segmented.label).color(palette.secondary));
-                        for (index, option) in gallery.segmented.options.clone().iter().enumerate()
-                        {
-                            if ui
-                                .selectable_label(
-                                    gallery.segmented.selected == index,
-                                    RichText::new(option).color(
-                                        if gallery.segmented.selected == index {
-                                            palette.on_accent
-                                        } else {
-                                            palette.primary
-                                        },
-                                    ),
-                                )
-                                .clicked()
-                            {
-                                gallery.segmented.select(index);
-                            }
-                        }
-                        ui.separator();
-                        for scene in &mut gallery.scenes {
-                            let selected = scene.status == ScenePadStatus::Active;
-                            if ui
-                                .add(
-                                    egui::Button::new(RichText::new(&scene.name).color(
-                                        if selected {
-                                            palette.on_accent
-                                        } else {
-                                            palette.primary
-                                        },
-                                    ))
-                                    .selected(selected)
-                                    .min_size(Vec2::new(
-                                        dimension(Layout::GallerySceneControlWidth),
-                                        dimension(Layout::GallerySceneControlHeight),
-                                    )),
-                                )
-                                .clicked()
-                            {
-                                scene.activate();
-                            }
-                        }
-                    });
-                });
-
-                gallery_section(ui, "FAULT BANNER", palette, |ui| {
-                    Frame::new()
-                        .fill(palette.raised)
-                        .stroke(stroke(BorderWidth::Thick, palette.steel))
-                        .corner_radius(radius(Radius::Large))
-                        .inner_margin(margin(Spacing::Md, Spacing::Md))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("!  FAULT")
-                                        .color(Palette::status(Status::Error))
-                                        .strong(),
-                                );
-                                ui.label(
-                                    RichText::new(&gallery.fault.message)
-                                        .color(Palette::status(Status::Error)),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        let _ = ui.button("Restart rack");
-                                        let _ = ui.button("Keep dry bypass");
-                                    },
-                                );
-                            });
-                        });
-                });
-            });
-        });
+#[cfg(target_os = "macos")]
+fn saved_route(
+    devices: &[MacOsAudioDevice],
+    settings: &AudioDeviceSettings,
+) -> Option<AudioRouteConfig> {
+    let output = resolve_audio_device(devices, &settings.output, false)?;
+    let input = match &settings.input {
+        Some(selection) => Some(resolve_audio_device(devices, selection, true)?),
+        None => None,
+    };
+    Some(AudioRouteConfig {
+        input,
+        output,
+        format: AudioFormat::product_stereo(settings.buffer_frames)
+            .expect("saved product buffer size"),
+    })
 }
 
-fn gallery_section(ui: &mut Ui, title: &str, palette: Palette, contents: impl FnOnce(&mut Ui)) {
-    ui.label(
-        RichText::new(title)
-            .size(text_size(TypographyRole::Caption))
-            .monospace()
-            .color(Palette::brand()),
-    );
-    ui.add_space(space(Spacing::Sm));
-    Frame::new()
-        .fill(palette.panel)
-        .stroke(stroke(BorderWidth::Thin, palette.steel))
-        .corner_radius(radius(Radius::Large))
-        .inner_margin(margin(Spacing::Md, Spacing::Md))
-        .show(ui, contents);
-    ui.add_space(space(Spacing::Lg));
-}
-
-fn draw_parameter(ui: &mut Ui, parameter: &mut ParameterControlState, palette: Palette) {
-    ui.horizontal(|ui| {
-        ui.set_min_width(dimension(Layout::ParameterRowMinWidth));
-        ui.label(
-            RichText::new(&parameter.name)
-                .color(palette.primary)
-                .strong(),
-        );
-        let response = ui.add_enabled(
-            !parameter.read_only,
-            egui::Slider::new(&mut parameter.normalized, 0.0..=1.0).show_value(false),
-        );
-        if response.double_clicked() {
-            parameter.reset();
-        }
-        ui.label(
-            RichText::new(&parameter.formatted)
-                .monospace()
-                .color(palette.secondary),
-        );
-        let kind = if parameter.read_only {
-            "READ ONLY"
-        } else if parameter.discrete {
-            "DISCRETE"
+#[cfg(target_os = "macos")]
+fn resolve_audio_device(
+    devices: &[MacOsAudioDevice],
+    saved: &AudioDeviceSelection,
+    input: bool,
+) -> Option<sp_audio_io::AudioDeviceId> {
+    let candidates = devices.iter().filter(|device| {
+        if input {
+            device.capabilities.max_input_channels > 0
         } else {
-            "CONTINUOUS"
-        };
-        ui.label(
-            RichText::new(kind)
-                .size(text_size(TypographyRole::Meta))
-                .color(Palette::status(Status::Info)),
-        );
+            device.capabilities.max_output_channels > 0
+        }
     });
+    if let Some(device) = candidates
+        .clone()
+        .find(|device| device.info.id.as_str() == saved.id && device.info.name == saved.name)
+    {
+        return Some(device.info.id.clone());
+    }
+    let mut matching_names = candidates.filter(|device| device.info.name == saved.name);
+    let device = matching_names.next()?;
+    matching_names
+        .next()
+        .is_none()
+        .then(|| device.info.id.clone())
+}
+
+#[cfg(target_os = "macos")]
+fn available_buffer_frames(devices: &[MacOsAudioDevice], route: &AudioRouteConfig) -> Vec<u32> {
+    let Some(output) = devices.iter().find(|device| device.info.id == route.output) else {
+        return Vec::new();
+    };
+    output
+        .supported_buffer_frames
+        .iter()
+        .copied()
+        .filter(|frames| {
+            route.input.as_ref().is_none_or(|input| {
+                devices
+                    .iter()
+                    .find(|device| &device.info.id == input)
+                    .is_some_and(|device| device.supported_buffer_frames.contains(frames))
+            })
+        })
+        .collect()
+}
+
+fn default_physical_channels(layout: &ChannelLayout) -> PhysicalChannels {
+    if layout.channels() == 1 {
+        PhysicalChannels::Mono { channel: 0 }
+    } else {
+        PhysicalChannels::Stereo { left: 0, right: 1 }
+    }
+}
+
+fn physical_channels_fit(route: PhysicalChannels, channel_count: u16) -> bool {
+    match route {
+        PhysicalChannels::Mono { channel } => u16::from(channel) < channel_count,
+        PhysicalChannels::Stereo { left, right } => {
+            left != right && u16::from(left) < channel_count && u16::from(right) < channel_count
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use sp_session::SessionController;
-
-    use super::LiveRackApp;
-
-    #[test]
-    fn added_rack_creates_a_valid_serial_route() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let process = std::process::id();
-        let root = std::env::temp_dir().join(format!("superposition-ui-{process}-{unique}"));
-        let mut app = LiveRackApp::new(
-            SessionController::empty(&root),
-            false,
-            Err("helpers unavailable in UI test".to_owned()),
-        );
-
-        app.add_rack();
-
-        let session = &app.controller.document().model;
-        assert_eq!(session.racks.len(), 1);
-        assert_eq!(session.racks[0].source_id.0, "input-1");
-        assert_eq!(session.racks[0].endpoint_id.0, "output-1");
-        session.validate().expect("rack route is valid");
-    }
-}
+mod tests;

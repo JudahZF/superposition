@@ -7,13 +7,14 @@
 mod realtime;
 
 pub use realtime::{
-    MAX_MIX_FRAMES, MAX_TRANSITION_FRAMES, MIN_TRANSITION_FRAMES, MIX_CHANNELS, MixError,
-    RackAudioSource, RackMeterSnapshot, RackSettings, RealtimeRackMixer, WET_RECOVERY_BLOCKS,
+    MAX_DRY_DELAY_FRAMES, MAX_MIX_FRAMES, MAX_TRANSITION_FRAMES, MIN_TRANSITION_FRAMES,
+    MIX_CHANNELS, MixError, MixerLane, RackAudioSource, RackMeterSnapshot, RackSettings,
+    RealtimeRackMixer, SidechainSources, WET_RECOVERY_BLOCKS, lane_permutation, permute_lanes,
 };
 
 use sp_model::{
-    ChannelLayout, EntityKind, MAX_RACKS, MAX_SLOTS_PER_RACK, PluginSlot, RackTopology, Session,
-    ValidationError,
+    ChannelLayout, EntityKind, MAX_RACKS, MAX_SLOTS_PER_RACK, PhysicalChannels, PluginSlot,
+    RackChannelRoute, RackTopology, Session, SlotSidechain, ValidationError,
 };
 use sp_protocol::{BlockTicket, ProtocolError};
 use thiserror::Error;
@@ -31,7 +32,7 @@ impl PreparedGraph {
     /// # Errors
     ///
     /// Returns [`PrepareError`] when the model violates a capacity or validation
-    /// contract, or requests a topology or channel layout Phase 0 does not support.
+    /// contract, or requests a topology or channel layout the engine does not support.
     pub fn compile(session: &Session) -> Result<Self, PrepareError> {
         if session.racks.len() > MAX_RACKS {
             return Err(PrepareError::TooManyRacks {
@@ -83,13 +84,22 @@ impl PreparedGraph {
                         id: rack.endpoint_id.0.clone(),
                     })
                 })?;
-            let source_layout = PreparedChannelLayout::try_from(&session.sources[source].layout)
+            let route = session.rack_routes.get(&rack.id).copied();
+            let input_channels = route.map_or_else(
+                || Some(default_physical_channels(&session.sources[source].layout)),
+                |route| route.input,
+            );
+            let output_channels = route.map_or_else(
+                || default_physical_channels(&session.endpoints[endpoint].layout),
+                |route| route.output,
+            );
+            let input_layout =
+                input_channels.map_or_else(|| output_channels.layout(), PhysicalChannels::layout);
+            let source_layout = PreparedChannelLayout::try_from(&input_layout)
                 .map_err(|layout| PrepareError::UnsupportedChannelLayout { rack_index, layout })?;
-            let endpoint_layout = PreparedChannelLayout::try_from(
-                &session.endpoints[endpoint].layout,
-            )
-            .map_err(|layout| PrepareError::UnsupportedChannelLayout { rack_index, layout })?;
-            if source_layout != endpoint_layout {
+            let endpoint_layout = PreparedChannelLayout::try_from(&output_channels.layout())
+                .map_err(|layout| PrepareError::UnsupportedChannelLayout { rack_index, layout })?;
+            if route.is_none() && source_layout != endpoint_layout {
                 return Err(PrepareError::MismatchedChannelLayouts {
                     rack_index,
                     source_layout,
@@ -98,14 +108,22 @@ impl PreparedGraph {
             }
             let conversion = PreparedChannelConversion::between(source_layout, endpoint_layout);
 
-            graph.racks[rack_index] = Some(PreparedRack::new(
+            let mut prepared = PreparedRack::new(
                 source,
                 endpoint,
                 source_layout,
                 endpoint_layout,
                 conversion,
+                RackChannelRoute {
+                    input: input_channels,
+                    output: output_channels,
+                },
                 &rack.slots,
-            ));
+            );
+            for (slot, model_slot) in prepared.slots.iter_mut().flatten().zip(&rack.slots) {
+                slot.sidechain = prepare_sidechain(session, model_slot)?;
+            }
+            graph.racks[rack_index] = Some(prepared);
             graph.rack_count += 1;
         }
         Ok(graph)
@@ -133,6 +151,48 @@ impl PreparedGraph {
     }
 }
 
+/// Resolves a slot's sidechain source to fixed callback data. Rack sources become graph positions.
+fn prepare_sidechain(
+    session: &Session,
+    slot: &PluginSlot,
+) -> Result<Option<PreparedSidechain>, PrepareError> {
+    match &slot.sidechain {
+        None => Ok(None),
+        Some(SlotSidechain::PhysicalInput(PhysicalChannels::Stereo { left, right })) => {
+            Ok(Some(PreparedSidechain::PhysicalInput {
+                left: *left,
+                right: *right,
+            }))
+        }
+        Some(SlotSidechain::PhysicalInput(PhysicalChannels::Mono { .. })) => Err(
+            PrepareError::InvalidSession(ValidationError::MonoSidechain {
+                slot_id: slot.id.0.clone(),
+            }),
+        ),
+        Some(SlotSidechain::RackOutput(source)) => session
+            .racks
+            .iter()
+            .position(|rack| rack.id == *source)
+            .map(|index| Some(PreparedSidechain::RackOutput(index)))
+            .ok_or_else(|| {
+                PrepareError::InvalidSession(ValidationError::UnknownReference {
+                    owner: EntityKind::PluginSlot,
+                    reference: EntityKind::Rack,
+                    id: source.0.clone(),
+                })
+            }),
+    }
+}
+
+fn default_physical_channels(layout: &ChannelLayout) -> PhysicalChannels {
+    match layout {
+        ChannelLayout::Mono => PhysicalChannels::Mono { channel: 0 },
+        ChannelLayout::Stereo | ChannelLayout::Discrete { .. } => {
+            PhysicalChannels::Stereo { left: 0, right: 1 }
+        }
+    }
+}
+
 impl Default for PreparedGraph {
     fn default() -> Self {
         Self::empty()
@@ -147,6 +207,8 @@ pub struct PreparedRack {
     source_layout: PreparedChannelLayout,
     endpoint_layout: PreparedChannelLayout,
     conversion: PreparedChannelConversion,
+    input_channels: Option<PhysicalChannels>,
+    output_channels: PhysicalChannels,
     fallback: PreparedFallbackRoute,
     slots: [Option<PreparedSlot>; MAX_SLOTS_PER_RACK],
     slot_count: usize,
@@ -159,6 +221,7 @@ impl PreparedRack {
         source_layout: PreparedChannelLayout,
         endpoint_layout: PreparedChannelLayout,
         conversion: PreparedChannelConversion,
+        route: RackChannelRoute,
         model_slots: &[PluginSlot],
     ) -> Self {
         let mut slots = [None; MAX_SLOTS_PER_RACK];
@@ -166,6 +229,7 @@ impl PreparedRack {
         while index < model_slots.len() {
             slots[index] = Some(PreparedSlot {
                 parameter_count: model_slots[index].parameters.values.len(),
+                sidechain: None,
             });
             index += 1;
         }
@@ -175,6 +239,8 @@ impl PreparedRack {
             source_layout,
             endpoint_layout,
             conversion,
+            input_channels: route.input,
+            output_channels: route.output,
             fallback: PreparedFallbackRoute::DelayedDry,
             slots,
             slot_count: model_slots.len(),
@@ -217,6 +283,18 @@ impl PreparedRack {
         self.conversion
     }
 
+    /// Returns selected zero-based input channels, or `None` for an instrument rack.
+    #[must_use]
+    pub const fn input_channels(&self) -> Option<PhysicalChannels> {
+        self.input_channels
+    }
+
+    /// Returns selected zero-based output channels.
+    #[must_use]
+    pub const fn output_channels(&self) -> PhysicalChannels {
+        self.output_channels
+    }
+
     /// Returns the deterministic fallback route for this rack.
     #[must_use]
     pub const fn fallback(&self) -> PreparedFallbackRoute {
@@ -240,6 +318,7 @@ impl PreparedRack {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PreparedSlot {
     parameter_count: usize,
+    sidechain: Option<PreparedSidechain>,
 }
 
 impl PreparedSlot {
@@ -248,9 +327,29 @@ impl PreparedSlot {
     pub const fn parameter_count(&self) -> usize {
         self.parameter_count
     }
+
+    /// Returns where this slot's sidechain audio comes from, if it has one.
+    #[must_use]
+    pub const fn sidechain(&self) -> Option<PreparedSidechain> {
+        self.sidechain
+    }
 }
 
-/// Channel layouts that the Phase 0 graph executor can activate.
+/// A slot's sidechain source, resolved when the graph is prepared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedSidechain {
+    /// Two zero-based channels of the callback input, copied in the same block.
+    PhysicalInput {
+        /// Left input channel.
+        left: u8,
+        /// Right input channel.
+        right: u8,
+    },
+    /// The post-fader output of the rack at this graph position, one block late.
+    RackOutput(usize),
+}
+
+/// Channel layouts that the graph executor can activate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreparedChannelLayout {
     /// One discrete channel.
@@ -350,6 +449,14 @@ impl GraphArena {
         &self.active.graph
     }
 
+    /// Returns the graph that the next block will use.
+    #[must_use]
+    pub fn prepared_graph(&self) -> &PreparedGraph {
+        self.staged
+            .as_ref()
+            .map_or(&self.active.graph, |staged| &staged.graph)
+    }
+
     /// Returns the current active graph generation.
     #[must_use]
     pub const fn active_generation(&self) -> GraphGeneration {
@@ -368,7 +475,7 @@ pub struct GraphSwapRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GraphGeneration(pub u64);
 
-/// An exclusive Phase 0 audio-thread view of a graph arena.
+/// An exclusive audio-thread view of a graph arena.
 ///
 /// This type does not execute DSP. It provides the allocation-free,
 /// lock-free block-boundary graph activation contract that a later audio layer
@@ -683,7 +790,7 @@ const fn fallback_reason(error: ProtocolError) -> FallbackReason {
     }
 }
 
-/// Reasons a model cannot become a Phase 0 prepared graph.
+/// Reasons a model cannot become a prepared graph.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum PrepareError {
     /// The session exceeded the graph's rack bound.
@@ -860,9 +967,15 @@ pub enum RackBlockAction {
 }
 
 /// Allocation-free planner that maps gate outcomes onto block actions.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct LiveBlockPlanner {
     dry_delay_available: [bool; MAX_RACKS],
+}
+
+impl Default for LiveBlockPlanner {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LiveBlockPlanner {

@@ -3,21 +3,23 @@
 //! This crate intentionally describes only persistent session state. It has no
 //! plug-in SDK, host, audio-device, or operating-system types.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// The only session schema version supported during Phase 0.
+/// The only supported session schema version.
 pub const CURRENT_SESSION_VERSION: u32 = 1;
 /// Maximum number of racks in one session.
-pub const MAX_RACKS: usize = 8;
+pub const MAX_RACKS: usize = 64;
 /// Maximum number of plug-in slots in a rack.
 pub const MAX_SLOTS_PER_RACK: usize = 8;
-/// Maximum number of declared sources in one session.
-pub const MAX_SOURCES: usize = 16;
-/// Maximum number of declared endpoints in one session.
-pub const MAX_ENDPOINTS: usize = 16;
+/// Maximum number of declared sources in one session: one per rack.
+pub const MAX_SOURCES: usize = MAX_RACKS;
+/// Maximum number of declared endpoints in one session: one per rack.
+pub const MAX_ENDPOINTS: usize = MAX_RACKS;
+/// Maximum number of rack pages in one session.
+pub const MAX_PAGES: usize = 16;
 /// Maximum number of saved scenes in one session.
 pub const MAX_SCENES: usize = 128;
 /// Maximum number of MIDI mappings in one session.
@@ -41,12 +43,34 @@ pub struct Session {
     /// Ordered processing racks.
     #[serde(default)]
     pub racks: Vec<Rack>,
+    /// Physical channel assignments for racks that override the legacy first channels.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rack_routes: BTreeMap<RackId, RackChannelRoute>,
+    /// Selected input/output devices and preferred callback block size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_settings: Option<AudioDeviceSettings>,
     /// Saved state recalls.
     #[serde(default)]
     pub scenes: Vec<Scene>,
     /// MIDI-to-parameter controls.
     #[serde(default)]
     pub midi_mappings: Vec<MidiMapping>,
+    /// Named views of racks on the show screen.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pages: Vec<RackPage>,
+}
+
+/// A named view of racks. A page only chooses which racks the show screen shows; it never
+/// changes routing or audio. A rack may be on several pages.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RackPage {
+    /// Stable page identifier.
+    pub id: PageId,
+    /// Display name.
+    pub name: String,
+    /// Racks on this page; the show screen lists them in session rack order.
+    #[serde(default)]
+    pub racks: Vec<RackId>,
 }
 
 impl Default for Session {
@@ -56,8 +80,11 @@ impl Default for Session {
             sources: Vec::new(),
             endpoints: Vec::new(),
             racks: Vec::new(),
+            rack_routes: BTreeMap::new(),
+            audio_settings: None,
             scenes: Vec::new(),
             midi_mappings: Vec::new(),
+            pages: Vec::new(),
         }
     }
 }
@@ -76,22 +103,7 @@ impl Session {
     /// Returns [`ValidationError`] when a field, capacity, or cross-reference
     /// is invalid.
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.version != CURRENT_SESSION_VERSION {
-            return Err(ValidationError::UnsupportedVersion {
-                found: self.version,
-                supported: CURRENT_SESSION_VERSION,
-            });
-        }
-
-        validate_capacity(Collection::Sources, self.sources.len(), MAX_SOURCES)?;
-        validate_capacity(Collection::Endpoints, self.endpoints.len(), MAX_ENDPOINTS)?;
-        validate_capacity(Collection::Racks, self.racks.len(), MAX_RACKS)?;
-        validate_capacity(Collection::Scenes, self.scenes.len(), MAX_SCENES)?;
-        validate_capacity(
-            Collection::MidiMappings,
-            self.midi_mappings.len(),
-            MAX_MIDI_MAPPINGS,
-        )?;
+        self.validate_header()?;
 
         let mut source_ids = BTreeSet::new();
         for source in &self.sources {
@@ -157,6 +169,9 @@ impl Session {
             }
         }
 
+        self.validate_rack_routes(&rack_ids)?;
+        self.validate_sidechains(&rack_ids)?;
+
         let mut scene_ids = BTreeSet::new();
         for scene in &self.scenes {
             validate_identifier(&scene.id.0, EntityKind::Scene)?;
@@ -181,6 +196,97 @@ impl Session {
             mapping.validate(&rack_ids, &self.racks)?;
         }
 
+        self.validate_pages(&rack_ids)
+    }
+
+    /// Checks page IDs, names, and the racks each page lists.
+    fn validate_pages(&self, rack_ids: &BTreeSet<&RackId>) -> Result<(), ValidationError> {
+        let mut page_ids = BTreeSet::new();
+        for page in &self.pages {
+            validate_identifier(&page.id.0, EntityKind::Page)?;
+            validate_identifier(&page.name, EntityKind::Page)?;
+            if !page_ids.insert(&page.id) {
+                return Err(ValidationError::DuplicateId {
+                    kind: EntityKind::Page,
+                    id: page.id.0.clone(),
+                });
+            }
+            let mut page_racks = BTreeSet::new();
+            for rack in &page.racks {
+                validate_rack_reference(rack, rack_ids, EntityKind::Page)?;
+                if !page_racks.insert(rack) {
+                    return Err(ValidationError::DuplicateId {
+                        kind: EntityKind::Rack,
+                        id: rack.0.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_header(&self) -> Result<(), ValidationError> {
+        if self.version != CURRENT_SESSION_VERSION {
+            return Err(ValidationError::UnsupportedVersion {
+                found: self.version,
+                supported: CURRENT_SESSION_VERSION,
+            });
+        }
+        validate_capacity(Collection::Sources, self.sources.len(), MAX_SOURCES)?;
+        validate_capacity(Collection::Endpoints, self.endpoints.len(), MAX_ENDPOINTS)?;
+        validate_capacity(Collection::Racks, self.racks.len(), MAX_RACKS)?;
+        validate_capacity(Collection::Racks, self.rack_routes.len(), MAX_RACKS)?;
+        if let Some(settings) = &self.audio_settings {
+            settings.validate()?;
+        }
+        validate_capacity(Collection::Scenes, self.scenes.len(), MAX_SCENES)?;
+        validate_capacity(Collection::Pages, self.pages.len(), MAX_PAGES)?;
+        validate_capacity(
+            Collection::MidiMappings,
+            self.midi_mappings.len(),
+            MAX_MIDI_MAPPINGS,
+        )
+    }
+
+    fn validate_rack_routes(&self, rack_ids: &BTreeSet<&RackId>) -> Result<(), ValidationError> {
+        for (rack_id, route) in &self.rack_routes {
+            if !rack_ids.contains(rack_id) {
+                return Err(ValidationError::UnknownRackRoute {
+                    rack_id: rack_id.0.clone(),
+                });
+            }
+            route.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Rack sources are read one block late, so any rack other than the slot's own may feed it
+    /// and no cycle check is needed.
+    fn validate_sidechains(&self, rack_ids: &BTreeSet<&RackId>) -> Result<(), ValidationError> {
+        for rack in &self.racks {
+            for slot in &rack.slots {
+                match &slot.sidechain {
+                    None => {}
+                    Some(SlotSidechain::PhysicalInput(channels)) => {
+                        if !matches!(channels, PhysicalChannels::Stereo { .. }) {
+                            return Err(ValidationError::MonoSidechain {
+                                slot_id: slot.id.0.clone(),
+                            });
+                        }
+                        channels.validate()?;
+                    }
+                    Some(SlotSidechain::RackOutput(source)) => {
+                        if *source == rack.id {
+                            return Err(ValidationError::SelfSidechain {
+                                slot_id: slot.id.0.clone(),
+                            });
+                        }
+                        validate_rack_reference(source, rack_ids, EntityKind::PluginSlot)?;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -227,7 +333,7 @@ impl Session {
                     reference: EntityKind::Endpoint,
                     id: rack.endpoint_id.0.clone(),
                 })?;
-            if source.layout != endpoint.layout {
+            if !self.rack_routes.contains_key(&rack.id) && source.layout != endpoint.layout {
                 return Err(ValidationError::MismatchedRackLayouts {
                     rack_id: rack.id.0.clone(),
                     source_layout: source.layout.clone(),
@@ -237,6 +343,119 @@ impl Session {
         }
 
         Ok(())
+    }
+}
+
+/// Persisted audio device selection. Device discovery resolves this before opening a stream.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioDeviceSettings {
+    /// Optional input device; `None` permits instrument-only sessions.
+    pub input: Option<AudioDeviceSelection>,
+    /// Required output device.
+    pub output: AudioDeviceSelection,
+    /// Requested callback block size.
+    pub buffer_frames: u32,
+}
+
+impl AudioDeviceSettings {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if let Some(input) = &self.input {
+            input.validate()?;
+        }
+        self.output.validate()?;
+        if !matches!(self.buffer_frames, 32 | 64 | 128 | 256) {
+            return Err(ValidationError::InvalidAudioBufferFrames {
+                frames: self.buffer_frames,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Persisted identity and display name of a selected physical audio device.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioDeviceSelection {
+    /// Backend-reported identifier.
+    pub id: String,
+    /// Backend-reported display name, used to guard against reused identifiers.
+    pub name: String,
+}
+
+impl AudioDeviceSelection {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.id.trim().is_empty() || self.name.trim().is_empty() {
+            return Err(ValidationError::InvalidAudioDeviceSelection);
+        }
+        Ok(())
+    }
+}
+
+/// One rack's selected hardware input and output channels. Indices are zero-based.
+/// The hardware backend validates these indices against the selected devices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RackChannelRoute {
+    /// `None` supplies silence to an instrument rack.
+    pub input: Option<PhysicalChannels>,
+    /// Output destination channels.
+    pub output: PhysicalChannels,
+}
+
+impl RackChannelRoute {
+    fn validate(self) -> Result<(), ValidationError> {
+        if let Some(input) = self.input {
+            input.validate()?;
+        }
+        self.output.validate()
+    }
+}
+
+/// One mono channel or an ordered stereo pair on a physical device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PhysicalChannels {
+    /// One zero-based hardware channel.
+    Mono {
+        /// Zero-based device channel index.
+        channel: u8,
+    },
+    /// Two distinct, zero-based hardware channels in left/right order.
+    Stereo {
+        /// Zero-based left channel index.
+        left: u8,
+        /// Zero-based right channel index.
+        right: u8,
+    },
+}
+
+impl PhysicalChannels {
+    /// Returns the selected processing width.
+    #[must_use]
+    pub const fn layout(self) -> ChannelLayout {
+        match self {
+            Self::Mono { .. } => ChannelLayout::Mono,
+            Self::Stereo { .. } => ChannelLayout::Stereo,
+        }
+    }
+
+    fn validate(self) -> Result<(), ValidationError> {
+        let check = |channel| {
+            if channel < 64 {
+                Ok(())
+            } else {
+                Err(ValidationError::InvalidPhysicalChannel { channel })
+            }
+        };
+        match self {
+            Self::Mono { channel } => check(channel),
+            Self::Stereo { left, right } => {
+                check(left)?;
+                check(right)?;
+                if left == right {
+                    return Err(ValidationError::DuplicatePhysicalStereoChannel { channel: left });
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -314,6 +533,19 @@ pub struct PluginSlot {
     /// Persisted normalized parameter values.
     #[serde(default)]
     pub parameters: NormalizedParameters,
+    /// Audio fed to the plug-in's stereo aux input, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidechain: Option<SlotSidechain>,
+}
+
+/// Where a plug-in's sidechain (aux input) audio comes from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotSidechain {
+    /// A stereo pair of the input device, same block.
+    PhysicalInput(PhysicalChannels),
+    /// Another rack's post-fader output, one block late.
+    RackOutput(RackId),
 }
 
 /// Identity and fingerprint for a plug-in instance.
@@ -362,7 +594,10 @@ pub struct PluginFingerprint {
 }
 
 /// Schema version for helper-produced plug-in scan metadata.
-pub const PLUGIN_SCAN_METADATA_VERSION: u32 = 1;
+///
+/// Version 3 adds [`PluginClassScanMetadata::sidechain_capable`]; older cached scans are
+/// rescanned rather than read as incapable.
+pub const PLUGIN_SCAN_METADATA_VERSION: u32 = 3;
 
 /// CPU architecture advertised by a scanned plug-in bundle.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -455,6 +690,9 @@ pub struct PluginClassScanMetadata {
     /// Whether the class advertises a native editor view.
     #[serde(default)]
     pub editor_supported: bool,
+    /// Whether the first auxiliary audio input is stereo, so it can carry a sidechain.
+    #[serde(default)]
+    pub sidechain_capable: bool,
 }
 
 /// Input and output buses supported by one plug-in class.
@@ -498,6 +736,9 @@ pub struct PluginParameterMetadata {
     pub unit: String,
     /// Plug-in default normalized value when available.
     pub default_normalized: Option<f64>,
+    /// Number of discrete steps; zero denotes a continuous parameter.
+    #[serde(default)]
+    pub step_count: u32,
     /// Whether the host may expose automation/MIDI binding for this parameter.
     #[serde(default)]
     pub automatable: bool,
@@ -577,6 +818,9 @@ pub struct Scene {
     /// Rack mute overrides.
     #[serde(default)]
     pub mutes: Vec<RackMute>,
+    /// Rack bypass overrides.
+    #[serde(default)]
+    pub rack_bypasses: Vec<RackBypass>,
     /// Plug-in bypass overrides.
     #[serde(default)]
     pub bypasses: Vec<SlotBypass>,
@@ -596,6 +840,11 @@ impl Scene {
     ) -> Result<(), ValidationError> {
         validate_capacity(Collection::SceneGains, self.gains.len(), MAX_RACKS)?;
         validate_capacity(Collection::SceneMutes, self.mutes.len(), MAX_RACKS)?;
+        validate_capacity(
+            Collection::SceneRackBypasses,
+            self.rack_bypasses.len(),
+            MAX_RACKS,
+        )?;
         validate_capacity(
             Collection::SceneBypasses,
             self.bypasses.len(),
@@ -626,6 +875,17 @@ impl Scene {
                 return Err(ValidationError::DuplicateTarget {
                     kind: EntityKind::Scene,
                     id: mute.rack_id.0.clone(),
+                });
+            }
+        }
+
+        let mut rack_bypass_targets = BTreeSet::new();
+        for bypass in &self.rack_bypasses {
+            validate_rack_reference(&bypass.rack_id, rack_ids, EntityKind::Scene)?;
+            if !rack_bypass_targets.insert(&bypass.rack_id) {
+                return Err(ValidationError::DuplicateTarget {
+                    kind: EntityKind::Scene,
+                    id: bypass.rack_id.0.clone(),
                 });
             }
         }
@@ -728,6 +988,15 @@ pub struct RackMute {
     pub muted: bool,
 }
 
+/// A rack bypass override.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RackBypass {
+    /// Rack receiving the override.
+    pub rack_id: RackId,
+    /// Whether the rack is bypassed.
+    pub bypassed: bool,
+}
+
 /// A plug-in bypass override.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotBypass {
@@ -750,6 +1019,20 @@ pub struct SceneParameterValue {
     pub parameter_id: ParameterId,
     /// Target normalized value.
     pub value: NormalizedValue,
+    /// Whether recall interpolates or applies this parameter immediately.
+    #[serde(default)]
+    pub transition: SceneParameterTransition,
+}
+
+/// Recall behavior for one scene parameter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SceneParameterTransition {
+    /// Interpolate over the scene's transition time.
+    #[default]
+    Ramp,
+    /// Apply the target value at the scene boundary.
+    Step,
 }
 
 /// A MIDI control mapping.
@@ -900,6 +1183,10 @@ pub struct ParameterId(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SceneId(pub String);
+/// Stable rack page identifier.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PageId(pub String);
 /// Stable MIDI mapping identifier.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -920,12 +1207,16 @@ pub enum Collection {
     Scenes,
     /// MIDI mappings collection.
     MidiMappings,
+    /// Rack pages collection.
+    Pages,
     /// Per-plug-in parameter collection.
     PluginParameters,
     /// Scene gains collection.
     SceneGains,
     /// Scene mutes collection.
     SceneMutes,
+    /// Scene rack bypasses collection.
+    SceneRackBypasses,
     /// Scene bypasses collection.
     SceneBypasses,
     /// Scene parameter values collection.
@@ -953,11 +1244,52 @@ pub enum EntityKind {
     Scene,
     /// MIDI mapping entity.
     MidiMapping,
+    /// Rack page entity.
+    Page,
 }
 
 /// Reasons a session model cannot be accepted.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum ValidationError {
+    /// An audio device selection lacks a usable identifier or name.
+    #[error("audio device selection requires a nonempty id and name")]
+    InvalidAudioDeviceSelection,
+    /// The requested callback block size is not supported by the product mixer.
+    #[error("audio buffer size {frames} must be 32, 64, 128, or 256 frames")]
+    InvalidAudioBufferFrames {
+        /// Requested block size.
+        frames: u32,
+    },
+    /// A physical route names a rack that is not present in the session.
+    #[error("physical route references unknown rack {rack_id:?}")]
+    UnknownRackRoute {
+        /// Missing rack identifier.
+        rack_id: String,
+    },
+    /// A physical channel exceeds the supported 64-channel device limit.
+    #[error("physical channel index {channel} must be between 0 and 63")]
+    InvalidPhysicalChannel {
+        /// Zero-based channel index.
+        channel: u8,
+    },
+    /// A stereo pair cannot address the same physical channel twice.
+    #[error("stereo route repeats physical channel index {channel}")]
+    DuplicatePhysicalStereoChannel {
+        /// Repeated zero-based channel index.
+        channel: u8,
+    },
+    /// A physical sidechain must use a stereo input pair.
+    #[error("plug-in slot {slot_id:?} sidechain must use a stereo input pair")]
+    MonoSidechain {
+        /// Slot whose sidechain is mono.
+        slot_id: String,
+    },
+    /// A rack-output sidechain cannot come from the slot's own rack.
+    #[error("plug-in slot {slot_id:?} cannot take a sidechain from its own rack")]
+    SelfSidechain {
+        /// Slot whose sidechain names its own rack.
+        slot_id: String,
+    },
     /// A session uses an unsupported schema version.
     #[error("unsupported session version {found}; only version {supported} is supported")]
     UnsupportedVersion {
@@ -1145,4 +1477,100 @@ fn validate_parameter_reference(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod physical_route_tests {
+    use super::*;
+
+    fn session() -> Session {
+        let mut session = Session::new();
+        session.sources.push(Source {
+            id: SourceId("source".into()),
+            name: "Source".into(),
+            layout: ChannelLayout::Stereo,
+        });
+        session.endpoints.push(Endpoint {
+            id: EndpointId("endpoint".into()),
+            name: "Endpoint".into(),
+            layout: ChannelLayout::Stereo,
+        });
+        session.racks.push(Rack {
+            id: RackId("rack".into()),
+            name: "Rack".into(),
+            source_id: SourceId("source".into()),
+            endpoint_id: EndpointId("endpoint".into()),
+            topology: RackTopology::Serial,
+            gain_db: GainDb::default(),
+            muted: false,
+            bypassed: false,
+            slots: Vec::new(),
+        });
+        session
+    }
+
+    #[test]
+    fn old_session_json_defaults_to_legacy_route() {
+        let session = session();
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(!json.contains("rack_routes"));
+        let decoded: Session = serde_json::from_str(&json).unwrap();
+        assert!(decoded.rack_routes.is_empty());
+        decoded.validate_for_alpha().unwrap();
+    }
+
+    #[test]
+    fn route_round_trips_and_rejects_invalid_channels() {
+        let mut session = session();
+        let rack_id = RackId("rack".into());
+        session.rack_routes.insert(
+            rack_id.clone(),
+            RackChannelRoute {
+                input: None,
+                output: PhysicalChannels::Stereo {
+                    left: 62,
+                    right: 63,
+                },
+            },
+        );
+        session.validate_for_alpha().unwrap();
+        let encoded = serde_json::to_string(&session).unwrap();
+        assert_eq!(serde_json::from_str::<Session>(&encoded).unwrap(), session);
+
+        session.rack_routes.get_mut(&rack_id).unwrap().output = PhysicalChannels::Stereo {
+            left: 63,
+            right: 64,
+        };
+        assert_eq!(
+            session.validate(),
+            Err(ValidationError::InvalidPhysicalChannel { channel: 64 })
+        );
+        session.rack_routes.get_mut(&rack_id).unwrap().output =
+            PhysicalChannels::Stereo { left: 7, right: 7 };
+        assert_eq!(
+            session.validate(),
+            Err(ValidationError::DuplicatePhysicalStereoChannel { channel: 7 })
+        );
+    }
+
+    #[test]
+    fn audio_settings_round_trip_and_validate_buffer_size() {
+        let mut session = session();
+        session.audio_settings = Some(AudioDeviceSettings {
+            input: None,
+            output: AudioDeviceSelection {
+                id: "42".into(),
+                name: "Studio Output".into(),
+            },
+            buffer_frames: 64,
+        });
+        session.validate().unwrap();
+        let encoded = serde_json::to_string(&session).unwrap();
+        assert_eq!(serde_json::from_str::<Session>(&encoded).unwrap(), session);
+        session.audio_settings.as_mut().unwrap().buffer_frames = 16;
+        assert_eq!(
+            session.validate(),
+            Err(ValidationError::InvalidAudioBufferFrames { frames: 16 })
+        );
+    }
 }

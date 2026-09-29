@@ -1,6 +1,6 @@
 # ADR 0008: Helper-only library-validation exception
 
-- **Status:** Accepted (Phase 0 target; implementation evidence required)
+- **Status:** Accepted (implementation evidence required)
 - **Date:** 2026-07-13
 
 ## Context
@@ -13,4 +13,4 @@ If testing proves it necessary, grant the library-validation entitlement only to
 
 ## Consequences
 
-Loading may work for the targeted native code without weakening the host process to the same degree. The exception is not a general sandbox bypass and needs a release-time entitlement audit, exact-path evidence, and Apple Silicon feasibility results before shipping.
+Loading may work for the targeted native code without weakening the host process to the same degree. The exception is not a general sandbox bypass and needs a release-time entitlement audit, exact-path evidence, and Apple Silicon test results before shipping.

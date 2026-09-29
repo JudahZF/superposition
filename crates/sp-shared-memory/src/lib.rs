@@ -1,15 +1,22 @@
-#![forbid(unsafe_code)]
-//! In-process, aligned dual-bank storage for the Phase 0 shared-memory contract.
+#![deny(unsafe_code)]
+//! In-process, aligned dual-bank storage for the shared-memory contract.
 //!
-//! Phase 0 owns `SharedBank` values in aligned `Box` allocations. The allocations
+//! This crate owns `SharedBank` values in aligned `Box` allocations. The allocations
 //! provide stable bank addresses and exercise the exact protocol layout without OS
-//! mapping. The macOS Phase 1 mapping lives in `sp-shared-memory-macos`, preserving
-//! this crate's platform-neutral, safe fixed-layout and state-transition contract.
+//! mapping. The macOS mapping lives in `sp-shared-memory-macos`, preserving
+//! this crate's platform-neutral, safe state-transition contract. The one unsafe module
+//! initializes the enlarged fixed layout directly on the heap to avoid stack overflow.
 
-use std::array;
 use std::fmt;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+mod bank_init;
+mod parameter_feedback;
+pub use parameter_feedback::{
+    PARAMETER_FEEDBACK_CAPACITY_PER_SLOT, ParameterFeedbackBank, ParameterFeedbackError,
+    ParameterFeedbackSnapshot, RestartCursor, RestartSnapshot,
+};
 
 pub use sp_protocol::{
     BLOCK_EVENT_PARAMETER, BLOCK_EVENT_SLOT_BYPASS, BLOCK_SLOT_COUNT, BlockEvent, BlockMetadata,
@@ -47,7 +54,7 @@ pub struct DualBankMetadata {
 
 /// Complete fixed-layout contents of one independently usable shared bank.
 ///
-/// This is the only structure intended to become an OS-mapped region in Phase 1. It
+/// This is the only structure intended to become an OS-mapped region. It
 /// contains no Rust references, heap containers, strings, or Rust enum fields.
 #[repr(C, align(64))]
 pub struct SharedBank {
@@ -57,6 +64,8 @@ pub struct SharedBank {
     pub racks: [RackDescriptor; MAX_RACKS],
     /// Fixed-capacity block data and state machine storage.
     pub slots: [BlockSlot; BLOCK_SLOT_COUNT],
+    /// Worker-to-host latest native-editor parameter values, independent of audio slots.
+    pub feedback: ParameterFeedbackBank,
 }
 
 impl SharedBank {
@@ -66,16 +75,8 @@ impl SharedBank {
     ///
     /// Returns [`SharedMemoryError::Protocol`] when `generation` is zero, because a
     /// zero generation can never identify a request or a valid mapped bank.
-    pub fn new(generation: u64) -> Result<Self, SharedMemoryError> {
-        if generation == 0 {
-            return Err(ProtocolError::InvalidTicket.into());
-        }
-        let bank_bytes = bank_size_u32();
-        Ok(Self {
-            header: ProtocolHeader::new(bank_bytes, generation),
-            racks: [RackDescriptor::EMPTY; MAX_RACKS],
-            slots: array::from_fn(|_| BlockSlot::new()),
-        })
+    pub fn new(generation: u64) -> Result<Box<Self>, SharedMemoryError> {
+        bank_init::new_boxed(generation)
     }
 
     /// Returns whether this bank's header, topology, and fixed layout match this build.
@@ -117,7 +118,15 @@ impl SharedBank {
         if !self.is_quiescent() {
             return Err(SharedMemoryError::BankBusy);
         }
-        *self = Self::new(generation)?;
+        if generation == 0 {
+            return Err(ProtocolError::InvalidTicket.into());
+        }
+        self.header = ProtocolHeader::new(bank_size_u32(), generation);
+        self.racks.fill(RackDescriptor::EMPTY);
+        for slot in &mut self.slots {
+            *slot = BlockSlot::new();
+        }
+        self.feedback.clear_for_replacement();
         Ok(())
     }
 
@@ -135,7 +144,7 @@ impl SharedBank {
     /// Allocates and publishes a request into the selected free slot.
     ///
     /// Input audio and bounded event payloads must be written into the selected slot
-    /// before its request is published. Phase 0 users can do that through `slots` while
+    /// before its request is published. Callers can do that through `slots` while
     /// holding ordinary exclusive access to this owned bank.
     ///
     /// # Errors
@@ -185,20 +194,14 @@ impl SharedBank {
         self.slots.get(slot_index)
     }
 
-    /// Returns one slot with Phase 0 exclusive mutable access.
+    /// Returns one slot with exclusive mutable access.
     #[must_use]
     pub fn slot_mut(&mut self, slot_index: usize) -> Option<&mut BlockSlot> {
         self.slots.get_mut(slot_index)
     }
 }
 
-impl Default for SharedBank {
-    fn default() -> Self {
-        Self::new(1).expect("the fixed default shared-bank generation is nonzero")
-    }
-}
-
-/// Stable owner of two independently addressable Phase 0 banks.
+/// Stable owner of two independently addressable in-process banks.
 ///
 /// Each bank lives in its own `Box`, so moving `DualBankStorage` itself cannot move a
 /// bank allocation. The active index is only a selection signal; it never copies or
@@ -221,8 +224,8 @@ impl DualBankStorage {
             .ok_or(SharedMemoryError::GenerationExhausted)?;
         Ok(Self {
             banks: [
-                Box::new(SharedBank::new(initial_generation)?),
-                Box::new(SharedBank::new(inactive_generation)?),
+                SharedBank::new(initial_generation)?,
+                SharedBank::new(inactive_generation)?,
             ],
             active_bank: AtomicU32::new(0),
         })
@@ -234,7 +237,7 @@ impl DualBankStorage {
         self.banks.get(bank_index).map(Box::as_ref)
     }
 
-    /// Returns a mutable bank reference by fixed index for Phase 0 setup and tests.
+    /// Returns a mutable bank reference by fixed index for setup and tests.
     #[must_use]
     pub fn bank_mut(&mut self, bank_index: usize) -> Option<&mut SharedBank> {
         self.banks.get_mut(bank_index).map(Box::as_mut)
@@ -366,7 +369,7 @@ impl Default for DualBankStorage {
     }
 }
 
-/// Errors returned by owned Phase 0 bank selection and request operations.
+/// Errors returned by owned bank selection and request operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SharedMemoryError {
     /// The requested slot does not exist in the four-slot fixed bank.
@@ -416,7 +419,7 @@ fn inactive_index(active_index: usize) -> usize {
 }
 
 fn bank_size_u32() -> u32 {
-    u32::try_from(size_of::<SharedBank>()).expect("Phase 0 bank layout exceeds u32 byte count")
+    u32::try_from(size_of::<SharedBank>()).expect("bank layout exceeds u32 byte count")
 }
 
 #[cfg(test)]
@@ -435,6 +438,13 @@ mod tests {
         let bank = SharedBank::new(1).unwrap();
         assert!(bank.is_compatible());
         assert_eq!(bank.header.bank_bytes, bank_size_u32());
+    }
+
+    #[test]
+    fn old_layout_version_is_rejected() {
+        let mut bank = SharedBank::new(1).expect("bank");
+        bank.header.version = PROTOCOL_VERSION - 1;
+        assert!(!bank.is_compatible());
     }
 
     #[test]
@@ -466,6 +476,20 @@ mod tests {
     }
 
     #[test]
+    fn full_capacity_banks_initialize_on_two_megabyte_stack() {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let storage = DualBankStorage::new(11).expect("dual banks");
+                assert!(storage.bank(0).expect("first bank").is_compatible());
+                assert!(storage.bank(1).expect("second bank").is_compatible());
+            })
+            .expect("small-stack thread")
+            .join()
+            .expect("bank initialization");
+    }
+
+    #[test]
     fn rejects_raw_topology_outside_alpha_main_bus_layouts() {
         let mut bank = SharedBank::new(1).unwrap();
         bank.racks[0].plugin_count = 1;
@@ -493,6 +517,7 @@ mod tests {
                     midi_event_count: 256,
                     event_count: 256,
                     flags: 0,
+                    sidechain_slots: 0,
                 },
             )
             .unwrap();
@@ -510,6 +535,33 @@ mod tests {
     }
 
     #[test]
+    fn small_blocks_publish_and_complete_in_fixed_slots() {
+        for frames in [32, 64] {
+            let mut bank = SharedBank::new(9).unwrap();
+            let request = BlockRequest {
+                frame_count: frames,
+                input_channel_count: 2,
+                output_channel_count: 2,
+                midi_event_count: 0,
+                event_count: 0,
+                flags: 0,
+                sidechain_slots: 0,
+            };
+            let ticket = bank.request_block_at(0, request, 10).unwrap();
+            let slot = bank.slot_mut(0).unwrap();
+            assert_eq!(slot.metadata.state(), Ok(SlotState::Requested));
+            assert_eq!(slot.metadata.frame_count, frames);
+            assert_eq!(slot.claim_for_processing_at(7, 11).unwrap(), ticket);
+            slot.publish_completion_at(7, ticket, 12).unwrap();
+            let completion = slot.completion_snapshot().unwrap().unwrap();
+            assert_eq!(completion.request.frame_count, frames);
+            assert_eq!(completion.ticket, ticket);
+            slot.consume_completion(ticket).unwrap();
+            assert_eq!(slot.metadata.state(), Ok(SlotState::Free));
+        }
+    }
+
+    #[test]
     fn timed_request_preserves_its_publication_tick() {
         let mut bank = SharedBank::new(9).unwrap();
         let request = BlockRequest {
@@ -519,6 +571,7 @@ mod tests {
             midi_event_count: 256,
             event_count: 256,
             flags: 0,
+            sidechain_slots: 0,
         };
 
         assert_eq!(
@@ -587,6 +640,7 @@ mod tests {
             midi_event_count: 0,
             event_count: 0,
             flags: 0,
+            sidechain_slots: 0,
         };
         let ticket = storage
             .bank_mut(1)

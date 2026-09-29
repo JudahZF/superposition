@@ -1,4 +1,4 @@
-//! Parent-supervised isolated VST3 scanning for Phase 2.
+//! Parent-supervised isolated VST3 scanning.
 
 use std::{
     path::{Path, PathBuf},
@@ -10,7 +10,7 @@ use sp_supervisor::{
     CapturedHelperOutput, HelperKind, HelperLaunch, ProcessSupervisor, TimedHelperResult,
 };
 
-use crate::phase1::{CommandOutcome, Phase1Error};
+use crate::outcome::{CommandError, CommandOutcome};
 
 /// Default disposable-scanner timeout from the product plan.
 pub(crate) const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -38,7 +38,7 @@ pub(crate) fn scan_bundle_isolated(
     scanner: &Path,
     bundle: &Path,
     timeout: Duration,
-) -> Result<IsolatedScanReport, Phase1Error> {
+) -> Result<IsolatedScanReport, CommandError> {
     let mut supervisor = ProcessSupervisor::new();
     let launch = HelperLaunch {
         kind: HelperKind::PluginScanner,
@@ -53,7 +53,7 @@ pub(crate) fn scan_bundle_isolated(
     let captured = supervisor
         .launch_and_wait_capturing(&launch, timeout)
         .map_err(|error| {
-            Phase1Error::Infrastructure(format!("could not launch isolated scanner: {error}"))
+            CommandError::Infrastructure(format!("could not launch isolated scanner: {error}"))
         })?;
     Ok(map_captured_scan(bundle, &captured))
 }

@@ -15,23 +15,25 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use sp_protocol::{
     BlockRequest, BlockTicket, ProtocolError,
     control::{
-        BankIdentity, ControlErrorCode, ControlOperation, ControlRequest, ControlRequestId,
-        ControlResponse, ControlResponseStatus, ControlTarget, RackIdentity, SlotIdentity,
-        unix::UnixControlClient,
+        BankIdentity, ControlOperation, ControlResponse, ControlResponseStatus, ControlTarget,
+        RackIdentity, SlotIdentity,
     },
-    payload::{ControlPayloadCodec, PluginSlotConfiguration, RackTopology},
+    payload::{
+        ControlPayloadCodec, EditorGeometry, EditorPosition, MAX_PARAMETER_BATCH_SIZE, ParameterId,
+        ParameterIds, ParameterMetadata, ParameterValues, ParameterWrite, PluginSlotConfiguration,
+        RackTopology,
+    },
 };
 use sp_shared_memory_macos::{MonotonicClock, SharedMemoryRegion};
-use sp_vst3::{
-    Vst3BundlePath, adapter::ProcessingFormat, adapter::Vst3ClassSelection, sdk::HostSdkRackFactory,
-};
+use sp_supervisor::{PluginCatalog, Scanner, WorkerControlClient};
 
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -39,10 +41,8 @@ const BLOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const BANK_GENERATION: u64 = 1;
 const RACK_GENERATION: u64 = 1;
 
-/// Well-behaved free plug-ins that are safe to describe inside the test process. Discovery
-/// still verifies native Apple Silicon code via the SDK-free layout probe before any load, and
-/// arbitrary bundles are never instantiated in-process: a misbehaving plug-in must only ever be
-/// able to crash the isolated worker or scanner helpers.
+/// Well-behaved free plug-ins used when no explicit test bundle is selected. Every candidate
+/// is described in an isolated scanner helper, never in the test process.
 const KNOWN_SIMPLE_PLUGINS: &[&str] = &[
     "ValhallaSupermassive.vst3",
     "ValhallaFreqEcho.vst3",
@@ -56,6 +56,8 @@ struct TestPlugin {
     class_id: String,
     input_channels: u8,
     output_channels: u8,
+    parameter_ids: Vec<u32>,
+    writable_parameters: Vec<u32>,
 }
 
 fn plugin_directories() -> Vec<PathBuf> {
@@ -66,42 +68,94 @@ fn plugin_directories() -> Vec<PathBuf> {
     directories
 }
 
-/// Enumerates classes without instantiating any plug-in in the test process, then asks the
-/// factory to describe the class so the fixed stereo rack contract is known to accept it.
-fn describe_candidate(bundle: &Path) -> Option<TestPlugin> {
-    // The SDK-free layout probe rejects Intel-only bundles before anything is loaded;
-    // attempting to load non-native code can crash the loading process outright.
-    let layout = sp_vst3::inspect_bundle_layout(bundle).ok()?;
-    if !layout.supported_on_apple_silicon {
-        return None;
+/// Resolves the scanner beside the deployed worker unless a test deployment specifies it.
+fn scanner_executable() -> Result<PathBuf, String> {
+    let scanner = std::env::var_os("SUPERPOSITION_TEST_SCANNER").map_or_else(
+        || Path::new(env!("CARGO_BIN_EXE_sp-plugin-worker")).with_file_name("sp-plugin-scanner"),
+        PathBuf::from,
+    );
+    if !scanner.is_file() {
+        return Err(format!(
+            "scanner helper is missing at {}; build sp-plugin-scanner or set SUPERPOSITION_TEST_SCANNER",
+            scanner.display()
+        ));
     }
-    let factory = HostSdkRackFactory;
-    let path = Vst3BundlePath::new(bundle);
-    let class = factory.enumerate_classes(&path).ok()?.into_iter().next()?;
-    let selection = Vst3ClassSelection::new(path, class.class_id.clone());
-    let format = ProcessingFormat::new(48_000.0, 256).ok()?;
-    let metadata = factory.describe_class(&selection, format).ok()?;
-    let inputs = metadata
-        .audio_inputs
-        .first()
-        .map_or(0, |bus| bus.channel_count);
-    let outputs = metadata
-        .audio_outputs
-        .first()
-        .map_or(0, |bus| bus.channel_count);
+    Ok(scanner)
+}
+
+/// Scans in a disposable helper, then applies the fixed stereo rack contract to its SDK-free
+/// metadata. Third-party code never enters the libtest process (which runs tests off main thread).
+fn describe_candidate(bundle: &Path) -> Result<TestPlugin, String> {
+    let catalog_path =
+        std::env::temp_dir().join(format!("sp-e2e-catalog-{}.json", unique_suffix()));
+    let catalog = PluginCatalog::open(&catalog_path).map_err(|error| error.to_string())?;
+    let mut scanner = Scanner::new(scanner_executable()?, LAUNCH_TIMEOUT, catalog);
+    let scan = scanner.scan(bundle).map_err(|error| error.to_string());
+    let _ = std::fs::remove_file(&catalog_path);
+    let scan = scan?;
+    if !scan.is_supported() {
+        return Err(format!(
+            "isolated scan of {} returned {:?}: {}",
+            bundle.display(),
+            scan.outcome(),
+            scan.metadata.detail.as_deref().unwrap_or("no detail")
+        ));
+    }
+    let class =
+        if let Ok(class_id) = std::env::var("SUPERPOSITION_TEST_VST3_CLASS") {
+            scan.metadata
+                .classes
+                .into_iter()
+                .find(|class| class.identity.unique_id == class_id)
+                .ok_or_else(|| {
+                    format!(
+                        "selected VST3 class {class_id} not found in {}",
+                        bundle.display()
+                    )
+                })?
+        } else {
+            scan.metadata.classes.into_iter().next().ok_or_else(|| {
+                format!("isolated scan of {} returned no classes", bundle.display())
+            })?
+        };
+    let inputs = class
+        .buses
+        .inputs
+        .iter()
+        .find(|bus| bus.main && !bus.event)
+        .map_or(0, |bus| bus.channels);
+    let outputs = class
+        .buses
+        .outputs
+        .iter()
+        .find(|bus| bus.main && !bus.event)
+        .map_or(0, |bus| bus.channels);
     if outputs == 0 || outputs > 2 || inputs > 2 {
-        return None;
+        return Err(format!(
+            "class {} has unsupported main audio topology {inputs} in / {outputs} out",
+            class.identity.unique_id
+        ));
     }
-    Some(TestPlugin {
+    Ok(TestPlugin {
         bundle: bundle.to_path_buf(),
-        class_id: class.class_id,
+        class_id: class.identity.unique_id,
         input_channels: inputs,
         output_channels: outputs,
+        parameter_ids: class
+            .parameters
+            .iter()
+            .map(|parameter| parameter.id)
+            .collect(),
+        writable_parameters: class
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.automatable && !parameter.bypass && !parameter.read_only)
+            .map(|parameter| parameter.id)
+            .collect(),
     })
 }
 
-/// VST3 modules are not safe to load concurrently in one process, and discovery loads the
-/// candidate once to read its bus topology. The result is computed a single time and shared.
+/// Discovery is computed once and shared so parallel tests do not launch duplicate scanners.
 fn discover_plugin() -> Option<TestPlugin> {
     static DISCOVERED: std::sync::OnceLock<Option<TestPlugin>> = std::sync::OnceLock::new();
     DISCOVERED.get_or_init(discover_plugin_uncached).clone()
@@ -110,17 +164,20 @@ fn discover_plugin() -> Option<TestPlugin> {
 fn discover_plugin_uncached() -> Option<TestPlugin> {
     if let Ok(bundle) = std::env::var("SUPERPOSITION_TEST_VST3") {
         let bundle = PathBuf::from(bundle);
-        if bundle.exists() {
-            return describe_candidate(&bundle);
-        }
+        return Some(
+            describe_candidate(&bundle).unwrap_or_else(|error| {
+                panic!("explicit test bundle {}: {error}", bundle.display())
+            }),
+        );
     }
     for directory in plugin_directories() {
         for name in KNOWN_SIMPLE_PLUGINS {
             let bundle = directory.join(name);
-            if bundle.exists()
-                && let Some(plugin) = describe_candidate(&bundle)
-            {
-                return Some(plugin);
+            if bundle.exists() {
+                match describe_candidate(&bundle) {
+                    Ok(plugin) => return Some(plugin),
+                    Err(error) => eprintln!("skipping {}: {error}", bundle.display()),
+                }
             }
         }
     }
@@ -128,13 +185,11 @@ fn discover_plugin_uncached() -> Option<TestPlugin> {
 }
 
 fn unique_suffix() -> String {
+    static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
     format!(
         "{}-{}",
         std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
+        NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed)
     )
 }
 
@@ -149,6 +204,29 @@ fn slot_identity(slot: usize) -> SlotIdentity {
     SlotIdentity::new(u64::try_from(slot).expect("slot index") + 1).expect("slot identity")
 }
 
+fn continuous_writable_parameter(
+    harness: &mut WorkerHarness,
+    plugin: &TestPlugin,
+    slot: SlotIdentity,
+) -> Result<Option<ParameterId>, String> {
+    for &id in &plugin.writable_parameters {
+        let id = ParameterId {
+            value: u64::from(id),
+        };
+        let response = harness.request_ok(
+            ControlOperation::ParameterMetadata,
+            Some(slot),
+            &id.encode().map_err(|error| error.to_string())?,
+        )?;
+        let metadata =
+            ParameterMetadata::decode(response.payload()).map_err(|error| error.to_string())?;
+        if metadata.step_count == 0 {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
 /// Uses the same shared Darwin monotonic clock as the worker; timestamps from any other
 /// clock domain are rejected by the shared-memory protocol as out of order.
 fn now_tick() -> u64 {
@@ -159,9 +237,8 @@ fn now_tick() -> u64 {
 struct WorkerHarness {
     child: Child,
     region: SharedMemoryRegion,
-    client: UnixControlClient,
+    client: WorkerControlClient,
     socket: PathBuf,
-    next_request_id: u64,
 }
 
 impl WorkerHarness {
@@ -202,14 +279,15 @@ impl WorkerHarness {
         let client = match connect_with_retry(&socket) {
             Ok(client) => client,
             Err(error) => {
-                let mut failed = Self {
-                    child,
-                    region,
-                    client: UnixControlClient::from_stream(disconnected_stream()),
-                    socket,
-                    next_request_id: 0,
-                };
-                return Err(format!("{error}; {}", failed.drain_output()));
+                let mut child = child;
+                let _ = child.kill();
+                let status = child.wait();
+                let mut stderr = String::new();
+                if let Some(output) = child.stderr.as_mut() {
+                    let _ = output.read_to_string(&mut stderr);
+                }
+                let _ = std::fs::remove_file(&socket);
+                return Err(format!("{error}; worker status {status:?}; {stderr}"));
             }
         };
         let mut harness = Self {
@@ -217,9 +295,11 @@ impl WorkerHarness {
             region,
             client,
             socket,
-            next_request_id: 0,
         };
-        let health = harness.request(ControlOperation::QueryHealth, None, &[])?;
+        let health = match harness.request(ControlOperation::QueryHealth, None, &[]) {
+            Ok(health) => health,
+            Err(error) => return Err(format!("{error}; {}", harness.drain_output())),
+        };
         if health.status() != ControlResponseStatus::Ok {
             return Err(format!(
                 "initial health rejected: {:?} {}",
@@ -237,17 +317,8 @@ impl WorkerHarness {
         slot: Option<SlotIdentity>,
         payload: &[u8],
     ) -> Result<ControlResponse, String> {
-        self.next_request_id += 1;
-        let request = ControlRequest::new(
-            ControlRequestId::new(self.next_request_id).expect("nonzero id"),
-            target(),
-            operation,
-            slot,
-            payload,
-        )
-        .map_err(|error| format!("invalid request: {error}"))?;
         self.client
-            .round_trip(&request)
+            .request(operation, slot, payload)
             .map_err(|error| format!("{operation:?} round trip failed: {error}"))
     }
 
@@ -279,6 +350,7 @@ impl WorkerHarness {
                     input_channels: plugin.input_channels,
                     output_channels: plugin.output_channels,
                     event_input_active: false,
+                    sidechain_active: false,
                     bundle_path: plugin.bundle.display().to_string(),
                     class_id: Some(plugin.class_id.clone()),
                 })
@@ -312,6 +384,7 @@ impl WorkerHarness {
             midi_event_count: 0,
             event_count: 0,
             flags: 0,
+            sidechain_slots: 0,
         };
         let ticket = bank
             .request_block_at(slot_index, request, now_tick())
@@ -369,7 +442,10 @@ impl WorkerHarness {
                     if status.success() {
                         return Ok(());
                     }
-                    return Err(format!("worker exited with {status}"));
+                    return Err(format!(
+                        "worker exited with {status}; {}",
+                        self.drain_output()
+                    ));
                 }
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
                 Ok(None) => return Err("worker did not exit after shutdown".to_owned()),
@@ -407,25 +483,11 @@ impl Drop for WorkerHarness {
     }
 }
 
-/// A pre-closed stream used only to satisfy the harness type when launch already failed.
-fn disconnected_stream() -> std::os::unix::net::UnixStream {
-    let (left, _right) = std::os::unix::net::UnixStream::pair().expect("socket pair");
-    left
-}
-
-fn connect_with_retry(socket: &Path) -> Result<UnixControlClient, String> {
+fn connect_with_retry(socket: &Path) -> Result<WorkerControlClient, String> {
     let deadline = Instant::now() + LAUNCH_TIMEOUT;
     loop {
-        match std::os::unix::net::UnixStream::connect(socket) {
-            Ok(stream) => {
-                stream
-                    .set_read_timeout(Some(REQUEST_TIMEOUT))
-                    .map_err(|error| error.to_string())?;
-                stream
-                    .set_write_timeout(Some(REQUEST_TIMEOUT))
-                    .map_err(|error| error.to_string())?;
-                return Ok(UnixControlClient::from_stream(stream));
-            }
+        match WorkerControlClient::connect(socket, target(), REQUEST_TIMEOUT) {
+            Ok(client) => return Ok(client),
             Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
             Err(error) => return Err(format!("could not connect control socket: {error}")),
         }
@@ -514,6 +576,8 @@ fn rebuild_with_missing_bundle_returns_error_response_and_worker_survives() {
         class_id: plugin.class_id.clone(),
         input_channels: plugin.input_channels,
         output_channels: plugin.output_channels,
+        parameter_ids: plugin.parameter_ids.clone(),
+        writable_parameters: plugin.writable_parameters.clone(),
     };
     let result = harness.rebuild_topology(&missing, &[0]);
     assert!(
@@ -556,7 +620,11 @@ fn worker_processes_audio_blocks_through_shared_memory() {
 }
 
 #[test]
-fn capture_state_reports_controller_state_unsupported_on_high_level_backend() {
+#[allow(
+    clippy::too_many_lines,
+    reason = "complete state roundtrip keeps the worker lifecycle in one test"
+)]
+fn capture_and_restore_complete_state_through_worker_control() {
     let Some(plugin) = discover_plugin() else {
         return;
     };
@@ -565,34 +633,202 @@ fn capture_state_reports_controller_state_unsupported_on_high_level_backend() {
         .rebuild_topology(&plugin, &[0])
         .expect("rebuild with one real plug-in");
     let slot = slot_identity(0);
-    // The app deactivates before capture. The high-level backend must reject capture rather than
-    // claim that an incomplete component-only snapshot is a complete two-stream state.
+    let parameter = continuous_writable_parameter(&mut harness, &plugin, slot)
+        .expect("query writable parameter metadata");
+    if let Some(id) = parameter {
+        let write = ParameterWrite {
+            id,
+            normalized: 0.25,
+        };
+        harness
+            .request_ok(
+                ControlOperation::WriteParameter,
+                Some(slot),
+                &write.encode().expect("parameter payload"),
+            )
+            .expect("write parameter before capture");
+        harness.process_block(128, 0.25).expect("apply parameter");
+    }
+    // The app deactivates before state capture and restore. vst3-host 0.9 puts both VST3
+    // streams in a versioned envelope carried by the outer component field.
     harness
         .request_ok(ControlOperation::DeactivateSlot, Some(slot), &[])
         .expect("deactivate");
-    let response = harness
-        .request(ControlOperation::CaptureState, Some(slot), &[])
-        .expect("capture yields a correlated response");
-    assert_eq!(response.status(), ControlResponseStatus::Unsupported);
-    let error = response.error_record().expect("unsupported error record");
-    assert_eq!(error.code(), ControlErrorCode::UNSUPPORTED);
-    assert!(
-        error
-            .message()
-            .contains("controller-specific state is unsupported"),
-        "unexpected unsupported-state message: {}",
-        error.message()
-    );
+    let state = harness
+        .client
+        .capture_state(slot)
+        .expect("capture complete state through chunked client");
+    assert!(state.component.starts_with(b"VST3HOST_STATE\0\0"));
+    assert!(state.controller.is_empty());
+    let captured_parameter = parameter.map(|id| {
+        let response = harness
+            .request_ok(
+                ControlOperation::ReadParameter,
+                Some(slot),
+                &id.encode().expect("parameter ID"),
+            )
+            .expect("read captured parameter");
+        ParameterWrite::decode(response.payload())
+            .expect("parameter value")
+            .normalized
+    });
+    if let Some(id) = parameter {
+        harness
+            .request_ok(ControlOperation::ActivateSlot, Some(slot), &[])
+            .expect("reactivate to change parameter");
+        let write = ParameterWrite {
+            id,
+            normalized: 0.75,
+        };
+        harness
+            .request_ok(
+                ControlOperation::WriteParameter,
+                Some(slot),
+                &write.encode().expect("parameter payload"),
+            )
+            .expect("change parameter after capture");
+        harness
+            .process_block(128, 0.25)
+            .expect("apply later parameter");
+        let changed = harness
+            .request_ok(
+                ControlOperation::ReadParameter,
+                Some(slot),
+                &id.encode().expect("parameter ID"),
+            )
+            .expect("read changed parameter");
+        let changed = ParameterWrite::decode(changed.payload())
+            .expect("changed parameter value")
+            .normalized;
+        if let Some(captured) = captured_parameter {
+            assert!(
+                (changed - captured).abs() > 0.1,
+                "parameter change must be observable before restore: captured {captured}, changed {changed}"
+            );
+        }
+        harness
+            .request_ok(ControlOperation::DeactivateSlot, Some(slot), &[])
+            .expect("deactivate before restore");
+    }
+    harness
+        .client
+        .restore_state(slot, &state)
+        .expect("restore complete state through chunked client");
+    let restored = harness
+        .client
+        .capture_state(slot)
+        .expect("capture after restore");
+    assert!(restored.component.starts_with(b"VST3HOST_STATE\0\0"));
     harness
         .request_ok(ControlOperation::ActivateSlot, Some(slot), &[])
-        .expect("reactivate after rejected capture");
+        .expect("reactivate after restore");
+    if let (Some(id), Some(expected)) = (parameter, captured_parameter) {
+        let response = harness
+            .request_ok(
+                ControlOperation::ReadParameter,
+                Some(slot),
+                &id.encode().expect("parameter ID"),
+            )
+            .expect("read restored parameter");
+        let restored = ParameterWrite::decode(response.payload()).expect("parameter value");
+        assert!(
+            (restored.normalized - expected).abs() < 0.01,
+            "opaque restore must recover the captured parameter: expected {expected}, got {}",
+            restored.normalized
+        );
+    }
     harness
         .request_ok(ControlOperation::QueryHealth, None, &[])
-        .expect("health after rejected capture");
+        .expect("health after restore");
+    let output = harness
+        .process_block(128, 0.25)
+        .expect("audio after restore");
+    assert!(output.iter().all(|sample| sample.is_finite()));
     harness.shutdown().expect("clean shutdown");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
+#[ignore = "opens a native editor window; run only with explicit approval"]
+fn native_editor_opens_resizes_and_closes_without_stopping_worker() {
+    let bundle = Path::new("/Library/Audio/Plug-Ins/VST3/ValhallaSupermassive.vst3");
+    let plugin = describe_candidate(bundle).expect("ValhallaSupermassive test plug-in installed");
+    let mut harness = WorkerHarness::launch(&plugin).expect("launch worker");
+    harness
+        .rebuild_topology(&plugin, &[0])
+        .expect("rebuild with real plug-in");
+    let slot = slot_identity(0);
+    let position = EditorPosition {
+        left: 120.0,
+        top: 160.0,
+    };
+    harness
+        .request_ok(
+            ControlOperation::OpenNativeEditor,
+            Some(slot),
+            &position.encode().expect("valid editor position"),
+        )
+        .expect("attach native editor");
+    // The first picture follows the editor's first paint.
+    thread::sleep(Duration::from_secs(1));
+    let opened = harness
+        .client
+        .capture_editor_preview(slot, 0)
+        .expect("poll opened editor picture");
+    assert!(opened.editor_open);
+    let png = opened.png.expect("opened editor is pictured");
+    assert_png_preview(&png);
+    assert!(
+        harness
+            .client
+            .capture_editor_preview(slot, opened.sequence)
+            .expect("poll known picture")
+            .png
+            .is_none()
+    );
+    let geometry = EditorGeometry {
+        width: 900,
+        height: 600,
+    };
+    harness
+        .request_ok(
+            ControlOperation::ResizeNativeEditor,
+            Some(slot),
+            &geometry.encode().expect("valid editor geometry"),
+        )
+        .expect("resize native editor");
+    harness
+        .request_ok(ControlOperation::CloseNativeEditor, Some(slot), &[])
+        .expect("detach native editor");
+    let closed = harness
+        .client
+        .capture_editor_preview(slot, opened.sequence)
+        .expect("poll closed editor picture");
+    assert!(!closed.editor_open);
+    assert!(
+        closed.sequence > opened.sequence,
+        "closing pictures the editor"
+    );
+    assert_png_preview(&closed.png.expect("closed editor is pictured"));
+    harness
+        .request_ok(ControlOperation::QueryHealth, None, &[])
+        .expect("worker remains healthy after editor close");
+    harness.shutdown().expect("clean shutdown");
+}
+
+/// Editor pictures are 320×200 PNGs.
+fn assert_png_preview(png: &[u8]) {
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "PNG signature");
+    assert_eq!(&png[12..16], b"IHDR");
+    assert_eq!(png[16..20], 320_u32.to_be_bytes(), "picture width");
+    assert_eq!(png[20..24], 200_u32.to_be_bytes(), "picture height");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the parameter sweep and mutation share one worker lifecycle"
+)]
 fn parameter_metadata_and_writes_stay_in_protocol() {
     let Some(plugin) = discover_plugin() else {
         return;
@@ -601,6 +837,239 @@ fn parameter_metadata_and_writes_stay_in_protocol() {
     harness
         .rebuild_topology(&plugin, &[0])
         .expect("rebuild with one real plug-in");
+    let slot = slot_identity(0);
+    let writable = continuous_writable_parameter(&mut harness, &plugin, slot)
+        .expect("query writable parameter metadata")
+        .expect("test plug-in needs a writable continuous parameter");
+    let metadata = harness
+        .request_ok(
+            ControlOperation::ParameterMetadata,
+            Some(slot),
+            &writable.encode().expect("parameter ID"),
+        )
+        .expect("query writable parameter metadata");
+    let metadata = ParameterMetadata::decode(metadata.payload()).expect("parameter metadata");
+    assert_eq!(metadata.id, writable);
+    assert_eq!(metadata.step_count, 0);
+
+    let metadata_started = Instant::now();
+    let mut slowest_metadata = Duration::ZERO;
+    for &id in &plugin.parameter_ids {
+        let parameter = ParameterId {
+            value: u64::from(id),
+        };
+        let started = Instant::now();
+        let response = harness
+            .request_ok(
+                ControlOperation::ParameterMetadata,
+                Some(slot),
+                &parameter.encode().expect("parameter ID"),
+            )
+            .unwrap_or_else(|error| panic!("parameter {id} metadata failed: {error}"));
+        slowest_metadata = slowest_metadata.max(started.elapsed());
+        let metadata = ParameterMetadata::decode(response.payload()).expect("parameter metadata");
+        assert_eq!(metadata.id, parameter);
+    }
+    eprintln!(
+        "parameter metadata sweep: bundle={} count={} elapsed={:?} slowest={slowest_metadata:?}",
+        plugin.bundle.display(),
+        plugin.parameter_ids.len(),
+        metadata_started.elapsed()
+    );
+
+    let sweep_started = Instant::now();
+    let mut slowest_read = Duration::ZERO;
+    let mut individual_values = Vec::with_capacity(plugin.parameter_ids.len());
+    for &id in &plugin.parameter_ids {
+        let parameter = ParameterId {
+            value: u64::from(id),
+        };
+        let started = Instant::now();
+        let response = harness
+            .request_ok(
+                ControlOperation::ReadParameter,
+                Some(slot),
+                &parameter.encode().expect("parameter ID"),
+            )
+            .unwrap_or_else(|error| panic!("parameter {id} read failed: {error}"));
+        slowest_read = slowest_read.max(started.elapsed());
+        let read = ParameterWrite::decode(response.payload()).expect("parameter read payload");
+        assert_eq!(read.id, parameter);
+        assert!(
+            read.normalized.is_finite() && (0.0..=1.0).contains(&read.normalized),
+            "parameter {id} returned invalid normalized value {}",
+            read.normalized
+        );
+        individual_values.push(read);
+    }
+    eprintln!(
+        "parameter read sweep: bundle={} count={} elapsed={:?} slowest={slowest_read:?}",
+        plugin.bundle.display(),
+        plugin.parameter_ids.len(),
+        sweep_started.elapsed()
+    );
+
+    let batch_started = Instant::now();
+    let mut slowest_batch = Duration::ZERO;
+    for (batch_index, ids) in plugin
+        .parameter_ids
+        .chunks(MAX_PARAMETER_BATCH_SIZE)
+        .enumerate()
+    {
+        let request = ParameterIds {
+            parameters: ids
+                .iter()
+                .copied()
+                .map(|id| ParameterId {
+                    value: u64::from(id),
+                })
+                .collect(),
+        };
+        let started = Instant::now();
+        let response = harness
+            .request_ok(
+                ControlOperation::ReadParameters,
+                Some(slot),
+                &request.encode().expect("parameter batch"),
+            )
+            .unwrap_or_else(|error| panic!("parameter batch {batch_index} failed: {error}"));
+        slowest_batch = slowest_batch.max(started.elapsed());
+        let values = ParameterValues::decode(response.payload()).expect("parameter batch values");
+        assert_eq!(values.parameters.len(), ids.len());
+        for (index, value) in values.parameters.iter().enumerate() {
+            let expected = individual_values[batch_index * MAX_PARAMETER_BATCH_SIZE + index];
+            assert_eq!(value.id, expected.id);
+            assert!(
+                (value.normalized - expected.normalized).abs() < 0.01,
+                "batched value for parameter {} diverged from individual read: {} vs {}",
+                value.id.value,
+                value.normalized,
+                expected.normalized
+            );
+        }
+    }
+    eprintln!(
+        "parameter batch sweep: bundle={} count={} batches={} elapsed={:?} slowest={slowest_batch:?}",
+        plugin.bundle.display(),
+        plugin.parameter_ids.len(),
+        plugin
+            .parameter_ids
+            .len()
+            .div_ceil(MAX_PARAMETER_BATCH_SIZE),
+        batch_started.elapsed()
+    );
+
+    for target in [0.25, 0.75] {
+        let write = ParameterWrite {
+            id: writable,
+            normalized: target,
+        };
+        harness
+            .request_ok(
+                ControlOperation::WriteParameter,
+                Some(slot),
+                &write.encode().expect("parameter write"),
+            )
+            .expect("write normalized parameter");
+        harness
+            .process_block(128, 0.25)
+            .expect("apply normalized parameter in DSP block");
+        let response = harness
+            .request_ok(
+                ControlOperation::ReadParameter,
+                Some(slot),
+                &writable.encode().expect("parameter ID"),
+            )
+            .expect("read written parameter");
+        let read = ParameterWrite::decode(response.payload()).expect("parameter read payload");
+        assert_eq!(read.id, writable);
+        assert!(
+            (read.normalized - target).abs() < 0.02,
+            "controller value did not reflect write {target}: {}",
+            read.normalized
+        );
+        let response = harness
+            .request_ok(
+                ControlOperation::ParameterMetadata,
+                Some(slot),
+                &writable.encode().expect("parameter ID"),
+            )
+            .expect("metadata after parameter write");
+        let metadata = ParameterMetadata::decode(response.payload()).expect("parameter metadata");
+        assert_eq!(metadata.id, writable);
+        assert!(
+            (metadata.normalized - read.normalized).abs() < 0.01,
+            "metadata and value queries diverged after write"
+        );
+    }
+
+    let unknown = (0..=u32::MAX)
+        .find(|id| !plugin.parameter_ids.contains(id))
+        .expect("a plug-in cannot define every u32 parameter ID");
+    let unknown = ParameterId {
+        value: u64::from(unknown),
+    };
+    for operation in [
+        ControlOperation::ParameterMetadata,
+        ControlOperation::ReadParameter,
+    ] {
+        let response = harness
+            .request(
+                operation,
+                Some(slot),
+                &unknown.encode().expect("unknown parameter ID"),
+            )
+            .expect("unknown ID still gets a correlated response");
+        assert_eq!(response.status(), ControlResponseStatus::Failed);
+        assert!(
+            response
+                .error_record()
+                .is_some_and(|error| error.message().contains("unknown VST3 parameter")),
+            "{operation:?} did not report an unknown parameter ID"
+        );
+    }
+    let response = harness
+        .request(
+            ControlOperation::ReadParameters,
+            Some(slot),
+            &ParameterIds {
+                parameters: vec![writable, unknown],
+            }
+            .encode()
+            .expect("parameter batch with unknown ID"),
+        )
+        .expect("unknown batch ID still gets a correlated response");
+    assert_eq!(response.status(), ControlResponseStatus::Failed);
+    assert!(
+        response
+            .error_record()
+            .is_some_and(|error| error.message().contains("unknown VST3 parameter")),
+        "batched read did not reject an unknown parameter ID"
+    );
+    let beyond_vst3_range = ParameterId {
+        value: 0x1_0000_0000,
+    };
+    for operation in [
+        ControlOperation::ParameterMetadata,
+        ControlOperation::ReadParameter,
+    ] {
+        let response = harness
+            .request(
+                operation,
+                Some(slot),
+                &beyond_vst3_range
+                    .encode()
+                    .expect("out-of-range parameter ID"),
+            )
+            .expect("out-of-range ID still gets a correlated response");
+        assert_eq!(response.status(), ControlResponseStatus::Failed);
+        assert!(
+            response
+                .error_record()
+                .is_some_and(|error| error.message().contains("exceeds VST3 u32 range")),
+            "{operation:?} did not reject an ID outside the VST3 range"
+        );
+    }
     // Capture-state on an out-of-range slot must be an error response, never a disconnect.
     let response = harness
         .request(ControlOperation::CaptureState, Some(slot_identity(7)), &[])

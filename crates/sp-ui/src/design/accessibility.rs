@@ -20,13 +20,12 @@ pub fn meets_aa_large_text(foreground: Color, background: Color) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{meets_aa_large_text, meets_aa_normal_text};
-    use crate::design::{ColorToken, Surface, TextColor};
+    use crate::design::ColorToken;
 
     #[test]
-    fn primary_text_is_accessible_on_the_canvas() {
-        let foreground = ColorToken::Text(TextColor::Primary).color();
-        let background = ColorToken::Surface(Surface::Canvas).color();
-        assert!(meets_aa_normal_text(foreground, background));
-        assert!(meets_aa_large_text(foreground, background));
+    fn faint_is_only_decorative_on_the_window() {
+        let base = ColorToken::Base.color();
+        assert!(meets_aa_normal_text(ColorToken::Dim.color(), base));
+        assert!(!meets_aa_large_text(ColorToken::Faint.color(), base));
     }
 }

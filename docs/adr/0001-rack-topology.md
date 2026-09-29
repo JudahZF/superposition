@@ -1,6 +1,6 @@
 # ADR 0001: Rack topology
 
-- **Status:** Accepted (Phase 0 target)
+- **Status:** Accepted
 - **Date:** 2026-07-13
 
 ## Context

@@ -1,14 +1,17 @@
 //! macOS POSIX shared-memory mappings for a fixed [`SharedBank`] layout.
 //!
-//! This is the sole Rust `unsafe` boundary for the Phase 1 feasibility prototype.
-//! It maps initialized `SharedBank` bytes; all protocol state changes remain in the
-//! safe `sp-shared-memory` and `sp-protocol` APIs.
+//! This crate maps initialized `SharedBank` bytes. Fixed-bank heap initialization has its
+//! own narrow unsafe boundary in `sp-shared-memory`; protocol state changes remain safe APIs.
+
+mod audio_thread;
+
+pub use audio_thread::AudioThreadPolicy;
 
 use std::{
     ffi::CString,
     io,
     mem::{MaybeUninit, size_of},
-    os::raw::{c_char, c_int, c_long, c_uint, c_void},
+    os::raw::{c_char, c_int, c_uint, c_void},
     ptr::{self, NonNull},
     sync::{
         OnceLock,
@@ -17,7 +20,10 @@ use std::{
     time::Duration,
 };
 
-pub use sp_shared_memory::{BANK_COUNT, BankMetadata, SharedBank};
+pub use sp_shared_memory::{
+    BANK_COUNT, BankMetadata, PARAMETER_FEEDBACK_CAPACITY_PER_SLOT, RestartCursor, RestartSnapshot,
+    SharedBank,
+};
 
 const O_RDWR: c_int = 0x0002;
 const O_CREAT: c_int = 0x0200;
@@ -51,178 +57,29 @@ unsafe extern "C" {
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> c_int;
     fn superposition_shm_open_create(name: *const c_char, flags: c_int, mode: c_uint) -> c_int;
     fn superposition_shm_length(file_descriptor: c_int, length: *mut i64) -> c_int;
+    fn superposition_request_wake_supported() -> c_int;
+    fn superposition_notify_request(address: *mut c_void) -> c_int;
+    fn superposition_wait_for_request(
+        address: *mut c_void,
+        observed: u32,
+        timeout_ns: u64,
+    ) -> c_int;
     fn shm_open(name: *const c_char, flags: c_int) -> c_int;
     fn shm_unlink(name: *const c_char) -> c_int;
 }
 
 static NEXT_REGION_ID: AtomicU64 = AtomicU64::new(1);
+
 static RUN_NONCE: OnceLock<u32> = OnceLock::new();
 
+/// Whether the running macOS supports process-shared address waits (14.4 or later).
+#[must_use]
+pub fn request_wake_supported() -> bool {
+    // SAFETY: the shim has no arguments or side effects and checks OS availability.
+    unsafe { superposition_request_wake_supported() != 0 }
+}
+
 const SHARED_MEMORY_CREATE_ATTEMPTS: usize = 64;
-const RUSAGE_SELF: c_int = 0;
-const RUSAGE_CHILDREN: c_int = -1;
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct Timeval {
-    seconds: c_long,
-    microseconds: c_int,
-}
-
-#[repr(C)]
-struct Rusage {
-    user_time: Timeval,
-    system_time: Timeval,
-    maximum_resident_set_size: c_long,
-    _remaining: [c_long; 13],
-}
-
-#[cfg(test)]
-#[repr(C)]
-struct RusageInfoV6 {
-    _uuid: [u8; 16],
-    _before_energy_nj: [u64; 42],
-    energy_nj: u64,
-    _after_energy_nj: [u64; 15],
-}
-
-unsafe extern "C" {
-    fn getrusage(who: c_int, usage: *mut Rusage) -> c_int;
-    fn superposition_process_energy_nj(process_id: c_int, energy_nj: *mut u64) -> c_int;
-}
-
-/// A process-energy sample reported by Darwin.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ProcessEnergy {
-    /// Cumulative process energy reported by Darwin, in nanojoules.
-    pub raw_nanojoules: u64,
-    /// Cumulative process energy reported by Darwin, in joules.
-    pub joules: f64,
-}
-
-/// Availability of Darwin's process-energy counter for one PID.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ProcessEnergySample {
-    /// Darwin returned the cumulative process-energy counter.
-    Available(ProcessEnergy),
-    /// The running macOS version does not support `RUSAGE_INFO_V6`.
-    Unavailable,
-}
-
-/// Samples cumulative energy for one process using `proc_pid_rusage`.
-///
-/// The requested `RUSAGE_INFO_V4` does not contain `ri_energy_nj`: Xcode 27's
-/// `sys/resource.h` defines that field in `rusage_info_v6`. The opaque `rusage_info_t`
-/// typedef makes the SDK declaration a `void **`, so a narrow C shim makes the typed V6 call
-/// and returns only the initialized nanjoule field. This function returns
-/// [`ProcessEnergySample::Unavailable`] when that flavor is not supported by the running macOS
-/// version.
-///
-/// # Errors
-///
-/// Returns `InvalidInput` when `process_id` cannot be represented by Darwin's `pid_t`.
-/// Other operating-system failures, such as an unknown PID or insufficient permission,
-/// are returned unchanged.
-pub fn sample_process_energy(process_id: u32) -> io::Result<ProcessEnergySample> {
-    let process_id = c_int::try_from(process_id).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "process ID cannot be represented by Darwin pid_t",
-        )
-    })?;
-    let mut energy_nj = 0_u64;
-    // SAFETY: `energy_nj` is valid writable storage and the C shim accepts exactly a Darwin
-    // `pid_t` plus this output pointer. The shim zero-initializes its SDK-defined V6 record.
-    let status = unsafe { superposition_process_energy_nj(process_id, &raw mut energy_nj) };
-    if status != 0 {
-        return if status == libc_einval() {
-            Ok(ProcessEnergySample::Unavailable)
-        } else {
-            Err(io::Error::from_raw_os_error(status))
-        };
-    }
-    Ok(ProcessEnergySample::Available(energy_from_nanojoules(
-        energy_nj,
-    )))
-}
-
-fn energy_from_nanojoules(nanojoules: u64) -> ProcessEnergy {
-    const NANOJOULES_PER_JOULE: u64 = 1_000_000_000;
-    let whole_joules = nanojoules / NANOJOULES_PER_JOULE;
-    let fractional_nanojoules = nanojoules % NANOJOULES_PER_JOULE;
-    let billions_of_joules = u32::try_from(whole_joules / NANOJOULES_PER_JOULE)
-        .expect("u64 nanojoules contain fewer than 19 billion joules");
-    let remaining_whole_joules = u32::try_from(whole_joules % NANOJOULES_PER_JOULE)
-        .expect("remaining whole joules fit in u32");
-    let fractional_nanojoules =
-        u32::try_from(fractional_nanojoules).expect("fractional nanojoules fit in u32");
-    ProcessEnergy {
-        raw_nanojoules: nanojoules,
-        joules: f64::from(billions_of_joules) * 1_000_000_000.0
-            + f64::from(remaining_whole_joules)
-            + f64::from(fractional_nanojoules) / 1_000_000_000.0,
-    }
-}
-
-const fn libc_einval() -> c_int {
-    22
-}
-
-/// Safe snapshot of host-process CPU use and high-water resident memory.
-///
-/// The snapshot is intentionally process-scoped. It does not claim per-worker CPU or
-/// device-energy measurements, which require separately collected evidence.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProcessResourceUsage {
-    /// Accumulated user CPU time for the current process, rounded down to microseconds.
-    pub user_cpu_micros: u64,
-    /// Accumulated kernel CPU time for the current process, rounded down to microseconds.
-    pub system_cpu_micros: u64,
-    /// macOS reports this process high-water resident set size in bytes.
-    pub max_resident_bytes: u64,
-}
-
-/// Captures a safe `getrusage(RUSAGE_SELF)` snapshot for the current process.
-///
-/// # Errors
-///
-/// Returns the operating-system error when Darwin cannot provide resource usage.
-pub fn current_process_resource_usage() -> io::Result<ProcessResourceUsage> {
-    resource_usage(RUSAGE_SELF)
-}
-
-/// Captures accumulated resource usage for child processes which have been reaped.
-///
-/// # Errors
-///
-/// Returns the operating-system error when Darwin cannot provide resource usage.
-pub fn child_process_resource_usage() -> io::Result<ProcessResourceUsage> {
-    resource_usage(RUSAGE_CHILDREN)
-}
-
-fn resource_usage(who: c_int) -> io::Result<ProcessResourceUsage> {
-    let mut usage = MaybeUninit::<Rusage>::uninit();
-    // SAFETY: Darwin writes one `rusage` record to the valid out pointer for the supported
-    // `RUSAGE_SELF` or `RUSAGE_CHILDREN` selector.
-    if unsafe { getrusage(who, usage.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: a zero result documents that Darwin initialized the output record.
-    let usage = unsafe { usage.assume_init() };
-    Ok(ProcessResourceUsage {
-        user_cpu_micros: timeval_to_micros(usage.user_time),
-        system_cpu_micros: timeval_to_micros(usage.system_time),
-        max_resident_bytes: u64::try_from(usage.maximum_resident_set_size).unwrap_or_default(),
-    })
-}
-
-fn timeval_to_micros(time: Timeval) -> u64 {
-    let seconds = u64::try_from(time.seconds).unwrap_or_default();
-    let microseconds = u64::try_from(time.microseconds).unwrap_or_default();
-    seconds
-        .saturating_mul(1_000_000)
-        .saturating_add(microseconds.min(999_999))
-}
 
 /// Conversion and sampling for Darwin's process-independent continuous clock.
 ///
@@ -433,6 +290,66 @@ impl SharedMemoryRegion {
         self.bank().generation()
     }
 
+    /// Returns the wake sequence before scanning this bank for a request.
+    #[must_use]
+    pub fn request_wake_sequence(&self) -> u32 {
+        self.bank()
+            .header
+            .request_wake_sequence
+            .load(Ordering::Acquire)
+    }
+
+    /// Signals the worker after a request has been release-published in this bank.
+    ///
+    /// The caller must publish the slot first. A missing waiter is a successful signal;
+    /// the sequence change prevents the next compare-and-wait from sleeping past it.
+    /// This method performs one kernel wake call but does not allocate, wait, or format errors.
+    #[must_use]
+    pub fn notify_request(&self) -> bool {
+        self.notify_request_status() >= 0
+    }
+
+    fn notify_request_status(&self) -> c_int {
+        let sequence = &self.bank().header.request_wake_sequence;
+        sequence.fetch_add(1, Ordering::Release);
+        // SAFETY: `sequence` is a four-byte aligned atomic in this live MAP_SHARED bank.
+        // The shim never stores through the pointer and makes one shared-address wake call.
+        unsafe { superposition_notify_request(ptr::from_ref(sequence).cast_mut().cast()) }
+    }
+
+    /// Waits until the wake sequence differs from `observed`, a signal arrives, or time expires.
+    ///
+    /// Snapshot the sequence before scanning slots. Always rescan after this returns because
+    /// timeout, interruption, and spurious wakeups are normal. Only the worker may wait here.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` for a zero timeout or an OS error for unsupported or failed waits.
+    pub fn wait_for_request(&self, observed: u32, timeout: Duration) -> io::Result<()> {
+        if timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "request-wake timeout must be nonzero",
+            ));
+        }
+        let timeout_ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        let sequence = &self.bank().header.request_wake_sequence;
+        // SAFETY: `sequence` is a four-byte aligned atomic in this live MAP_SHARED bank.
+        // The shim compares it without storing and waits for no longer than `timeout_ns`.
+        let status = unsafe {
+            superposition_wait_for_request(
+                ptr::from_ref(sequence).cast_mut().cast(),
+                observed,
+                timeout_ns,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(status))
+        }
+    }
+
     /// Reinitializes this mapping in place after the old worker has exited and been reaped.
     ///
     /// The POSIX mapping and its callback-visible address are preserved. This operation is
@@ -454,7 +371,10 @@ impl SharedMemoryRegion {
                 format!("invalid replacement shared-memory generation: {error}"),
             )
         })?;
-        *self.bank_mut() = bank;
+        // SAFETY: the method's contract excludes all other mappings/readers. Both source and
+        // destination have the exact SharedBank layout; the source is fully initialized and
+        // contains no owned pointers or destructors. Copying avoids a bank-sized stack value.
+        unsafe { ptr::copy_nonoverlapping(bank.as_ref(), self.bank.as_ptr(), 1) };
         Ok(())
     }
 
@@ -740,20 +660,49 @@ impl MappedRackBanks {
         active: SharedMemoryRegion,
         inactive: SharedMemoryRegion,
     ) -> io::Result<Self> {
-        if !active.bank().is_compatible()
-            || !inactive.bank().is_compatible()
-            || active.generation() == inactive.generation()
-            || active.bank_address() == inactive.bank_address()
+        // SAFETY: the caller guarantees the second region is not accessed by a worker.
+        unsafe { Self::from_indexed_regions([active, inactive], 0) }
+    }
+
+    /// Reconstitutes a pair in fixed bank-index order with either bank selected as active.
+    ///
+    /// # Safety
+    ///
+    /// No worker may map or access `regions[active_index ^ 1]`. The caller must preserve the
+    /// control plane's original bank-index order; this constructor never swaps the mappings.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` for an index other than zero or one, or `InvalidData` for
+    /// incompatible, duplicate-generation, or duplicate-address mappings.
+    pub unsafe fn from_indexed_regions(
+        regions: [SharedMemoryRegion; BANK_COUNT],
+        active_index: usize,
+    ) -> io::Result<Self> {
+        if active_index >= BANK_COUNT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mapped rack active bank index is outside the fixed pair",
+            ));
+        }
+        if !regions[0].bank().is_compatible()
+            || !regions[1].bank().is_compatible()
+            || regions[0].generation() == regions[1].generation()
+            || regions[0].bank_address() == regions[1].bank_address()
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "mapped rack banks must be distinct compatible generations",
             ));
         }
+        let mut lifecycle = [MappedBankLifecycle::Inactive; BANK_COUNT];
+        lifecycle[active_index] = MappedBankLifecycle::Active;
         Ok(Self {
-            regions: [active, inactive],
-            active_index: AtomicU32::new(0),
-            lifecycle: [MappedBankLifecycle::Active, MappedBankLifecycle::Inactive],
+            regions,
+            active_index: AtomicU32::new(u32::try_from(active_index).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid active bank index")
+            })?),
+            lifecycle,
         })
     }
 
@@ -1013,9 +962,10 @@ fn initialize_created_region(
             )
         })?;
         let bank = map_bank(file_descriptor)?;
-        // SAFETY: this new mapping is exclusively owned until this function returns.
-        // `ptr::write` initializes the Rust atomics and all fields before sharing its name.
-        unsafe { ptr::write(bank.as_ptr(), initialized_bank) };
+        // SAFETY: this new mapping is exclusively owned until this function returns. The boxed
+        // bank has every atomic and fixed-layout field initialized, and contains no owned
+        // pointers or destructors. Copying avoids a bank-sized stack value.
+        unsafe { ptr::copy_nonoverlapping(initialized_bank.as_ref(), bank.as_ptr(), 1) };
         Ok(SharedMemoryRegion {
             name: name.clone(),
             file_descriptor,
@@ -1124,15 +1074,177 @@ fn map_bank(file_descriptor: c_int) -> io::Result<NonNull<SharedBank>> {
 mod tests {
     use super::{
         MappedBankLifecycle, MappedRackBanks, MonotonicClock, O_CREAT, O_EXCL, O_RDWR,
-        ProcessEnergySample, RackRecoverySignal, RackRecoveryState, RusageInfoV6,
-        SHARED_MEMORY_MODE, SharedMemoryRegion, child_process_resource_usage, close,
-        current_process_resource_usage, energy_from_nanojoules, ftruncate, generated_name,
-        sample_process_energy, shm_unlink, superposition_shm_open_create,
+        RackRecoverySignal, RackRecoveryState, SHARED_MEMORY_MODE, SharedMemoryRegion, close,
+        ftruncate, generated_name, request_wake_supported, shm_unlink,
+        superposition_shm_open_create,
     };
     use sp_shared_memory::{BlockRequest, BlockTicket, SlotState};
-    use std::mem::{offset_of, size_of};
+    use std::io::{BufRead, Write};
+    use std::process::{Child, Command, Stdio};
     use std::sync::atomic::Ordering;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    const REQUEST_WAKE_CHILD_BANK: &str = "SP_REQUEST_WAKE_TEST_BANK";
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn request_wake_handles_notification_before_wait_and_timeout() {
+        if !request_wake_supported() {
+            return;
+        }
+        let region = SharedMemoryRegion::create(1).unwrap();
+        let observed = region.request_wake_sequence();
+        assert!(region.notify_request());
+        assert_eq!(region.request_wake_sequence(), observed.wrapping_add(1));
+        region
+            .wait_for_request(observed, Duration::from_millis(100))
+            .unwrap();
+
+        let current = region.request_wake_sequence();
+        region
+            .wait_for_request(current, Duration::from_millis(2))
+            .unwrap();
+        assert_eq!(region.request_wake_sequence(), current);
+    }
+
+    #[test]
+    fn request_wake_reaches_a_distinct_mapping() {
+        if !request_wake_supported() {
+            return;
+        }
+        let creator = SharedMemoryRegion::create(1).unwrap();
+        let opener = SharedMemoryRegion::open(creator.name()).unwrap();
+        assert_ne!(creator.bank_address(), opener.bank_address());
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            let observed = opener.request_wake_sequence();
+            ready_tx.send(()).unwrap();
+            let start = Instant::now();
+            opener
+                .wait_for_request(observed, Duration::from_secs(3))
+                .unwrap();
+            (opener.request_wake_sequence(), start.elapsed())
+        });
+        ready_rx.recv().unwrap();
+        assert!(creator.notify_request());
+        let (sequence, elapsed) = waiter.join().unwrap();
+        assert_eq!(sequence, 1);
+        assert!(elapsed < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn editor_feedback_survives_worker_mapping_exit_until_bank_reset() {
+        let mut creator = SharedMemoryRegion::create(7).expect("host mapping");
+        let worker = SharedMemoryRegion::open(creator.name()).expect("worker mapping");
+        worker
+            .bank()
+            .feedback
+            .reset_slot(2)
+            .expect("instance epoch");
+        worker
+            .bank()
+            .feedback
+            .publish(2, u32::MAX, 0.625)
+            .expect("editor value");
+        drop(worker);
+
+        let snapshot = creator
+            .bank()
+            .feedback
+            .snapshot_changed(2, 0, 0)
+            .expect("host retained worker value");
+        assert_eq!(snapshot.values, vec![(u32::MAX, 0.625)]);
+
+        // SAFETY: the worker mapping was dropped above and no other process maps this test bank.
+        unsafe { creator.reset_after_worker_exit(8) }.expect("next generation");
+        assert_eq!(creator.generation(), 8);
+        assert!(creator.bank().feedback.snapshot_changed(2, 0, 0).is_none());
+    }
+
+    #[test]
+    fn request_wake_child_waits_for_shared_region() {
+        let Ok(name) = std::env::var(REQUEST_WAKE_CHILD_BANK) else {
+            return;
+        };
+        let region = SharedMemoryRegion::open(&name).unwrap();
+        let observed = region.request_wake_sequence();
+        println!("SP_REQUEST_WAKE_READY");
+        std::io::stdout().flush().unwrap();
+        let start = Instant::now();
+        region
+            .wait_for_request(observed, Duration::from_secs(3))
+            .unwrap();
+        assert_ne!(region.request_wake_sequence(), observed);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn request_wake_reaches_a_waiter_in_another_process() {
+        if !request_wake_supported() {
+            return;
+        }
+        let creator = SharedMemoryRegion::create(1).unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::request_wake_child_waits_for_shared_region",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(REQUEST_WAKE_CHILD_BANK, creator.name())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = ChildGuard(child);
+        let stdout = child.0.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let output_reader = std::thread::spawn(move || {
+            let mut reported_ready = false;
+            for line in std::io::BufReader::new(stdout).lines() {
+                if !reported_ready && line.is_ok_and(|line| line.contains("SP_REQUEST_WAKE_READY"))
+                {
+                    let _ = ready_tx.send(true);
+                    reported_ready = true;
+                }
+            }
+            if !reported_ready {
+                let _ = ready_tx.send(false);
+            }
+        });
+        assert_eq!(ready_rx.recv_timeout(Duration::from_secs(2)), Ok(true));
+
+        // Give the child time to enter the kernel wait after flushing its readiness line.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            creator.notify_request_status(),
+            1,
+            "no cross-process waiter"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                output_reader.join().unwrap();
+                assert!(status.success(), "cross-process waiter failed: {status}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cross-process waiter did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     #[test]
     fn continuous_clock_uses_a_shared_nonzero_tick_domain() {
@@ -1154,41 +1266,6 @@ mod tests {
         assert_ne!(first, next_region);
         assert_ne!(first, next_run);
         assert!(first.as_bytes().len() <= 30);
-    }
-
-    #[test]
-    fn resource_usage_snapshot_is_safe_and_nonnegative() {
-        let snapshot = current_process_resource_usage().unwrap();
-        assert!(
-            snapshot
-                .user_cpu_micros
-                .saturating_add(snapshot.system_cpu_micros)
-                > 0
-        );
-        assert!(child_process_resource_usage().is_ok());
-    }
-
-    #[test]
-    fn process_energy_converts_nanojoules_and_samples_the_current_pid() {
-        let energy = energy_from_nanojoules(1_500_000_000);
-        assert_eq!(energy.raw_nanojoules, 1_500_000_000);
-        assert!((energy.joules - 1.5).abs() < f64::EPSILON);
-        assert_eq!(size_of::<RusageInfoV6>(), 480);
-        assert_eq!(offset_of!(RusageInfoV6, energy_nj), 352);
-
-        match sample_process_energy(std::process::id()).unwrap() {
-            ProcessEnergySample::Available(energy) => {
-                assert!(energy.joules.is_finite());
-                assert!(energy.joules >= 0.0);
-            }
-            ProcessEnergySample::Unavailable => {}
-        }
-    }
-
-    #[test]
-    fn process_energy_rejects_a_pid_outside_darwins_range() {
-        let error = sample_process_energy(u32::MAX).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -1294,6 +1371,21 @@ mod tests {
     }
 
     #[test]
+    fn indexed_pair_keeps_fixed_bank_order_when_second_bank_is_active() {
+        let first = SharedMemoryRegion::create(7).expect("bank zero");
+        let second = SharedMemoryRegion::create(11).expect("bank one");
+        let addresses = [first.bank_address(), second.bank_address()];
+        // SAFETY: neither test mapping has a worker, and fixed index zero is inactive.
+        let banks = unsafe { MappedRackBanks::from_indexed_regions([first, second], 1) }
+            .expect("indexed pair");
+        assert_eq!(banks.active_index(), 1);
+        assert_eq!(banks.active_bank().bank_address(), addresses[1]);
+        assert_eq!(banks.metadata()[0].address, addresses[0]);
+        assert_eq!(banks.metadata()[0].lifecycle, MappedBankLifecycle::Inactive);
+        assert_eq!(banks.metadata()[1].lifecycle, MappedBankLifecycle::Active);
+    }
+
+    #[test]
     fn recovery_signal_completes_one_dual_bank_handoff() {
         let recovery = RackRecoverySignal::new();
         assert_eq!(recovery.state(), RackRecoveryState::Idle);
@@ -1339,6 +1431,7 @@ mod tests {
             midi_event_count: 0,
             event_count: 0,
             flags: 0,
+            sidechain_slots: 0,
         };
         let ticket = banks
             .bank_mut(1)
@@ -1390,6 +1483,7 @@ mod tests {
                 midi_event_count: 0,
                 event_count: 1,
                 flags: 0,
+                sidechain_slots: 0,
             },
         )
         .unwrap();

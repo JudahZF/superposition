@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::scanner::{BundleFingerprint, CachedScan};
 
 /// Version of the on-disk plug-in catalog schema.
-pub const CATALOG_SCHEMA_VERSION: u32 = 2;
+pub const CATALOG_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct CatalogFile {
@@ -41,16 +41,21 @@ impl PluginCatalog {
         let entries = match fs::read(&path) {
             Ok(bytes) => {
                 let catalog: CatalogFile = serde_json::from_slice(&bytes).map_err(invalid_data)?;
-                if catalog.version != CATALOG_SCHEMA_VERSION {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "unsupported plug-in catalog version {}; expected {CATALOG_SCHEMA_VERSION}",
-                            catalog.version
-                        ),
-                    ));
+                match catalog.version {
+                    CATALOG_SCHEMA_VERSION => catalog.entries,
+                    // Version 2 results used stdout as the report channel. Third-party logs
+                    // could corrupt valid scans, so all derived outcomes need a fresh scan.
+                    // Leave the old file intact until the next successful atomic save.
+                    2 => BTreeMap::new(),
+                    version => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "unsupported plug-in catalog version {version}; expected {CATALOG_SCHEMA_VERSION}"
+                            ),
+                        ));
+                    }
                 }
-                catalog.entries
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(error) => return Err(error),
@@ -155,7 +160,7 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        sync::atomic::{AtomicU64, Ordering},
     };
 
     use sp_model::{PluginArchitecture, PluginScanMetadata, PluginScanOutcome};
@@ -164,10 +169,9 @@ mod tests {
     use crate::scanner::{BundleFingerprint, CachedScan};
 
     fn temporary_root() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
+        // Parallel tests can read the same clock value; the counter keeps their roots apart.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("sp-plugin-catalog-{}-{unique}", std::process::id()))
     }
 
@@ -206,6 +210,45 @@ mod tests {
                 )
                 .is_none()
         );
+        fs::remove_dir_all(root).expect("remove temporary root");
+    }
+
+    #[test]
+    fn old_catalog_results_are_rescanned_without_changing_the_file_on_open() {
+        let root = temporary_root();
+        fs::create_dir_all(&root).expect("create temporary root");
+        let path = root.join("catalog.json");
+        let bundle = root.join("Old.vst3");
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            bundle.clone(),
+            CachedScan {
+                bundle,
+                fingerprint: BundleFingerprint {
+                    algorithm: "sha256".to_owned(),
+                    digest: "old".to_owned(),
+                },
+                metadata: PluginScanMetadata::new(
+                    PluginArchitecture::Arm64,
+                    PluginScanOutcome::Crashed,
+                ),
+            },
+        );
+        let original = serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "entries": entries,
+        }))
+        .expect("serialize old catalog");
+        fs::write(&path, &original).expect("write old catalog");
+
+        let catalog = PluginCatalog::open(&path).expect("open old catalog");
+        assert_eq!(catalog.entries().count(), 0);
+        assert_eq!(fs::read(&path).expect("read old catalog"), original);
+        catalog.save().expect("publish new catalog version");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read new catalog"))
+                .expect("parse new catalog");
+        assert_eq!(stored["version"], super::CATALOG_SCHEMA_VERSION);
         fs::remove_dir_all(root).expect("remove temporary root");
     }
 }

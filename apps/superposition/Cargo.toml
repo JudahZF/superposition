@@ -9,6 +9,8 @@ repository.workspace = true
 [dependencies]
 eframe = { version = "0.31.1", default-features = true, features = ["default_fonts", "accesskit"] }
 egui = "0.31.1"
+# Decodes editor preview PNGs; already in the graph through eframe.
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 sp-audio-io = { path = "../../crates/sp-audio-io" }
 sp-engine = { path = "../../crates/sp-engine" }
 sp-midi = { path = "../../crates/sp-midi" }
@@ -20,7 +22,12 @@ sp-supervisor = { path = "../../crates/sp-supervisor" }
 sp-ui = { path = "../../crates/sp-ui" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Reads the system reduced-motion preference; already in the graph through winit.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSAccessibility", "NSWorkspace"] }
 sp-audio-io-macos = { path = "../../crates/sp-audio-io-macos" }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+midir = "0.10.1"
 
 [lints]
 workspace = true

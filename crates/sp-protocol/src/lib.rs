@@ -1,11 +1,10 @@
 #![forbid(unsafe_code)]
-//! Fixed-layout, versioned data structures for the Superposition Phase 0 IPC contract.
+//! Fixed-layout, versioned data structures for the Superposition host/worker IPC contract.
 //!
 //! Every type intended to reside in a shared bank is `#[repr(C)]` and contains only
 //! primitive values, fixed-size primitive arrays, or atomics. In particular, shared
-//! structures never contain Rust references, `Vec`, `String`, or Rust enum values.
-//! Phase 0 keeps these structures in process-owned memory; a later phase can map the
-//! exact same layout into an OS-backed shared-memory region.
+//! structures never contain Rust references, `Vec`, `String`, or Rust enum values, so the
+//! same layout works in process-owned memory and in an OS-backed shared-memory region.
 
 /// Bounded request/response control-plane transport contract.
 pub mod control;
@@ -17,13 +16,23 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Four-byte marker at the beginning of every shared bank.
 pub const PROTOCOL_MAGIC: u32 = u32::from_le_bytes(*b"SP00");
-/// Version of the Phase 1 binary layout.
+/// Version of the shared-bank binary layout.
 ///
-/// Version 3 adds calibrated worker busy-time counters to the shared header. Version 2 added
-/// shared monotonic timing and worker-heartbeat fields. Older mappings must therefore be rejected.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// Version 8 adds a stereo sidechain region per plug-in slot to every block slot. Older mappings
+/// are rejected.
+pub const PROTOCOL_VERSION: u32 = 9;
+/// Worker is scanning shared request slots.
+pub const WORKER_PHASE_SCANNING: u32 = 0;
+/// Worker is servicing control requests.
+pub const WORKER_PHASE_CONTROL: u32 = 1;
+/// Worker is polling native editor state.
+pub const WORKER_PHASE_EDITOR_POLL: u32 = 2;
+/// Worker is waiting for a request or periodic poll deadline.
+pub const WORKER_PHASE_WAITING: u32 = 3;
+/// Worker is stopping.
+pub const WORKER_PHASE_STOPPING: u32 = 4;
 /// Number of racks available in an Alpha topology.
-pub const MAX_RACKS: usize = 8;
+pub const MAX_RACKS: usize = 64;
 /// Number of plugins available in each Alpha rack.
 pub const MAX_PLUGINS_PER_RACK: usize = 8;
 /// Maximum audio channels in either direction for one block.
@@ -43,7 +52,7 @@ pub const BLOCK_EVENT_SLOT_BYPASS: u32 = 2;
 /// Length of the fixed, UTF-8-by-convention plugin identifier buffer.
 pub const PLUGIN_IDENTIFIER_BYTES: usize = 64;
 
-const MAX_RACKS_U32: u32 = 8;
+const MAX_RACKS_U32: u32 = 64;
 const MAX_PLUGINS_PER_RACK_U32: u32 = 8;
 const MAX_CHANNELS_U32: u32 = 2;
 const MAX_FRAMES_U32: u32 = 256;
@@ -169,10 +178,13 @@ pub struct BlockRequest {
     pub event_count: u32,
     /// Protocol-defined request flags.
     pub flags: u32,
+    /// Bit `n` marks `BlockSlot::sidechain_audio[n]` as holding this block's sidechain for
+    /// plug-in slot `n`.
+    pub sidechain_slots: u32,
 }
 
 impl BlockRequest {
-    /// Checks that every bounded count fits the Phase 0 fixed audio layout.
+    /// Checks that every bounded count fits the fixed audio layout.
     ///
     /// An Alpha request always carries at least one frame and one output channel. Input
     /// remains allowed to be zero so an instrument rack can produce audio without an
@@ -186,6 +198,7 @@ impl BlockRequest {
             && self.midi_event_count <= MAX_MIDI_EVENTS_U32
             && self.event_count <= MAX_EVENTS_U32
             && self.flags == 0
+            && self.sidechain_slots >> MAX_PLUGINS_PER_RACK_U32 == 0
     }
 }
 
@@ -375,8 +388,10 @@ pub struct BlockMetadata {
     pub event_count: u32,
     /// Protocol-defined block flags.
     pub flags: u32,
+    /// Plug-in slots whose sidechain region holds this block's audio, as a bitmask.
+    pub sidechain_slots: u32,
     /// Reserved for compatible layout expansion.
-    pub reserved: [u32; 2],
+    pub reserved: u32,
 }
 
 impl BlockMetadata {
@@ -399,7 +414,8 @@ impl BlockMetadata {
             midi_event_count: 0,
             event_count: 0,
             flags: 0,
-            reserved: [0; 2],
+            sidechain_slots: 0,
+            reserved: 0,
         }
     }
 
@@ -434,6 +450,7 @@ impl BlockMetadata {
             midi_event_count: self.midi_event_count,
             event_count: self.event_count,
             flags: self.flags,
+            sidechain_slots: self.sidechain_slots,
         }
     }
 
@@ -459,6 +476,9 @@ pub struct BlockSlot {
     pub metadata: BlockMetadata,
     /// Producer-to-worker audio input, indexed by channel then frame.
     pub input_audio: [[f32; MAX_FRAMES]; MAX_CHANNELS],
+    /// Producer-to-worker stereo sidechain, indexed by plug-in slot, channel, then frame. Only
+    /// slots marked in `BlockRequest::sidechain_slots` hold audio for the current request.
+    pub sidechain_audio: [[[f32; MAX_FRAMES]; MAX_CHANNELS]; MAX_PLUGINS_PER_RACK],
     /// Worker-to-producer audio output, indexed by channel then frame.
     pub output_audio: [[f32; MAX_FRAMES]; MAX_CHANNELS],
     /// Bounded producer-to-worker MIDI payload.
@@ -474,6 +494,7 @@ impl BlockSlot {
         Self {
             metadata: BlockMetadata::new(),
             input_audio: [[0.0; MAX_FRAMES]; MAX_CHANNELS],
+            sidechain_audio: [[[0.0; MAX_FRAMES]; MAX_CHANNELS]; MAX_PLUGINS_PER_RACK],
             output_audio: [[0.0; MAX_FRAMES]; MAX_CHANNELS],
             midi_events: [MidiEvent {
                 frame_offset: 0,
@@ -539,7 +560,7 @@ impl BlockSlot {
             return Err(ProtocolError::InvalidTicket);
         }
         self.validate_request_payload(request)?;
-        if self.metadata.reserved != [0; 2] {
+        if self.metadata.reserved != 0 {
             return Err(ProtocolError::InvalidRequest);
         }
 
@@ -621,7 +642,7 @@ impl BlockSlot {
             return Err(ProtocolError::InvalidTicket);
         }
         self.validate_request_payload(request)?;
-        if self.metadata.reserved != [0; 2] {
+        if self.metadata.reserved != 0 {
             return Err(ProtocolError::InvalidRequest);
         }
         self.acquire_owner(OWNER_REQUESTING)?;
@@ -664,6 +685,7 @@ impl BlockSlot {
         self.metadata.midi_event_count = request.midi_event_count;
         self.metadata.event_count = request.event_count;
         self.metadata.flags = request.flags;
+        self.metadata.sidechain_slots = request.sidechain_slots;
         self.metadata
             .state
             .store(SlotState::Requested.raw(), Ordering::Release);
@@ -851,16 +873,15 @@ impl BlockSlot {
 
     /// Deliberately publishes completion metadata with an invalid frame count.
     ///
-    /// This hook exists only for deterministic feasibility fault injection. It is
-    /// compiled for this crate's tests or when the unmistakable `test-hooks` feature is
-    /// explicitly enabled. Production integrations must use [`Self::publish_completion`]
-    /// or [`Self::publish_completion_at`].
+    /// This test-only hook lets protocol tests prove that consumers reject the fault.
+    /// Production integrations must use [`Self::publish_completion`] or
+    /// [`Self::publish_completion_at`].
     ///
     /// # Errors
     ///
     /// Returns an error unless `worker_id` owns the matching timed request and
     /// `completed_tick` is coherent with its earlier timestamps.
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     pub fn test_publish_malformed_completion_at(
         &mut self,
         worker_id: u32,
@@ -879,16 +900,15 @@ impl BlockSlot {
 
     /// Deliberately publishes a valid completion under a mismatched ticket.
     ///
-    /// This hook exists only for deterministic feasibility fault injection. It is
-    /// compiled for this crate's tests or when the unmistakable `test-hooks` feature is
-    /// explicitly enabled. Production integrations must use [`Self::publish_completion`]
-    /// or [`Self::publish_completion_at`].
+    /// This test-only hook lets protocol tests prove that consumers reject the fault.
+    /// Production integrations must use [`Self::publish_completion`] or
+    /// [`Self::publish_completion_at`].
     ///
     /// # Errors
     ///
     /// Returns an error unless `worker_id` owns `live_ticket`, both tickets are valid and
     /// different, and `completed_tick` is coherent with the live request timestamps.
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     pub fn test_publish_stale_completion_at(
         &self,
         worker_id: u32,
@@ -931,6 +951,9 @@ impl BlockSlot {
         if !ticket.is_valid() {
             return Err(ProtocolError::InvalidTicket);
         }
+        if self.metadata.state()? != SlotState::Complete {
+            return Err(ProtocolError::UnexpectedState);
+        }
         self.acquire_owner(OWNER_COMPLETING)?;
         let result = (|| {
             let snapshot = self
@@ -962,6 +985,11 @@ impl BlockSlot {
     /// or timing record is malformed, or when another transition temporarily owns the
     /// slot.
     pub fn completion_snapshot(&self) -> Result<Option<CompletionSnapshot>, ProtocolError> {
+        // Polling an unfinished slot must not compete with the worker's claim. Recheck
+        // under ownership below before reading any non-atomic completion payload.
+        if self.metadata.state()? != SlotState::Complete {
+            return Ok(None);
+        }
         self.acquire_owner(OWNER_COMPLETING)?;
         let result = self.completion_snapshot_inner();
         self.release_owner(OWNER_COMPLETING);
@@ -977,7 +1005,7 @@ impl BlockSlot {
             return Err(ProtocolError::MalformedCompletion);
         }
         let request = self.metadata.request();
-        if self.metadata.reserved != [0; 2] || self.validate_request_payload(request).is_err() {
+        if self.metadata.reserved != 0 || self.validate_request_payload(request).is_err() {
             return Err(ProtocolError::MalformedCompletion);
         }
         let timing = self.metadata.timing();
@@ -1217,8 +1245,20 @@ pub struct ProtocolHeader {
     pub worker_busy_observed_ticks: AtomicU64,
     /// Number of calibrated busy-spin operations included in the busy-time counters.
     pub worker_busy_operations: AtomicU64,
+    /// Sequence used to wake a worker after a request is published.
+    pub request_wake_sequence: AtomicU32,
     /// Reserved for compatible layout expansion.
-    pub reserved: [u32; 2],
+    pub reserved: u32,
+    /// Current processing-thread phase, using `WORKER_PHASE_*` values.
+    pub worker_phase: AtomicU32,
+    /// Request wake sequence observed at the beginning of the processing loop.
+    pub worker_wait_sequence: AtomicU32,
+    /// Monotonic tick recorded at the beginning of the processing loop.
+    pub worker_loop_tick: AtomicU64,
+    /// Latest rack latency in samples, published by the worker.
+    pub worker_latency_samples: AtomicU32,
+    /// Latched VST3 change-notification bitmask; the host clears it after observing it.
+    pub worker_restart_requested: AtomicU32,
 }
 
 impl ProtocolHeader {
@@ -1246,7 +1286,13 @@ impl ProtocolHeader {
             worker_busy_requested_ticks: AtomicU64::new(0),
             worker_busy_observed_ticks: AtomicU64::new(0),
             worker_busy_operations: AtomicU64::new(0),
-            reserved: [0; 2],
+            request_wake_sequence: AtomicU32::new(0),
+            reserved: 0,
+            worker_phase: AtomicU32::new(WORKER_PHASE_SCANNING),
+            worker_wait_sequence: AtomicU32::new(0),
+            worker_loop_tick: AtomicU64::new(0),
+            worker_latency_samples: AtomicU32::new(0),
+            worker_restart_requested: AtomicU32::new(0),
         }
     }
 
@@ -1267,7 +1313,7 @@ impl ProtocolHeader {
             && self.flags == 0
             && self.generation.load(Ordering::Acquire) != 0
             && self.next_request_sequence.load(Ordering::Acquire) != 0
-            && self.reserved == [0; 2]
+            && self.reserved == 0
     }
 
     /// Allocates the next nonzero ticket for the current generation.
@@ -1450,7 +1496,7 @@ impl std::error::Error for ProtocolError {}
 
 fn header_size_u32() -> u32 {
     u32::try_from(std::mem::size_of::<ProtocolHeader>())
-        .expect("Phase 0 header layout exceeds u32 byte count")
+        .expect("header layout exceeds u32 byte count")
 }
 
 fn is_reserved_owner(owner: u32) -> bool {
@@ -1489,12 +1535,37 @@ mod tests {
         midi_event_count: 1,
         event_count: 1,
         flags: 0,
+        sidechain_slots: 0,
     };
 
     #[test]
+    fn completion_poll_does_not_compete_for_an_unfinished_request() {
+        let mut slot = BlockSlot::new();
+        let ticket = BlockTicket {
+            generation: 1,
+            sequence: 1,
+        };
+        slot.publish_request(ticket, REQUEST).unwrap();
+        slot.acquire_owner(OWNER_REQUESTING).unwrap();
+        assert_eq!(slot.completion_snapshot(), Ok(None));
+        assert_eq!(
+            slot.consume_completion_timing(ticket),
+            Err(ProtocolError::UnexpectedState)
+        );
+        assert_eq!(
+            slot.metadata.owner.load(Ordering::Acquire),
+            OWNER_REQUESTING
+        );
+        slot.release_owner(OWNER_REQUESTING);
+        slot.claim_for_processing(7).unwrap();
+        assert_eq!(slot.completion_snapshot(), Ok(None));
+        assert_eq!(slot.metadata.owner.load(Ordering::Acquire), 7);
+    }
+
+    #[test]
     fn fixed_capacities_are_part_of_the_contract() {
-        assert_eq!(PROTOCOL_VERSION, 3);
-        assert_eq!(MAX_RACKS, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(MAX_RACKS, 64);
         assert_eq!(MAX_PLUGINS_PER_RACK, 8);
         assert_eq!(MAX_CHANNELS, 2);
         assert_eq!(MAX_FRAMES, 256);
@@ -1504,18 +1575,48 @@ mod tests {
     }
 
     #[test]
+    fn small_callback_requests_fit_the_fixed_slot_contract() {
+        for frames in [32, 64] {
+            assert!(
+                BlockRequest {
+                    frame_count: frames,
+                    ..REQUEST
+                }
+                .is_valid()
+            );
+        }
+    }
+
+    #[test]
     fn shared_layouts_are_c_aligned_and_primitive_sized() {
         assert_eq!(size_of::<MidiEvent>(), 16);
         assert_eq!(size_of::<BlockEvent>(), 20);
         assert_eq!(align_of::<BlockMetadata>(), 64);
         assert_eq!(align_of::<BlockSlot>(), 64);
         assert_eq!(align_of::<ProtocolHeader>(), 64);
+        assert_eq!(size_of::<ProtocolHeader>(), 192);
+        assert_eq!(offset_of!(ProtocolHeader, worker_phase), 112);
+        assert_eq!(offset_of!(ProtocolHeader, worker_wait_sequence), 116);
+        assert_eq!(offset_of!(ProtocolHeader, worker_loop_tick), 120);
+        assert_eq!(offset_of!(ProtocolHeader, worker_latency_samples), 128);
+        assert_eq!(offset_of!(ProtocolHeader, worker_restart_requested), 132);
         assert_eq!(size_of::<BlockMetadata>() % 64, 0);
         assert_eq!(size_of::<BlockSlot>() % 64, 0);
         assert_eq!(size_of::<ProtocolHeader>() % 64, 0);
         assert_eq!(offset_of!(BlockSlot, metadata), 0);
+        assert_eq!(size_of::<BlockMetadata>(), 128);
+        assert_eq!(offset_of!(BlockMetadata, sidechain_slots), 88);
         assert_eq!(offset_of!(BlockSlot, input_audio) % align_of::<f32>(), 0);
-        assert!(offset_of!(BlockSlot, output_audio) > offset_of!(BlockSlot, input_audio));
+        assert_eq!(
+            offset_of!(BlockSlot, sidechain_audio) % align_of::<f32>(),
+            0
+        );
+        assert_eq!(
+            size_of::<[[[f32; MAX_FRAMES]; MAX_CHANNELS]; MAX_PLUGINS_PER_RACK]>(),
+            MAX_PLUGINS_PER_RACK * MAX_CHANNELS * MAX_FRAMES * size_of::<f32>()
+        );
+        assert!(offset_of!(BlockSlot, sidechain_audio) > offset_of!(BlockSlot, input_audio));
+        assert!(offset_of!(BlockSlot, output_audio) > offset_of!(BlockSlot, sidechain_audio));
         assert!(offset_of!(BlockSlot, midi_events) > offset_of!(BlockSlot, output_audio));
         assert!(offset_of!(BlockSlot, events) > offset_of!(BlockSlot, midi_events));
     }
@@ -1584,6 +1685,42 @@ mod tests {
         let mut rack = RackDescriptor::EMPTY;
         rack.plugin_count = u32::try_from(MAX_PLUGINS_PER_RACK).unwrap() + 1;
         assert!(!rack.is_valid());
+    }
+
+    #[test]
+    fn sidechain_mask_names_only_fixed_plug_in_slots_and_survives_completion() {
+        let every_slot = (1_u32 << MAX_PLUGINS_PER_RACK_U32) - 1;
+        assert!(
+            BlockRequest {
+                sidechain_slots: every_slot,
+                ..REQUEST
+            }
+            .is_valid()
+        );
+        assert!(
+            !BlockRequest {
+                sidechain_slots: every_slot + 1,
+                ..REQUEST
+            }
+            .is_valid()
+        );
+
+        let ticket = BlockTicket {
+            generation: 1,
+            sequence: 1,
+        };
+        let request = BlockRequest {
+            sidechain_slots: 0b101,
+            ..REQUEST
+        };
+        let mut slot = BlockSlot::new();
+        slot.publish_request(ticket, request).unwrap();
+        slot.claim_for_processing(7).unwrap();
+        slot.publish_completion(7, ticket).unwrap();
+        assert_eq!(
+            slot.completion_snapshot().unwrap().unwrap().request,
+            request
+        );
     }
 
     #[test]
