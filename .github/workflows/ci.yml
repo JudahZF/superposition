@@ -61,10 +61,10 @@ jobs:
           mkdir -p target/llvm-cov
           cargo llvm-cov nextest --workspace --lcov --output-path target/llvm-cov/lcov.info
 
-      - name: Smoke compatibility corpus and app bundle
-        run: |
-          cargo xtask compatibility
-          cargo xtask bundle --profile local-dev
+      # The compatibility corpus, loopback, MIDI, and soak gates need plug-in fixtures and
+      # controlled Apple Silicon hardware, so hosted CI does not run them.
+      - name: Smoke app bundle
+        run: cargo xtask bundle --profile local-dev
 
       - name: Enforce dependency policy
         run: cargo deny check
