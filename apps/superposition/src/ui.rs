@@ -2753,14 +2753,16 @@ fn channels_label(channels: PhysicalChannels) -> String {
     }
 }
 
-/// `-3.0 dB`, `+2.0 dB`, or `-inf dB`.
+/// `−3.0 dB`, `0.0 dB`, `+2.0 dB`, or `−inf dB`, with a true minus sign.
 fn gain_label(gain_db: f32) -> String {
     if gain_db <= show::GAIN_MIN_DB {
-        "-inf dB".to_owned()
+        "−inf dB".to_owned()
+    } else if gain_db < 0.0 {
+        format!("−{:.1} dB", gain_db.abs())
     } else if gain_db > 0.0 {
         format!("+{gain_db:.1} dB")
     } else {
-        format!("{gain_db:.1} dB")
+        "0.0 dB".to_owned()
     }
 }
 

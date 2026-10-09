@@ -7,7 +7,8 @@ use sp_ui::components::StateToken;
 use sp_ui::design::{ColorToken, Layout, Spacing, TypographyRole};
 
 use super::style::{
-    Mark, action, choice_row, color, hairline, line, note, paint_text, px, sp, title,
+    Mark, action, button, button_with, choice_row, color, hairline, line, note, paint_text, px,
+    radius, sp, title,
 };
 use super::{LiveRackApp, SetupTab, show::latency_label};
 #[cfg(target_os = "macos")]
@@ -30,6 +31,11 @@ fn columns(lines: &[f32]) -> Vec<f32> {
     lines.iter().map(|lines| lines * line()).collect()
 }
 
+/// A spacing token as the signed pixel count that margins take.
+fn padding(spacing: Spacing) -> i8 {
+    i8::try_from(spacing.pixels()).unwrap_or(i8::MAX)
+}
+
 impl LiveRackApp {
     pub(super) fn draw_setup(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
@@ -40,6 +46,8 @@ impl LiveRackApp {
                     area.min,
                     Vec2::new(px(Layout::SetupRailWidth), area.height()),
                 );
+                ui.painter()
+                    .rect_filled(rail, 0.0, color(ColorToken::Surface));
                 ui.painter().vline(
                     rail.right() - px(Layout::Hairline) / 2.0,
                     rail.y_range(),
@@ -59,10 +67,7 @@ impl LiveRackApp {
                     .auto_shrink([false, false])
                     .show(&mut page_ui, |ui| {
                         Frame::new()
-                            .inner_margin(Margin::symmetric(
-                                i8::try_from(Spacing::S24.pixels()).unwrap_or(i8::MAX),
-                                i8::try_from(Spacing::S16.pixels()).unwrap_or(i8::MAX),
-                            ))
+                            .inner_margin(Margin::same(padding(Spacing::S24)))
                             .show(ui, |ui| {
                                 ui.set_max_width(px(Layout::SetupPageWidth));
                                 match self.setup_tab {
@@ -87,7 +92,7 @@ impl LiveRackApp {
             note(
                 ui,
                 "Stop the engine to change devices or buffer size.",
-                ColorToken::Warn,
+                ColorToken::Dim,
             );
             ui.add_space(sp(Spacing::S8));
         }
@@ -225,7 +230,7 @@ impl LiveRackApp {
             note(ui, &message, ColorToken::Warn);
         }
         ui.add_space(sp(Spacing::S10));
-        if action(ui, "Refresh devices", None, !locked).clicked() {
+        if button(ui, "Refresh devices", None, !locked).clicked() {
             self.refresh_audio_devices();
         }
         if self.selected_route != previous_route || self.buffer_frames != previous_buffer {
@@ -254,7 +259,7 @@ impl LiveRackApp {
                 note(
                     ui,
                     "Stop the engine to change the MIDI input.",
-                    ColorToken::Warn,
+                    ColorToken::Dim,
                 );
                 ui.add_space(sp(Spacing::S8));
             }
@@ -283,23 +288,13 @@ impl LiveRackApp {
                 }
             }
             ui.add_space(sp(Spacing::S10));
-            if action(ui, "Refresh MIDI", None, !locked).clicked() {
+            if button(ui, "Refresh MIDI", None, !locked).clicked() {
                 self.refresh_midi_ports();
             }
         }
         section(ui, "Mappings");
         let widths = columns(&[NARROW, NARROW, WIDE * 2.0, MEDIUM]);
-        table_row(
-            ui,
-            &widths,
-            &[
-                ("CC", ColorToken::Dim),
-                ("Ch", ColorToken::Dim),
-                ("Target", ColorToken::Dim),
-                ("", ColorToken::Dim),
-            ],
-            ColorToken::Hairline,
-        );
+        table_header(ui, &widths, &["CC", "Ch", "Target", ""]);
         let model = &self.controller.document().model;
         let rows: Vec<(String, String, String)> = model
             .midi_mappings
@@ -335,7 +330,6 @@ impl LiveRackApp {
                     (target, ColorToken::Text),
                     ("", ColorToken::Text),
                 ],
-                ColorToken::HoverFill,
             );
             if cell_action(ui, cells[3], ("remove_mapping", index), "Remove").clicked() {
                 removed = Some(index);
@@ -345,6 +339,7 @@ impl LiveRackApp {
             self.remove_midi_mapping(index);
         }
         if rows.is_empty() {
+            ui.add_space(sp(Spacing::S8));
             super::style::text(
                 ui,
                 "No mappings yet.",
@@ -363,12 +358,12 @@ impl LiveRackApp {
                     TypographyRole::Body,
                     ColorToken::Warn,
                 );
-                if action(ui, "Cancel", None, true).clicked() {
+                if button(ui, "Cancel", None, true).clicked() {
                     self.cancel_midi_learn();
                     self.set_status("MIDI Learn cancelled");
                 }
             });
-        } else if action(ui, "Learn new mapping", None, true).clicked() {
+        } else if button(ui, "Learn new mapping", None, true).clicked() {
             self.arm_midi_learn();
         }
         ui.add_space(sp(Spacing::S8));
@@ -406,7 +401,7 @@ impl LiveRackApp {
             .map_or(0, crate::ProductRuntime::stale_catalog_entries);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = sp(Spacing::S20);
-            if action(ui, "Rescan plug-ins", None, true).clicked() {
+            if button_with(ui, "Rescan plug-ins", None, true, true, px(Layout::Control)).clicked() {
                 self.scan_plugins();
             }
             let last_scan = self
@@ -434,17 +429,7 @@ impl LiveRackApp {
         }
         section(ui, "Catalog");
         let widths = columns(&[WIDE, MEDIUM * 1.5, WIDE, MEDIUM]);
-        table_row(
-            ui,
-            &widths,
-            &[
-                ("Plug-in", ColorToken::Dim),
-                ("Vendor", ColorToken::Dim),
-                ("State", ColorToken::Dim),
-                ("", ColorToken::Dim),
-            ],
-            ColorToken::Hairline,
-        );
+        table_header(ui, &widths, &["Plug-in", "Vendor", "State", ""]);
         let plugins: Vec<(String, String)> = self
             .catalog_plugins
             .iter()
@@ -461,11 +446,10 @@ impl LiveRackApp {
                 &widths,
                 &[
                     (name, ColorToken::Text),
-                    (vendor, ColorToken::Text),
-                    ("OK", ColorToken::Dim),
-                    ("", ColorToken::Dim),
+                    (vendor, ColorToken::Dim),
+                    ("OK", ColorToken::Text),
+                    ("", ColorToken::Text),
                 ],
-                ColorToken::HoverFill,
             );
         }
         for entry in &unavailable {
@@ -475,11 +459,10 @@ impl LiveRackApp {
                 &widths,
                 &[
                     (&entry.name, ColorToken::Text),
-                    (&entry.vendor, ColorToken::Text),
+                    (&entry.vendor, ColorToken::Dim),
                     (&state, ColorToken::Warn),
                     ("", ColorToken::Text),
                 ],
-                ColorToken::HoverFill,
             );
         }
         let mut retry = None;
@@ -494,7 +477,6 @@ impl LiveRackApp {
                     (&state, ColorToken::Fault),
                     ("", ColorToken::Text),
                 ],
-                ColorToken::HoverFill,
             );
             if cell_action(ui, cells[3], ("retry", index), "Allow retry").clicked() {
                 retry = Some(entry.fingerprint.clone());
@@ -535,20 +517,19 @@ impl LiveRackApp {
             MEDIUM * 0.75,
             MEDIUM,
         ]);
-        table_row(
+        table_header(
             ui,
             &widths,
             &[
-                ("#", ColorToken::Dim),
-                ("Rack", ColorToken::Dim),
-                ("Worker", ColorToken::Dim),
-                ("Restarts", ColorToken::Dim),
-                ("Misses", ColorToken::Dim),
-                ("Rejections", ColorToken::Dim),
-                ("Saved", ColorToken::Dim),
-                ("", ColorToken::Dim),
+                "#",
+                "Rack",
+                "Worker",
+                "Restarts",
+                "Misses",
+                "Rejections",
+                "Saved",
+                "",
             ],
-            ColorToken::Hairline,
         );
         let racks: Vec<(String, bool)> = self
             .controller
@@ -610,10 +591,9 @@ impl LiveRackApp {
                     ),
                     (&misses, ColorToken::Text),
                     (&rejections, ColorToken::Text),
-                    (&saved, ColorToken::Text),
+                    (&saved, ColorToken::Dim),
                     ("", ColorToken::Text),
                 ],
-                ColorToken::HoverFill,
             );
             let restart_failed = product.is_some_and(|product| {
                 product.planned_maintenance_failed(index) || product.worker_recovery_failed(index)
@@ -700,11 +680,13 @@ impl LiveRackApp {
             ("Deadline misses", misses.as_str()),
             ("Aggregate device", aggregate),
         ] {
-            table_row(
+            table_cells(
                 ui,
                 &widths,
-                &[(label, ColorToken::Dim), (value, ColorToken::Text)],
-                ColorToken::HoverFill,
+                &[
+                    (label, TypographyRole::Label, ColorToken::Dim),
+                    (value, TypographyRole::Body, ColorToken::Strong),
+                ],
             );
         }
         if let Some(message) = self
@@ -714,8 +696,21 @@ impl LiveRackApp {
             .and_then(|product| product.diagnostics().last())
             .cloned()
         {
-            ui.add_space(sp(Spacing::S10));
-            note(ui, &format!("Last event: {message}"), ColorToken::Dim);
+            section(ui, "Last event");
+            Frame::new()
+                .fill(color(ColorToken::Well))
+                .corner_radius(radius())
+                .inner_margin(Margin::same(padding(Spacing::S8)))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(message)
+                                .text_style(egui::TextStyle::Monospace)
+                                .color(color(ColorToken::Text)),
+                        )
+                        .wrap(),
+                    );
+                });
         }
     }
 
@@ -734,27 +729,41 @@ impl LiveRackApp {
     }
 }
 
-/// A setup rail tab: dim, text on hover, inverted while active.
+/// A setup rail tab: a 32 px row with a radius. Hover fills it with the hover fill and sets the
+/// label Strong. The active tab is filled too, with Strong text and an Accent bar on its left edge.
 fn setup_tab(ui: &mut Ui, label: &str, active: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), line() + sp(Spacing::S4)),
+    let (row, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), px(Layout::Control) + sp(Spacing::S6)),
         Sense::click(),
     );
-    let token = if active {
-        ui.painter().rect_filled(rect, 0.0, color(ColorToken::Text));
-        ColorToken::Base
-    } else if response.hovered() {
-        ColorToken::Text
+    let rect = row.shrink2(Vec2::X * sp(Spacing::S8));
+    let hovered = response.hovered();
+    let painter = ui.painter();
+    if active || hovered {
+        painter.rect_filled(rect, radius(), color(ColorToken::HoverFill));
+    }
+    if active {
+        painter.rect_filled(
+            Rect::from_min_size(
+                rect.left_top(),
+                Vec2::new(px(Layout::AccentBar), rect.height()),
+            ),
+            0.0,
+            color(ColorToken::Accent),
+        );
+    }
+    let text = if active || hovered {
+        ColorToken::Strong
     } else {
-        ColorToken::Dim
+        ColorToken::Text
     };
     paint_text(
         ui,
-        Pos2::new(rect.left() + sp(Spacing::S20), rect.center().y),
+        Pos2::new(rect.left() + sp(Spacing::S12), rect.center().y),
         Align2::LEFT_CENTER,
         label,
         TypographyRole::Body,
-        token,
+        text,
         rect.width(),
     );
     super::style::focus_outline(ui, &response, rect);
@@ -764,33 +773,59 @@ fn setup_tab(ui: &mut Ui, label: &str, active: bool) -> Response {
     response
 }
 
-/// A section title with space above it.
+/// A section title with a Hairline rule beneath it and space before the content.
 fn section(ui: &mut Ui, text: &str) {
     ui.add_space(sp(Spacing::S16));
     title(ui, text);
-    ui.add_space(sp(Spacing::S4));
+    let (rule, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), px(Layout::Hairline)),
+        Sense::hover(),
+    );
+    ui.painter().hline(
+        rule.x_range(),
+        rule.center().y,
+        hairline(ColorToken::Hairline),
+    );
+    ui.add_space(sp(Spacing::S8));
 }
 
-/// One table row of text cells with a rule beneath it. Returns each cell's rect so callers can
-/// place actions in them.
-fn table_row(
+/// A table header: Label-role column names in Dim over a Hairline rule.
+fn table_header(ui: &mut Ui, widths: &[f32], labels: &[&str]) {
+    let cells: Vec<_> = labels
+        .iter()
+        .map(|label| (*label, TypographyRole::Label, ColorToken::Dim))
+        .collect();
+    table_cells(ui, widths, &cells);
+}
+
+/// One table row of Body cells with a Hairline rule beneath. Returns each cell's rect so callers
+/// can place actions in them.
+fn table_row(ui: &mut Ui, widths: &[f32], cells: &[(&str, ColorToken)]) -> Vec<Rect> {
+    let cells: Vec<_> = cells
+        .iter()
+        .map(|(text, token)| (*text, TypographyRole::Body, *token))
+        .collect();
+    table_cells(ui, widths, &cells)
+}
+
+/// One 24 px table row of cells, each in its own role and colour, with a Hairline rule beneath.
+fn table_cells(
     ui: &mut Ui,
     widths: &[f32],
-    cells: &[(&str, ColorToken)],
-    rule: ColorToken,
+    cells: &[(&str, TypographyRole, ColorToken)],
 ) -> Vec<Rect> {
-    let height = line() + sp(Spacing::S4);
+    let height = px(Layout::RouteRow);
     let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
     ui.painter().hline(
         row.x_range(),
         row.bottom() - px(Layout::Hairline) / 2.0,
-        hairline(rule),
+        hairline(ColorToken::Hairline),
     );
     let mut left = row.left();
     widths
         .iter()
         .zip(cells)
-        .map(|(width, (text, token))| {
+        .map(|(width, (text, role, token))| {
             let cell = Rect::from_min_size(Pos2::new(left, row.top()), Vec2::new(*width, height));
             left += width;
             paint_text(
@@ -798,7 +833,7 @@ fn table_row(
                 cell.left_center(),
                 Align2::LEFT_CENTER,
                 *text,
-                TypographyRole::Body,
+                *role,
                 *token,
                 (width - sp(Spacing::S8)).max(0.0),
             );

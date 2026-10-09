@@ -161,6 +161,14 @@ fn render_show_screen_snapshots() {
         (1920.0, 1080.0),
         &directory.join("setup-diagnostics.png"),
     );
+    for (tab, name) in [
+        (super::SetupTab::Audio, "setup-audio.png"),
+        (super::SetupTab::Midi, "setup-midi.png"),
+        (super::SetupTab::Plugins, "setup-plugins.png"),
+    ] {
+        app.setup_tab = tab;
+        snapshot(&mut app, (1920.0, 1080.0), &directory.join(name));
+    }
     app.screen = super::Screen::Show;
     app.system.state = SystemStatusState::Offline;
     app.overlay = Overlay::Modal(Modal::Recovery);

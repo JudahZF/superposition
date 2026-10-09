@@ -1,13 +1,16 @@
 //! Menus, popovers, the plug-in picker, and modals. Popovers sit on a transparent scrim that
 //! closes them on an outside click; modals ignore it.
 
-use eframe::egui::{self, Align, Align2, Layout as EguiLayout, Pos2, Sense, Ui, Vec2};
+use eframe::egui::{
+    self, Align, Align2, Layout as EguiLayout, Pos2, Response, Sense, Ui, Vec2, WidgetInfo,
+    WidgetType,
+};
 use sp_model::{MAX_SLOTS_PER_RACK, PhysicalChannels, RackChannelRoute, SlotSidechain};
 use sp_ui::design::{ColorToken, Layout, Spacing, TypographyRole};
 
 use super::style::{
-    Mark, action, action_with, choice_row, color, hairline, jack, line, list_row, note, popover,
-    popover_title, px, scrim, sp, text, text_field, title,
+    Mark, action_with, button, button_with, choice_row, color, focus_outline, jack, line, list_row,
+    note, paint_text, popover, popover_title, px, radius, scrim, sp, text, text_field, title,
 };
 use super::{LiveRackApp, Modal, Overlay, SlotAction, channels_label, show::latency_label};
 use crate::CatalogPlugin;
@@ -107,7 +110,9 @@ impl LiveRackApp {
             None,
             Some(("Remove rack…", "", true, RackCommand::Remove)),
         ];
-        let Some(command) = menu(ctx, "rack_menu", at, &items) else {
+        let Some(command) = menu(ctx, "rack_menu", at, &items, |command| {
+            matches!(command, RackCommand::Remove)
+        }) else {
             return;
         };
         self.overlay = Overlay::None;
@@ -196,7 +201,9 @@ impl LiveRackApp {
                 SlotCommand::Action(SlotAction::Remove(slot)),
             )),
         ];
-        let Some(command) = menu(ctx, "slot_menu", at, &items) else {
+        let Some(command) = menu(ctx, "slot_menu", at, &items, |command| {
+            matches!(command, SlotCommand::Action(SlotAction::Remove(_)))
+        }) else {
             return;
         };
         self.overlay = Overlay::None;
@@ -241,7 +248,7 @@ impl LiveRackApp {
                 let stereo = matches!(input, PhysicalChannels::Stereo { .. });
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = sp(Spacing::S4);
-                    text(ui, "Input", TypographyRole::Body, ColorToken::Dim);
+                    text(ui, "Input", TypographyRole::Caption, ColorToken::Dim);
                     ui.add_space(sp(Spacing::S8));
                     if action_with(ui, "Mono", None, true, !stereo).clicked() && stereo {
                         next = Some(RackChannelRoute {
@@ -273,7 +280,7 @@ impl LiveRackApp {
                 text(
                     ui,
                     "Output, stereo pair",
-                    TypographyRole::Body,
+                    TypographyRole::Caption,
                     ColorToken::Dim,
                 );
                 ui.add_space(sp(Spacing::S4));
@@ -295,7 +302,7 @@ impl LiveRackApp {
                 }
                 ui.add_space(sp(Spacing::S12));
                 ui.with_layout(EguiLayout::right_to_left(Align::Center), |ui| {
-                    done = action(ui, "Done", Some("Esc"), true).clicked();
+                    done = button(ui, "Done", Some("Esc"), true).clicked();
                 });
             },
         );
@@ -362,7 +369,7 @@ impl LiveRackApp {
             return;
         };
         let title = format!("Sidechain for {}", model_slot.plugin.identity.name);
-        let detail = format!("on {}, slot {}", rack.name, slot + 1);
+        let detail = format!("On {}, slot {}", rack.name, slot + 1);
         let current = model_slot.sidechain.clone();
         let others: Vec<(sp_model::RackId, String, String)> = model
             .racks
@@ -374,7 +381,7 @@ impl LiveRackApp {
                     other.id.clone(),
                     other.name.clone(),
                     format!(
-                        "out {}",
+                        "Out {}",
                         channels_label(super::rack_route(model, other).output)
                     ),
                 )
@@ -398,7 +405,7 @@ impl LiveRackApp {
                     Mark::Radio,
                     current.is_none(),
                     "None",
-                    "plug-in uses its own input",
+                    "Plug-in uses its own input",
                     true,
                 )
                 .clicked()
@@ -409,7 +416,7 @@ impl LiveRackApp {
                 text(
                     ui,
                     "From a physical input, stereo pair",
-                    TypographyRole::Body,
+                    TypographyRole::Caption,
                     ColorToken::Dim,
                 );
                 ui.add_space(sp(Spacing::S4));
@@ -424,7 +431,7 @@ impl LiveRackApp {
                 text(
                     ui,
                     "From another rack, post fader",
-                    TypographyRole::Body,
+                    TypographyRole::Caption,
                     ColorToken::Dim,
                 );
                 egui::ScrollArea::vertical()
@@ -444,7 +451,7 @@ impl LiveRackApp {
                         ui,
                         "No other racks yet.",
                         TypographyRole::Body,
-                        ColorToken::Faint,
+                        ColorToken::Dim,
                     );
                 }
                 ui.add_space(sp(Spacing::S8));
@@ -458,7 +465,7 @@ impl LiveRackApp {
                 );
                 ui.add_space(sp(Spacing::S12));
                 ui.with_layout(EguiLayout::right_to_left(Align::Center), |ui| {
-                    done = action(ui, "Done", Some("Esc"), true).clicked();
+                    done = button(ui, "Done", Some("Esc"), true).clicked();
                 });
             },
         );
@@ -543,7 +550,7 @@ impl LiveRackApp {
                     text(ui, "No pages yet.", TypographyRole::Body, ColorToken::Dim);
                 }
                 ui.add_space(sp(Spacing::S8));
-                new_page = action(ui, "New page with this rack", None, can_add).clicked();
+                new_page = button(ui, "New page with this rack", None, can_add).clicked();
                 ui.add_space(sp(Spacing::S8));
                 note(
                     ui,
@@ -552,7 +559,7 @@ impl LiveRackApp {
                 );
                 ui.add_space(sp(Spacing::S12));
                 ui.with_layout(EguiLayout::right_to_left(Align::Center), |ui| {
-                    done = action(ui, "Done", Some("Esc"), true).clicked();
+                    done = button(ui, "Done", Some("Esc"), true).clicked();
                 });
             },
         );
@@ -572,7 +579,9 @@ impl LiveRackApp {
             Some(("Rename…", "", true, PageCommand::Rename)),
             Some(("Remove page", "", true, PageCommand::Remove)),
         ];
-        let Some(command) = menu(ctx, "page_menu", at, &items) else {
+        let Some(command) = menu(ctx, "page_menu", at, &items, |command| {
+            matches!(command, PageCommand::Remove)
+        }) else {
             return;
         };
         self.overlay = Overlay::None;
@@ -618,7 +627,8 @@ impl LiveRackApp {
                 }
                 ui.add_space(sp(Spacing::S12));
                 ui.with_layout(EguiLayout::right_to_left(Align::Center), |ui| {
-                    commit |= action(ui, "Rename", Some("↩"), true).clicked();
+                    commit |= button_with(ui, "Rename", Some("↩"), true, true, px(Layout::Control))
+                        .clicked();
                 });
             },
         );
@@ -751,7 +761,7 @@ impl LiveRackApp {
                 popover_title(
                     ui,
                     &format!("Add plug-in to {rack_name}"),
-                    &format!("slot {slot_number} of {MAX_SLOTS_PER_RACK}"),
+                    &format!("Slot {slot_number} of {MAX_SLOTS_PER_RACK}"),
                 );
                 let search = text_field(
                     ui,
@@ -781,7 +791,7 @@ impl LiveRackApp {
                                 } else {
                                     &row.vendor
                                 };
-                                text(ui, heading, TypographyRole::Body, ColorToken::Dim);
+                                text(ui, heading, TypographyRole::Caption, ColorToken::Dim);
                             }
                             let current = index == picker.cursor;
                             let response = list_row(
@@ -816,8 +826,8 @@ impl LiveRackApp {
                 ui.with_layout(EguiLayout::right_to_left(Align::Center), |ui| {
                     text(
                         ui,
-                        "↑↓ choose   ↩ add   Esc close",
-                        TypographyRole::Body,
+                        "Choose ↑↓   Add ↩   Close Esc",
+                        TypographyRole::Label,
                         ColorToken::Dim,
                     );
                 });
@@ -914,12 +924,15 @@ impl LiveRackApp {
                 }
                 ui.add_space(sp(Spacing::S12));
                 ui.with_layout(EguiLayout::right_to_left(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = sp(Spacing::S20);
-                    if action(ui, confirm, Some("↩"), true).clicked() || confirm_key {
+                    ui.spacing_mut().item_spacing.x = sp(Spacing::S8);
+                    let confirmed =
+                        button_with(ui, confirm, Some("↩"), true, true, px(Layout::Control))
+                            .clicked();
+                    if confirmed || confirm_key {
                         choice = Some(true);
                     }
                     let cancel_key = (modal != Modal::Recovery).then_some("Esc");
-                    if action(ui, cancel, cancel_key, true).clicked() {
+                    if button(ui, cancel, cancel_key, true).clicked() {
                         choice = Some(false);
                     }
                 });
@@ -947,68 +960,114 @@ impl LiveRackApp {
     }
 }
 
-/// Draws a bordered menu at `at` and returns the command of a clicked row.
-fn menu<A: Copy>(ctx: &egui::Context, id: &str, at: Pos2, items: &[MenuItem<A>]) -> Option<A> {
+/// Draws a popover menu at `at` and returns the command of a clicked row. `removes` marks the
+/// commands that delete something; their labels read in Fault.
+fn menu<A: Copy>(
+    ctx: &egui::Context,
+    id: &str,
+    at: Pos2,
+    items: &[MenuItem<A>],
+    removes: impl Fn(A) -> bool,
+) -> Option<A> {
     let mut chosen = None;
-    egui::Area::new(egui::Id::new(id))
-        .order(egui::Order::Foreground)
-        .fixed_pos(at)
-        .constrain(true)
-        .fade_in(false)
-        .show(ctx, |ui| {
-            egui::Frame::new()
-                .fill(color(ColorToken::Base))
-                .stroke(hairline(ColorToken::Dim))
-                .inner_margin(egui::Margin::symmetric(
-                    0,
-                    i8::try_from(Spacing::S4.pixels()).unwrap_or(i8::MAX),
-                ))
-                .show(ui, |ui| {
-                    let width = items
-                        .iter()
-                        .flatten()
-                        .map(|(label, key, ..)| {
-                            let measure = |text: &str| {
-                                super::style::galley(
-                                    ui,
-                                    text,
-                                    TypographyRole::Body,
-                                    ColorToken::Text,
-                                    f32::INFINITY,
-                                )
-                                .size()
-                                .x
-                            };
-                            measure(label)
-                                + measure(key)
-                                + sp(Spacing::S12) * 2.0
-                                + sp(Spacing::S20)
-                        })
-                        .fold(px(Layout::MenuMinWidth), f32::max);
-                    ui.set_width(width);
-                    for item in items {
-                        match item {
-                            None => {
-                                ui.add_space(sp(Spacing::S4));
-                                let (rect, _) = ui.allocate_exact_size(
-                                    Vec2::new(ui.available_width(), px(Layout::Hairline)),
-                                    Sense::hover(),
-                                );
-                                ui.painter()
-                                    .rect_filled(rect, 0.0, color(ColorToken::Hairline));
-                                ui.add_space(sp(Spacing::S4));
-                            }
-                            Some((label, key, enabled, command)) => {
-                                let key = (!key.is_empty()).then_some(*key);
-                                if list_row(ui, label, "", key, false, *enabled).clicked() {
-                                    chosen = Some(*command);
-                                }
-                            }
-                        }
+    popover(ctx, egui::Id::new(id), at, Align2::LEFT_TOP, None, |ui| {
+        let width = items
+            .iter()
+            .flatten()
+            .map(|(label, key, ..)| {
+                let measure = |text: &str| {
+                    super::style::galley(
+                        ui,
+                        text,
+                        TypographyRole::Body,
+                        ColorToken::Text,
+                        f32::INFINITY,
+                    )
+                    .size()
+                    .x
+                };
+                measure(label) + measure(key) + sp(Spacing::S12) * 2.0 + sp(Spacing::S20)
+            })
+            .fold(px(Layout::MenuMinWidth), f32::max);
+        ui.set_width(width);
+        for item in items {
+            match item {
+                None => {
+                    ui.add_space(sp(Spacing::S4));
+                    let (rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), px(Layout::Hairline)),
+                        Sense::hover(),
+                    );
+                    ui.painter()
+                        .rect_filled(rect, 0.0, color(ColorToken::Hairline));
+                    ui.add_space(sp(Spacing::S4));
+                }
+                Some((label, key, enabled, command)) => {
+                    let key = (!key.is_empty()).then_some(*key);
+                    let response = if removes(*command) {
+                        removal_row(ui, label, key, *enabled)
+                    } else {
+                        list_row(ui, label, "", key, false, *enabled)
+                    };
+                    if response.clicked() {
+                        chosen = Some(*command);
                     }
-                });
-        });
+                }
+            }
+        }
+    });
     chosen
+}
+
+/// A menu row that removes something. It matches [`list_row`] except that its label reads in
+/// Fault, and the label stays Fault on hover.
+fn removal_row(ui: &mut Ui, label: &str, key: Option<&str>, enabled: bool) -> Response {
+    let width = ui.available_width();
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, px(Layout::RouteRow)), sense);
+    if ui.is_rect_visible(rect) {
+        let hovered = enabled && response.hovered();
+        let (text, secondary) = match (enabled, hovered) {
+            (false, _) => (ColorToken::Faint, ColorToken::Faint),
+            (true, true) => (ColorToken::Fault, ColorToken::Text),
+            (true, false) => (ColorToken::Fault, ColorToken::Dim),
+        };
+        if hovered {
+            ui.painter()
+                .rect_filled(rect, radius(), color(ColorToken::HoverFill));
+        }
+        let inset = sp(Spacing::S12);
+        let key_rect = key.map(|key| {
+            paint_text(
+                ui,
+                Pos2::new(rect.right() - inset, rect.center().y),
+                Align2::RIGHT_CENTER,
+                key,
+                TypographyRole::Body,
+                secondary,
+                rect.width() / 2.0,
+            )
+        });
+        let label_width = key_rect.map_or(rect.width() - inset * 2.0, |key_rect| {
+            (key_rect.left() - rect.left() - inset * 2.0).max(0.0)
+        });
+        paint_text(
+            ui,
+            Pos2::new(rect.left() + inset, rect.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            TypographyRole::Body,
+            text,
+            label_width,
+        );
+        focus_outline(ui, &response, rect);
+    }
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
+    response
 }
 
 /// A jack grid of 16 mono channels or 8 stereo pairs (more rows for larger devices). Channels

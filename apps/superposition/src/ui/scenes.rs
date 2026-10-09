@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eframe::egui::{self, Align, Align2, Layout as EguiLayout};
+use eframe::egui::{self, Align, Align2, Layout as EguiLayout, Sense, Vec2};
 use sp_model::{
     MAX_SCENE_PARAMETER_VALUES, ParameterId, PluginParameterMetadata, PluginSlot, Scene,
     SceneParameterTransition, SceneParameterValue, Session,
@@ -12,7 +12,8 @@ use sp_ui::design::{ColorToken, Layout, Spacing, TypographyRole};
 
 use super::LiveRackApp;
 use super::style::{
-    Mark, action, choice_row, line, note, popover, popover_title, px, sp, text, text_field,
+    Mark, button, button_with, choice_row, line, note, paint_text, popover, popover_title, px, sp,
+    text, text_field,
 };
 
 /// Parameters a new capture selects per plug-in by default.
@@ -232,11 +233,23 @@ impl SceneEditor {
                 egui::ScrollArea::vertical()
                     .max_height(list_height)
                     .auto_shrink([false, true])
-                    .show_rows(ui, line(), self.rows.len(), |ui, range| {
+                    .show_rows(ui, px(Layout::RouteRow), self.rows.len(), |ui, range| {
                         for row in range {
                             match &self.rows[row] {
                                 Row::Group(location) => {
-                                    text(ui, location, TypographyRole::Body, ColorToken::Dim);
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        Vec2::new(ui.available_width(), px(Layout::RouteRow)),
+                                        Sense::hover(),
+                                    );
+                                    paint_text(
+                                        ui,
+                                        rect.left_center(),
+                                        Align2::LEFT_CENTER,
+                                        location,
+                                        TypographyRole::Caption,
+                                        ColorToken::Dim,
+                                        rect.width(),
+                                    );
                                 }
                                 Row::Choice(index) => {
                                     let index = *index;
@@ -283,17 +296,25 @@ impl SceneEditor {
                 );
                 ui.add_space(sp(Spacing::S12));
                 ui.with_layout(EguiLayout::right_to_left(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = sp(Spacing::S20);
+                    ui.spacing_mut().item_spacing.x = sp(Spacing::S8);
                     let confirm = if self.scene_index.is_some() {
                         "Save scene"
                     } else {
                         "Capture"
                     };
-                    if action(ui, confirm, Some("↩"), !self.scene.name.trim().is_empty()).clicked()
+                    if button_with(
+                        ui,
+                        confirm,
+                        Some("↩"),
+                        !self.scene.name.trim().is_empty(),
+                        true,
+                        px(Layout::Control),
+                    )
+                    .clicked()
                     {
                         choice = Some(SceneChoice::Commit);
                     }
-                    if action(ui, "Cancel", Some("Esc"), true).clicked() {
+                    if button(ui, "Cancel", Some("Esc"), true).clicked() {
                         choice = Some(SceneChoice::Cancel);
                     }
                 });

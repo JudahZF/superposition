@@ -5,13 +5,16 @@ use eframe::egui::{
     UiBuilder, Vec2, WidgetInfo, WidgetType,
 };
 use sp_model::{MAX_RACKS, SlotSidechain};
-use sp_ui::components::{LED_SEGMENTS, Segment, StateToken, SystemStatusState, led_segment};
+use sp_ui::components::{
+    METER_FAULT_DBFS, METER_SCALE_DBFS, METER_WARN_DBFS, StateToken, SystemStatusState,
+    dbfs_fraction,
+};
 use sp_ui::design::{ColorToken, Layout, Spacing, TypographyRole};
 
 use super::previews::Tile;
 use super::style::{
-    action, action_with, color, dashed_rect, font, galley, hairline, line, paint_text, px, readout,
-    sp, toggle,
+    button_with, color, dashed_rect, font, galley, hairline, line, line_height, paint_text, px,
+    radius, readout, small_radius, sp, square_button, toggle,
 };
 use super::{LiveRackApp, Modal, Overlay, Picker, Screen, SlotAction, channels_label, gain_label};
 
@@ -24,9 +27,38 @@ const GAIN_FINE_STEP_DB: f32 = 0.1;
 /// Preview slots per column; every column shares one rhythm.
 const PREVIEW_SLOTS: usize = sp_model::MAX_SLOTS_PER_RACK;
 
-fn margin(horizontal: Spacing, vertical: Spacing) -> Margin {
-    let pixels = |spacing: Spacing| i8::try_from(spacing.pixels()).unwrap_or(i8::MAX);
-    Margin::symmetric(pixels(horizontal), pixels(vertical))
+fn inset(spacing: Spacing) -> i8 {
+    i8::try_from(spacing.pixels()).unwrap_or(i8::MAX)
+}
+
+/// The padding of a head, fault line, page line, or foot: 16 px at each side, none vertically.
+fn edge_margin() -> Margin {
+    Margin::symmetric(inset(Spacing::S16), 0)
+}
+
+/// The full width of a bar whose contents were inset by [`edge_margin`].
+fn bar_edge(ui: &Ui) -> Rect {
+    ui.max_rect().expand2(Vec2::new(sp(Spacing::S16), 0.0))
+}
+
+/// A Hairline rule along the bottom edge of a bar.
+fn bottom_rule(ui: &Ui) {
+    let edge = bar_edge(ui);
+    ui.painter().hline(
+        edge.x_range(),
+        edge.bottom() - px(Layout::Hairline) / 2.0,
+        hairline(ColorToken::Hairline),
+    );
+}
+
+/// A Hairline rule along the top edge of a bar.
+fn top_rule(ui: &Ui) {
+    let edge = bar_edge(ui);
+    ui.painter().hline(
+        edge.x_range(),
+        edge.top() + px(Layout::Hairline) / 2.0,
+        hairline(ColorToken::Hairline),
+    );
 }
 
 /// Horizontal fraction of a gain on the −60 to +12 dB track.
@@ -34,11 +66,11 @@ fn gain_fraction(gain_db: f32) -> f32 {
     ((gain_db - GAIN_MIN_DB) / (GAIN_MAX_DB - GAIN_MIN_DB)).clamp(0.0, 1.0)
 }
 
-/// Vertical extents of the column parts below the previews, top to bottom.
+/// Heights of the column parts below the previews, top to bottom. Each includes the space above
+/// it.
 struct ColumnFoot {
     gain: f32,
     meters: f32,
-    labels: f32,
     toggles: f32,
     status: f32,
 }
@@ -46,38 +78,44 @@ struct ColumnFoot {
 impl ColumnFoot {
     fn new() -> Self {
         Self {
-            // Padding, the label row, the track with its margins, and the tick labels.
-            gain: sp(Spacing::S8)
-                + line()
+            // Padding, the label row, a 9 px gap, the track, a 7 px gap, and the tick labels.
+            gain: sp(Spacing::S10)
+                + line_height(TypographyRole::Caption)
                 + sp(Spacing::S8)
+                + px(Layout::Hairline)
                 + px(Layout::GainTrack)
+                + sp(Spacing::S6)
+                + px(Layout::Hairline)
+                + line_height(TypographyRole::Label),
+            // Padding, the bars, a 4 px gap, and the bar labels.
+            meters: sp(Spacing::S12)
+                + px(Layout::MeterHeight)
                 + sp(Spacing::S4)
-                + px(Layout::Caption),
-            meters: sp(Spacing::S10) + px(Layout::MeterHeight) + sp(Spacing::S4),
-            labels: px(Layout::Caption),
-            toggles: sp(Spacing::S8) + line() + px(Layout::Hairline) * 2.0,
-            status: sp(Spacing::S8) + line(),
+                + line_height(TypographyRole::Label),
+            toggles: sp(Spacing::S10) + px(Layout::Control),
+            // A 9 px gap, then the status line.
+            status: sp(Spacing::S8) + px(Layout::Hairline) + line_height(TypographyRole::Caption),
         }
     }
 
     fn height(&self) -> f32 {
-        self.gain + self.meters + self.labels + self.toggles + self.status
+        self.gain + self.meters + self.toggles + self.status
     }
 }
 
-/// Room above the previews: the header row and the route line.
+/// Room above the previews: the header row, the route row, and a 4 px gap.
 fn column_head_height() -> f32 {
-    line() + sp(Spacing::S2) + line() + sp(Spacing::S10)
+    px(Layout::RackHeader) + px(Layout::RouteRow) + sp(Spacing::S4)
 }
 
-/// Preview height that fits eight slots in the column: 84 px at 1920×1080, down to 60 px on
-/// the laptop preset or while the fault line shows.
+/// Preview height that fits eight slots and the column foot. It clamps between the laptop and
+/// the 1920×1080 heights, and the fault line takes its share of the column.
 fn preview_height(column_height: f32) -> f32 {
     let gaps = sp(Spacing::S4) * 7.0;
     #[allow(clippy::cast_precision_loss, reason = "eight preview slots")]
     let slots = PREVIEW_SLOTS as f32;
     let available = column_height
-        - sp(Spacing::S12) * 2.0
+        - sp(Spacing::S10) * 2.0
         - column_head_height()
         - ColumnFoot::new().height()
         - gaps;
@@ -90,33 +128,42 @@ impl LiveRackApp {
     pub(super) fn draw_head(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("head")
             .exact_height(px(Layout::Head))
+            .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(color(ColorToken::Base))
-                    .inner_margin(margin(Spacing::S20, Spacing::S12)),
+                    .fill(color(ColorToken::Surface))
+                    .inner_margin(edge_margin()),
             )
             .show(ctx, |ui| {
+                bottom_rule(ui);
                 ui.horizontal_centered(|ui| {
-                    ui.spacing_mut().item_spacing.x = sp(Spacing::S24);
+                    // Each readout cell carries its own 14 px padding, so the row adds no spacing.
+                    ui.spacing_mut().item_spacing.x = 0.0;
                     super::style::text(
                         ui,
                         "Superposition",
                         TypographyRole::Wordmark,
-                        ColorToken::Text,
+                        ColorToken::Strong,
                     );
+                    ui.add_space(sp(Spacing::S20) + sp(Spacing::S2));
                     self.draw_readouts(ui);
+                    ui.add_space(sp(Spacing::S16));
                     ui.with_layout(EguiLayout::right_to_left(Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = sp(Spacing::S20);
+                        ui.spacing_mut().item_spacing.x = sp(Spacing::S8);
                         let setup_open = self.screen == Screen::Setup;
                         let label = if setup_open { "Close setup" } else { "Setup" };
-                        if action_with(ui, label, Some("⌘,"), true, setup_open).clicked() {
+                        if button_with(ui, label, Some("⌘,"), true, setup_open, px(Layout::Control))
+                            .clicked()
+                        {
                             self.screen = if setup_open {
                                 Screen::Show
                             } else {
                                 Screen::Setup
                             };
                         }
-                        if action(ui, "Save", Some("⌘S"), true).clicked() {
+                        if button_with(ui, "Save", Some("⌘S"), true, false, px(Layout::Control))
+                            .clicked()
+                        {
                             self.save_session();
                         }
                         let engine = if self.online() {
@@ -124,7 +171,8 @@ impl LiveRackApp {
                         } else {
                             "Start engine"
                         };
-                        if action(ui, engine, None, true).clicked() {
+                        if button_with(ui, engine, None, true, false, px(Layout::Control)).clicked()
+                        {
                             self.request_engine_toggle();
                         }
                         let message = self.saved_at.map_or_else(
@@ -144,7 +192,7 @@ impl LiveRackApp {
 
     fn draw_readouts(&self, ui: &mut Ui) {
         let (engine, engine_token) = match self.system.state {
-            SystemStatusState::Online => ("Online", ColorToken::Text),
+            SystemStatusState::Online => ("Online", ColorToken::Strong),
             SystemStatusState::Connecting => ("Connecting", ColorToken::Warn),
             SystemStatusState::Offline => ("Offline", ColorToken::Warn),
         };
@@ -153,33 +201,33 @@ impl LiveRackApp {
             ui,
             "Device",
             &self.output_device_name(),
-            ColorToken::Text,
+            ColorToken::Strong,
             px(Layout::SessionNameWidth),
         );
-        readout(ui, "Rate", "48 000", ColorToken::Text, f32::INFINITY);
+        readout(ui, "Rate", "48 kHz", ColorToken::Strong, f32::INFINITY);
         let frames = self.buffer_frames_value();
         readout(
             ui,
             "Buffer",
-            &format!("{frames} smp"),
-            ColorToken::Text,
+            &format!("{frames} samples"),
+            ColorToken::Strong,
             f32::INFINITY,
         );
         readout(
             ui,
             "Latency",
             &latency_label(frames),
-            ColorToken::Text,
+            ColorToken::Strong,
             f32::INFINITY,
         );
         let load = self
             .callback_load()
             .map_or_else(|| "--".to_owned(), |load| format!("{:.0} %", load * 100.0));
-        readout(ui, "Load", &load, ColorToken::Text, f32::INFINITY);
+        readout(ui, "Load", &load, ColorToken::Strong, f32::INFINITY);
         let misses = self
             .deadline_misses()
             .map_or_else(|| "--".to_owned(), |misses| misses.to_string());
-        readout(ui, "Misses", &misses, ColorToken::Text, f32::INFINITY);
+        readout(ui, "Misses", &misses, ColorToken::Strong, f32::INFINITY);
         let racks = self.controller.document().model.racks.len();
         let restarts: u32 = self.product.as_ref().map_or(0, |product| {
             (0..racks)
@@ -193,7 +241,7 @@ impl LiveRackApp {
             if restarts > 0 {
                 ColorToken::Warn
             } else {
-                ColorToken::Text
+                ColorToken::Strong
             },
             f32::INFINITY,
         );
@@ -202,7 +250,7 @@ impl LiveRackApp {
             ui,
             "Session",
             &format!("{}{dirty}", self.session_name()),
-            ColorToken::Text,
+            ColorToken::Strong,
             px(Layout::SessionNameWidth),
         );
     }
@@ -237,32 +285,39 @@ impl LiveRackApp {
             .frame(
                 Frame::new()
                     .fill(color(ColorToken::FaultTint))
-                    .inner_margin(margin(Spacing::S20, Spacing::S8)),
+                    .inner_margin(edge_margin()),
             )
             .show(ctx, |ui| {
-                let rule = ui
-                    .max_rect()
-                    .expand2(Vec2::new(sp(Spacing::S20), sp(Spacing::S8)));
-                ui.painter().hline(
-                    rule.x_range(),
-                    rule.bottom() - px(Layout::Hairline) / 2.0,
-                    hairline(ColorToken::Fault),
-                );
+                bottom_rule(ui);
                 ui.horizontal_centered(|ui| {
-                    ui.spacing_mut().item_spacing.x = sp(Spacing::S16);
-                    super::style::text(ui, "Fault", TypographyRole::Body, ColorToken::Fault);
+                    ui.spacing_mut().item_spacing.x = sp(Spacing::S14);
+                    super::style::text(ui, "Fault", TypographyRole::Title, ColorToken::Fault);
                     ui.with_layout(EguiLayout::right_to_left(Align::Center), |ui| {
-                        if action(ui, "Dismiss", Some("Esc"), true).clicked() {
+                        if button_with(
+                            ui,
+                            "Dismiss",
+                            Some("Esc"),
+                            true,
+                            false,
+                            px(Layout::Control) - sp(Spacing::S4),
+                        )
+                        .clicked()
+                        {
                             self.fault = None;
                         }
                         ui.with_layout(EguiLayout::left_to_right(Align::Center), |ui| {
                             let width = ui.available_width();
-                            let galley =
-                                galley(ui, message, TypographyRole::Body, ColorToken::Text, width);
+                            let galley = galley(
+                                ui,
+                                message,
+                                TypographyRole::Body,
+                                ColorToken::Strong,
+                                width,
+                            );
                             let (rect, response) =
                                 ui.allocate_exact_size(galley.size(), Sense::hover());
                             ui.painter()
-                                .galley(rect.min, galley, color(ColorToken::Text));
+                                .galley(rect.min, galley, color(ColorToken::Strong));
                             response.widget_info(|| {
                                 WidgetInfo::labeled(WidgetType::Label, true, "Fault")
                             });
@@ -275,12 +330,14 @@ impl LiveRackApp {
     pub(super) fn draw_foot(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("foot")
             .exact_height(px(Layout::Foot))
+            .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(color(ColorToken::Base))
-                    .inner_margin(margin(Spacing::S20, Spacing::S12)),
+                    .fill(color(ColorToken::Surface))
+                    .inner_margin(edge_margin()),
             )
             .show(ctx, |ui| {
+                top_rule(ui);
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = sp(Spacing::S4);
                     super::style::text(ui, "Scene", TypographyRole::Body, ColorToken::Dim);
@@ -296,35 +353,65 @@ impl LiveRackApp {
                         .collect();
                     for (index, name) in names.iter().enumerate() {
                         let active = self.current_scene == Some(index);
-                        if pad(ui, "Scene", Some(index + 1), name, active, online).clicked() {
+                        if pad(
+                            ui,
+                            "Scene",
+                            Some(index + 1),
+                            name,
+                            active,
+                            online,
+                            px(Layout::ScenePad),
+                        )
+                        .clicked()
+                        {
                             self.recall_scene(index);
                         }
                     }
-                    ui.add_space(sp(Spacing::S24));
+                    ui.add_space(sp(Spacing::S14));
                     super::style::text(ui, "Fade", TypographyRole::Body, ColorToken::Dim);
-                    ui.add_space(sp(Spacing::S4));
-                    if action(ui, "−", None, self.fade_ms > 0).clicked() {
+                    ui.add_space(sp(Spacing::S8));
+                    if square_button(ui, "−", self.fade_ms > 0).clicked() {
                         self.step_fade(-1);
                     }
-                    super::style::text(
+                    let slot = Vec2::new(
+                        sp(Spacing::S24) * 2.0 + sp(Spacing::S4),
+                        px(Layout::Control),
+                    );
+                    let (rect, _) = ui.allocate_exact_size(slot, Sense::hover());
+                    paint_text(
                         ui,
+                        rect.center(),
+                        Align2::CENTER_CENTER,
                         format!("{} ms", self.fade_ms),
                         TypographyRole::Body,
-                        ColorToken::Text,
+                        ColorToken::Strong,
+                        rect.width(),
                     );
-                    if action(ui, "+", None, self.fade_ms < super::FADE_MAX_MS).clicked() {
+                    if square_button(ui, "+", self.fade_ms < super::FADE_MAX_MS).clicked() {
                         self.step_fade(1);
                     }
-                    ui.add_space(sp(Spacing::S24));
-                    ui.spacing_mut().item_spacing.x = sp(Spacing::S20);
-                    if action(ui, "Capture", Some("⌘⇧C"), online).clicked() {
+                    ui.add_space(sp(Spacing::S14));
+                    ui.spacing_mut().item_spacing.x = sp(Spacing::S6);
+                    if button_with(
+                        ui,
+                        "Capture",
+                        Some("⌘⇧C"),
+                        online,
+                        false,
+                        px(Layout::Control),
+                    )
+                    .clicked()
+                    {
                         self.capture_scene();
                     }
                     let scene_open = online && self.current_scene.is_some();
-                    if action(ui, "Update", None, scene_open).clicked() {
+                    if button_with(ui, "Update", None, scene_open, false, px(Layout::Control))
+                        .clicked()
+                    {
                         self.update_current_scene();
                     }
-                    if action(ui, "Edit", None, scene_open).clicked()
+                    if button_with(ui, "Edit", None, scene_open, false, px(Layout::Control))
+                        .clicked()
                         && let Some(index) = self.current_scene
                         && let Some(scene) =
                             self.controller.document().model.scenes.get(index).cloned()
@@ -368,7 +455,7 @@ impl LiveRackApp {
                     Pos2::new(left, rect.bottom() - bar_height),
                     Pos2::new(left + bar, rect.bottom()),
                 ),
-                0.0,
+                small_radius(),
                 color(token),
             );
         }
@@ -423,6 +510,18 @@ impl LiveRackApp {
                             if !ui.is_rect_visible(column) {
                                 continue;
                             }
+                            if rack == self.selected_rack {
+                                ui.painter()
+                                    .rect_filled(column, 0.0, color(ColorToken::Surface));
+                                ui.painter().rect_filled(
+                                    Rect::from_min_size(
+                                        column.left_top(),
+                                        Vec2::new(column.width(), px(Layout::AccentBar)),
+                                    ),
+                                    0.0,
+                                    color(ColorToken::Accent),
+                                );
+                            }
                             ui.painter().vline(
                                 column.right() - px(Layout::Hairline) / 2.0,
                                 column.y_range(),
@@ -463,7 +562,7 @@ impl LiveRackApp {
                 (
                     "No racks on this page.",
                     TypographyRole::Title,
-                    ColorToken::Text,
+                    ColorToken::Strong,
                 ),
                 (
                     "Add a rack here, or use a rack's menu, Pages, on another page.",
@@ -478,7 +577,7 @@ impl LiveRackApp {
             ]
         } else {
             [
-                ("No racks yet.", TypographyRole::Title, ColorToken::Text),
+                ("No racks yet.", TypographyRole::Title, ColorToken::Strong),
                 (
                     "Add a rack, then choose a plug-in after scanning.",
                     TypographyRole::Body,
@@ -512,22 +611,35 @@ impl LiveRackApp {
         }
     }
 
-    /// The page line: `All racks`, each page as `n Name`, and `+ page`. Right-click a page for
+    /// The page line: `All racks`, each page as `n Name`, and `+ Page`. Right-click a page for
     /// its menu.
     pub(super) fn draw_page_line(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("page_line")
             .exact_height(px(Layout::FaultLine))
+            .show_separator_line(false)
             .frame(
                 Frame::new()
                     .fill(color(ColorToken::Base))
-                    .inner_margin(margin(Spacing::S20, Spacing::S6)),
+                    .inner_margin(edge_margin()),
             )
             .show(ctx, |ui| {
+                bottom_rule(ui);
+                let height = px(Layout::Control) - sp(Spacing::S4);
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = sp(Spacing::S4);
                     super::style::text(ui, "Page", TypographyRole::Body, ColorToken::Dim);
                     ui.add_space(sp(Spacing::S8));
-                    if pad(ui, "Page", None, "All racks", self.page.is_none(), true).clicked() {
+                    if pad(
+                        ui,
+                        "Page",
+                        None,
+                        "All racks",
+                        self.page.is_none(),
+                        true,
+                        height,
+                    )
+                    .clicked()
+                    {
                         self.show_page(None);
                     }
                     let pages: Vec<String> = self
@@ -546,6 +658,7 @@ impl LiveRackApp {
                             name,
                             self.page == Some(index),
                             true,
+                            height,
                         );
                         if response.clicked() {
                             self.show_page(Some(index));
@@ -559,7 +672,7 @@ impl LiveRackApp {
                     }
                     ui.add_space(sp(Spacing::S8));
                     let can_add = pages.len() < sp_model::MAX_PAGES;
-                    if action(ui, "+ page", None, can_add).clicked() {
+                    if button_with(ui, "+ Page", None, can_add, false, height).clicked() {
                         self.new_page(None);
                     }
                 });
@@ -581,41 +694,33 @@ impl LiveRackApp {
         else {
             return;
         };
-        let inner = column.shrink(sp(Spacing::S12));
+        let inner = column.shrink(sp(Spacing::S10));
         let id = ui.id().with(("column", rack_index));
         let selected = rack_index == self.selected_rack;
         let online = self.online();
         let mut y = inner.top();
 
-        // Header: index, name, and gain. The selected rack's header is inverted.
-        let header =
-            Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(inner.width(), line()));
-        let header_hit = header.expand2(Vec2::new(sp(Spacing::S6), 0.0));
-        if selected {
-            ui.painter()
-                .rect_filled(header_hit, 0.0, color(ColorToken::Text));
-        }
-        let (text_token, index_token) = if selected {
-            (ColorToken::Base, ColorToken::Faint)
-        } else {
-            (ColorToken::Text, ColorToken::Dim)
-        };
+        // Header: index, name, and gain.
+        let header = Rect::from_min_size(
+            Pos2::new(inner.left(), y),
+            Vec2::new(inner.width(), px(Layout::RackHeader)),
+        );
         let index_rect = paint_text(
             ui,
             header.left_center(),
             Align2::LEFT_CENTER,
             format!("{:02}", rack_index + 1),
-            TypographyRole::Body,
-            index_token,
+            TypographyRole::Caption,
+            ColorToken::Dim,
             header.width(),
         );
         let gain_rect = paint_text(
             ui,
             header.right_center(),
             Align2::RIGHT_CENTER,
-            gain_label(rack.gain_db.get()).trim_end_matches(" dB"),
-            TypographyRole::Body,
-            text_token,
+            gain_label(rack.gain_db.get()),
+            TypographyRole::Caption,
+            ColorToken::Dim,
             header.width(),
         );
         let name_left = index_rect.right() + sp(Spacing::S8);
@@ -623,9 +728,9 @@ impl LiveRackApp {
         if let Some((renaming, draft)) = &mut self.rename
             && *renaming == rack_index
         {
-            let field = Rect::from_min_size(
-                Pos2::new(name_left, header.top()),
-                Vec2::new(name_width, line()),
+            let field = Rect::from_center_size(
+                Pos2::new(name_left + name_width / 2.0, header.center().y),
+                Vec2::new(name_width, line_height(TypographyRole::Title)),
             );
             let response = ui.put(
                 field,
@@ -650,11 +755,11 @@ impl LiveRackApp {
                 Align2::LEFT_CENTER,
                 &rack.name,
                 TypographyRole::Title,
-                text_token,
+                ColorToken::Strong,
                 name_width,
             );
         }
-        let header_response = ui.interact(header_hit, id.with("header"), Sense::click());
+        let header_response = ui.interact(header, id.with("header"), Sense::click());
         header_response.widget_info(|| {
             WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, &rack.name)
         });
@@ -672,19 +777,21 @@ impl LiveRackApp {
                 at: pointer_or(ui, header.left_bottom()),
             };
         }
-        y += line() + sp(Spacing::S2);
+        y += px(Layout::RackHeader);
 
-        // Route line: "in 1   out 1-2", warn colour when the device lacks a channel.
+        // Route row: "In 1", then "Out 1-2", warn colour when the device lacks a channel.
         let route = super::rack_route(&self.controller.document().model, &rack);
-        let route_text = format!(
-            "in {}   out {}",
+        let input_text = format!(
+            "In {}",
             route
                 .input
-                .map_or_else(|| "none".to_owned(), channels_label),
-            channels_label(route.output)
+                .map_or_else(|| "none".to_owned(), channels_label)
         );
-        let route_rect =
-            Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(inner.width(), line()));
+        let output_text = format!("Out {}", channels_label(route.output));
+        let route_rect = Rect::from_min_size(
+            Pos2::new(inner.left(), y),
+            Vec2::new(inner.width(), px(Layout::RouteRow)),
+        );
         let route_response = ui.interact(route_rect, id.with("route"), Sense::click());
         let route_token = if !self.route_fits(route) {
             ColorToken::Warn
@@ -693,16 +800,31 @@ impl LiveRackApp {
         } else {
             ColorToken::Dim
         };
-        paint_text(
+        let input_rect = paint_text(
             ui,
             route_rect.left_center(),
             Align2::LEFT_CENTER,
-            &route_text,
-            TypographyRole::Body,
+            &input_text,
+            TypographyRole::Caption,
             route_token,
             inner.width(),
         );
-        route_response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &route_text));
+        paint_text(
+            ui,
+            Pos2::new(input_rect.right() + sp(Spacing::S10), route_rect.center().y),
+            Align2::LEFT_CENTER,
+            &output_text,
+            TypographyRole::Caption,
+            route_token,
+            (inner.right() - input_rect.right() - sp(Spacing::S10)).max(0.0),
+        );
+        route_response.widget_info(|| {
+            WidgetInfo::labeled(
+                WidgetType::Button,
+                true,
+                format!("{input_text} {output_text}"),
+            )
+        });
         if route_response.clicked() {
             self.select_rack(rack_index);
             self.overlay = Overlay::Route {
@@ -710,7 +832,7 @@ impl LiveRackApp {
                 at: route_rect.left_bottom(),
             };
         }
-        y += line() + sp(Spacing::S10);
+        y += px(Layout::RouteRow) + sp(Spacing::S4);
 
         // Eight preview slots.
         for slot in 0..PREVIEW_SLOTS {
@@ -749,19 +871,19 @@ impl LiveRackApp {
                 }
             } else if slot == rack.slots.len() {
                 let response = ui.interact(tile, id.with(("add", slot)), Sense::click());
-                let token = if response.hovered() {
-                    ColorToken::Dim
+                let (border, text_token) = if response.hovered() {
+                    (ColorToken::Faint, ColorToken::Text)
                 } else {
-                    ColorToken::Faint
+                    (ColorToken::Groove, ColorToken::Dim)
                 };
-                dashed_rect(ui, tile, token);
+                dashed_rect(ui, tile, border);
                 paint_text(
                     ui,
                     tile.center(),
                     Align2::CENTER_CENTER,
-                    "+ add plug-in",
-                    TypographyRole::Label,
-                    token,
+                    "+ Add plug-in",
+                    TypographyRole::Caption,
+                    text_token,
                     tile.width(),
                 );
                 response
@@ -775,24 +897,30 @@ impl LiveRackApp {
                     });
                 }
             } else {
-                dashed_rect(ui, tile, ColorToken::Faint);
+                dashed_rect(ui, tile, ColorToken::Groove);
             }
         }
 
         // Gain, meters, toggles, and status sit at the column's foot.
         let foot = ColumnFoot::new();
-        let mut y = inner.bottom() - foot.height();
-        let gain_top = y + sp(Spacing::S8);
-        self.draw_gain(ui, id, inner, gain_top, rack_index, &rack);
-        y += foot.gain;
-        self.draw_meters(ui, inner, y + sp(Spacing::S10), rack_index, online);
-        y += foot.meters + foot.labels + sp(Spacing::S8);
+        let foot_top = inner.bottom() - foot.height();
+        self.draw_gain(
+            ui,
+            id,
+            inner,
+            foot_top + sp(Spacing::S10),
+            rack_index,
+            &rack,
+        );
+        let meters_top = foot_top + foot.gain + sp(Spacing::S12);
+        self.draw_meters(ui, inner, meters_top, rack_index, online);
 
+        let toggles_top = foot_top + foot.gain + foot.meters + sp(Spacing::S10);
         let half = (inner.width() - sp(Spacing::S6)) / 2.0;
         let mut toggles = ui.new_child(
             UiBuilder::new()
                 .max_rect(Rect::from_min_size(
-                    Pos2::new(inner.left(), y),
+                    Pos2::new(inner.left(), toggles_top),
                     Vec2::new(inner.width(), px(Layout::Control)),
                 ))
                 .layout(EguiLayout::left_to_right(Align::Center)),
@@ -812,30 +940,37 @@ impl LiveRackApp {
         {
             self.set_rack_controls(rack_index, rack.gain_db.get(), rack.muted, !rack.bypassed);
         }
-        y += px(Layout::Control) + sp(Spacing::S8);
 
-        let status =
-            Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(inner.width(), line()));
+        let status_top = toggles_top + px(Layout::Control) + sp(Spacing::S8) + px(Layout::Hairline);
+        let status = Rect::from_min_size(
+            Pos2::new(inner.left(), status_top),
+            Vec2::new(inner.width(), line_height(TypographyRole::Caption)),
+        );
         let token = self.rack_token(rack_index);
         let token_rect = paint_text(
             ui,
             status.left_center(),
             Align2::LEFT_CENTER,
             token.code(),
-            TypographyRole::Body,
+            TypographyRole::Token,
             token.color(),
             status.width(),
         );
         let ready = (0..rack.slots.len())
             .filter(|slot| self.slot_token(rack_index, *slot) == StateToken::Ready)
             .count();
+        let detail = if token == StateToken::Faulted {
+            "Passes dry".to_owned()
+        } else {
+            format!("{ready}/{} ready", rack.slots.len())
+        };
         paint_text(
             ui,
-            Pos2::new(token_rect.right() + sp(Spacing::S6), status.center().y),
+            Pos2::new(token_rect.right() + sp(Spacing::S8), status.center().y),
             Align2::LEFT_CENTER,
-            format!("{ready}/{}", rack.slots.len()),
-            TypographyRole::Body,
-            ColorToken::Text,
+            detail,
+            TypographyRole::Caption,
+            ColorToken::Dim,
             status.width(),
         );
         if rack.muted {
@@ -843,8 +978,8 @@ impl LiveRackApp {
                 ui,
                 status.right_center(),
                 Align2::RIGHT_CENTER,
-                "muted",
-                TypographyRole::Body,
+                "Muted",
+                TypographyRole::Caption,
                 ColorToken::Dim,
                 status.width(),
             );
@@ -869,7 +1004,7 @@ impl LiveRackApp {
         }
     }
 
-    /// Gain: label row, a 2 px track with a 0 dB tick and a marker, and tick labels. Click or
+    /// Gain: a label row, a 2 px track with a 0 dB tick and a marker, and tick labels. Click or
     /// drag sets it, Shift drags finely, and double-click resets to 0 dB.
     fn draw_gain(
         &mut self,
@@ -883,14 +1018,14 @@ impl LiveRackApp {
         let gain_db = rack.gain_db.get();
         let label_row = Rect::from_min_size(
             Pos2::new(inner.left(), top),
-            Vec2::new(inner.width(), line()),
+            Vec2::new(inner.width(), line_height(TypographyRole::Caption)),
         );
         paint_text(
             ui,
             label_row.left_center(),
             Align2::LEFT_CENTER,
             "Gain",
-            TypographyRole::Body,
+            TypographyRole::Caption,
             ColorToken::Dim,
             inner.width(),
         );
@@ -899,36 +1034,45 @@ impl LiveRackApp {
             label_row.right_center(),
             Align2::RIGHT_CENTER,
             gain_label(gain_db),
-            TypographyRole::Body,
-            ColorToken::Text,
+            TypographyRole::Caption,
+            ColorToken::Strong,
             inner.width(),
         );
-        let track_y = label_row.bottom() + sp(Spacing::S8) + px(Layout::GainTrack) / 2.0;
+        let track_y = label_row.bottom()
+            + sp(Spacing::S8)
+            + px(Layout::Hairline)
+            + px(Layout::GainTrack) / 2.0;
         let track = Rect::from_center_size(
             Pos2::new(inner.center().x, track_y),
             Vec2::new(inner.width(), px(Layout::GainTrack)),
         );
         let hit = track.expand2(Vec2::Y * sp(Spacing::S8));
         let response = ui.interact(hit, id.with("gain"), Sense::click_and_drag());
-        let painter = ui.painter();
-        painter.rect_filled(track, 0.0, color(ColorToken::Faint));
         let x_for = |db: f32| track.left() + track.width() * gain_fraction(db);
-        painter.vline(
+        let marker = Rect::from_center_size(
+            Pos2::new(x_for(gain_db), track_y),
+            Vec2::new(px(Layout::GainThumbWidth), px(Layout::GainThumbHeight)),
+        );
+        ui.painter()
+            .rect_filled(track, small_radius(), color(ColorToken::Groove));
+        ui.painter().rect_filled(
+            Rect::from_min_max(track.min, Pos2::new(marker.center().x, track.bottom())),
+            small_radius(),
+            color(ColorToken::Dim),
+        );
+        ui.painter().vline(
             x_for(0.0),
             track_y - px(Layout::GainTick) / 2.0..=track_y + px(Layout::GainTick) / 2.0,
             hairline(ColorToken::Dim),
         );
-        painter.rect_filled(
-            Rect::from_center_size(
-                Pos2::new(x_for(gain_db), track_y),
-                Vec2::new(px(Layout::GainMarkerWidth), px(Layout::GainMarkerHeight)),
-            ),
-            0.0,
-            color(ColorToken::Text),
-        );
-        let ticks_y = track.bottom() + sp(Spacing::S4) + px(Layout::Caption) / 2.0;
+        ui.painter()
+            .rect_filled(marker, small_radius(), color(ColorToken::Strong));
+        let ticks_y = track.bottom()
+            + sp(Spacing::S6)
+            + px(Layout::Hairline)
+            + line_height(TypographyRole::Label) / 2.0;
         for (db, anchor, label) in [
-            (GAIN_MIN_DB, Align2::LEFT_CENTER, "-60"),
+            (GAIN_MIN_DB, Align2::LEFT_CENTER, "−60"),
             (0.0, Align2::CENTER_CENTER, "0"),
             (GAIN_MAX_DB, Align2::RIGHT_CENTER, "+12"),
         ] {
@@ -938,7 +1082,7 @@ impl LiveRackApp {
                 anchor,
                 label,
                 TypographyRole::Label,
-                ColorToken::Faint,
+                ColorToken::Dim,
                 inner.width(),
             );
         }
@@ -954,7 +1098,7 @@ impl LiveRackApp {
         }
     }
 
-    /// Three LED columns: rack input, then output L and R.
+    /// Three bar meters beside a dBFS scale: rack input, then output L and R.
     fn draw_meters(&self, ui: &mut Ui, inner: Rect, top: f32, rack_index: usize, online: bool) {
         #[cfg(target_os = "macos")]
         let (input, output) = (
@@ -963,42 +1107,43 @@ impl LiveRackApp {
         );
         #[cfg(target_os = "macos")]
         let levels = [
-            (input.fill_fraction(), input.held_fraction(), "in"),
+            (input.fill_fraction(), input.held_fraction(), "In"),
             (output.channel_fraction(0), output.held_fraction(), "L"),
             (output.channel_fraction(1), output.held_fraction(), "R"),
         ];
         #[cfg(not(target_os = "macos"))]
-        let levels = [(0.0, 0.0, "in"), (0.0, 0.0, "L"), (0.0, 0.0, "R")];
-        let width = px(Layout::MeterWidth);
-        let segment = px(Layout::MeterSegment);
-        let gap = sp(Spacing::S2);
+        let levels = [(0.0, 0.0, "In"), (0.0, 0.0, "L"), (0.0, 0.0, "R")];
         let bottom = top + px(Layout::MeterHeight);
+        let scale_width = px(Layout::MeterScaleWidth);
+        let width = px(Layout::MeterWidth);
+        let gap = sp(Spacing::S6);
+        let bars_left = inner.left() + scale_width + gap;
+        let bars_right = bars_left + width * 3.0 + gap * 2.0;
+        for db in METER_SCALE_DBFS {
+            let y = bottom - dbfs_fraction(db) * px(Layout::MeterHeight);
+            paint_text(
+                ui,
+                Pos2::new(inner.left() + scale_width, y),
+                Align2::RIGHT_CENTER,
+                format!("{db:.0}").replace('-', "−"),
+                TypographyRole::Label,
+                ColorToken::Dim,
+                scale_width,
+            );
+        }
         for (column, (level, held, label)) in levels.into_iter().enumerate() {
             #[allow(clippy::cast_precision_loss, reason = "three meter columns")]
-            let left = inner.left() + column as f32 * (width + sp(Spacing::S10));
-            for index in 0..LED_SEGMENTS {
-                #[allow(clippy::cast_precision_loss, reason = "sixteen segments")]
-                let segment_bottom = bottom - index as f32 * (segment + gap);
-                let token = match (led_segment(level, held, index), online) {
-                    (Segment::Off, _) => ColorToken::SegmentOff,
-                    (_, false) => ColorToken::Faint,
-                    (Segment::Lit, true) => ColorToken::Text,
-                    (Segment::Hot, true) => ColorToken::Fault,
-                };
-                ui.painter().rect_filled(
-                    Rect::from_min_max(
-                        Pos2::new(left, segment_bottom - segment),
-                        Pos2::new(left + width, segment_bottom),
-                    ),
-                    0.0,
-                    color(token),
-                );
-            }
+            let left = bars_left + column as f32 * (width + gap);
+            let bar = Rect::from_min_size(
+                Pos2::new(left, top),
+                Vec2::new(width, px(Layout::MeterHeight)),
+            );
+            meter_bar(ui, bar, level, held, online);
             paint_text(
                 ui,
                 Pos2::new(
-                    left + width / 2.0,
-                    bottom + sp(Spacing::S4) + px(Layout::Caption) / 2.0,
+                    bar.center().x,
+                    bottom + sp(Spacing::S4) + line_height(TypographyRole::Label) / 2.0,
                 ),
                 Align2::CENTER_CENTER,
                 label,
@@ -1007,10 +1152,8 @@ impl LiveRackApp {
                 width * 2.0,
             );
         }
-        let meters = Rect::from_min_max(
-            Pos2::new(inner.left(), top),
-            Pos2::new(inner.left() + (width + sp(Spacing::S10)) * 3.0, bottom),
-        );
+        let meters =
+            Rect::from_min_max(Pos2::new(inner.left(), top), Pos2::new(bars_right, bottom));
         ui.interact(meters, ui.id().with(("meters", rack_index)), Sense::hover())
             .widget_info(|| {
                 let mut info =
@@ -1045,8 +1188,60 @@ impl LiveRackApp {
     }
 }
 
-/// A scene or page pad: `n Name`, inverted while active, faint while disabled. `kind` names it
-/// for assistive technology.
+/// One bar meter: a Well track, the level lit from the bottom in its zone colours (Faint when
+/// offline), and a peak-hold line at the held level.
+fn meter_bar(ui: &Ui, bar: Rect, level: f32, held: f32, online: bool) {
+    let height = bar.height();
+    let y_for = |fraction: f32| bar.bottom() - fraction * height;
+    ui.painter()
+        .rect_filled(bar, small_radius(), color(ColorToken::Well));
+    if online {
+        let zones = [
+            (0.0, dbfs_fraction(METER_WARN_DBFS), ColorToken::MeterLit),
+            (
+                dbfs_fraction(METER_WARN_DBFS),
+                dbfs_fraction(METER_FAULT_DBFS),
+                ColorToken::Warn,
+            ),
+            (dbfs_fraction(METER_FAULT_DBFS), 1.0, ColorToken::Fault),
+        ];
+        for (low, high, token) in zones {
+            if level > low {
+                let top = level.min(high);
+                ui.painter().rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(bar.left(), y_for(top)),
+                        Pos2::new(bar.right(), y_for(low)),
+                    ),
+                    small_radius(),
+                    color(token),
+                );
+            }
+        }
+    } else if level > 0.0 {
+        ui.painter().rect_filled(
+            Rect::from_min_max(Pos2::new(bar.left(), y_for(level)), bar.max),
+            small_radius(),
+            color(ColorToken::Faint),
+        );
+    }
+    if held > 0.0 {
+        let top = (y_for(held) - px(Layout::PeakHold))
+            .clamp(bar.top(), bar.bottom() - px(Layout::PeakHold));
+        ui.painter().rect_filled(
+            Rect::from_min_size(
+                Pos2::new(bar.left(), top),
+                Vec2::new(bar.width(), px(Layout::PeakHold)),
+            ),
+            0.0,
+            color(ColorToken::Strong),
+        );
+    }
+}
+
+/// A scene or page pad: `n Name` on a Surface fill with a Groove border. Hover fills it with the
+/// hover fill, active fills it with `AccentFill` and an Accent border, and disabled pads have no
+/// fill. `kind` names it for assistive technology.
 fn pad(
     ui: &mut Ui,
     kind: &str,
@@ -1054,6 +1249,7 @@ fn pad(
     name: &str,
     active: bool,
     enabled: bool,
+    height: f32,
 ) -> Response {
     let number_text = number.map(|number| number.to_string());
     let gap = sp(Spacing::S6);
@@ -1077,11 +1273,8 @@ fn pad(
     )
     .size()
     .x;
-    let pad = sp(Spacing::S8);
-    let size = Vec2::new(
-        pad * 2.0 + number_width + name_width,
-        line() + sp(Spacing::S4),
-    );
+    let inset_width = sp(Spacing::S12);
+    let size = Vec2::new(inset_width * 2.0 + number_width + name_width, height);
     let sense = if enabled {
         Sense::click()
     } else {
@@ -1089,20 +1282,38 @@ fn pad(
     };
     let (rect, response) = ui.allocate_exact_size(size, sense);
     let hovered = enabled && response.hovered();
-    let (fill, number_token, name_token) = match (enabled, active, hovered) {
-        (false, _, _) => (None, ColorToken::Faint, ColorToken::Faint),
-        (true, true, _) => (Some(ColorToken::Text), ColorToken::Faint, ColorToken::Base),
+    let (fill, border, number_token, name_token) = match (enabled, active, hovered) {
+        (false, _, _) => (
+            None,
+            ColorToken::Hairline,
+            ColorToken::Faint,
+            ColorToken::Faint,
+        ),
+        (true, true, _) => (
+            Some(ColorToken::AccentFill),
+            ColorToken::Accent,
+            ColorToken::Text,
+            ColorToken::Strong,
+        ),
         (true, false, true) => (
             Some(ColorToken::HoverFill),
+            ColorToken::Groove,
             ColorToken::Text,
             ColorToken::Text,
         ),
-        (true, false, false) => (None, ColorToken::Dim, ColorToken::Text),
+        (true, false, false) => (
+            Some(ColorToken::Surface),
+            ColorToken::Groove,
+            ColorToken::Dim,
+            ColorToken::Text,
+        ),
     };
     if let Some(fill) = fill {
-        ui.painter().rect_filled(rect, 0.0, color(fill));
+        ui.painter().rect_filled(rect, radius(), color(fill));
     }
-    let mut left = rect.left() + pad;
+    ui.painter()
+        .rect_stroke(rect, radius(), hairline(border), egui::StrokeKind::Inside);
+    let mut left = rect.left() + inset_width;
     if let Some(number_text) = &number_text {
         let placed = paint_text(
             ui,
@@ -1165,19 +1376,19 @@ fn gain_target(ui: &Ui, response: &Response, track: Rect, gain_db: f32) -> Optio
     }
 }
 
-/// The "+ add rack" column.
+/// The "+ Add rack" column.
 fn add_rack_column(ui: &mut Ui, rect: Rect) -> Response {
     let response = ui.interact(rect, ui.id().with("add_rack"), Sense::click());
     let token = if response.hovered() {
-        ColorToken::Dim
+        ColorToken::Text
     } else {
-        ColorToken::Faint
+        ColorToken::Dim
     };
     paint_text(
         ui,
         rect.center(),
         Align2::CENTER_CENTER,
-        "+ add rack",
+        "+ Add rack",
         TypographyRole::Body,
         token,
         rect.width(),
