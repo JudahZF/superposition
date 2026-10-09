@@ -44,8 +44,12 @@ pub(super) fn line() -> f32 {
     px(Layout::Line)
 }
 
+/// The line height of a typography role.
+pub(super) fn line_height(role: TypographyRole) -> f32 {
+    f32::from(role.typography().line_height)
+}
+
 /// The corner radius of controls, preview slots, and popovers.
-#[expect(dead_code, reason = "used by the screen restyle")]
 pub(super) fn radius() -> f32 {
     px(Layout::Radius)
 }
@@ -218,12 +222,14 @@ pub(super) fn paint_text(
     rect
 }
 
-/// Plain text that behaves as a button: hover underlines it, a key hint follows in dim, and
-/// disabled actions are faint. `inverted` draws it selected.
+/// Plain text that acts as a button. Hover underlines it in Strong and sets the label Strong; a
+/// key hint follows in Dim. Disabled actions are faint.
 pub(super) fn action(ui: &mut Ui, label: &str, key: Option<&str>, enabled: bool) -> Response {
     action_with(ui, label, key, enabled, false)
 }
 
+/// [`action`] that can draw a selected chip. `inverted` fills it with the accent fill, sets the label
+/// Strong and the key hint Text, and pads it 6 px on each side.
 pub(super) fn action_with(
     ui: &mut Ui,
     label: &str,
@@ -231,18 +237,29 @@ pub(super) fn action_with(
     enabled: bool,
     inverted: bool,
 ) -> Response {
-    let (text_token, key_token) = match (enabled, inverted) {
-        (false, _) => (ColorToken::Faint, ColorToken::Faint),
-        (true, true) => (ColorToken::Base, ColorToken::Faint),
-        (true, false) => (ColorToken::Text, ColorToken::Dim),
-    };
-    let text = galley(ui, label, TypographyRole::Body, text_token, f32::INFINITY);
-    let key = key.map(|key| galley(ui, key, TypographyRole::Body, key_token, f32::INFINITY));
+    let label_width = galley(
+        ui,
+        label,
+        TypographyRole::Body,
+        ColorToken::Text,
+        f32::INFINITY,
+    )
+    .size()
+    .x;
+    let key_width = key.map_or(0.0, |key| {
+        sp(Spacing::S6)
+            + galley(
+                ui,
+                key,
+                TypographyRole::Body,
+                ColorToken::Dim,
+                f32::INFINITY,
+            )
+            .size()
+            .x
+    });
     let pad = if inverted { sp(Spacing::S6) } else { 0.0 };
-    let key_width = key
-        .as_ref()
-        .map_or(0.0, |key| sp(Spacing::S6) + key.size().x);
-    let size = Vec2::new(pad * 2.0 + text.size().x + key_width, line());
+    let size = Vec2::new(pad * 2.0 + label_width + key_width, line());
     let sense = if enabled {
         Sense::click()
     } else {
@@ -250,27 +267,43 @@ pub(super) fn action_with(
     };
     let (rect, response) = ui.allocate_exact_size(size, sense);
     if ui.is_rect_visible(rect) {
+        let hovered = enabled && response.hovered();
+        let (text_token, key_token) = match (enabled, inverted, hovered) {
+            (false, _, _) => (ColorToken::Faint, ColorToken::Faint),
+            (true, true, _) => (ColorToken::Strong, ColorToken::Text),
+            (true, false, true) => (ColorToken::Strong, ColorToken::Dim),
+            (true, false, false) => (ColorToken::Text, ColorToken::Dim),
+        };
         let painter = ui.painter();
         if inverted {
-            painter.rect_filled(rect, 0.0, color(ColorToken::Text));
+            painter.rect_filled(rect, radius(), color(ColorToken::AccentFill));
         }
-        let text_pos = Pos2::new(rect.left() + pad, rect.center().y - text.size().y / 2.0);
-        let text_width = text.size().x;
-        painter.galley(text_pos, text, color(text_token));
-        if enabled && response.hovered() && !inverted {
-            let y = rect.bottom() - sp(Spacing::S2);
+        let label_rect = paint_text(
+            ui,
+            Pos2::new(rect.left() + pad, rect.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            TypographyRole::Body,
+            text_token,
+            f32::INFINITY,
+        );
+        if hovered && !inverted {
             painter.hline(
-                text_pos.x..=text_pos.x + text_width,
-                y,
-                hairline(text_token),
+                label_rect.x_range(),
+                rect.bottom() - sp(Spacing::S2),
+                hairline(ColorToken::Strong),
             );
         }
         if let Some(key) = key {
-            let pos = Pos2::new(
-                text_pos.x + text_width + sp(Spacing::S6),
-                rect.center().y - key.size().y / 2.0,
+            paint_text(
+                ui,
+                Pos2::new(label_rect.right() + sp(Spacing::S6), rect.center().y),
+                Align2::LEFT_CENTER,
+                key,
+                TypographyRole::Body,
+                key_token,
+                f32::INFINITY,
             );
-            painter.galley(pos, key, color(key_token));
         }
         focus_outline(ui, &response, rect);
     }
@@ -278,40 +311,177 @@ pub(super) fn action_with(
     response
 }
 
-/// A bordered text toggle. Lit fills with `lit`.
-pub(super) fn toggle(ui: &mut Ui, label: &str, on: bool, lit: ColorToken) -> Response {
-    let text = galley(
+/// A command button at the control height. See [`button_with`].
+#[expect(dead_code, reason = "used by the screen restyle")]
+pub(super) fn button(ui: &mut Ui, label: &str, key: Option<&str>, enabled: bool) -> Response {
+    button_with(ui, label, key, enabled, false, px(Layout::Control))
+}
+
+/// A bordered command button with an optional key hint in Dim after a 6 px gap. Hover fills it
+/// with the hover fill and sets the label Strong. `active` marks an open or pressed state with an
+/// Accent border. Disabled buttons are inert and faint.
+pub(super) fn button_with(
+    ui: &mut Ui,
+    label: &str,
+    key: Option<&str>,
+    enabled: bool,
+    active: bool,
+    height: f32,
+) -> Response {
+    let label_width = galley(
         ui,
         label,
         TypographyRole::Body,
-        ColorToken::Dim,
+        ColorToken::Text,
         f32::INFINITY,
-    );
-    let size = Vec2::new(
-        text.size().x + sp(Spacing::S6) * 2.0,
-        line() + px(Layout::Hairline) * 2.0,
-    );
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    )
+    .size()
+    .x;
+    let key_width = key.map_or(0.0, |key| {
+        sp(Spacing::S6)
+            + galley(
+                ui,
+                key,
+                TypographyRole::Body,
+                ColorToken::Dim,
+                f32::INFINITY,
+            )
+            .size()
+            .x
+    });
+    let size = Vec2::new(sp(Spacing::S12) * 2.0 + label_width + key_width, height);
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
     if ui.is_rect_visible(rect) {
-        let hovered = response.hovered();
-        let (fill, border, text_token) = if on {
-            (Some(lit), lit, ColorToken::Base)
-        } else if hovered {
-            (None, ColorToken::Dim, ColorToken::Text)
-        } else {
-            (None, ColorToken::Faint, ColorToken::Dim)
-        };
-        let painter = ui.painter();
-        if let Some(fill) = fill {
-            painter.rect_filled(rect, 0.0, color(fill));
+        let (label_token, key_token) = paint_button(ui, rect, &response, enabled, active);
+        let label_rect = paint_text(
+            ui,
+            Pos2::new(rect.left() + sp(Spacing::S12), rect.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            TypographyRole::Body,
+            label_token,
+            f32::INFINITY,
+        );
+        if let Some(key) = key {
+            paint_text(
+                ui,
+                Pos2::new(label_rect.right() + sp(Spacing::S6), rect.center().y),
+                Align2::LEFT_CENTER,
+                key,
+                TypographyRole::Body,
+                key_token,
+                f32::INFINITY,
+            );
         }
-        painter.rect_stroke(rect, 0.0, hairline(border), egui::StrokeKind::Inside);
-        painter.text(
+        focus_outline(ui, &response, rect);
+    }
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
+    response
+}
+
+/// A square button for fade − and +: the control height on each side, with its label centred.
+#[expect(dead_code, reason = "used by the screen restyle")]
+pub(super) fn square_button(ui: &mut Ui, label: &str, enabled: bool) -> Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(px(Layout::Control)), sense);
+    if ui.is_rect_visible(rect) {
+        let (label_token, _) = paint_button(ui, rect, &response, enabled, false);
+        paint_text(
+            ui,
             rect.center(),
             Align2::CENTER_CENTER,
             label,
-            font(TypographyRole::Body),
-            color(text_token),
+            TypographyRole::Body,
+            label_token,
+            rect.width(),
+        );
+        focus_outline(ui, &response, rect);
+    }
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
+    response
+}
+
+/// Paints the fill and border of a button in its state, and returns the label and key colours.
+fn paint_button(
+    ui: &Ui,
+    rect: Rect,
+    response: &Response,
+    enabled: bool,
+    active: bool,
+) -> (ColorToken, ColorToken) {
+    let (fill, border, label, key) = if enabled {
+        let hovered = response.hovered();
+        let fill = if hovered {
+            ColorToken::HoverFill
+        } else {
+            ColorToken::Raised
+        };
+        let border = if active {
+            ColorToken::Accent
+        } else if hovered {
+            ColorToken::Faint
+        } else {
+            ColorToken::Outline
+        };
+        let label = if hovered || active {
+            ColorToken::Strong
+        } else {
+            ColorToken::Text
+        };
+        let key = if hovered {
+            ColorToken::Text
+        } else {
+            ColorToken::Dim
+        };
+        (fill, border, label, key)
+    } else {
+        (
+            ColorToken::Base,
+            ColorToken::Hairline,
+            ColorToken::Faint,
+            ColorToken::Faint,
+        )
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, radius(), color(fill));
+    painter.rect_stroke(rect, radius(), hairline(border), egui::StrokeKind::Inside);
+    (label, key)
+}
+
+/// A bordered toggle at the control height, `width` wide, with a centred label. Lit fills with
+/// `lit` and sets the label in Base; off is a button with a Raised fill.
+pub(super) fn toggle(ui: &mut Ui, label: &str, on: bool, lit: ColorToken, width: f32) -> Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(width, px(Layout::Control)), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let hovered = response.hovered();
+        let (fill, border, text_token) = if on {
+            (lit, lit, ColorToken::Base)
+        } else if hovered {
+            (ColorToken::HoverFill, ColorToken::Faint, ColorToken::Strong)
+        } else {
+            (ColorToken::Raised, ColorToken::Outline, ColorToken::Text)
+        };
+        let painter = ui.painter();
+        painter.rect_filled(rect, radius(), color(fill));
+        painter.rect_stroke(rect, radius(), hairline(border), egui::StrokeKind::Inside);
+        paint_text(
+            ui,
+            rect.center(),
+            Align2::CENTER_CENTER,
+            label,
+            TypographyRole::Body,
+            text_token,
+            rect.width(),
         );
         focus_outline(ui, &response, rect);
     }
@@ -319,8 +489,14 @@ pub(super) fn toggle(ui: &mut Ui, label: &str, on: bool, lit: ColorToken) -> Res
     response
 }
 
-/// A readout cell: a 10 px dim label over a 12 px value, truncated to `max_width`.
+/// A readout cell: a 1 px Hairline rule at its left edge, then a Label-role name in Dim above a
+/// Value-role figure in `token`. The Text token draws as Strong, the readout default.
 pub(super) fn readout(ui: &mut Ui, label: &str, value: &str, token: ColorToken, max_width: f32) {
+    let value_token = if token == ColorToken::Text {
+        ColorToken::Strong
+    } else {
+        token
+    };
     let label_galley = galley(
         ui,
         label,
@@ -328,19 +504,30 @@ pub(super) fn readout(ui: &mut Ui, label: &str, value: &str, token: ColorToken, 
         ColorToken::Dim,
         f32::INFINITY,
     );
-    let value_galley = galley(ui, value, TypographyRole::Body, token, max_width);
-    let caption = px(Layout::Caption);
+    let value_galley = galley(ui, value, TypographyRole::Value, value_token, max_width);
+    let rule = px(Layout::Hairline);
+    let text_width = label_galley.size().x.max(value_galley.size().x);
     let size = Vec2::new(
-        label_galley.size().x.max(value_galley.size().x),
-        caption * 2.0,
+        rule + sp(Spacing::S14) * 2.0 + text_width,
+        line_height(TypographyRole::Label) + line_height(TypographyRole::Value),
     );
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter();
-    painter.galley(rect.min, label_galley, color(ColorToken::Dim));
+    painter.vline(
+        rect.left() + rule / 2.0,
+        rect.y_range(),
+        hairline(ColorToken::Hairline),
+    );
+    let text_left = rect.left() + rule + sp(Spacing::S14);
     painter.galley(
-        Pos2::new(rect.left(), rect.top() + caption),
+        Pos2::new(text_left, rect.top()),
+        label_galley,
+        color(ColorToken::Dim),
+    );
+    painter.galley(
+        Pos2::new(text_left, rect.top() + line_height(TypographyRole::Label)),
         value_galley,
-        color(token),
+        color(value_token),
     );
     response.widget_info(|| {
         let mut info = WidgetInfo::labeled(WidgetType::Label, true, label);
@@ -349,20 +536,20 @@ pub(super) fn readout(ui: &mut Ui, label: &str, value: &str, token: ColorToken, 
     });
 }
 
-/// A 1 px text-colour outline around a keyboard-focused control.
+/// A 1 px Accent outline with the control's radius, 2 px outside a keyboard-focused control.
 pub(super) fn focus_outline(ui: &Ui, response: &Response, rect: Rect) {
     if response.has_focus() {
         ui.painter().rect_stroke(
             rect.expand(sp(Spacing::S2)),
-            0.0,
-            hairline(ColorToken::Text),
+            radius(),
+            hairline(ColorToken::Accent),
             egui::StrokeKind::Outside,
         );
     }
 }
 
-/// A route or sidechain jack: bordered channel label, inverted when selected, faint when the
-/// device lacks the channel.
+/// A route or sidechain jack: a channel label in a radius-cornered box. Selected jacks fill with
+/// the accent fill and an Accent border; unavailable channels have a Hairline border and no fill.
 pub(super) fn jack(ui: &mut Ui, label: &str, on: bool, available: bool, width: f32) -> Response {
     let size = Vec2::new(width, px(Layout::JackHeight));
     let sense = if available {
@@ -375,21 +562,35 @@ pub(super) fn jack(ui: &mut Ui, label: &str, on: bool, available: bool, width: f
         let hovered = available && response.hovered();
         let (fill, border, text) = match (available, on, hovered) {
             (false, _, _) => (None, ColorToken::Hairline, ColorToken::Faint),
-            (true, true, _) => (Some(ColorToken::Text), ColorToken::Text, ColorToken::Base),
-            (true, false, true) => (None, ColorToken::Text, ColorToken::Text),
-            (true, false, false) => (None, ColorToken::Faint, ColorToken::Dim),
+            (true, true, _) => (
+                Some(ColorToken::AccentFill),
+                ColorToken::Accent,
+                ColorToken::Strong,
+            ),
+            (true, false, true) => (
+                Some(ColorToken::Raised),
+                ColorToken::Faint,
+                ColorToken::Strong,
+            ),
+            (true, false, false) => (
+                Some(ColorToken::Raised),
+                ColorToken::Outline,
+                ColorToken::Dim,
+            ),
         };
         let painter = ui.painter();
         if let Some(fill) = fill {
-            painter.rect_filled(rect, 0.0, color(fill));
+            painter.rect_filled(rect, radius(), color(fill));
         }
-        painter.rect_stroke(rect, 0.0, hairline(border), egui::StrokeKind::Inside);
-        painter.text(
+        painter.rect_stroke(rect, radius(), hairline(border), egui::StrokeKind::Inside);
+        paint_text(
+            ui,
             rect.center(),
             Align2::CENTER_CENTER,
             label,
-            font(TypographyRole::Body),
-            color(text),
+            TypographyRole::Body,
+            text,
+            rect.width(),
         );
         focus_outline(ui, &response, rect);
     }
@@ -406,8 +607,8 @@ pub(super) enum Mark {
     Check,
 }
 
-/// A full-width choice row: mark, label, and a right-aligned dim value. Hover fills the row
-/// and promotes the value to text colour so it keeps AA contrast.
+/// A full-width choice row: mark, label, and a right-aligned value. Hover fills the row with
+/// the hover fill, sets the label Strong, and promotes the value to Text so it keeps AA contrast.
 pub(super) fn choice_row(
     ui: &mut Ui,
     mark: Mark,
@@ -422,33 +623,29 @@ pub(super) fn choice_row(
     } else {
         Sense::hover()
     };
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, line()), sense);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, px(Layout::RouteRow)), sense);
     if ui.is_rect_visible(rect) {
         let hovered = enabled && response.hovered();
         let painter = ui.painter();
         if hovered {
-            painter.rect_filled(rect, 0.0, color(ColorToken::HoverFill));
+            painter.rect_filled(rect, radius(), color(ColorToken::HoverFill));
         }
-        let (text, secondary, mark_token) = if !enabled {
-            (ColorToken::Faint, ColorToken::Faint, ColorToken::Faint)
-        } else if hovered {
-            (ColorToken::Text, ColorToken::Text, ColorToken::Text)
-        } else {
-            (
-                ColorToken::Text,
-                ColorToken::Dim,
-                if on {
-                    ColorToken::Text
-                } else {
-                    ColorToken::Dim
-                },
-            )
+        let (text, secondary) = match (enabled, hovered, on) {
+            (false, _, _) => (ColorToken::Faint, ColorToken::Faint),
+            (true, true, _) => (ColorToken::Strong, ColorToken::Text),
+            (true, false, true) => (ColorToken::Text, ColorToken::Text),
+            (true, false, false) => (ColorToken::Text, ColorToken::Dim),
+        };
+        let mark_token = match (enabled, on) {
+            (false, _) => ColorToken::Faint,
+            (true, true) => ColorToken::Accent,
+            (true, false) => ColorToken::Outline,
         };
         let inset = sp(Spacing::S6);
-        let mark_size = sp(Spacing::S6);
+        let mark_size = sp(Spacing::S10);
         let center = Pos2::new(rect.left() + inset + mark_size / 2.0, rect.center().y);
-        let stroke = hairline(mark_token);
         let square = Rect::from_center_size(center, Vec2::splat(mark_size));
+        let stroke = hairline(mark_token);
         match (mark, on) {
             (Mark::Radio, true) => {
                 painter.circle_filled(center, mark_size / 2.0, color(mark_token));
@@ -457,10 +654,10 @@ pub(super) fn choice_row(
                 painter.circle_stroke(center, mark_size / 2.0, stroke);
             }
             (Mark::Check, true) => {
-                painter.rect_filled(square, 0.0, color(mark_token));
+                painter.rect_filled(square, sp(Spacing::S2), color(mark_token));
             }
             (Mark::Check, false) => {
-                painter.rect_stroke(square, 0.0, stroke, egui::StrokeKind::Inside);
+                painter.rect_stroke(square, sp(Spacing::S2), stroke, egui::StrokeKind::Inside);
             }
         }
         let value_rect = paint_text(
@@ -492,7 +689,7 @@ pub(super) fn choice_row(
     response
 }
 
-/// A full-width list row that inverts on hover or when it is the keyboard cursor. Returns the
+/// A full-width list row that highlights on hover or when it is the keyboard cursor. Returns the
 /// response; disabled rows are faint and inert.
 pub(super) fn list_row(
     ui: &mut Ui,
@@ -508,16 +705,17 @@ pub(super) fn list_row(
     } else {
         Sense::hover()
     };
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, line()), sense);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, px(Layout::RouteRow)), sense);
     if ui.is_rect_visible(rect) {
-        let inverted = enabled && (current || response.hovered());
-        let (text, secondary) = match (enabled, inverted) {
+        let highlighted = enabled && (current || response.hovered());
+        let (text, secondary) = match (enabled, highlighted) {
             (false, _) => (ColorToken::Faint, ColorToken::Faint),
-            (true, true) => (ColorToken::Base, ColorToken::Faint),
+            (true, true) => (ColorToken::Strong, ColorToken::Text),
             (true, false) => (ColorToken::Text, ColorToken::Dim),
         };
-        if inverted {
-            ui.painter().rect_filled(rect, 0.0, color(ColorToken::Text));
+        if highlighted {
+            ui.painter()
+                .rect_filled(rect, radius(), color(ColorToken::HoverFill));
         }
         let inset = sp(Spacing::S12);
         let right = key.unwrap_or(detail);
@@ -574,29 +772,30 @@ pub(super) fn note(ui: &mut Ui, text: &str, token: ColorToken) {
 
 /// A section title inside the setup page and popovers.
 pub(super) fn title(ui: &mut Ui, text: &str) {
-    self::text(ui, text, TypographyRole::Title, ColorToken::Text);
+    self::text(ui, text, TypographyRole::Title, ColorToken::Strong);
 }
 
-/// A single-line text field on the base fill.
+/// A single-line text field on the Well fill. The egui visuals draw its border and focus ring.
 pub(super) fn text_field(ui: &mut Ui, value: &mut String, hint: &str, width: f32) -> Response {
     ui.add(
         egui::TextEdit::singleline(value)
             .font(font(TypographyRole::Body))
+            .background_color(color(ColorToken::Well))
             .hint_text(
                 egui::RichText::new(hint)
                     .font(font(TypographyRole::Body))
                     .color(color(ColorToken::Faint)),
             )
             .margin(egui::Margin::symmetric(
-                i8::try_from(Spacing::S6.pixels()).unwrap_or(i8::MAX),
-                i8::try_from(Spacing::S2.pixels()).unwrap_or(i8::MAX),
+                i8::try_from(Spacing::S8.pixels()).unwrap_or(i8::MAX),
+                i8::try_from(Spacing::S4.pixels()).unwrap_or(i8::MAX),
             ))
             .desired_width(width),
     )
 }
 
-/// The bordered box of a popover or modal: base fill, dim border, and the one permitted
-/// shadow. `pivot` places the box relative to `pos`.
+/// The bordered box of a popover or modal: Surface fill, an Outline border, a Radius corner, and
+/// the one permitted shadow. `pivot` places the box relative to `pos`.
 pub(super) fn popover<R>(
     ctx: &egui::Context,
     id: egui::Id,
@@ -613,8 +812,9 @@ pub(super) fn popover<R>(
         .fade_in(false)
         .show(ctx, |ui| {
             egui::Frame::new()
-                .fill(color(ColorToken::Base))
-                .stroke(hairline(ColorToken::Dim))
+                .fill(color(ColorToken::Surface))
+                .stroke(hairline(ColorToken::Outline))
+                .corner_radius(corner_radius())
                 .inner_margin(egui::Margin::symmetric(
                     i8::try_from(Spacing::S12.pixels()).unwrap_or(i8::MAX),
                     i8::try_from(Spacing::S10.pixels()).unwrap_or(i8::MAX),
@@ -623,7 +823,7 @@ pub(super) fn popover<R>(
                     offset: [0, i8::try_from(Spacing::S10.pixels()).unwrap_or(i8::MAX)],
                     blur: Spacing::S24.pixels() + Spacing::S16.pixels(),
                     spread: 0,
-                    color: color(ColorToken::Base).gamma_multiply(0.6),
+                    color: color(ColorToken::Well).gamma_multiply(0.6),
                 })
                 .show(ui, |ui| {
                     if let Some(width) = width {
@@ -635,7 +835,7 @@ pub(super) fn popover<R>(
         })
 }
 
-/// A popover title: medium text at the left, a dim detail at the right.
+/// A popover title: a Title-role heading at the left, a Body detail in Dim at the right.
 pub(super) fn popover_title(ui: &mut Ui, title: &str, detail: &str) {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, line()), Sense::hover());
@@ -654,7 +854,7 @@ pub(super) fn popover_title(ui: &mut Ui, title: &str, detail: &str) {
         Align2::LEFT_CENTER,
         title,
         TypographyRole::Title,
-        ColorToken::Text,
+        ColorToken::Strong,
         (detail_rect.left() - rect.left() - sp(Spacing::S12)).max(0.0),
     );
     ui.add_space(sp(Spacing::S8));

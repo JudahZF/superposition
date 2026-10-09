@@ -788,22 +788,31 @@ impl LiveRackApp {
         self.draw_meters(ui, inner, y + sp(Spacing::S10), rack_index, online);
         y += foot.meters + foot.labels + sp(Spacing::S8);
 
+        let half = (inner.width() - sp(Spacing::S6)) / 2.0;
         let mut toggles = ui.new_child(
             UiBuilder::new()
                 .max_rect(Rect::from_min_size(
                     Pos2::new(inner.left(), y),
-                    Vec2::new(inner.width(), line() + px(Layout::Hairline) * 2.0),
+                    Vec2::new(inner.width(), px(Layout::Control)),
                 ))
                 .layout(EguiLayout::left_to_right(Align::Center)),
         );
         toggles.spacing_mut().item_spacing.x = sp(Spacing::S6);
-        if toggle(&mut toggles, "Mute", rack.muted, ColorToken::Warn).clicked() {
+        if toggle(&mut toggles, "Mute", rack.muted, ColorToken::Warn, half).clicked() {
             self.set_rack_controls(rack_index, rack.gain_db.get(), !rack.muted, rack.bypassed);
         }
-        if toggle(&mut toggles, "Byp", rack.bypassed, ColorToken::Info).clicked() {
+        if toggle(
+            &mut toggles,
+            "Bypass",
+            rack.bypassed,
+            ColorToken::Info,
+            half,
+        )
+        .clicked()
+        {
             self.set_rack_controls(rack_index, rack.gain_db.get(), rack.muted, !rack.bypassed);
         }
-        y += line() + px(Layout::Hairline) * 2.0 + sp(Spacing::S8);
+        y += px(Layout::Control) + sp(Spacing::S8);
 
         let status =
             Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(inner.width(), line()));
