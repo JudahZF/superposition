@@ -11,8 +11,9 @@ pub const METER_REPAINT_INTERVAL: Duration =
 pub const METER_WARN_DBFS: f32 = -6.0;
 /// Level where a bar meter turns to the fault colour.
 pub const METER_FAULT_DBFS: f32 = -3.0;
-/// Scale tick levels on the bar meter, loudest first.
-pub const METER_SCALE_DBFS: [f32; 5] = [0.0, -6.0, -12.0, -24.0, -48.0];
+/// Scale tick levels on the bar meter, loudest first. Labels sit at least 12 dB apart so they
+/// do not overlap on the 92 px meter; the warn zone colour marks −6 dBFS.
+pub const METER_SCALE_DBFS: [f32; 4] = [0.0, -12.0, -24.0, -48.0];
 
 const METER_FLOOR_DBFS: f32 = -60.0;
 const METER_DECAY_DB_PER_SECOND: f32 = 24.0;
@@ -140,7 +141,7 @@ mod tests {
 
     #[test]
     fn scale_ticks_map_onto_the_meter_track() {
-        let expected = [1.0, 0.9, 0.8, 0.6, 0.2];
+        let expected = [1.0, 0.8, 0.6, 0.2];
         for (dbfs, expected) in METER_SCALE_DBFS.into_iter().zip(expected) {
             assert!(
                 (dbfs_fraction(dbfs) - expected).abs() < 0.001,

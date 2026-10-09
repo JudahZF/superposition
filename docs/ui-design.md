@@ -189,7 +189,7 @@ its top edge. Each column, top to bottom:
    0, +12 in Label Dim sit under the track. Range −60 to +12 dB. Click or drag sets;
    double-click resets to 0 dB.
 5. Meters (12 px above the gain block): a 22 px scale column with right-aligned Label Dim
-   ticks at 0, −6, −12, −24 and −48 dBFS, then three bars (In, L, R), each 6 × 92 px with
+   ticks at 0, −12, −24 and −48 dBFS, then three bars (In, L, R), each 6 × 92 px with
    1 px corners. Each bar is a linear −60 dBFS (bottom) to 0 dBFS (top) track on a Well
    fill. The lit part rises from the bottom in its zone colour: MeterLit below −6 dBFS,
    Warn from −6 to −3 dBFS, Fault above −3 dBFS. A 2 px Strong peak-hold line marks the
