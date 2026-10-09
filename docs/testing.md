@@ -49,7 +49,7 @@ Every report records `certified: false`; no command certifies the product. Missi
 
 ## UI snapshots
 
-The show screen renders headlessly for visual review. `SUPERPOSITION_UI_SNAPSHOT=<dir> cargo test -p superposition --bin superposition render_show_screen_snapshots -- --ignored` software-rasterizes a fixture show (eight racks, generated editor pictures, sidechains, live meters) into PNGs: the 1920×1080 show screen, the laptop preset with the fault line, the route and sidechain popovers, the slot menu, the plug-in picker, scene capture, the Diagnostics setup page, the offline recovery modal, and an empty session. No window or GPU is used, so it runs in any shell. The rasterizer samples egui's font atlas approximately; faint marks on inverted fills are rasterizer artifacts, not UI.
+The show screen renders headlessly for visual review. `SUPERPOSITION_UI_SNAPSHOT=<dir> cargo test -p superposition --bin superposition render_show_screen_snapshots -- --ignored` software-rasterizes a fixture show (eight racks, generated editor pictures, sidechains, live meters) into PNGs: the 1920×1080 show screen, the laptop preset with the fault line, the route and sidechain popovers, the slot menu, the plug-in picker, scene capture, the Diagnostics setup page, the offline recovery modal, and an empty session. No window or GPU is used, so it runs in any shell. The rasterizer samples egui's font atlas approximately.
 
 `crates/sp-ui` tests every foreground/background pairing the renderer draws against WCAG AA, and a source test fails if a palette literal, literal dimension, or egui colour constructor appears outside the token bridge. Keyboard, VoiceOver, and 1x/2x Retina passes still need the running app.
 

@@ -7,10 +7,6 @@ pub const METER_REPAINT_HZ: u32 = 30;
 /// Interval derived from [`METER_REPAINT_HZ`].
 pub const METER_REPAINT_INTERVAL: Duration =
     Duration::from_nanos(1_000_000_000 / METER_REPAINT_HZ as u64);
-/// Segments in one LED meter column.
-pub const LED_SEGMENTS: usize = 16;
-/// Topmost segments that light in the fault colour.
-pub const LED_FAULT_SEGMENTS: usize = 2;
 /// Level where a bar meter turns from its lit colour to the warn colour.
 pub const METER_WARN_DBFS: f32 = -6.0;
 /// Level where a bar meter turns to the fault colour.
@@ -136,48 +132,11 @@ pub fn meter_zone(fraction: f32) -> MeterZone {
     }
 }
 
-/// How one LED segment is drawn.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Segment {
-    /// Unlit.
-    Off,
-    /// Lit in the text colour.
-    Lit,
-    /// Lit in the fault colour: one of the top [`LED_FAULT_SEGMENTS`].
-    Hot,
-}
-
-/// Returns segment `index` (0 is the bottom) of a [`LED_SEGMENTS`]-tall meter showing `level`
-/// with the peak hold at `held`, both as fill fractions.
-#[must_use]
-pub fn led_segment(level: f32, held: f32, index: usize) -> Segment {
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss,
-        reason = "fractions are clamped to 0..=1 and the meter has 16 segments"
-    )]
-    let lit = |fraction: f32| (fraction.clamp(0.0, 1.0) * LED_SEGMENTS as f32).round() as usize;
-    let held_index = lit(held).checked_sub(1);
-    if index < lit(level) || Some(index) == held_index {
-        if index >= LED_SEGMENTS - LED_FAULT_SEGMENTS {
-            Segment::Hot
-        } else {
-            Segment::Lit
-        }
-    } else {
-        Segment::Off
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use super::{
-        LED_SEGMENTS, METER_SCALE_DBFS, MeterBallistics, MeterZone, Segment, dbfs_fraction,
-        led_segment, meter_zone,
-    };
+    use super::{METER_SCALE_DBFS, MeterBallistics, MeterZone, dbfs_fraction, meter_zone};
 
     #[test]
     fn scale_ticks_map_onto_the_meter_track() {
@@ -215,23 +174,5 @@ mod tests {
         meter.update([0.0; 2], false, Duration::from_millis(300));
         assert!(meter.held_fraction() < 1.0);
         assert!(!meter.clipping(Duration::from_millis(500)));
-    }
-
-    #[test]
-    fn led_meter_lights_from_the_bottom_with_a_hot_top_and_a_held_peak() {
-        let lit = |level, held| {
-            (0..LED_SEGMENTS)
-                .map(|index| led_segment(level, held, index))
-                .collect::<Vec<_>>()
-        };
-        assert!(lit(0.0, 0.0).iter().all(|segment| *segment == Segment::Off));
-        let half = lit(0.5, 0.75);
-        assert_eq!(half[7], Segment::Lit);
-        assert_eq!(half[8], Segment::Off);
-        assert_eq!(half[11], Segment::Lit, "the held peak stays lit");
-        let full = lit(1.0, 1.0);
-        assert_eq!(full[LED_SEGMENTS - 3], Segment::Lit);
-        assert_eq!(full[LED_SEGMENTS - 2], Segment::Hot);
-        assert_eq!(full[LED_SEGMENTS - 1], Segment::Hot);
     }
 }

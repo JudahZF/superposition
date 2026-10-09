@@ -1,16 +1,13 @@
 //! Menus, popovers, the plug-in picker, and modals. Popovers sit on a transparent scrim that
 //! closes them on an outside click; modals ignore it.
 
-use eframe::egui::{
-    self, Align, Align2, Layout as EguiLayout, Pos2, Response, Sense, Ui, Vec2, WidgetInfo,
-    WidgetType,
-};
+use eframe::egui::{self, Align, Align2, Layout as EguiLayout, Pos2, Sense, Ui, Vec2};
 use sp_model::{MAX_SLOTS_PER_RACK, PhysicalChannels, RackChannelRoute, SlotSidechain};
 use sp_ui::design::{ColorToken, Layout, Spacing, TypographyRole};
 
 use super::style::{
-    Mark, action_with, button, button_with, choice_row, color, focus_outline, jack, line, list_row,
-    note, paint_text, popover, popover_title, px, radius, scrim, sp, text, text_field, title,
+    Mark, action_with, button, button_with, choice_row, color, jack, line, list_row, note, popover,
+    popover_title, px, scrim, sp, text, text_field, title,
 };
 use super::{LiveRackApp, Modal, Overlay, SlotAction, channels_label, show::latency_label};
 use crate::CatalogPlugin;
@@ -110,9 +107,7 @@ impl LiveRackApp {
             None,
             Some(("Remove rack…", "", true, RackCommand::Remove)),
         ];
-        let Some(command) = menu(ctx, "rack_menu", at, &items, |command| {
-            matches!(command, RackCommand::Remove)
-        }) else {
+        let Some(command) = menu(ctx, "rack_menu", at, &items) else {
             return;
         };
         self.overlay = Overlay::None;
@@ -201,9 +196,7 @@ impl LiveRackApp {
                 SlotCommand::Action(SlotAction::Remove(slot)),
             )),
         ];
-        let Some(command) = menu(ctx, "slot_menu", at, &items, |command| {
-            matches!(command, SlotCommand::Action(SlotAction::Remove(_)))
-        }) else {
+        let Some(command) = menu(ctx, "slot_menu", at, &items) else {
             return;
         };
         self.overlay = Overlay::None;
@@ -579,9 +572,7 @@ impl LiveRackApp {
             Some(("Rename…", "", true, PageCommand::Rename)),
             Some(("Remove page", "", true, PageCommand::Remove)),
         ];
-        let Some(command) = menu(ctx, "page_menu", at, &items, |command| {
-            matches!(command, PageCommand::Remove)
-        }) else {
+        let Some(command) = menu(ctx, "page_menu", at, &items) else {
             return;
         };
         self.overlay = Overlay::None;
@@ -960,15 +951,8 @@ impl LiveRackApp {
     }
 }
 
-/// Draws a popover menu at `at` and returns the command of a clicked row. `removes` marks the
-/// commands that delete something; their labels read in Fault.
-fn menu<A: Copy>(
-    ctx: &egui::Context,
-    id: &str,
-    at: Pos2,
-    items: &[MenuItem<A>],
-    removes: impl Fn(A) -> bool,
-) -> Option<A> {
+/// Draws a popover menu at `at` and returns the command of a clicked row.
+fn menu<A: Copy>(ctx: &egui::Context, id: &str, at: Pos2, items: &[MenuItem<A>]) -> Option<A> {
     let mut chosen = None;
     popover(ctx, egui::Id::new(id), at, Align2::LEFT_TOP, None, |ui| {
         let width = items
@@ -1004,11 +988,7 @@ fn menu<A: Copy>(
                 }
                 Some((label, key, enabled, command)) => {
                     let key = (!key.is_empty()).then_some(*key);
-                    let response = if removes(*command) {
-                        removal_row(ui, label, key, *enabled)
-                    } else {
-                        list_row(ui, label, "", key, false, *enabled)
-                    };
+                    let response = list_row(ui, label, "", key, false, *enabled);
                     if response.clicked() {
                         chosen = Some(*command);
                     }
@@ -1017,57 +997,6 @@ fn menu<A: Copy>(
         }
     });
     chosen
-}
-
-/// A menu row that removes something. It matches [`list_row`] except that its label reads in
-/// Fault, and the label stays Fault on hover.
-fn removal_row(ui: &mut Ui, label: &str, key: Option<&str>, enabled: bool) -> Response {
-    let width = ui.available_width();
-    let sense = if enabled {
-        Sense::click()
-    } else {
-        Sense::hover()
-    };
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, px(Layout::RouteRow)), sense);
-    if ui.is_rect_visible(rect) {
-        let hovered = enabled && response.hovered();
-        let (text, secondary) = match (enabled, hovered) {
-            (false, _) => (ColorToken::Faint, ColorToken::Faint),
-            (true, true) => (ColorToken::Fault, ColorToken::Text),
-            (true, false) => (ColorToken::Fault, ColorToken::Dim),
-        };
-        if hovered {
-            ui.painter()
-                .rect_filled(rect, radius(), color(ColorToken::HoverFill));
-        }
-        let inset = sp(Spacing::S12);
-        let key_rect = key.map(|key| {
-            paint_text(
-                ui,
-                Pos2::new(rect.right() - inset, rect.center().y),
-                Align2::RIGHT_CENTER,
-                key,
-                TypographyRole::Body,
-                secondary,
-                rect.width() / 2.0,
-            )
-        });
-        let label_width = key_rect.map_or(rect.width() - inset * 2.0, |key_rect| {
-            (key_rect.left() - rect.left() - inset * 2.0).max(0.0)
-        });
-        paint_text(
-            ui,
-            Pos2::new(rect.left() + inset, rect.center().y),
-            Align2::LEFT_CENTER,
-            label,
-            TypographyRole::Body,
-            text,
-            label_width,
-        );
-        focus_outline(ui, &response, rect);
-    }
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
-    response
 }
 
 /// A jack grid of 16 mono channels or 8 stereo pairs (more rows for larger devices). Channels

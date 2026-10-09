@@ -55,7 +55,6 @@ pub(super) fn radius() -> f32 {
 }
 
 /// The corner radius of meter bars, the gain marker, and load bars.
-#[allow(dead_code, reason = "used by the screen restyle")]
 pub(super) fn small_radius() -> f32 {
     px(Layout::SmallRadius)
 }
@@ -384,7 +383,6 @@ pub(super) fn button_with(
 }
 
 /// A square button for fade − and +: the control height on each side, with its label centred.
-#[allow(dead_code, reason = "used by the screen restyle")]
 pub(super) fn square_button(ui: &mut Ui, label: &str, enabled: bool) -> Response {
     let sense = if enabled {
         Sense::click()

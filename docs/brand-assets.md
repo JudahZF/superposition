@@ -12,19 +12,27 @@ The application chrome follows the film-strip brief in [ui-design.md](ui-design.
 
 | Token | Value | Use |
 | --- | --- | --- |
-| `Base` | `#121315` | window background |
-| `Text` | `#D9DAD6` | primary text, lit meter segments, inverted-selection fill |
-| `Dim` | `#7C8088` | labels, secondary text, tick marks |
-| `Faint` | `#3A3E45` | empty slots, unlit borders, disabled text, secondary text on an inverted fill |
-| `Hairline` | `#26292E` | column dividers, head and foot rules |
-| `SegmentOff` | `#24272C` | unlit meter segment |
-| `HoverFill` | `#1B1D21` | row hover in lists |
-| `Warn` | `#D9A21B` | LDG and REC tokens, mute lit, route warnings |
-| `Fault` | `#E5484D` | MIS and FLT tokens, top two meter segments, fault line |
-| `Info` | `#7FB0FF` | bypass lit, sidechain marker, mapped CCs |
-| `FaultTint` | `#1A1214` | fault line background |
+| `Base` | `#15181C` | window and rack-column background |
+| `Surface` | `#1A1E23` | head and foot bars, selected rack column, scene pads, popovers, and modals |
+| `Well` | `#101215` | preview slot fill, opaque caption bar, unlit meter, and text-field fill |
+| `Raised` | `#1D2126` | button and toggle fill |
+| `HoverFill` | `#252A31` | hovered button, pad, or list row |
+| `Strong` | `#E7EAEE` | rack names, readout values, caption names, gain marker, and meter peak hold |
+| `Text` | `#C9CED5` | body text |
+| `Dim` | `#868E99` | labels, secondary text, tick labels, key hints, and gain track fill |
+| `Faint` | `#4D5560` | disabled text, hovered preview ring, and hovered empty-slot border |
+| `Hairline` | `#252A30` | column dividers, head and foot rules, and readout-cell dividers |
+| `Groove` | `#2E353E` | empty-slot dashes, gain track, and scene pad border |
+| `Outline` | `#353C45` | button, toggle, text-field, and popover borders |
+| `Accent` | `#2BB3A3` | selection and focus only: selected rack bar, selected slot ring, active scene border, focus outline |
+| `AccentFill` | `#1B4A46` | active scene pad fill, selected jack fill, and text selection background |
+| `MeterLit` | `#AAB2BC` | meter fill below −6 dBFS |
+| `Warn` | `#D9A21B` | LDG and REC tokens, lit Mute, route warnings, meter −6 to −3 dBFS, hot load bars |
+| `Fault` | `#E6494D` | MIS and FLT tokens, the "Fault" label, the live dot, meter above −3 dBFS |
+| `Info` | `#7FB0FF` | lit Bypass, sidechain markers, mapped CCs |
+| `FaultTint` | `#24161A` | fault line background |
 
-Warn, fault, and info always accompany a text state token (RDY, LDG, BYP, MIS, FLT, REC, UNL); colour never carries meaning alone. `crates/sp-ui/src/design/theme.rs` lists every foreground/background pairing the renderer draws and tests each against WCAG AA (4.5:1 for text, 3:1 for boundaries). Faint text is reserved for disabled and decorative content, and hovered list rows promote secondary text to `Text` because `Dim` on `HoverFill` falls below 4.5:1.
+Warn, fault, and info always accompany a text state token (RDY, LDG, BYP, MIS, FLT, REC, UNL); colour never carries meaning alone. Accent marks selection and focus only and never means a state. Text on lit Mute (`Warn`) and lit Bypass (`Info`) is `Base`, and text on `AccentFill` is `Strong`. `crates/sp-ui/src/design/theme.rs` lists every foreground/background pairing the renderer draws and tests each against WCAG AA (4.5:1 for text, 3:1 for boundaries). Faint text is reserved for disabled content, and hovered list rows promote secondary text to `Text` because `Dim` on `HoverFill` falls below 4.5:1.
 
 ## Application-UI fonts
 

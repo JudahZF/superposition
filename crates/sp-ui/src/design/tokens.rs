@@ -71,7 +71,7 @@ fn linear_srgb(channel: u8) -> f64 {
     }
 }
 
-/// One of the twenty Cue colours.
+/// One of the nineteen Cue colours.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColorToken {
     /// Window and rack-column background.
@@ -112,13 +112,11 @@ pub enum ColorToken {
     Info,
     /// Fault line background.
     FaultTint,
-    /// An unlit meter. Retired with the LED meter; the bar meter uses [`ColorToken::Well`].
-    SegmentOff,
 }
 
 impl ColorToken {
     /// Every Cue colour, in the order of the design spec.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 19] = [
         Self::Base,
         Self::Surface,
         Self::Well,
@@ -138,7 +136,6 @@ impl ColorToken {
         Self::Fault,
         Self::Info,
         Self::FaultTint,
-        Self::SegmentOff,
     ];
 
     /// Resolves this token to its colour.
@@ -147,7 +144,7 @@ impl ColorToken {
         match self {
             Self::Base => Color::rgb(0x15, 0x18, 0x1C),
             Self::Surface => Color::rgb(0x1A, 0x1E, 0x23),
-            Self::Well | Self::SegmentOff => Color::rgb(0x10, 0x12, 0x15),
+            Self::Well => Color::rgb(0x10, 0x12, 0x15),
             Self::Raised => Color::rgb(0x1D, 0x21, 0x26),
             Self::HoverFill => Color::rgb(0x25, 0x2A, 0x31),
             Self::Strong => Color::rgb(0xE7, 0xEA, 0xEE),
@@ -172,7 +169,7 @@ impl ColorToken {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum Spacing {
-    /// 2 px: meter segment gaps and hairline offsets.
+    /// 2 px: small gaps, focus offsets, and check-mark corners.
     S2 = 2,
     /// 4 px: the base unit, preview gaps.
     S4 = 4,
@@ -245,10 +242,6 @@ pub enum Layout {
     LiveDot,
     /// Gain track thickness.
     GainTrack,
-    /// Gain marker width.
-    GainMarkerWidth,
-    /// Gain marker height.
-    GainMarkerHeight,
     /// Gain thumb width: the marker that shows the rack's gain on the track.
     GainThumbWidth,
     /// Gain thumb height.
@@ -263,8 +256,6 @@ pub enum Layout {
     MeterScaleWidth,
     /// Height of the peak-hold line on a meter bar.
     PeakHold,
-    /// One LED segment's height: sixteen segments and 2 px gaps fill the meter height.
-    MeterSegment,
     /// Height of the accent bar across the top of the selected rack column.
     AccentBar,
     /// Width of the accent bar on the left edge of the selected preview slot.
@@ -307,14 +298,12 @@ impl Layout {
     pub const fn pixels(self) -> u16 {
         match self {
             Self::Hairline | Self::SmallRadius => 1,
-            Self::GainTrack | Self::GainMarkerWidth | Self::PeakHold | Self::AccentBar => 2,
-            Self::LoadBarWidth | Self::MeterSegment | Self::Radius | Self::SlotMarker => 3,
+            Self::GainTrack | Self::PeakHold | Self::AccentBar => 2,
+            Self::LoadBarWidth | Self::Radius | Self::SlotMarker => 3,
             Self::LiveDot | Self::GainThumbWidth | Self::MeterWidth => 6,
             Self::GainTick => 10,
-            Self::GainMarkerHeight => 12,
             Self::Caption => 18,
-            Self::LoadBarHeight => 14,
-            Self::Line | Self::GainThumbHeight => 16,
+            Self::Line | Self::GainThumbHeight | Self::LoadBarHeight => 16,
             Self::JackHeight => 20,
             Self::MeterScaleWidth => 22,
             Self::RouteRow => 24,
