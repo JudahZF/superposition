@@ -1,8 +1,9 @@
-//! Foundational design tokens for the film-strip UI.
+//! Foundational design tokens for the Cue console UI.
 //!
-//! Every chrome colour and fixed dimension is defined only in this module. The chrome is almost
-//! colourless so the plug-in editor pictures supply the colour; warn, fault, and info are the only
-//! chromatic values and always accompany a text state token.
+//! Every chrome colour and fixed dimension is defined only in this module. The chrome is a calm,
+//! neutral console so the plug-in editor pictures supply the colour. Teal marks selection and
+//! focus only. Warn, fault, and info are the only status colours and always accompany a text
+//! state token.
 
 /// An opaque sRGB color.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,64 +71,99 @@ fn linear_srgb(channel: u8) -> f64 {
     }
 }
 
-/// One of the eleven chrome colours.
+/// One of the twenty Cue colours.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColorToken {
-    /// Window background.
+    /// Window and rack-column background.
     Base,
-    /// Primary text, lit meter segments, and the inverted-selection fill.
-    Text,
-    /// Labels, secondary text, and tick marks.
-    Dim,
-    /// Empty slots, unlit borders, and disabled text. Also secondary text on an inverted fill.
-    Faint,
-    /// Column dividers and the head and foot rules.
-    Hairline,
-    /// An unlit meter segment.
-    SegmentOff,
-    /// Row hover in lists.
+    /// Head and foot bars, the selected rack column, scene pads, popovers, and modals.
+    Surface,
+    /// Preview slot fill, the opaque caption bar, and text-field fill.
+    Well,
+    /// Button and toggle fill.
+    Raised,
+    /// Hovered button, pad, or list row.
     HoverFill,
-    /// LDG and REC tokens, mute lit, and route warnings.
+    /// Rack names, readout values, caption names, the gain marker, and the peak hold.
+    Strong,
+    /// Body text.
+    Text,
+    /// Labels, secondary text, tick labels, key hints, and the gain track fill.
+    Dim,
+    /// Disabled text, the hovered preview ring, and the hovered empty-slot border.
+    Faint,
+    /// Column dividers, head and foot rules, and readout-cell dividers.
+    Hairline,
+    /// Empty-slot dashes, the gain track, and the scene pad border.
+    Groove,
+    /// Button, toggle, text-field, and popover borders.
+    Outline,
+    /// Selection and focus only: the selected rack bar, selected slot ring, and focus outline.
+    Accent,
+    /// Active scene pad fill, selected jack fill, and text selection background.
+    AccentFill,
+    /// Meter fill below −6 dBFS.
+    MeterLit,
+    /// LDG and REC tokens, lit Mute, route warnings, and meter −6 to −3 dBFS.
     Warn,
-    /// MIS and FLT tokens, the top two meter segments, and the fault line.
+    /// MIS and FLT tokens, the "Fault" label, the live dot, and meter above −3 dBFS.
     Fault,
-    /// Bypass lit, the sidechain marker, and mapped CCs.
+    /// Lit Bypass, sidechain markers, and mapped CCs.
     Info,
     /// Fault line background.
     FaultTint,
+    /// An unlit meter. Retired with the LED meter; the bar meter uses [`ColorToken::Well`].
+    SegmentOff,
 }
 
 impl ColorToken {
-    /// Every chrome colour, in the order of the design brief.
-    pub const ALL: [Self; 11] = [
+    /// Every Cue colour, in the order of the design spec.
+    pub const ALL: [Self; 20] = [
         Self::Base,
+        Self::Surface,
+        Self::Well,
+        Self::Raised,
+        Self::HoverFill,
+        Self::Strong,
         Self::Text,
         Self::Dim,
         Self::Faint,
         Self::Hairline,
-        Self::SegmentOff,
-        Self::HoverFill,
+        Self::Groove,
+        Self::Outline,
+        Self::Accent,
+        Self::AccentFill,
+        Self::MeterLit,
         Self::Warn,
         Self::Fault,
         Self::Info,
         Self::FaultTint,
+        Self::SegmentOff,
     ];
 
     /// Resolves this token to its colour.
     #[must_use]
     pub const fn color(self) -> Color {
         match self {
-            Self::Base => Color::rgb(0x12, 0x13, 0x15),
-            Self::Text => Color::rgb(0xD9, 0xDA, 0xD6),
-            Self::Dim => Color::rgb(0x7C, 0x80, 0x88),
-            Self::Faint => Color::rgb(0x3A, 0x3E, 0x45),
-            Self::Hairline => Color::rgb(0x26, 0x29, 0x2E),
-            Self::SegmentOff => Color::rgb(0x24, 0x27, 0x2C),
-            Self::HoverFill => Color::rgb(0x1B, 0x1D, 0x21),
+            Self::Base => Color::rgb(0x15, 0x18, 0x1C),
+            Self::Surface => Color::rgb(0x1A, 0x1E, 0x23),
+            Self::Well | Self::SegmentOff => Color::rgb(0x10, 0x12, 0x15),
+            Self::Raised => Color::rgb(0x1D, 0x21, 0x26),
+            Self::HoverFill => Color::rgb(0x25, 0x2A, 0x31),
+            Self::Strong => Color::rgb(0xE7, 0xEA, 0xEE),
+            Self::Text => Color::rgb(0xC9, 0xCE, 0xD5),
+            Self::Dim => Color::rgb(0x86, 0x8E, 0x99),
+            Self::Faint => Color::rgb(0x4D, 0x55, 0x60),
+            Self::Hairline => Color::rgb(0x25, 0x2A, 0x30),
+            Self::Groove => Color::rgb(0x2E, 0x35, 0x3E),
+            Self::Outline => Color::rgb(0x35, 0x3C, 0x45),
+            Self::Accent => Color::rgb(0x2B, 0xB3, 0xA3),
+            Self::AccentFill => Color::rgb(0x1B, 0x4A, 0x46),
+            Self::MeterLit => Color::rgb(0xAA, 0xB2, 0xBC),
             Self::Warn => Color::rgb(0xD9, 0xA2, 0x1B),
-            Self::Fault => Color::rgb(0xE5, 0x48, 0x4D),
+            Self::Fault => Color::rgb(0xE6, 0x49, 0x4D),
             Self::Info => Color::rgb(0x7F, 0xB0, 0xFF),
-            Self::FaultTint => Color::rgb(0x1A, 0x12, 0x14),
+            Self::FaultTint => Color::rgb(0x24, 0x16, 0x1A),
         }
     }
 }
@@ -148,7 +184,9 @@ pub enum Spacing {
     S10 = 10,
     /// 12 px: column and popover horizontal padding.
     S12 = 12,
-    /// 16 px.
+    /// 14 px: padding on each side of a head readout cell's divider.
+    S14 = 14,
+    /// 16 px: head, foot, and fault-line edge padding.
     S16 = 16,
     /// 20 px: head, foot, and fault-line edge padding.
     S20 = 20,
@@ -171,12 +209,24 @@ pub enum Layout {
     Hairline,
     /// The text line grid.
     Line,
-    /// Head height.
+    /// Head height: wordmark, readouts, and actions.
     Head,
-    /// Fault line height, shown only while a fault is showing.
+    /// Fault line height, also the page line height. The fault line shows only while a fault is showing.
     FaultLine,
-    /// Foot height.
+    /// Foot height: scene pads, fade, and load.
     Foot,
+    /// Button and toggle height. Square fade buttons use the same height and width.
+    Control,
+    /// Scene pad height. Page pads are 22 px tall.
+    ScenePad,
+    /// Rack column header row height.
+    RackHeader,
+    /// Route line row height and list and menu row height.
+    RouteRow,
+    /// Corner radius of controls, preview slots, and popovers.
+    Radius,
+    /// Corner radius of small bars and markers: meter bars, gain marker, and load bars.
+    SmallRadius,
     /// Rack column width: eight across 1920 px, six on the 1512 px laptop preset.
     ColumnWidth,
     /// The "+ add rack" column.
@@ -185,7 +235,7 @@ pub enum Layout {
     PreviewMaxHeight,
     /// Preview tile height on the 1512×982 laptop preset.
     PreviewMinHeight,
-    /// Preview caption bar height.
+    /// Preview caption bar height: an opaque bar across the bottom of each slot.
     Caption,
     /// Editor capture width.
     CaptureWidth,
@@ -199,14 +249,26 @@ pub enum Layout {
     GainMarkerWidth,
     /// Gain marker height.
     GainMarkerHeight,
+    /// Gain thumb width: the marker that shows the rack's gain on the track.
+    GainThumbWidth,
+    /// Gain thumb height.
+    GainThumbHeight,
     /// The 0 dB tick height.
     GainTick,
-    /// LED meter height.
+    /// Meter bar height.
     MeterHeight,
-    /// One LED meter column's width.
+    /// One meter bar's width.
     MeterWidth,
+    /// Width of the meter scale column with its right-aligned tick labels.
+    MeterScaleWidth,
+    /// Height of the peak-hold line on a meter bar.
+    PeakHold,
     /// One LED segment's height: sixteen segments and 2 px gaps fill the meter height.
     MeterSegment,
+    /// Height of the accent bar across the top of the selected rack column.
+    AccentBar,
+    /// Width of the accent bar on the left edge of the selected preview slot.
+    SlotMarker,
     /// Menu minimum width.
     MenuMinWidth,
     /// Route and sidechain popover width.
@@ -244,20 +306,25 @@ impl Layout {
     #[must_use]
     pub const fn pixels(self) -> u16 {
         match self {
-            Self::Hairline => 1,
-            Self::GainTrack | Self::GainMarkerWidth => 2,
-            Self::LoadBarWidth | Self::MeterSegment => 3,
-            Self::LiveDot | Self::GainTick => 6,
-            Self::GainMarkerHeight | Self::MeterWidth => 12,
-            Self::Caption | Self::LoadBarHeight => 14,
-            Self::Line => 16,
+            Self::Hairline | Self::SmallRadius => 1,
+            Self::GainTrack | Self::GainMarkerWidth | Self::PeakHold | Self::AccentBar => 2,
+            Self::LoadBarWidth | Self::MeterSegment | Self::Radius | Self::SlotMarker => 3,
+            Self::LiveDot | Self::GainThumbWidth | Self::MeterWidth => 6,
+            Self::GainTick => 10,
+            Self::GainMarkerHeight => 12,
+            Self::Caption => 18,
+            Self::LoadBarHeight => 14,
+            Self::Line | Self::GainThumbHeight => 16,
             Self::JackHeight => 20,
-            Self::JackWidth => 30,
-            Self::FaultLine => 32,
-            Self::Foot => 40,
-            Self::Head => 56,
+            Self::MeterScaleWidth => 22,
+            Self::RouteRow => 24,
+            Self::Control | Self::RackHeader => 26,
+            Self::ScenePad => 28,
+            Self::JackWidth | Self::FaultLine => 30,
+            Self::Foot => 46,
+            Self::Head => 52,
             Self::PreviewMinHeight => 60,
-            Self::MeterHeight => 80,
+            Self::MeterHeight => 92,
             Self::PreviewMaxHeight => 84,
             Self::AddRackWidth => 120,
             Self::MenuMinWidth => 190,

@@ -28,7 +28,7 @@ Warn, fault, and info always accompany a text state token (RDY, LDG, BYP, MIS, F
 
 ## Application-UI fonts
 
-The app UI embeds IBM Plex Mono Regular and Medium from `crates/sp-ui/assets/fonts/`, downloaded from the IBM Plex repository. It is licensed under the SIL Open Font License 1.1; the license text is stored alongside the payloads (`OFL-IBMPlexMono.txt`) and permits app embedding and redistribution. Plex Mono lacks a few symbols the UI uses (⌘, ⇧); egui's bundled Hack and icon font supply them as fallbacks. The embedded UI fonts are separate from the release asset manifest below: the manifest's font entries (with hashes and approval records) still gate `cargo xtask bundle --profile release` for production payloads.
+The app UI embeds Inter Regular, Medium, and SemiBold (rsms/inter v4.1) from `crates/sp-ui/assets/fonts/` for all chrome, and IBM Plex Mono Regular and Medium, downloaded from the IBM Plex repository, for monospace text such as diagnostics. Both families are licensed under the SIL Open Font License 1.1; the license texts are stored alongside the payloads (`OFL-Inter.txt` and `OFL-IBMPlexMono.txt`) and permit app embedding and redistribution. Inter and Plex Mono lack a few symbols the UI uses (⌘, ⇧); egui's bundled Hack and icon font supply them as fallbacks. The embedded UI fonts are separate from the release asset manifest below: the manifest's font entries (with hashes and approval records) still gate `cargo xtask bundle --profile release` for production payloads.
 
 ## Release assets and provenance
 

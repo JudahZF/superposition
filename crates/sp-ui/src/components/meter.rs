@@ -1,4 +1,4 @@
-//! Meter ballistics and the segmented LED meter.
+//! Meter ballistics and the bar meter.
 
 use std::time::Duration;
 
@@ -11,6 +11,12 @@ pub const METER_REPAINT_INTERVAL: Duration =
 pub const LED_SEGMENTS: usize = 16;
 /// Topmost segments that light in the fault colour.
 pub const LED_FAULT_SEGMENTS: usize = 2;
+/// Level where a bar meter turns from its lit colour to the warn colour.
+pub const METER_WARN_DBFS: f32 = -6.0;
+/// Level where a bar meter turns to the fault colour.
+pub const METER_FAULT_DBFS: f32 = -3.0;
+/// Scale tick levels on the bar meter, loudest first.
+pub const METER_SCALE_DBFS: [f32; 5] = [0.0, -6.0, -12.0, -24.0, -48.0];
 
 const METER_FLOOR_DBFS: f32 = -60.0;
 const METER_DECAY_DB_PER_SECOND: f32 = 24.0;
@@ -97,8 +103,37 @@ impl MeterBallistics {
     }
 }
 
-fn fraction(dbfs: f32) -> f32 {
+/// Maps a dBFS level onto the −60 to 0 dBFS track: 0.0 at −60 dBFS and 1.0 at 0 dBFS.
+#[must_use]
+pub fn dbfs_fraction(dbfs: f32) -> f32 {
     ((dbfs - METER_FLOOR_DBFS) / -METER_FLOOR_DBFS).clamp(0.0, 1.0)
+}
+
+fn fraction(dbfs: f32) -> f32 {
+    dbfs_fraction(dbfs)
+}
+
+/// The colour zone of a bar meter at one level.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MeterZone {
+    /// At or below −6 dBFS.
+    Lit,
+    /// Above −6 dBFS, up to and including −3 dBFS.
+    Warn,
+    /// Above −3 dBFS.
+    Fault,
+}
+
+/// Returns the zone for a fill fraction from [`dbfs_fraction`].
+#[must_use]
+pub fn meter_zone(fraction: f32) -> MeterZone {
+    if fraction > dbfs_fraction(METER_FAULT_DBFS) {
+        MeterZone::Fault
+    } else if fraction > dbfs_fraction(METER_WARN_DBFS) {
+        MeterZone::Warn
+    } else {
+        MeterZone::Lit
+    }
 }
 
 /// How one LED segment is drawn.
@@ -139,7 +174,32 @@ pub fn led_segment(level: f32, held: f32, index: usize) -> Segment {
 mod tests {
     use std::time::Duration;
 
-    use super::{LED_SEGMENTS, MeterBallistics, Segment, led_segment};
+    use super::{
+        LED_SEGMENTS, METER_SCALE_DBFS, MeterBallistics, MeterZone, Segment, dbfs_fraction,
+        led_segment, meter_zone,
+    };
+
+    #[test]
+    fn scale_ticks_map_onto_the_meter_track() {
+        let expected = [1.0, 0.9, 0.8, 0.6, 0.2];
+        for (dbfs, expected) in METER_SCALE_DBFS.into_iter().zip(expected) {
+            assert!(
+                (dbfs_fraction(dbfs) - expected).abs() < 0.001,
+                "{dbfs} dBFS maps to {}",
+                dbfs_fraction(dbfs)
+            );
+        }
+    }
+
+    #[test]
+    fn meter_zones_change_at_the_warn_and_fault_levels() {
+        assert_eq!(meter_zone(dbfs_fraction(-60.0)), MeterZone::Lit);
+        assert_eq!(meter_zone(dbfs_fraction(-6.0)), MeterZone::Lit);
+        assert_eq!(meter_zone(dbfs_fraction(-5.9)), MeterZone::Warn);
+        assert_eq!(meter_zone(dbfs_fraction(-3.0)), MeterZone::Warn);
+        assert_eq!(meter_zone(dbfs_fraction(-2.9)), MeterZone::Fault);
+        assert_eq!(meter_zone(1.0), MeterZone::Fault);
+    }
 
     #[test]
     fn meter_ballistics_attack_decay_hold_and_clip() {

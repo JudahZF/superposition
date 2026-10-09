@@ -1,8 +1,9 @@
 //! Token bridge and the painted primitives every screen shares.
 //!
 //! Every colour, size, and font the renderer uses resolves through this module from
-//! `sp_ui::design`. Primitives are plain text on the 16 px line: no cards, radii, or shadows
-//! (popovers are the one exception), inverted video for selection, and hairline borders.
+//! `sp_ui::design`. The Cue style is a calm console: Inter text on a flat window, filled controls
+//! with soft radii, hairline dividers, and the teal accent reserved for selection and focus.
+//! Popovers are the one place a shadow appears.
 
 use eframe::egui::{
     self, Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, InnerResponse, Pos2,
@@ -10,7 +11,8 @@ use eframe::egui::{
 };
 use sp_ui::design::{ColorToken, FontWeight, Layout, Spacing, TypographyRole, fonts};
 
-const MEDIUM_FAMILY: &str = "plex-mono-medium";
+const INTER_MEDIUM_FAMILY: &str = "inter-medium";
+const INTER_SEMIBOLD_FAMILY: &str = "inter-semibold";
 
 /// Resolves a chrome colour token. The only egui colour constructor in the renderer.
 pub(super) fn color(token: ColorToken) -> Color32 {
@@ -32,7 +34,8 @@ pub(super) fn font(role: TypographyRole) -> FontId {
         f32::from(typography.size),
         match typography.weight {
             FontWeight::Regular => FontFamily::Proportional,
-            FontWeight::Medium => FontFamily::Name(MEDIUM_FAMILY.into()),
+            FontWeight::Medium => FontFamily::Name(INTER_MEDIUM_FAMILY.into()),
+            FontWeight::SemiBold => FontFamily::Name(INTER_SEMIBOLD_FAMILY.into()),
         },
     )
 }
@@ -41,23 +44,86 @@ pub(super) fn line() -> f32 {
     px(Layout::Line)
 }
 
+/// The corner radius of controls, preview slots, and popovers.
+#[expect(dead_code, reason = "used by the screen restyle")]
+pub(super) fn radius() -> f32 {
+    px(Layout::Radius)
+}
+
+/// The corner radius of meter bars, the gain marker, and load bars.
+#[expect(dead_code, reason = "used by the screen restyle")]
+pub(super) fn small_radius() -> f32 {
+    px(Layout::SmallRadius)
+}
+
+fn corner_radius() -> egui::CornerRadius {
+    egui::CornerRadius::same(u8::try_from(Layout::Radius.pixels()).unwrap_or(u8::MAX))
+}
+
 pub(super) fn hairline(token: ColorToken) -> Stroke {
     Stroke::new(px(Layout::Hairline), color(token))
 }
 
-/// Installs IBM Plex Mono and the token-driven egui style.
+/// Installs Inter, IBM Plex Mono, and the Cue egui style.
 pub fn install_style(ctx: &egui::Context) {
+    install_fonts(ctx);
+
+    let mut style = (*ctx.style()).clone();
+    let visuals = &mut style.visuals;
+    *visuals = egui::Visuals::dark();
+    visuals.override_text_color = Some(color(ColorToken::Text));
+    visuals.panel_fill = color(ColorToken::Base);
+    visuals.window_fill = color(ColorToken::Base);
+    visuals.extreme_bg_color = color(ColorToken::Well);
+    visuals.faint_bg_color = color(ColorToken::HoverFill);
+    visuals.code_bg_color = color(ColorToken::Well);
+    visuals.window_stroke = hairline(ColorToken::Outline);
+    visuals.window_corner_radius = corner_radius();
+    visuals.menu_corner_radius = corner_radius();
+    visuals.window_shadow = egui::Shadow::NONE;
+    visuals.popup_shadow = egui::Shadow::NONE;
+    visuals.selection.bg_fill = color(ColorToken::AccentFill);
+    visuals.selection.stroke = hairline(ColorToken::Accent);
+    visuals.text_cursor.stroke = hairline(ColorToken::Strong);
+    install_widget_states(visuals);
+    // Only meters animate: no hover, scroll, or popover transitions.
+    style.animation_time = 0.0;
+    style.spacing.item_spacing = Vec2::new(sp(Spacing::S8), 0.0);
+    style.spacing.button_padding = Vec2::new(sp(Spacing::S6), 0.0);
+    style.spacing.interact_size.y = px(Layout::Control);
+    style.spacing.scroll = egui::style::ScrollStyle::thin();
+    for (text_style, role) in [
+        (egui::TextStyle::Body, TypographyRole::Body),
+        (egui::TextStyle::Button, TypographyRole::Body),
+        (egui::TextStyle::Small, TypographyRole::Label),
+        (egui::TextStyle::Heading, TypographyRole::Title),
+    ] {
+        style.text_styles.insert(text_style, font(role));
+    }
+    style.text_styles.insert(
+        egui::TextStyle::Monospace,
+        FontId::new(
+            f32::from(TypographyRole::Body.typography().size),
+            FontFamily::Monospace,
+        ),
+    );
+    ctx.set_style(style);
+}
+
+fn install_fonts(ctx: &egui::Context) {
     let mut definitions = FontDefinitions::default();
     for (name, bytes) in [
+        ("inter-regular", fonts::INTER_REGULAR),
+        (INTER_MEDIUM_FAMILY, fonts::INTER_MEDIUM),
+        (INTER_SEMIBOLD_FAMILY, fonts::INTER_SEMIBOLD),
         ("plex-mono", fonts::PLEX_MONO_REGULAR),
-        (MEDIUM_FAMILY, fonts::PLEX_MONO_MEDIUM),
     ] {
         definitions.font_data.insert(
             name.to_owned(),
             std::sync::Arc::new(FontData::from_static(bytes)),
         );
     }
-    // Plex Mono lacks ⌘ and ⇧; egui's bundled Hack and icon font supply them.
+    // Inter and Plex Mono lack ⌘ and ⇧; egui's bundled Hack and icon font supply them.
     let fallbacks = ["Hack", "emoji-icon-font", "NotoEmoji-Regular"].map(str::to_owned);
     let family = |first: &str| {
         std::iter::once(first.to_owned())
@@ -66,63 +132,61 @@ pub fn install_style(ctx: &egui::Context) {
     };
     definitions
         .families
-        .insert(FontFamily::Proportional, family("plex-mono"));
+        .insert(FontFamily::Proportional, family("inter-regular"));
     definitions
         .families
         .insert(FontFamily::Monospace, family("plex-mono"));
     definitions.families.insert(
-        FontFamily::Name(MEDIUM_FAMILY.into()),
-        family(MEDIUM_FAMILY),
+        FontFamily::Name(INTER_MEDIUM_FAMILY.into()),
+        family(INTER_MEDIUM_FAMILY),
+    );
+    definitions.families.insert(
+        FontFamily::Name(INTER_SEMIBOLD_FAMILY.into()),
+        family(INTER_SEMIBOLD_FAMILY),
     );
     ctx.set_fonts(definitions);
+}
 
-    let mut style = (*ctx.style()).clone();
-    let visuals = &mut style.visuals;
-    *visuals = egui::Visuals::dark();
-    visuals.override_text_color = Some(color(ColorToken::Text));
-    visuals.panel_fill = color(ColorToken::Base);
-    visuals.window_fill = color(ColorToken::Base);
-    visuals.extreme_bg_color = color(ColorToken::Base);
-    visuals.faint_bg_color = color(ColorToken::HoverFill);
-    visuals.code_bg_color = color(ColorToken::Base);
-    visuals.window_stroke = hairline(ColorToken::Dim);
-    visuals.window_corner_radius = egui::CornerRadius::ZERO;
-    visuals.menu_corner_radius = egui::CornerRadius::ZERO;
-    visuals.window_shadow = egui::Shadow::NONE;
-    visuals.popup_shadow = egui::Shadow::NONE;
-    visuals.selection.bg_fill = color(ColorToken::Faint);
-    visuals.selection.stroke = hairline(ColorToken::Text);
-    visuals.text_cursor.stroke = hairline(ColorToken::Text);
-    for (widget, border) in [
-        (&mut visuals.widgets.noninteractive, ColorToken::Hairline),
-        (&mut visuals.widgets.inactive, ColorToken::Faint),
-        (&mut visuals.widgets.hovered, ColorToken::Dim),
-        (&mut visuals.widgets.active, ColorToken::Text),
-        (&mut visuals.widgets.open, ColorToken::Text),
+fn install_widget_states(visuals: &mut egui::Visuals) {
+    for (widget, fill, border, text) in [
+        (
+            &mut visuals.widgets.noninteractive,
+            ColorToken::Base,
+            ColorToken::Hairline,
+            ColorToken::Text,
+        ),
+        (
+            &mut visuals.widgets.inactive,
+            ColorToken::Raised,
+            ColorToken::Outline,
+            ColorToken::Text,
+        ),
+        (
+            &mut visuals.widgets.hovered,
+            ColorToken::HoverFill,
+            ColorToken::Faint,
+            ColorToken::Strong,
+        ),
+        (
+            &mut visuals.widgets.active,
+            ColorToken::HoverFill,
+            ColorToken::Accent,
+            ColorToken::Strong,
+        ),
+        (
+            &mut visuals.widgets.open,
+            ColorToken::Raised,
+            ColorToken::Accent,
+            ColorToken::Text,
+        ),
     ] {
-        widget.corner_radius = egui::CornerRadius::ZERO;
-        widget.bg_fill = color(ColorToken::Base);
-        widget.weak_bg_fill = color(ColorToken::Base);
+        widget.corner_radius = corner_radius();
+        widget.bg_fill = color(fill);
+        widget.weak_bg_fill = color(fill);
         widget.bg_stroke = hairline(border);
-        widget.fg_stroke = hairline(ColorToken::Text);
+        widget.fg_stroke = hairline(text);
         widget.expansion = 0.0;
     }
-    // Only meters animate: no hover, scroll, or popover transitions.
-    style.animation_time = 0.0;
-    style.spacing.item_spacing = Vec2::new(sp(Spacing::S8), 0.0);
-    style.spacing.button_padding = Vec2::new(sp(Spacing::S6), 0.0);
-    style.spacing.interact_size.y = line();
-    style.spacing.scroll = egui::style::ScrollStyle::thin();
-    for (text_style, role) in [
-        (egui::TextStyle::Body, TypographyRole::Body),
-        (egui::TextStyle::Button, TypographyRole::Body),
-        (egui::TextStyle::Monospace, TypographyRole::Body),
-        (egui::TextStyle::Small, TypographyRole::Label),
-        (egui::TextStyle::Heading, TypographyRole::Title),
-    ] {
-        style.text_styles.insert(text_style, font(role));
-    }
-    ctx.set_style(style);
 }
 
 /// Lays out one line of text, truncated with an ellipsis to `max_width`.

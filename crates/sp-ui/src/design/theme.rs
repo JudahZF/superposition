@@ -1,9 +1,9 @@
 //! The foreground/background pairings the renderer draws, checked against WCAG AA.
 //!
 //! The renderer resolves colours straight from [`ColorToken`]; this module is the inventory of
-//! which tokens meet on screen. Faint text is reserved for disabled and decorative content (empty
-//! slots, tick labels), which WCAG exempts. Hovered list rows promote secondary text to
-//! [`ColorToken::Text`], because dim on the hover fill is below 4.5:1.
+//! which tokens meet on screen. Disabled text ([`ColorToken::Faint`]) is exempt from WCAG and is
+//! not listed. Hovered buttons and list rows promote secondary text to [`ColorToken::Text`],
+//! because [`ColorToken::Dim`] on the hover fill is below 4.5:1.
 
 use super::tokens::ColorToken;
 
@@ -40,38 +40,53 @@ impl Pairing {
 
 /// Every text pairing the UI draws. Each must meet [`AA_NORMAL_TEXT_RATIO`].
 ///
-/// Preview captions use an opaque base bar, so plug-in pictures never reduce caption contrast.
-pub const TEXT_PAIRINGS: [Pairing; 12] = [
-    // Primary, secondary, and state-token text on the window and preview captions.
+/// Preview captions use an opaque [`ColorToken::Well`] bar, so plug-in pictures never reduce
+/// caption contrast.
+pub const TEXT_PAIRINGS: [Pairing; 20] = [
+    // Window, rack column, and head and foot text.
     Pairing::new(ColorToken::Text, ColorToken::Base),
+    Pairing::new(ColorToken::Strong, ColorToken::Base),
     Pairing::new(ColorToken::Dim, ColorToken::Base),
     Pairing::new(ColorToken::Warn, ColorToken::Base),
     Pairing::new(ColorToken::Fault, ColorToken::Base),
     Pairing::new(ColorToken::Info, ColorToken::Base),
-    // Inverted-video selection: selected rack header, active scene, hovered menu row.
-    Pairing::new(ColorToken::Base, ColorToken::Text),
-    Pairing::new(ColorToken::Faint, ColorToken::Text),
-    // Lit Mute and Byp toggles.
+    // Head, foot, selected rack column, popovers, and modals.
+    Pairing::new(ColorToken::Text, ColorToken::Surface),
+    Pairing::new(ColorToken::Strong, ColorToken::Surface),
+    Pairing::new(ColorToken::Dim, ColorToken::Surface),
+    // Preview captions and text fields.
+    Pairing::new(ColorToken::Strong, ColorToken::Well),
+    Pairing::new(ColorToken::Dim, ColorToken::Well),
+    // Buttons and toggles.
+    Pairing::new(ColorToken::Text, ColorToken::Raised),
+    Pairing::new(ColorToken::Dim, ColorToken::Raised),
+    // Hovered buttons, pads, and list rows.
+    Pairing::new(ColorToken::Text, ColorToken::HoverFill),
+    Pairing::new(ColorToken::Strong, ColorToken::HoverFill),
+    // Lit Mute and lit Bypass.
     Pairing::new(ColorToken::Base, ColorToken::Warn),
     Pairing::new(ColorToken::Base, ColorToken::Info),
+    // Active scene pad and text selection.
+    Pairing::new(ColorToken::Strong, ColorToken::AccentFill),
     // Fault line.
-    Pairing::new(ColorToken::Text, ColorToken::FaultTint),
+    Pairing::new(ColorToken::Strong, ColorToken::FaultTint),
     Pairing::new(ColorToken::Fault, ColorToken::FaultTint),
-    // Hovered list rows.
-    Pairing::new(ColorToken::Text, ColorToken::HoverFill),
 ];
 
 /// Every non-text boundary the UI relies on. Each must meet [`AA_NON_TEXT_RATIO`].
-pub const BOUNDARY_PAIRINGS: [Pairing; 5] = [
-    // Selected preview, focus outline, and gain marker.
-    Pairing::new(ColorToken::Text, ColorToken::Base),
-    // Hovered preview and popover border.
-    Pairing::new(ColorToken::Dim, ColorToken::Base),
-    // Lit and clipping meter segments against unlit ones.
-    Pairing::new(ColorToken::Text, ColorToken::SegmentOff),
-    Pairing::new(ColorToken::Fault, ColorToken::SegmentOff),
-    // Lit toggles on the window.
-    Pairing::new(ColorToken::Info, ColorToken::Base),
+///
+/// Outline borders are decorative and not listed.
+pub const BOUNDARY_PAIRINGS: [Pairing; 7] = [
+    // Selection rings and the selected rack bar, against the window, column, and slot fills.
+    Pairing::new(ColorToken::Accent, ColorToken::Base),
+    Pairing::new(ColorToken::Accent, ColorToken::Surface),
+    Pairing::new(ColorToken::Accent, ColorToken::Well),
+    // Gain marker on the gain track.
+    Pairing::new(ColorToken::Strong, ColorToken::Groove),
+    // Meter bar zones against the unlit well.
+    Pairing::new(ColorToken::MeterLit, ColorToken::Well),
+    Pairing::new(ColorToken::Fault, ColorToken::Well),
+    Pairing::new(ColorToken::Warn, ColorToken::Well),
 ];
 
 #[cfg(test)]
