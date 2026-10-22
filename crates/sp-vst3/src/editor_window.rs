@@ -1,4 +1,5 @@
-//! Worker-owned `AppKit` window for a native VST3 editor, and the editor's preview picture.
+//! Worker-owned `AppKit` window for a native VST3 editor, the editor's preview picture, and the
+//! pictures and input that stream the editor to remote clients.
 
 #![allow(unsafe_code)] // AppKit initialization is this crate's isolated Objective-C boundary.
 
@@ -19,19 +20,23 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBitmapImageFileType,
-    NSBitmapImageRep, NSBitmapImageRepPropertyKey, NSEventMask, NSScreen, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask, NSWindowTabbingMode,
+    NSBitmapImageRep, NSBitmapImageRepPropertyKey, NSEvent, NSEventMask, NSEventModifierFlags,
+    NSEventType, NSScreen, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSWindowTabbingMode,
 };
 use objc2_core_foundation::{CFRetained, CGFloat};
 use objc2_core_graphics::{
-    CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGContext, CGImage,
-    CGImageAlphaInfo, CGInterpolationQuality, CGWindowImageOption, CGWindowListOption,
+    CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGContext, CGEvent,
+    CGEventField, CGEventFlags, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo,
+    CGInterpolationQuality, CGScrollEventUnit, CGWindowImageOption, CGWindowListOption,
     kCGColorSpaceSRGB,
 };
 use objc2_foundation::{
-    NSDate, NSDefaultRunLoopMode, NSDictionary, NSObject, NSObjectProtocol, NSPoint, NSRect,
-    NSSize, NSString,
+    NSDate, NSDefaultRunLoopMode, NSDictionary, NSObject, NSObjectProtocol, NSPoint, NSProcessInfo,
+    NSRect, NSSize, NSString,
 };
+
+use crate::editor_input::{EditorInput, Modifiers, MouseButton};
 
 // Editor preview pictures are exactly 320×200 pixels.
 const PREVIEW_WIDTH: u32 = 320;
@@ -212,6 +217,260 @@ impl MacOsEditorWindow {
         })
     }
 
+    /// The window server's number for this window. It is unique across processes, so it names
+    /// the window in the editor stream. `None` before the window has a window-server device.
+    pub fn window_number(&self) -> Option<u32> {
+        u32::try_from(self.window.windowNumber())
+            .ok()
+            .filter(|&number| number > 0)
+    }
+
+    /// Pictures the editor's content at one pixel per point into `pixels` as BGRX, rows top to
+    /// bottom: the window-stream tile format. Returns the width and height in pixels.
+    ///
+    /// The view draws itself into a bitmap inside this process, so this needs no permission and
+    /// changes nothing on screen. Layer-backed Metal or OpenGL content stays blank here.
+    ///
+    /// # Errors
+    /// Returns an error when the window has no content, or a bitmap cannot be made.
+    pub fn capture_bgrx(&self, pixels: &mut Vec<u8>) -> Result<(u16, u16), String> {
+        autoreleasepool(|_| {
+            let view = self
+                .window
+                .contentView()
+                .ok_or("native editor window has no content view")?;
+            let bounds = view.bounds();
+            let (width, height) = (
+                whole_pixels(bounds.size.width),
+                whole_pixels(bounds.size.height),
+            );
+            if width == 0 || height == 0 {
+                return Err("native editor window has no content".to_owned());
+            }
+            let bitmap = view
+                .bitmapImageRepForCachingDisplayInRect(bounds)
+                .ok_or("native editor view has no cache bitmap")?;
+            view.cacheDisplayInRect_toBitmapImageRep(bounds, &bitmap);
+            let image = bitmap
+                .CGImage()
+                .ok_or("native editor cache bitmap has no image")?;
+            // SAFETY: `kCGColorSpaceSRGB` is an immutable CoreGraphics constant.
+            let space = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }))
+                .ok_or("sRGB color space is unavailable")?;
+            let (columns, rows) = (usize::from(width), usize::from(height));
+            pixels.clear();
+            pixels.resize(columns * rows * 4, 0);
+            // Little-endian 32-bit pixels with the alpha byte skipped first are B, G, R, X in
+            // memory. The context's first row in memory is the top of the drawn image.
+            // SAFETY: `pixels` holds `rows` rows of `columns * 4` bytes. The context writes only
+            // inside them and is released at the end of this block, before `pixels` is read.
+            let context = unsafe {
+                CGBitmapContextCreate(
+                    pixels.as_mut_ptr().cast(),
+                    columns,
+                    rows,
+                    8,
+                    columns * 4,
+                    Some(&space),
+                    CGImageAlphaInfo::NoneSkipFirst.0 | CGImageByteOrderInfo::Order32Little.0,
+                )
+            }
+            .ok_or("native editor capture context could not be made")?;
+            CGContext::draw_image(
+                Some(&context),
+                NSRect::new(
+                    NSPoint::ZERO,
+                    NSSize::new(f64::from(width), f64::from(height)),
+                ),
+                Some(&image),
+            );
+            drop(context);
+            Ok((width, height))
+        })
+    }
+
+    /// Delivers synthesized input to this window as if the user gave it. The events go through
+    /// `-[NSWindow sendEvent:]`, so only this window sees them: the system pointer does not move
+    /// and no Accessibility permission is needed.
+    ///
+    /// # Panics
+    /// Panics when called off the worker main thread, which violates the window's contract.
+    pub fn inject(&self, input: &EditorInput) {
+        let mtm = MainThreadMarker::new().expect("editor window remains on main thread");
+        autoreleasepool(|_| {
+            let event = match *input {
+                EditorInput::MouseMoved {
+                    x,
+                    y,
+                    dragging,
+                    modifiers,
+                } => {
+                    let kind = match dragging {
+                        None => NSEventType::MouseMoved,
+                        Some(MouseButton::Left) => NSEventType::LeftMouseDragged,
+                        Some(MouseButton::Right) => NSEventType::RightMouseDragged,
+                        Some(MouseButton::Middle) => NSEventType::OtherMouseDragged,
+                    };
+                    self.mouse_event(kind, (x, y), modifiers, 0, dragging.is_some())
+                }
+                EditorInput::MouseButton {
+                    x,
+                    y,
+                    button,
+                    pressed,
+                    click_count,
+                    modifiers,
+                } => {
+                    let kind = match (button, pressed) {
+                        (MouseButton::Left, true) => NSEventType::LeftMouseDown,
+                        (MouseButton::Left, false) => NSEventType::LeftMouseUp,
+                        (MouseButton::Right, true) => NSEventType::RightMouseDown,
+                        (MouseButton::Right, false) => NSEventType::RightMouseUp,
+                        (MouseButton::Middle, true) => NSEventType::OtherMouseDown,
+                        (MouseButton::Middle, false) => NSEventType::OtherMouseUp,
+                    };
+                    let clicks = isize::try_from(click_count).unwrap_or(isize::MAX);
+                    self.mouse_event(kind, (x, y), modifiers, clicks, pressed)
+                }
+                EditorInput::Scroll {
+                    x,
+                    y,
+                    dx,
+                    dy,
+                    modifiers,
+                } => self.scroll_event(mtm, (x, y), dx, dy, modifiers),
+                EditorInput::Key {
+                    key_code,
+                    ref characters,
+                    pressed,
+                    modifiers,
+                } => {
+                    let kind = if pressed {
+                        NSEventType::KeyDown
+                    } else {
+                        NSEventType::KeyUp
+                    };
+                    self.key_event(kind, key_code, characters, modifiers)
+                }
+                EditorInput::ModifiersChanged {
+                    key_code,
+                    modifiers,
+                } => self.key_event(NSEventType::FlagsChanged, key_code, "", modifiers),
+                EditorInput::Focus => {
+                    self.focus();
+                    None
+                }
+                EditorInput::Close => {
+                    self.request_close();
+                    None
+                }
+            };
+            if let Some(event) = event {
+                self.window.sendEvent(&event);
+            }
+        });
+    }
+
+    /// A content-view position, in points from its top-left corner, in window coordinates, which
+    /// grow upwards.
+    fn window_location(&self, (x, y): (f64, f64)) -> Option<NSPoint> {
+        let view = self.window.contentView()?;
+        let y = if view.isFlipped() {
+            y
+        } else {
+            view.bounds().size.height - y
+        };
+        Some(view.convertPoint_toView(NSPoint::new(x, y), None))
+    }
+
+    fn mouse_event(
+        &self,
+        kind: NSEventType,
+        position: (f64, f64),
+        modifiers: Modifiers,
+        clicks: isize,
+        pressed: bool,
+    ) -> Option<Retained<NSEvent>> {
+        NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+            kind,
+            self.window_location(position)?,
+            modifier_flags(modifiers),
+            NSProcessInfo::processInfo().systemUptime(),
+            self.window.windowNumber(),
+            None,
+            0,
+            clicks,
+            if pressed { 1.0 } else { 0.0 },
+        )
+    }
+
+    fn key_event(
+        &self,
+        kind: NSEventType,
+        key_code: u16,
+        characters: &str,
+        modifiers: Modifiers,
+    ) -> Option<Retained<NSEvent>> {
+        let characters = NSString::from_str(characters);
+        NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+            kind,
+            NSPoint::ZERO,
+            modifier_flags(modifiers),
+            NSProcessInfo::processInfo().systemUptime(),
+            self.window.windowNumber(),
+            None,
+            &characters,
+            &characters,
+            false,
+            key_code,
+        )
+    }
+
+    /// `AppKit` has no scroll-wheel event constructor, so this builds a `CGEvent` at the
+    /// screen position of `position` and tags it with this window, which makes `AppKit` give it
+    /// window coordinates.
+    fn scroll_event(
+        &self,
+        mtm: MainThreadMarker,
+        position: (f64, f64),
+        dx: i32,
+        dy: i32,
+        modifiers: Modifiers,
+    ) -> Option<Retained<NSEvent>> {
+        // CoreGraphics wheels are positive upwards and leftwards; the stream's are downwards and
+        // rightwards. Wheel 1 is vertical.
+        let event = CGEvent::new_scroll_wheel_event2(
+            None,
+            CGScrollEventUnit::Line,
+            2,
+            dy.saturating_neg(),
+            dx.saturating_neg(),
+            0,
+        )?;
+        let screen = self
+            .window
+            .convertPointToScreen(self.window_location(position)?);
+        // CoreGraphics measures from the primary screen's top-left corner, y downwards.
+        let primary = NSScreen::screens(mtm).firstObject()?.frame();
+        CGEvent::set_location(
+            Some(&event),
+            NSPoint::new(screen.x, primary.size.height - screen.y),
+        );
+        // Explicit flags stop AppKit from reading the hardware keyboard state.
+        CGEvent::set_flags(
+            Some(&event),
+            CGEventFlags::from_bits_retain(modifier_flags(modifiers).bits() as u64),
+        );
+        let number = i64::try_from(self.window.windowNumber()).ok()?;
+        for field in [
+            CGEventField::MouseEventWindowUnderMousePointer,
+            CGEventField::MouseEventWindowUnderMousePointerThatCanHandleThisEvent,
+        ] {
+            CGEvent::set_integer_value_field(Some(&event), field, number);
+        }
+        NSEvent::eventWithCGEvent(&event)
+    }
+
     /// Scales the window server's image of this window. The image includes the title bar; only
     /// the content area covers the picture.
     fn window_picture(&self) -> Option<CFRetained<CGImage>> {
@@ -262,6 +521,25 @@ impl MacOsEditorWindow {
         let image = bitmap.CGImage()?;
         cover(&image, NSRect::new(NSPoint::ZERO, image_size(&image)?))
     }
+}
+
+/// Whole pixels for a length in points, at one pixel per point.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "rounded and clamped to the u16 range first"
+)]
+fn whole_pixels(points: CGFloat) -> u16 {
+    points.round().clamp(0.0, f64::from(u16::MAX)) as u16
+}
+
+fn modifier_flags(modifiers: Modifiers) -> NSEventModifierFlags {
+    let mut flags = NSEventModifierFlags::empty();
+    flags.set(NSEventModifierFlags::Shift, modifiers.shift);
+    flags.set(NSEventModifierFlags::Control, modifiers.control);
+    flags.set(NSEventModifierFlags::Option, modifiers.option);
+    flags.set(NSEventModifierFlags::Command, modifiers.command);
+    flags
 }
 
 /// `CGWindowListCreateImage`. It is looked up at run time because current SDK headers mark it

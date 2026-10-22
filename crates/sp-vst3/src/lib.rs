@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 pub mod adapter;
 #[cfg(all(any(target_os = "linux", windows), feature = "editor-window"))]
 mod editor_common;
+#[cfg(feature = "editor-window")]
+pub mod editor_input;
 #[cfg(all(target_os = "macos", feature = "editor-window"))]
 pub mod editor_window;
 #[cfg(all(windows, feature = "editor-window"))]
