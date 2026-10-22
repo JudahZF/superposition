@@ -4,6 +4,7 @@ members = [
     "apps/superposition",
     "helpers/sp-plugin-worker",
     "helpers/sp-plugin-scanner",
+    "helpers/sp-window-streamer",
     "crates/sp-model",
     "crates/sp-protocol",
     "crates/sp-shared-memory",
