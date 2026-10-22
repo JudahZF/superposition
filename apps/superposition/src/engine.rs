@@ -1,6 +1,6 @@
 //! Shared audio preparation for the desktop and headless hosts.
 
-use sp_audio_io_macos::{
+use sp_audio_io::{
     ProductControl, ProductRenderer, current_product_parameters, prepare_product_scenes,
     product_midi_mappings,
 };

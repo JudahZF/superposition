@@ -61,7 +61,9 @@ mod tests {
                         "a second guard cannot restore this thread's active time constraint"
                     );
                 }
-                policy.enter(frames, rate).expect("cached scheduling policy");
+                policy
+                    .enter(frames, rate)
+                    .expect("cached scheduling policy");
                 policy.leave().expect("ordinary scheduling");
                 policy.leave().expect("already ordinary");
             }

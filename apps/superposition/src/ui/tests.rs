@@ -9,7 +9,7 @@ use sp_model::{
 use sp_session::SessionController;
 
 use super::{AUTOSAVE_INTERVAL, LiveRackApp, Modal, Overlay, mirror_update_matches};
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 use super::{ProductControl, SystemStatusState};
 use crate::MirroredParameterUpdate;
 
@@ -87,7 +87,7 @@ fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
 
 /// Software-renders the show screen in its main states to PNGs for visual review. Opt-in: set
 /// `SUPERPOSITION_UI_SNAPSHOT` to an output directory. No window or GPU is used.
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 #[test]
 #[ignore = "writes PNGs; set SUPERPOSITION_UI_SNAPSHOT to an output directory"]
 #[allow(
@@ -213,7 +213,7 @@ fn render_show_screen_snapshots() {
 }
 
 /// Eight racks resembling a show, with generated editor pictures and live meters.
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 #[allow(clippy::too_many_lines, reason = "one fixture show, built in order")]
 fn snapshot_fixture() -> (LiveRackApp, egui::Context) {
     const RACKS: [(&str, &[&str]); 8] = [
@@ -343,7 +343,7 @@ fn snapshot_fixture() -> (LiveRackApp, egui::Context) {
 }
 
 /// A stand-in editor picture: a coloured panel with a curve and bars, like a plug-in GUI.
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 fn editor_picture(name: &str) -> Vec<u8> {
     let seed = name.bytes().fold(7_u32, |hash, byte| {
         hash.wrapping_mul(31).wrapping_add(u32::from(byte))
@@ -385,7 +385,7 @@ fn editor_picture(name: &str) -> Vec<u8> {
 }
 
 /// Renders frames until textures settle, then rasterizes the last one to `path`.
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 fn snapshot(
     ctx: &egui::Context,
     app: &mut LiveRackApp,
@@ -449,7 +449,7 @@ fn snapshot(
     image.save(path).expect("write snapshot");
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 fn apply_textures(
     textures: &mut std::collections::HashMap<egui::TextureId, egui::ColorImage>,
     delta: &egui::TexturesDelta,
@@ -481,7 +481,7 @@ fn apply_textures(
 
 /// Fills one textured, vertex-coloured triangle with premultiplied-alpha blending in
 /// gamma space, matching egui's default renderer closely enough for visual review.
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -541,13 +541,13 @@ fn raster_triangle(
 }
 
 /// A reconnected device often returns with a new `CoreAudio` ID; the name must still match.
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 #[test]
 fn saved_route_finds_a_returned_device_by_name() {
     use sp_audio_io::{AudioDeviceCapabilities, AudioDeviceId, AudioDeviceInfo};
     use sp_model::{AudioDeviceSelection, AudioDeviceSettings};
 
-    let device = |id: &str, name: &str| super::MacOsAudioDevice {
+    let device = |id: &str, name: &str| super::PlatformAudioDevice {
         info: AudioDeviceInfo {
             id: AudioDeviceId::new(id),
             name: name.to_owned(),
@@ -587,7 +587,7 @@ fn saved_route_finds_a_returned_device_by_name() {
     assert_eq!(route.format.max_frames_per_callback, 128);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 #[test]
 fn reconnect_waits_for_its_interval_and_yields_to_manual_control() {
     let mut app = large_plugin_scene_app();
@@ -613,7 +613,7 @@ fn reconnect_waits_for_its_interval_and_yields_to_manual_control() {
     assert_eq!(app.reconnect_at, None);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 #[test]
 fn show_controls_guard_audio_and_recall_scenes_by_number() {
     let mut app = large_plugin_scene_app();
@@ -789,7 +789,7 @@ fn stale_parameter_feedback_does_not_match_replaced_slot_identity() {
     ));
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 #[test]
 fn stale_native_observation_does_not_follow_a_newer_host_value() {
     let mut app = large_plugin_scene_app();
@@ -973,7 +973,7 @@ fn dirty_session_autosaves_on_deadline_and_reschedules() {
     assert!(app.next_autosave_at >= now + AUTOSAVE_INTERVAL);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 #[test]
 fn full_live_queue_does_not_commit_rack_controls_to_session() {
     let mut app = empty_app("rack-controls");

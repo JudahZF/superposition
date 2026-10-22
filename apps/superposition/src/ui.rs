@@ -13,19 +13,19 @@ mod style;
 
 pub use style::install_style;
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 use crate::RackPlan;
 use crate::{CatalogPlugin, MirroredParameterUpdate, ProductRuntime, SlotEdit};
 use eframe::egui;
 use previews::PreviewCache;
 use scenes::SceneEditor;
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 use sp_audio_io::{AudioEndpoint, AudioEndpointEvent, AudioFormat, AudioRouteConfig};
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 use sp_midi::{
     MidiCcMonitor, MidiLearnController, MidiMappingPublisher, MidiMappingTarget, MidiPortId,
     MidiPortInfo, MidirInput, map_controller_to_target,
@@ -42,15 +42,14 @@ use sp_session::SessionController;
 use sp_ui::components::{StateToken, SystemStatus, SystemStatusState};
 use sp_ui::design::MotionPreference;
 
-#[cfg(target_os = "macos")]
-use sp_audio_io_macos::{
-    MacOsAudioDevice, MacOsAudioEndpoint, ProductControl, ProductTelemetry, enumerate_devices,
-};
-#[cfg(target_os = "macos")]
+use crate::platform_audio::{PlatformAudioDevice, PlatformAudioEndpoint, enumerate_devices};
+#[cfg(audio_backend)]
+use sp_audio_io::{ProductControl, ProductTelemetry};
+#[cfg(audio_backend)]
 use sp_ui::components::MeterBallistics;
 
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 /// Fade steps and range for scene transitions.
 const FADE_STEP_MS: u32 = 50;
@@ -209,44 +208,44 @@ pub struct LiveRackApp {
     last_product_diagnostic: Option<String>,
     last_rack_latency: [u32; MAX_RACKS],
     /// After a device loss, the next time to look for the saved route and restart audio.
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     reconnect_at: Option<Instant>,
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     meter_clock: Instant,
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     meters_updated_at: Option<Instant>,
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     rack_input_meters: [MeterBallistics; MAX_RACKS],
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     rack_output_meters: [MeterBallistics; MAX_RACKS],
-    #[cfg(target_os = "macos")]
-    audio: MacOsAudioEndpoint,
-    #[cfg(target_os = "macos")]
-    audio_devices: Vec<MacOsAudioDevice>,
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
+    audio: PlatformAudioEndpoint,
+    #[cfg(audio_backend)]
+    audio_devices: Vec<PlatformAudioDevice>,
+    #[cfg(audio_backend)]
     selected_route: Option<AudioRouteConfig>,
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     buffer_frames: u32,
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     midi_ports: Vec<MidiPortInfo>,
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     selected_midi: Option<MidiPortId>,
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     product_control: Option<ProductControl>,
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     pending_parameter_observations: BTreeMap<(usize, usize, u32), f32>,
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     midi_mapping_publisher: Option<MidiMappingPublisher>,
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     midi_learn: MidiLearnController,
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     midi_cc_monitor: Option<MidiCcMonitor>,
     /// MIDI Learn waits for a touched editor control, then for one CC.
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     midi_learn_armed: bool,
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     midi_learn_target: Option<MidiMappingTarget>,
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     telemetry: Option<std::sync::Arc<ProductTelemetry>>,
     /// Snapshot fixtures draw racks as if their workers were loaded.
     #[cfg(test)]
@@ -264,27 +263,27 @@ impl LiveRackApp {
         recovery_offered: bool,
         product: Result<ProductRuntime, String>,
     ) -> Self {
-        #[cfg(target_os = "macos")]
-        let audio = MacOsAudioEndpoint::new().allow_device_reconfiguration();
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
+        let audio = PlatformAudioEndpoint::new().allow_device_reconfiguration();
+        #[cfg(audio_backend)]
         let audio_devices = route_devices().unwrap_or_default();
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         let buffer_frames = controller
             .document()
             .model
             .audio_settings
             .as_ref()
             .map_or(128, |settings| settings.buffer_frames);
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         let selected_route = controller
             .document()
             .model
             .audio_settings
             .as_ref()
             .and_then(|settings| saved_route(&audio_devices, settings));
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         let midi_ports = MidirInput::enumerate_ports().unwrap_or_default();
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         let selected_midi = midi_ports.first().map(|port| port.id.clone());
         let catalog_plugins = product
             .as_ref()
@@ -325,43 +324,43 @@ impl LiveRackApp {
             next_autosave_at: Instant::now() + AUTOSAVE_INTERVAL,
             last_product_diagnostic: None,
             last_rack_latency: [u32::MAX; MAX_RACKS],
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             reconnect_at: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             meter_clock: Instant::now(),
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             meters_updated_at: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             rack_input_meters: [MeterBallistics::default(); MAX_RACKS],
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             rack_output_meters: [MeterBallistics::default(); MAX_RACKS],
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             audio,
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             audio_devices,
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             selected_route,
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             buffer_frames,
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             midi_ports,
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             selected_midi,
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             product_control: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             pending_parameter_observations: BTreeMap::new(),
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             midi_mapping_publisher: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             midi_learn: MidiLearnController::new(),
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             midi_cc_monitor: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             midi_learn_armed: false,
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             midi_learn_target: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             telemetry: None,
             #[cfg(test)]
             test_workers_running: false,
@@ -381,7 +380,7 @@ impl LiveRackApp {
         self.system.state == SystemStatusState::Online
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn persist_audio_settings(&mut self) {
         let Some(route) = &self.selected_route else {
             return;
@@ -435,12 +434,12 @@ impl LiveRackApp {
             .as_mut()
             .map_or_else(|_| Vec::new(), ProductRuntime::take_parameter_updates);
         if updates.is_empty() {
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             self.flush_parameter_observations();
             return;
         }
         let model = &self.controller.document().model;
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         let scene_targets: BTreeSet<(usize, usize, u32)> = if self.product_control.is_some() {
             model
                 .scenes
@@ -467,7 +466,7 @@ impl LiveRackApp {
             if !mirror_update_matches(model, &update) {
                 continue;
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             {
                 if scene_targets.contains(&(
                     update.rack_index,
@@ -510,11 +509,11 @@ impl LiveRackApp {
                     .insert(ParameterId(update.parameter_id.to_string()), update.value);
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         self.flush_parameter_observations();
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn flush_parameter_observations(&mut self) {
         let model = &self.controller.document().model;
         let Some(control) = self.product_control.as_mut() else {
@@ -565,7 +564,7 @@ impl LiveRackApp {
             .map_err(|error| format!("Saved plug-in state is unreadable: {error}"))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn load_unloaded_racks(&mut self) -> Result<(), String> {
         let racks = self.controller.document().model.racks.clone();
         for (rack_index, rack) in racks.iter().enumerate() {
@@ -828,7 +827,7 @@ impl LiveRackApp {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     #[allow(
         clippy::too_many_lines,
         reason = "engine start assembles every live handle in one deliberate sequence"
@@ -892,7 +891,7 @@ impl LiveRackApp {
             renderer = renderer.with_midi_input(midi);
         }
         self.system.set_state(SystemStatusState::Connecting);
-        self.audio = MacOsAudioEndpoint::with_renderer(renderer).allow_device_reconfiguration();
+        self.audio = PlatformAudioEndpoint::with_renderer(renderer).allow_device_reconfiguration();
         let Some(mut route) = self.selected_route.clone() else {
             self.system.set_state(SystemStatusState::Offline);
             self.show_fault("Choose an audio output device before starting".to_owned());
@@ -940,7 +939,7 @@ impl LiveRackApp {
     }
 
     /// Channel count of the selected input or output device, capped at 64.
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn device_channels(&self, input: bool) -> u16 {
         self.selected_route
             .as_ref()
@@ -965,7 +964,7 @@ impl LiveRackApp {
             })
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(audio_backend))]
     #[allow(clippy::unused_self, reason = "matches the macOS signature")]
     fn device_channels(&self, _input: bool) -> u16 {
         0
@@ -979,7 +978,7 @@ impl LiveRackApp {
                 .is_none_or(|input| physical_channels_fit(input, self.device_channels(true)))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn validate_selected_audio_route(&self) -> Result<(), String> {
         let route = self
             .selected_route
@@ -1006,7 +1005,7 @@ impl LiveRackApp {
         Ok(())
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn refresh_audio_devices(&mut self) {
         match route_devices() {
             Ok(devices) => {
@@ -1039,7 +1038,7 @@ impl LiveRackApp {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn refresh_midi_ports(&mut self) {
         match MidirInput::enumerate_ports() {
             Ok(ports) => {
@@ -1055,7 +1054,7 @@ impl LiveRackApp {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn poll_audio_event(&mut self) {
         let Some(event) = self.audio.poll_event() else {
             return;
@@ -1075,7 +1074,7 @@ impl LiveRackApp {
 
     /// Restarts audio on the saved route once its devices are present again. A manual start or
     /// stop cancels the attempt.
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn poll_reconnect(&mut self, now: Instant) {
         let Some(due) = self.reconnect_at else {
             return;
@@ -1114,14 +1113,14 @@ impl LiveRackApp {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(audio_backend))]
     fn toggle_engine(&mut self) {
-        self.show_fault("The live audio engine requires Apple Silicon macOS".to_owned());
+        self.show_fault("The live audio engine requires macOS or Linux".to_owned());
     }
 
     /// Starts the engine, or asks before stopping a running one.
     fn request_engine_toggle(&mut self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         {
             self.reconnect_at = None;
         }
@@ -1132,7 +1131,7 @@ impl LiveRackApp {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn clear_live_handles(&mut self) {
         if let Ok(product) = self.product.as_mut() {
             product.stop_retiring_workers();
@@ -1304,7 +1303,7 @@ impl LiveRackApp {
     /// While audio runs, untouched racks keep playing and only `rebuilt` or new racks restart;
     /// stopped audio uses the ordinary rebuild.
     fn apply_rack_edit(&mut self, before: &[RackId], rebuilt: &[RackId]) {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         if self.product_control.is_some() {
             if let Err(error) = self.apply_rack_edit_live(before, rebuilt) {
                 self.show_fault(error);
@@ -1315,7 +1314,7 @@ impl LiveRackApp {
         self.with_audio_paused(Self::rebuild_all_workers_stopped);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn apply_rack_edit_live(
         &mut self,
         before: &[RackId],
@@ -1358,7 +1357,7 @@ impl LiveRackApp {
         let product = self.product.as_mut().map_err(|error| error.clone())?;
         product.publish_live_topology(control, &model, &plan, &saved_states)?;
         self.midi_learn =
-            MidiLearnController::from_table(sp_audio_io_macos::product_midi_mappings(&model));
+            MidiLearnController::from_table(sp_audio_io::product_midi_mappings(&model));
         self.last_rack_latency = [u32::MAX; MAX_RACKS];
         self.rack_input_meters = [MeterBallistics::default(); MAX_RACKS];
         self.rack_output_meters = [MeterBallistics::default(); MAX_RACKS];
@@ -1369,9 +1368,9 @@ impl LiveRackApp {
     /// Runs a topology change that needs stopped audio, then restarts audio if it was running,
     /// so a rack edit during a show causes a short gap instead of lasting silence.
     fn with_audio_paused(&mut self, change: impl FnOnce(&mut Self)) {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         let resume = self.audio.active_format().is_some();
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         if resume {
             if let Err(error) = self.audio.stop() {
                 self.show_fault(format!(
@@ -1382,7 +1381,7 @@ impl LiveRackApp {
             self.clear_live_handles();
         }
         change(self);
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         if resume {
             let status = self.status_line.clone();
             self.toggle_engine();
@@ -1626,7 +1625,7 @@ impl LiveRackApp {
 
     /// Sends the session's scenes to the running engine. Returns false after reporting a fault.
     fn publish_live_scenes(&mut self) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         if let Some(control) = self.product_control.as_mut()
             && !control.publish_scenes(&self.controller.document().model)
         {
@@ -1667,7 +1666,7 @@ impl LiveRackApp {
             self.show_fault("Rack gain is invalid".to_owned());
             return;
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         if self.online() {
             let Some(control) = self.product_control.as_mut() else {
                 self.show_fault("Rack control queue is unavailable".to_owned());
@@ -1792,7 +1791,7 @@ impl LiveRackApp {
     /// changes in place so its other plug-ins keep playing; if it cannot, only this rack's
     /// worker restarts.
     fn reload_selected_rack_after_edit(&mut self, edit: SlotEdit) {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         if let Some(control) = self.product_control.as_mut() {
             if !control.changes_applied() {
                 self.show_fault(
@@ -1856,7 +1855,7 @@ impl LiveRackApp {
 
     /// Reloads the selected rack's worker with its current topology.
     fn load_selected_rack(&mut self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         if self.product_control.is_some() {
             let before = self.rack_ids();
             let rebuilt: Vec<RackId> = before
@@ -2002,7 +2001,7 @@ impl LiveRackApp {
     }
 
     /// Arms MIDI Learn: the next CC maps to the parameter last touched in any plug-in editor.
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn arm_midi_learn(&mut self) {
         if !self.online() || self.midi_cc_monitor.is_none() {
             self.show_fault(
@@ -2017,7 +2016,7 @@ impl LiveRackApp {
     }
 
     fn cancel_midi_learn(&mut self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         {
             self.midi_learn.cancel();
             self.midi_learn_target = None;
@@ -2025,7 +2024,7 @@ impl LiveRackApp {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn poll_midi_learn(&mut self) {
         let Some(event) = self
             .midi_cc_monitor
@@ -2115,9 +2114,9 @@ impl LiveRackApp {
             return;
         }
         model.midi_mappings.remove(index);
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         {
-            let table = sp_audio_io_macos::product_midi_mappings(&self.controller.document().model);
+            let table = sp_audio_io::product_midi_mappings(&self.controller.document().model);
             self.midi_learn = MidiLearnController::from_table(table);
             if let Some(publisher) = self.midi_mapping_publisher.as_mut()
                 && publisher.publish(table).is_err()
@@ -2149,7 +2148,7 @@ impl LiveRackApp {
         format!("{}, {}, {name}", rack.name, slot.plugin.identity.name)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn recall_scene(&mut self, scene_index: usize) {
         if !self.online() {
             return;
@@ -2172,10 +2171,10 @@ impl LiveRackApp {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(audio_backend))]
     fn recall_scene(&mut self, _scene_index: usize) {}
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn apply_scene_snapshot(&mut self, scene_index: usize) {
         let Some(scene) = self
             .controller
@@ -2242,7 +2241,7 @@ impl LiveRackApp {
         self.current_scene = Some(scene_index);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn poll_realtime_scene(&mut self) {
         let scene = self
             .telemetry
@@ -2298,7 +2297,7 @@ impl LiveRackApp {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn publish_latency_changes(&mut self) {
         if !self.online() {
             return;
@@ -2473,7 +2472,7 @@ impl LiveRackApp {
         self.product.as_mut().map_err(|error| error.clone())
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     fn update_meters(&mut self) {
         let Some(telemetry) = &self.telemetry else {
             return;
@@ -2511,7 +2510,7 @@ impl LiveRackApp {
 
     /// Total deadline misses across racks, or `None` while offline.
     fn deadline_misses(&self) -> Option<u64> {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         if let Some(telemetry) = &self.telemetry {
             return Some(
                 (0..MAX_RACKS)
@@ -2566,7 +2565,7 @@ impl eframe::App for LiveRackApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         {
             let _ = self.audio.stop();
             self.clear_live_handles();
@@ -2590,12 +2589,12 @@ impl LiveRackApp {
                 Err(error) => self.show_fault(error),
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         let stopped_dispatcher_racks = self.audio.service_stopped_recoveries();
         if let Ok(product) = self.product.as_mut() {
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             product.poll_with_stopped_dispatcher(stopped_dispatcher_racks.as_ref());
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(audio_backend))]
             product.poll();
             if product.native_editor_pending() || product.maintenance_pending() {
                 ctx.request_repaint_after(Duration::from_millis(16));
@@ -2603,7 +2602,7 @@ impl LiveRackApp {
         }
         self.poll_parameter_mirror();
         self.poll_product_diagnostic();
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         {
             self.publish_latency_changes();
             if let (Ok(product), Some(control)) =
@@ -2764,8 +2763,8 @@ fn gain_label(gain_db: f32) -> String {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn route_devices() -> Result<Vec<MacOsAudioDevice>, Box<dyn std::error::Error + Send + Sync>> {
+#[cfg(audio_backend)]
+fn route_devices() -> Result<Vec<PlatformAudioDevice>, Box<dyn std::error::Error + Send + Sync>> {
     Ok(enumerate_devices()?
         .into_iter()
         .filter(|device| {
@@ -2776,9 +2775,9 @@ fn route_devices() -> Result<Vec<MacOsAudioDevice>, Box<dyn std::error::Error + 
         .collect())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 fn saved_route(
-    devices: &[MacOsAudioDevice],
+    devices: &[PlatformAudioDevice],
     settings: &AudioDeviceSettings,
 ) -> Option<AudioRouteConfig> {
     let output = resolve_audio_device(devices, &settings.output, false)?;
@@ -2794,9 +2793,9 @@ fn saved_route(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 fn resolve_audio_device(
-    devices: &[MacOsAudioDevice],
+    devices: &[PlatformAudioDevice],
     saved: &AudioDeviceSelection,
     input: bool,
 ) -> Option<sp_audio_io::AudioDeviceId> {
@@ -2821,8 +2820,8 @@ fn resolve_audio_device(
         .then(|| device.info.id.clone())
 }
 
-#[cfg(target_os = "macos")]
-fn available_buffer_frames(devices: &[MacOsAudioDevice], route: &AudioRouteConfig) -> Vec<u32> {
+#[cfg(audio_backend)]
+fn available_buffer_frames(devices: &[PlatformAudioDevice], route: &AudioRouteConfig) -> Vec<u32> {
     let Some(output) = devices.iter().find(|device| device.info.id == route.output) else {
         return Vec::new();
     };

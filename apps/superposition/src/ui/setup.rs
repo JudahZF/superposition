@@ -10,7 +10,7 @@ use super::style::{
     Mark, action, choice_row, color, hairline, line, note, paint_text, px, sp, title,
 };
 use super::{LiveRackApp, SetupTab, show::latency_label};
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 use sp_audio_io::{AudioFormat, AudioRouteConfig};
 
 const TABS: [(SetupTab, &str); 4] = [
@@ -76,7 +76,7 @@ impl LiveRackApp {
             });
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     #[allow(
         clippy::too_many_lines,
         reason = "output, input, and buffer choices read top to bottom"
@@ -233,11 +233,11 @@ impl LiveRackApp {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(audio_backend))]
     fn draw_audio_setup(&mut self, ui: &mut Ui) {
         note(
             ui,
-            "The live audio engine requires Apple Silicon macOS.",
+            "The live audio engine requires macOS or Linux.",
             ColorToken::Warn,
         );
     }
@@ -247,7 +247,7 @@ impl LiveRackApp {
         reason = "input choice, mappings table, and learn controls read top to bottom"
     )]
     fn draw_midi_setup(&mut self, ui: &mut Ui) {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         {
             let locked = self.online();
             if locked {
@@ -353,7 +353,7 @@ impl LiveRackApp {
             );
         }
         ui.add_space(sp(Spacing::S10));
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         if self.midi_learn_armed {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = sp(Spacing::S20);
@@ -574,12 +574,12 @@ impl LiveRackApp {
                 _ => ("Unloaded", ColorToken::Dim),
             };
             let restarts = product.map_or(0, |product| product.rack_restart_count(index));
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             let diagnostics = self
                 .telemetry
                 .as_ref()
                 .and_then(|telemetry| telemetry.rack_diagnostics(index));
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             let (misses, rejections) = diagnostics.map_or_else(
                 || ("--".to_owned(), "--".to_owned()),
                 |diagnostics| {
@@ -589,7 +589,7 @@ impl LiveRackApp {
                     )
                 },
             );
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(audio_backend))]
             let (misses, rejections) = ("--".to_owned(), "--".to_owned());
             let number = format!("{:02}", index + 1);
             let restarts_text = restarts.to_string();
@@ -721,7 +721,7 @@ impl LiveRackApp {
 
     /// Whether the engine needs a private aggregate for separate input and output devices.
     fn aggregate_label(&self) -> &'static str {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         if let Some(route) = &self.selected_route
             && route
                 .input

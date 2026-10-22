@@ -34,7 +34,8 @@ pub(crate) struct TelemetryCell {
 impl TelemetryCell {
     pub(crate) fn record(&self, outcome: BlockOutcome, frames: BlockFrames) {
         let sequence = self.sequence.load(Ordering::Relaxed);
-        self.sequence.store(sequence.wrapping_add(1), Ordering::Relaxed);
+        self.sequence
+            .store(sequence.wrapping_add(1), Ordering::Relaxed);
         fence(Ordering::Release);
         let bump = |counter: &AtomicU64| {
             counter.store(counter.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
@@ -47,12 +48,14 @@ impl TelemetryCell {
                 } else {
                     &self.silenced
                 });
-                bump(&self.histogram[match frames {
-                    BlockFrames::Frames32 => 0,
-                    BlockFrames::Frames64 => 1,
-                    BlockFrames::Frames128 => 2,
-                    BlockFrames::Frames256 => 3,
-                }]);
+                bump(
+                    &self.histogram[match frames {
+                        BlockFrames::Frames32 => 0,
+                        BlockFrames::Frames64 => 1,
+                        BlockFrames::Frames128 => 2,
+                        BlockFrames::Frames256 => 3,
+                    }],
+                );
             }
             BlockOutcome::InvalidFrames => bump(&self.invalid_frames),
             BlockOutcome::InvalidBuffers => bump(&self.invalid_buffers),

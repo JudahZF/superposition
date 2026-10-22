@@ -148,7 +148,9 @@ pub(crate) unsafe fn notify(word: &AtomicU32) -> c_int {
         )
     };
     if woken < 0 {
-        -io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+        -io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
     } else {
         c_int::try_from(woken).unwrap_or(c_int::MAX)
     }

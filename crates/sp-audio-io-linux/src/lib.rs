@@ -49,9 +49,8 @@ pub struct LinuxAudioDevice {
     /// Physical capture and playback port counts.
     pub capabilities: AudioDeviceCapabilities,
     /// The server's current quantum when it is a product block size; JACK cannot change it here.
+    /// Opening a stream rejects a server whose sample rate differs from the product format.
     pub supported_buffer_frames: Vec<u32>,
-    /// The server's sample rate in hertz.
-    pub sample_rate_hz: u32,
 }
 
 /// Lists running JACK servers. Never starts a server.
@@ -68,15 +67,6 @@ pub fn enumerate_devices() -> Result<Vec<LinuxAudioDevice>, quanta_audio_io::Err
                     .unwrap_or(MAX_PRODUCT_CHANNELS)
             };
             let quantum = device.buffer_sizes.map(|sizes| sizes.minimum);
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "JACK reports one positive integer sample rate"
-            )]
-            let sample_rate_hz = device
-                .sample_rates
-                .first()
-                .map_or(0, |range| range.minimum.round() as u32);
             LinuxAudioDevice {
                 info: AudioDeviceInfo {
                     id: AudioDeviceId::new(format!("{DEVICE_ID_PREFIX}{}", device.uid)),
@@ -93,7 +83,6 @@ pub fn enumerate_devices() -> Result<Vec<LinuxAudioDevice>, quanta_audio_io::Err
                     .filter(|frames| BlockFrames::from_u32(*frames).is_some())
                     .into_iter()
                     .collect(),
-                sample_rate_hz,
             }
         })
         .collect())
@@ -213,10 +202,7 @@ impl Drop for ProductCallback {
     fn drop(&mut self) {
         // `quanta-audio-io` drops the callback on the control thread after deactivating JACK.
         if let Some(renderer) = self.renderer.take() {
-            *self
-                .returned
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(renderer);
+            *self.returned.lock().unwrap_or_else(PoisonError::into_inner) = Some(renderer);
         }
     }
 }
@@ -380,9 +366,11 @@ impl LinuxAudioEndpoint {
             .take();
         if renderer.is_none() {
             self.retirement_failed = true;
-            return Err("the JACK server stopped before the audio callback could be retired; \
+            return Err(
+                "the JACK server stopped before the audio callback could be retired; \
                         restart the endpoint"
-                .into());
+                    .into(),
+            );
         }
         self.pending_renderer = renderer;
         Ok(())
@@ -423,8 +411,7 @@ fn validate_product_format(format: AudioFormat) -> Result<AudioFormat, BoxError>
     if format.sample_rate_hz != PRODUCT_SAMPLE_RATE_HZ {
         return Err(format!("product audio requires {PRODUCT_SAMPLE_RATE_HZ} Hz").into());
     }
-    if format.channel_count == 0 || format.channel_count > MAX_PRODUCT_CHANNELS.min(MAX_CHANNELS)
-    {
+    if format.channel_count == 0 || format.channel_count > MAX_PRODUCT_CHANNELS.min(MAX_CHANNELS) {
         return Err(format!(
             "product audio supports 1 to {MAX_PRODUCT_CHANNELS} output channels; requested {}",
             format.channel_count
@@ -474,12 +461,11 @@ impl AudioEndpoint for LinuxAudioEndpoint {
         self.pending_renderer
             .as_ref()
             .ok_or("audio renderer could not be safely recovered; rebuild the endpoint")?
-            .validate_routes(usize::from(input_channels), usize::from(format.channel_count))?;
-        self.open(
-            AudioRouteConfig { format, ..route },
-            input_channels,
-            false,
-        )
+            .validate_routes(
+                usize::from(input_channels),
+                usize::from(format.channel_count),
+            )?;
+        self.open(AudioRouteConfig { format, ..route }, input_channels, false)
     }
 
     fn poll_event(&mut self) -> Option<AudioEndpointEvent> {

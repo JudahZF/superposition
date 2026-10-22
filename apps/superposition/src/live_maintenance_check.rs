@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use sp_audio_io_macos::{RackAutomationEvents, RackSharedMemoryDispatcher};
+use sp_audio_io::{RackAutomationEvents, RackSharedMemoryDispatcher};
 use sp_engine::RackAudioSource;
 use sp_model::{ParameterId, PluginInstanceId, RackId};
 use sp_session::{CapturedPluginState, SessionController};

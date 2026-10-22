@@ -3,12 +3,14 @@
 //! All plug-in discovery and hosting is driven from this process, but all third-party code stays
 //! in the scanner or one retained worker process per rack.
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 mod engine;
 mod headless;
 mod maintenance;
 #[cfg(test)]
 mod maintenance_tests;
+#[cfg(audio_backend)]
+mod platform_audio;
 mod ui;
 
 use std::{
@@ -655,10 +657,10 @@ impl ProductRuntime {
         self.poll_inner(None);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     pub(crate) fn poll_with_stopped_dispatcher(
         &mut self,
-        access: Option<&sp_audio_io_macos::StoppedRecoveryAccess<'_>>,
+        access: Option<&sp_audio_io::StoppedRecoveryAccess<'_>>,
     ) {
         let owns = |rack_index, signal: &Arc<RackRecoverySignal>| {
             access.is_some_and(|access| access.owns(rack_index, signal))
@@ -1395,15 +1397,15 @@ impl ProductRuntime {
     ///
     /// The callback applies the layout at one block boundary. Workers it retires stop after
     /// [`Self::finish_live_topology`] confirms the callback no longer reads their banks.
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     pub(crate) fn publish_live_topology(
         &mut self,
-        control: &mut sp_audio_io_macos::ProductControl,
+        control: &mut sp_audio_io::ProductControl,
         model: &sp_model::Session,
         plan: &[RackPlan],
         saved_states: &[Vec<Option<CapturedPluginState>>],
     ) -> Result<(), String> {
-        use sp_audio_io_macos::{LaneWorker, PreparedRackLane, TopologyLane};
+        use sp_audio_io::{LaneWorker, PreparedRackLane, TopologyLane};
 
         if !control.changes_applied() {
             return Err("the previous rack change is still being applied; try again".to_owned());
@@ -1556,8 +1558,8 @@ impl ProductRuntime {
     }
 
     /// Stops workers retired by a live layout change once the callback has applied it.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn finish_live_topology(&mut self, control: &mut sp_audio_io_macos::ProductControl) {
+    #[cfg(audio_backend)]
+    pub(crate) fn finish_live_topology(&mut self, control: &mut sp_audio_io::ProductControl) {
         if self.retiring_workers.is_empty() || !control.changes_applied() {
             return;
         }
@@ -1818,7 +1820,7 @@ impl ProductRuntime {
     }
 
     /// Writes one parameter through a running worker and records it in the worker's rack.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn write_parameter(
         &mut self,
         rack_index: usize,
@@ -1850,7 +1852,7 @@ impl ProductRuntime {
     }
 
     /// Reads one parameter's normalized value from a running worker.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn read_worker_parameter(
         &mut self,
         rack_index: usize,
@@ -3107,7 +3109,7 @@ fn write_worker_parameter(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn worker_parameter_metadata(
     session: &mut WorkerControlSession,
     slot: usize,

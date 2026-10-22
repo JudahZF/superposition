@@ -218,9 +218,9 @@ fn scan() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 fn list_devices() -> Result<(), String> {
-    let devices = sp_audio_io_macos::enumerate_devices()
+    let devices = crate::platform_audio::enumerate_devices()
         .map_err(|error| format!("CoreAudio device discovery failed: {error}"))?;
     if devices.is_empty() {
         println!("No CoreAudio devices were found.");
@@ -244,15 +244,15 @@ fn list_devices() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(audio_backend))]
 fn list_devices() -> Result<(), String> {
-    Err("CoreAudio device discovery requires macOS".to_owned())
+    Err("audio device discovery requires macOS or Linux".to_owned())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 fn list_midi_ports() -> Result<(), String> {
     let ports = sp_midi::MidirInput::enumerate_ports()
-        .map_err(|error| format!("CoreMIDI input discovery failed: {error}"))?;
+        .map_err(|error| format!("MIDI input discovery failed: {error}"))?;
     if ports.is_empty() {
         println!("No MIDI input ports were found.");
     }
@@ -262,19 +262,19 @@ fn list_midi_ports() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(audio_backend))]
 fn list_midi_ports() -> Result<(), String> {
-    Err("CoreMIDI input discovery requires macOS".to_owned())
+    Err("MIDI input discovery requires macOS or Linux".to_owned())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 #[allow(
     clippy::too_many_lines,
     reason = "live host lifetime and teardown stay together"
 )]
 fn host(options: &HostOptions) -> Result<(), String> {
+    use crate::platform_audio::PlatformAudioEndpoint;
     use sp_audio_io::{AudioEndpoint, AudioEndpointEvent, AudioFormat, AudioRouteConfig};
-    use sp_audio_io_macos::MacOsAudioEndpoint;
     use sp_session::{AtomicFileSessionStore, CapturedPluginState, SessionController};
     use std::time::{Duration, Instant};
 
@@ -297,7 +297,7 @@ fn host(options: &HostOptions) -> Result<(), String> {
     if !model.racks.iter().any(|rack| !rack.slots.is_empty()) {
         return Err("saved session has no plug-in racks to host".to_owned());
     }
-    let devices = sp_audio_io_macos::enumerate_devices()
+    let devices = crate::platform_audio::enumerate_devices()
         .map_err(|error| format!("CoreAudio device discovery failed: {error}"))?;
     let output = select_device_for_direction(
         &devices,
@@ -359,7 +359,7 @@ fn host(options: &HostOptions) -> Result<(), String> {
     let mut renderer = prepared.renderer;
     if let Some(requested) = options.midi_port.as_deref() {
         let ports = sp_midi::MidirInput::enumerate_ports()
-            .map_err(|error| format!("CoreMIDI input discovery failed: {error}"))?;
+            .map_err(|error| format!("MIDI input discovery failed: {error}"))?;
         let selected = select_midi_port(&ports, requested)?;
         let mut midi = sp_midi::MidirInput::new();
         midi.open_port(&selected.id)
@@ -371,7 +371,8 @@ fn host(options: &HostOptions) -> Result<(), String> {
     let mut control = prepared.control;
     let _mapping_publisher = prepared.mapping_publisher;
     let _mappings = prepared.mappings;
-    let mut endpoint = MacOsAudioEndpoint::with_renderer(renderer).allow_device_reconfiguration();
+    let mut endpoint =
+        PlatformAudioEndpoint::with_renderer(renderer).allow_device_reconfiguration();
     endpoint
         .start_route(route)
         .map_err(|error| format!("CoreAudio could not start: {error}"))?;
@@ -642,7 +643,7 @@ fn host(options: &HostOptions) -> Result<(), String> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 fn record_meter_max(
     meter: sp_engine::RackMeterSnapshot,
     peaks: &mut [f32; 2],
@@ -656,7 +657,7 @@ fn record_meter_max(
     *clipped |= meter.clipped;
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 #[derive(Clone, Copy)]
 enum DeviceDirection {
     Input,
@@ -665,22 +666,22 @@ enum DeviceDirection {
 
 #[cfg(all(test, target_os = "macos"))]
 fn select_device<'a>(
-    devices: &'a [sp_audio_io_macos::MacOsAudioDevice],
+    devices: &'a [crate::platform_audio::PlatformAudioDevice],
     requested: &str,
     frames: u32,
-) -> Result<&'a sp_audio_io_macos::MacOsAudioDevice, String> {
+) -> Result<&'a crate::platform_audio::PlatformAudioDevice, String> {
     let device = select_device_for_direction(devices, requested, frames, DeviceDirection::Input)?;
     select_device_for_direction(devices, requested, frames, DeviceDirection::Output)?;
     Ok(device)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 fn select_device_for_direction<'a>(
-    devices: &'a [sp_audio_io_macos::MacOsAudioDevice],
+    devices: &'a [crate::platform_audio::PlatformAudioDevice],
     requested: &str,
     frames: u32,
     direction: DeviceDirection,
-) -> Result<&'a sp_audio_io_macos::MacOsAudioDevice, String> {
+) -> Result<&'a crate::platform_audio::PlatformAudioDevice, String> {
     let selected = if let Some(device) = devices
         .iter()
         .find(|device| device.info.id.as_str() == requested)
@@ -722,7 +723,7 @@ fn select_device_for_direction<'a>(
     Ok(selected)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 fn select_midi_port<'a>(
     ports: &'a [sp_midi::MidiPortInfo],
     requested: &str,
@@ -742,9 +743,9 @@ fn select_midi_port<'a>(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(audio_backend))]
 fn host(_options: &HostOptions) -> Result<(), String> {
-    Err("live audio requires macOS".to_owned())
+    Err("live audio requires macOS or Linux".to_owned())
 }
 
 #[cfg(test)]
@@ -985,14 +986,14 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     #[test]
     fn validates_selected_device_direction_and_buffer_size() {
+        use crate::platform_audio::PlatformAudioDevice;
         use sp_audio_io::{AudioDeviceCapabilities, AudioDeviceId, AudioDeviceInfo};
-        use sp_audio_io_macos::MacOsAudioDevice;
 
         let devices = [
-            MacOsAudioDevice {
+            PlatformAudioDevice {
                 info: AudioDeviceInfo {
                     id: AudioDeviceId::new("coreaudio:1"),
                     name: "Capture".to_owned(),
@@ -1006,7 +1007,7 @@ mod tests {
                 },
                 supported_buffer_frames: vec![32, 64],
             },
-            MacOsAudioDevice {
+            PlatformAudioDevice {
                 info: AudioDeviceInfo {
                     id: AudioDeviceId::new("coreaudio:2"),
                     name: "Playback".to_owned(),
@@ -1068,7 +1069,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     #[test]
     fn selects_only_an_exact_or_unique_midi_input() {
         use sp_midi::{MidiPortId, MidiPortInfo};

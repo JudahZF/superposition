@@ -208,7 +208,7 @@ impl LiveRackApp {
     }
 
     pub(super) fn output_device_name(&self) -> String {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         if let Some(route) = &self.selected_route
             && let Some(device) = self
                 .audio_devices
@@ -221,9 +221,9 @@ impl LiveRackApp {
     }
 
     pub(super) fn buffer_frames_value(&self) -> u32 {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         return self.buffer_frames;
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(audio_backend))]
         128
     }
 
@@ -947,18 +947,18 @@ impl LiveRackApp {
 
     /// Three LED columns: rack input, then output L and R.
     fn draw_meters(&self, ui: &mut Ui, inner: Rect, top: f32, rack_index: usize, online: bool) {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         let (input, output) = (
             self.rack_input_meters[rack_index],
             self.rack_output_meters[rack_index],
         );
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         let levels = [
             (input.fill_fraction(), input.held_fraction(), "in"),
             (output.channel_fraction(0), output.held_fraction(), "L"),
             (output.channel_fraction(1), output.held_fraction(), "R"),
         ];
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(audio_backend))]
         let levels = [(0.0, 0.0, "in"), (0.0, 0.0, "L"), (0.0, 0.0, "R")];
         let width = px(Layout::MeterWidth);
         let segment = px(Layout::MeterSegment);

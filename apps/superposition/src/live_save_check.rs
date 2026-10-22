@@ -7,8 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::platform_audio::{PlatformAudioEndpoint, enumerate_devices};
 use sp_audio_io::{AudioEndpoint, AudioEndpointEvent, AudioFormat, AudioRouteConfig};
-use sp_audio_io_macos::{MacOsAudioEndpoint, enumerate_devices};
 use sp_model::{Scene, SceneId, SceneParameterTransition, SceneParameterValue};
 use sp_session::{CapturedPluginState, SessionController};
 
@@ -99,7 +99,7 @@ fn save_and_scene_capture_keep_audio_running() {
     let mut control = prepared.control;
     let _mapping_publisher = prepared.mapping_publisher;
     let mut endpoint =
-        MacOsAudioEndpoint::with_renderer(prepared.renderer).allow_device_reconfiguration();
+        PlatformAudioEndpoint::with_renderer(prepared.renderer).allow_device_reconfiguration();
     endpoint.start_route(route).expect("start BlackHole audio");
 
     // Plug-ins may request a latency-driven worker replacement right after start.

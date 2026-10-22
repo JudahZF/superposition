@@ -3283,6 +3283,7 @@ dependencies = [
  "midir",
  "objc2-app-kit 0.3.2",
  "sp-audio-io",
+ "sp-audio-io-linux",
  "sp-audio-io-macos",
  "sp-engine",
  "sp-midi",

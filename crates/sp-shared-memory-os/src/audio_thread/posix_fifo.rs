@@ -119,14 +119,22 @@ fn set_fifo(priority: i32) -> i32 {
         sched_priority: priority,
     };
     // SAFETY: `pthread_self` is the calling thread and `parameter` is a valid record.
-    unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &raw const parameter) }
+    unsafe {
+        libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &raw const parameter)
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn set_other() -> i32 {
     let parameter = libc::sched_param { sched_priority: 0 };
     // SAFETY: `pthread_self` is the calling thread and `parameter` is a valid record.
-    unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_OTHER, &raw const parameter) }
+    unsafe {
+        libc::pthread_setschedparam(
+            libc::pthread_self(),
+            libc::SCHED_OTHER,
+            &raw const parameter,
+        )
+    }
 }
 
 #[cfg(windows)]

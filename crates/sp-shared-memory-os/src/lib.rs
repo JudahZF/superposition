@@ -79,7 +79,9 @@ impl MonotonicClock {
     pub fn new() -> io::Result<Self> {
         let (numer, denom) = sys::clock_timebase()?;
         if numer == 0 || denom == 0 {
-            return Err(io::Error::other("the platform returned an invalid timebase"));
+            return Err(io::Error::other(
+                "the platform returned an invalid timebase",
+            ));
         }
         Ok(Self { numer, denom })
     }
@@ -941,7 +943,9 @@ fn backing_bytes_i64() -> io::Result<i64> {
     let bank_bytes = bank_bytes_i64()?;
     let page_bytes = sys::page_size();
     if page_bytes <= 0 {
-        return Err(io::Error::other("the platform returned an invalid VM page size"));
+        return Err(io::Error::other(
+            "the platform returned an invalid VM page size",
+        ));
     }
     bank_bytes
         .checked_add(page_bytes - 1)

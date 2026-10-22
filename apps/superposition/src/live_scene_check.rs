@@ -7,8 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::platform_audio::{PlatformAudioEndpoint, enumerate_devices};
 use sp_audio_io::{AudioEndpoint, AudioEndpointEvent, AudioFormat, AudioRouteConfig};
-use sp_audio_io_macos::{MacOsAudioEndpoint, enumerate_devices};
 use sp_model::{
     NormalizedValue, ParameterId, PhysicalChannels, RackChannelRoute, Scene, SceneId,
     SceneParameterTransition, SceneParameterValue,
@@ -214,7 +214,7 @@ fn pro_q_scene_recall_keeps_blackhole_audio_healthy() {
     let _mapping_publisher = prepared.mapping_publisher;
     let _mappings = prepared.mappings;
     let mut endpoint =
-        MacOsAudioEndpoint::with_renderer(prepared.renderer).allow_device_reconfiguration();
+        PlatformAudioEndpoint::with_renderer(prepared.renderer).allow_device_reconfiguration();
     let started_audio = endpoint.start_route(route.clone());
     let mut run_error = started_audio
         .as_ref()

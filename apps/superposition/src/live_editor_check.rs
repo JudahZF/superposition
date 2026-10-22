@@ -7,8 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::platform_audio::{PlatformAudioEndpoint, enumerate_devices};
 use sp_audio_io::{AudioEndpoint, AudioEndpointEvent, AudioFormat, AudioRouteConfig};
-use sp_audio_io_macos::{MacOsAudioEndpoint, enumerate_devices};
 use sp_session::{AtomicFileSessionStore, CapturedPluginState, SessionController};
 
 use crate::{ProductRuntime, engine};
@@ -184,7 +184,7 @@ fn plugin_editor_remains_open_during_blackhole_audio() {
     let _mapping_publisher = prepared.mapping_publisher;
     let _mappings = prepared.mappings;
     let mut endpoint =
-        MacOsAudioEndpoint::with_renderer(prepared.renderer).allow_device_reconfiguration();
+        PlatformAudioEndpoint::with_renderer(prepared.renderer).allow_device_reconfiguration();
 
     let start_result = endpoint.start_route(route);
     let mut run_error = start_result

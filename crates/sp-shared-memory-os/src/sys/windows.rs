@@ -66,7 +66,9 @@ fn load_bridge() -> Option<Bridge> {
             clock_ns: std::mem::transmute::<Export, ClockFn>(symbol(c"sp_wine_clock_ns")?),
             futex_wake: std::mem::transmute::<Export, WakeFn>(symbol(c"sp_wine_futex_wake")?),
             futex_wait: std::mem::transmute::<Export, WaitFn>(symbol(c"sp_wine_futex_wait")?),
-            set_scheduler: std::mem::transmute::<Export, SchedulerFn>(symbol(c"sp_wine_set_scheduler")?),
+            set_scheduler: std::mem::transmute::<Export, SchedulerFn>(symbol(
+                c"sp_wine_set_scheduler",
+            )?),
         })
     }
 }

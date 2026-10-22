@@ -1,13 +1,14 @@
 //! macOS product audio endpoint over the direct AUHAL streams in this crate.
 
-
 use sp_audio_io::{
     AudioDeviceInfo, AudioEndpoint, AudioEndpointEvent, AudioFormat, AudioFormatError,
     AudioRouteConfig, BlockFrames, CallbackTelemetry, ProductRenderer, StoppedRecoveryAccess,
 };
 use sp_engine::{PreparedGraph, RealtimeRackMixer};
 
-use crate::{ActiveMultiChannelDuplex, ActiveOutput, CoreAudioError, OutputConfig, enumerate_devices};
+use crate::{
+    ActiveMultiChannelDuplex, ActiveOutput, CoreAudioError, OutputConfig, enumerate_devices,
+};
 
 const PRODUCT_SAMPLE_RATE: u32 = 48_000;
 
@@ -300,7 +301,6 @@ fn core_audio_box(error: CoreAudioError) -> Box<dyn std::error::Error + Send + S
     Box::new(error)
 }
 
-
 #[cfg(test)]
 mod tests {
     use sp_audio_io::{AudioEndpoint, AudioFormat, ProductControl, ProductRenderer};
@@ -347,7 +347,12 @@ mod tests {
             .expect("original renderer returned");
         assert_eq!(std::ptr::from_ref(renderer.as_ref()), pointer);
         assert_eq!(
-            renderer.mixer_mut().rack_settings(0).unwrap().gain.to_bits(),
+            renderer
+                .mixer_mut()
+                .rack_settings(0)
+                .unwrap()
+                .gain
+                .to_bits(),
             0.4_f32.to_bits()
         );
         // The retained renderer still owns the control receiver.
