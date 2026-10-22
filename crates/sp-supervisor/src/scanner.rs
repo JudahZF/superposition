@@ -389,7 +389,18 @@ pub fn fingerprint_bundle(bundle: &Path) -> std::io::Result<BundleFingerprint> {
     })
 }
 
-/// Discovers direct VST3 bundle children in the standard user and system macOS locations.
+/// The per-user VST3 folder, relative to `HOME`.
+#[cfg(not(target_os = "linux"))]
+const USER_VST3_DIRECTORY: &str = "Library/Audio/Plug-Ins/VST3";
+#[cfg(target_os = "linux")]
+const USER_VST3_DIRECTORY: &str = ".vst3";
+
+/// Discovers direct VST3 bundle children in the standard user and system locations.
+///
+/// macOS searches `/Library/Audio/Plug-Ins/VST3` and `~/Library/Audio/Plug-Ins/VST3`. Linux
+/// searches each absolute folder in the colon-separated `VST3_PATH` first (`NixOS` profiles keep
+/// plug-ins outside the standard folders), then `~/.vst3`, `/usr/lib/vst3`, and
+/// `/usr/local/lib/vst3`. Symbolic links to bundles are followed.
 ///
 /// Passing `Some(home)` makes user-directory discovery deterministic for functional tests. With
 /// `None`, the current process's `HOME` is used when available. Discovery never opens a bundle.
@@ -398,10 +409,16 @@ pub fn discover_vst3_bundles(home: Option<&Path>) -> Vec<PathBuf> {
     let user_home = home
         .map(Path::to_path_buf)
         .or_else(|| env::var_os("HOME").map(PathBuf::from));
-    let mut roots = vec![PathBuf::from("/Library/Audio/Plug-Ins/VST3")];
-    if let Some(home) = user_home {
-        roots.push(home.join("Library/Audio/Plug-Ins/VST3"));
-    }
+    #[cfg(target_os = "linux")]
+    let roots = linux_vst3_roots(env::var_os("VST3_PATH").as_deref(), user_home.as_deref());
+    #[cfg(not(target_os = "linux"))]
+    let roots = {
+        let mut roots = vec![PathBuf::from("/Library/Audio/Plug-Ins/VST3")];
+        if let Some(home) = user_home {
+            roots.push(home.join(USER_VST3_DIRECTORY));
+        }
+        roots
+    };
     let mut bundles = roots
         .into_iter()
         .filter_map(|root| fs::read_dir(root).ok())
@@ -412,14 +429,28 @@ pub fn discover_vst3_bundles(home: Option<&Path>) -> Vec<PathBuf> {
                 .extension()
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("vst3"));
-            (extension_is_vst3 && entry.file_type().ok().is_some_and(|kind| kind.is_dir()))
-                .then_some(path)
+            (extension_is_vst3 && path.is_dir()).then_some(path)
         })
         .filter_map(|path| fs::canonicalize(path).ok())
         .collect::<Vec<_>>();
     bundles.sort();
     bundles.dedup();
     bundles
+}
+
+/// Linux VST3 roots in search order. Relative `VST3_PATH` entries are ignored.
+#[cfg(target_os = "linux")]
+fn linux_vst3_roots(vst3_path: Option<&std::ffi::OsStr>, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = vst3_path
+        .map(|paths| {
+            env::split_paths(paths)
+                .filter(|path| path.is_absolute())
+                .collect()
+        })
+        .unwrap_or_default();
+    roots.extend(home.map(|home| home.join(USER_VST3_DIRECTORY)));
+    roots.extend(["/usr/lib/vst3", "/usr/local/lib/vst3"].map(PathBuf::from));
+    roots
 }
 
 fn collect_regular_files(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
@@ -547,7 +578,7 @@ mod tests {
 
     use super::{
         BundleFingerprint, CachedScan, ScanCache, Scanner, TemporaryScanReport,
-        discover_vst3_bundles, fingerprint_bundle, map_scan,
+        USER_VST3_DIRECTORY, discover_vst3_bundles, fingerprint_bundle, map_scan,
     };
     use crate::TimedHelperResult;
 
@@ -698,11 +729,31 @@ mod tests {
     #[test]
     fn discovers_user_directory_without_scanning_a_bundle() {
         let root = temporary_root();
-        let bundle = root.join("Library/Audio/Plug-Ins/VST3/Fixture.vst3");
+        let bundle = root.join(USER_VST3_DIRECTORY).join("Fixture.vst3");
         fs::create_dir_all(&bundle).expect("create test bundle");
         let discovered = discover_vst3_bundles(Some(&root));
         assert!(discovered.contains(&fs::canonicalize(&bundle).expect("canonical bundle")));
         fs::remove_dir_all(root).expect("remove temporary root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_roots_put_vst3_path_overrides_before_standard_folders() {
+        let roots = super::linux_vst3_roots(
+            Some("/nix/profile/lib/vst3:relative/vst3::/opt/vst3".as_ref()),
+            Some("/home/user".as_ref()),
+        );
+        assert_eq!(
+            roots,
+            [
+                "/nix/profile/lib/vst3",
+                "/opt/vst3",
+                "/home/user/.vst3",
+                "/usr/lib/vst3",
+                "/usr/local/lib/vst3",
+            ]
+            .map(PathBuf::from)
+        );
     }
 
     #[cfg(unix)]

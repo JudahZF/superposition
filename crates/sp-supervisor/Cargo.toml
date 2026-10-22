@@ -13,5 +13,8 @@ sha2.workspace = true
 sp-model = { path = "../sp-model" }
 sp-protocol = { path = "../sp-protocol" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", features = ["process"] }
+
 [lints]
 workspace = true
