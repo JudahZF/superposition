@@ -35,7 +35,7 @@ nix develop -c cargo xtask wine-check        # Windows worker boundary under Win
 
 Windows VST3 plug-ins run in one shared Wine prefix (`<app support>/wine`, or `SUPERPOSITION_WINE_PREFIX`). Install them with **Setup → Plug-ins → Run Windows program…** (an `.exe` or `.msi`; its windows appear in the editor area), then **Rescan plug-ins**. Bundles in the prefix's `Program Files/Common Files/VST3` folder, and in any folder listed in `SUPERPOSITION_WINDOWS_VST3_PATH`, are scanned under Wine. A rack holds plug-ins of one platform, and a rack of Windows plug-ins is heard one buffer late.
 
-Audio runs through JACK (PipeWire's JACK library works). The server's rate and quantum must match the session, for example `pw-metadata -n settings 0 clock.force-quantum 128`. For real-time scheduling, grant `RLIMIT_RTPRIO` (for example through `security.pam.loginLimits` on NixOS).
+Audio runs through JACK (PipeWire's JACK library works). The server's rate and quantum must match the session, for example `pw-metadata -n settings 0 clock.force-quantum 128`. For real-time scheduling, grant `RLIMIT_RTPRIO` (the NixOS module below does this). Without it, native threads ask rtkit, if it runs; Windows workers under Wine need `RLIMIT_RTPRIO`.
 
 The app finds its helper executables beside its own executable, the Windows ones in `windows/` and the Wine bridge in `wine-bridge/` there. Packaged builds use the bundle's `Helpers` directory. `SUPERPOSITION_HELPERS_DIR` overrides both, and `SUPERPOSITION_APP_SUPPORT` selects a separate catalog and quarantine directory.
 

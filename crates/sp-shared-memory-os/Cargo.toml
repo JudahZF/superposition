@@ -11,6 +11,10 @@ sp-shared-memory = { path = "../sp-shared-memory" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.186"
+zbus = "4.4.0"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+zbus = { version = "4.4.0", features = ["p2p"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

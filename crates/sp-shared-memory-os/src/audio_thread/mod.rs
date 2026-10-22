@@ -2,9 +2,9 @@
 //!
 //! macOS applies a Mach time constraint sized to the block period. Linux, and a Windows worker
 //! under Wine through `sp_wine_bridge`, apply `SCHED_FIFO`. When Linux denies real-time
-//! priority (no `RLIMIT_RTPRIO`), the thread keeps ordinary scheduling, reports
-//! [`SchedulingMode::Normal`], and warns once, unless `SUPERPOSITION_REQUIRE_REALTIME=1`
-//! makes the denial an error.
+//! priority (no `RLIMIT_RTPRIO`), a native thread asks rtkit for `SCHED_RR`. If that fails too,
+//! the thread keeps ordinary scheduling, reports [`SchedulingMode::Normal`], and warns once,
+//! unless `SUPERPOSITION_REQUIRE_REALTIME=1` makes the denial an error.
 
 use std::io;
 
@@ -12,6 +12,8 @@ use std::io;
 mod macos;
 #[cfg(any(target_os = "linux", windows))]
 mod posix_fifo;
+#[cfg(target_os = "linux")]
+mod rtkit;
 
 #[cfg(target_os = "macos")]
 pub use macos::AudioThreadPolicy;

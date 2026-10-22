@@ -56,7 +56,7 @@ The host starts later segments first, last to first, and then points each worker
 
 Workers set plug-ins up for one sample rate, passed as `--sample-rate` (48000 or 96000), which also sizes the processing thread's scheduling policy. Audio start restarts any rack worker that runs at another rate, with its captured state.
 
-On Linux the processing thread requests `SCHED_FIFO` (priority `SUPERPOSITION_RT_PRIORITY`, default 70). Without `RLIMIT_RTPRIO` it keeps ordinary scheduling and warns once; `SUPERPOSITION_REQUIRE_REALTIME=1` makes that an error. It receives no control IPC and does not launch, log, allocate, or sleep from the callback path.
+On Linux the processing thread requests `SCHED_FIFO` (priority `SUPERPOSITION_RT_PRIORITY`, default 70). Without `RLIMIT_RTPRIO`, a native thread asks rtkit on the system bus for `SCHED_RR` (at most rtkit's `MaxRealtimePriority`, after lowering `RLIMIT_RTTIME` to rtkit's limit). A Wine worker cannot reach rtkit. If both are denied, the thread keeps ordinary scheduling and warns once; `SUPERPOSITION_REQUIRE_REALTIME=1` makes that an error. It receives no control IPC and does not launch, log, allocate, or sleep from the callback path.
 
 `SharedBank::new` builds the fixed layout in a box, field by field. The mapping
 creator copies that initialized bank into its exclusive mapping; replacement

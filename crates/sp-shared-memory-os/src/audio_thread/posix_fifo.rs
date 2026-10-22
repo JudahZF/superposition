@@ -1,4 +1,5 @@
 //! `SCHED_FIFO` for the processing thread on Linux, or under Wine through `sp_wine_bridge`.
+//! On Linux, rtkit is the fallback when `RLIMIT_RTPRIO` denies it.
 
 use std::{io, marker::PhantomData, rc::Rc, sync::Once};
 
@@ -44,7 +45,8 @@ impl AudioThreadPolicy {
     ///
     /// # Errors
     /// Returns an error for an unsupported format, for a scheduler failure other than a
-    /// permission denial, or for a denial when `SUPERPOSITION_REQUIRE_REALTIME=1`.
+    /// permission denial, or for a denial that rtkit does not lift when
+    /// `SUPERPOSITION_REQUIRE_REALTIME=1`.
     pub fn enter(&mut self, frames: u32, sample_rate: u32) -> io::Result<()> {
         validate_format(frames, sample_rate)?;
         if self.active == Some((frames, sample_rate)) {
@@ -53,9 +55,14 @@ impl AudioThreadPolicy {
         if self.mode == SchedulingMode::RealTime {
             match set_fifo(priority()) {
                 0 => {}
-                EPERM if !realtime_required() => {
-                    self.mode = SchedulingMode::Normal;
-                    warn_normal_scheduling();
+                EPERM => {
+                    if let Err(error) = request_from_rtkit(priority()) {
+                        if realtime_required() {
+                            return Err(io::Error::from_raw_os_error(EPERM));
+                        }
+                        self.mode = SchedulingMode::Normal;
+                        warn_normal_scheduling(&error);
+                    }
                 }
                 code => return Err(io::Error::from_raw_os_error(code)),
             }
@@ -103,14 +110,28 @@ fn realtime_required() -> bool {
     std::env::var_os("SUPERPOSITION_REQUIRE_REALTIME").is_some_and(|value| value == "1")
 }
 
-fn warn_normal_scheduling() {
+fn warn_normal_scheduling(rtkit_error: &io::Error) {
     static WARNED: Once = Once::new();
     WARNED.call_once(|| {
         eprintln!(
-            "superposition: real-time priority denied (raise RLIMIT_RTPRIO); \
+            "superposition: real-time priority denied (raise RLIMIT_RTPRIO; rtkit: {rtkit_error}); \
              the processing thread uses ordinary scheduling"
         );
     });
+}
+
+#[cfg(target_os = "linux")]
+fn request_from_rtkit(priority: i32) -> io::Result<()> {
+    let connection = zbus::blocking::Connection::system().map_err(io::Error::other)?;
+    super::rtkit::make_current_thread_realtime(&connection, priority)
+}
+
+#[cfg(windows)]
+fn request_from_rtkit(_priority: i32) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "a Wine worker cannot reach rtkit",
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -124,16 +145,21 @@ fn set_fifo(priority: i32) -> i32 {
     }
 }
 
+/// rtkit sets `SCHED_RESET_ON_FORK`, which an unprivileged thread cannot clear, so it is kept.
 #[cfg(target_os = "linux")]
 fn set_other() -> i32 {
+    // SAFETY: 0 names the calling thread.
+    let current = unsafe { libc::sched_getscheduler(0) };
+    if current < 0 {
+        return io::Error::last_os_error().raw_os_error().unwrap_or(EPERM);
+    }
     let parameter = libc::sched_param { sched_priority: 0 };
-    // SAFETY: `pthread_self` is the calling thread and `parameter` is a valid record.
-    unsafe {
-        libc::pthread_setschedparam(
-            libc::pthread_self(),
-            libc::SCHED_OTHER,
-            &raw const parameter,
-        )
+    let policy = libc::SCHED_OTHER | (current & libc::SCHED_RESET_ON_FORK);
+    // SAFETY: 0 names the calling thread and `parameter` is a valid record.
+    if unsafe { libc::sched_setscheduler(0, policy, &raw const parameter) } == 0 {
+        0
+    } else {
+        io::Error::last_os_error().raw_os_error().unwrap_or(EPERM)
     }
 }
 
