@@ -27,8 +27,44 @@
             }
           )
         );
+      pinnedWine = system: nixpkgs.legacyPackages.${system}.wineWow64Packages.staging;
     in
     {
+      nixosModules.default = import ./nix/nixos-module.nix { wineFor = pinnedWine; };
+
+      # Evaluates a NixOS system with the module enabled and checks the settings it must apply.
+      checks.x86_64-linux.nixos-module =
+        let
+          pkgs = nixpkgs.legacyPackages.x86_64-linux;
+          inherit (pkgs) lib;
+          host = nixpkgs.lib.nixosSystem {
+            system = "x86_64-linux";
+            modules = [
+              self.nixosModules.default
+              {
+                programs.superposition.enable = true;
+                boot.loader.grub.enable = false;
+                fileSystems."/" = {
+                  device = "none";
+                  fsType = "tmpfs";
+                };
+                system.stateVersion = "26.05";
+              }
+            ];
+          };
+          inherit (host) config;
+          ok =
+            lib.elem "ntsync" config.boot.kernelModules
+            && lib.any (
+              limit: limit.domain == "@audio" && limit.item == "rtprio" && limit.value == "95"
+            ) config.security.pam.loginLimits
+            && config.security.rtkit.enable
+            && config.environment.sessionVariables.SUPERPOSITION_WINE
+              == "${pinnedWine "x86_64-linux"}/bin/wine";
+        in
+        assert ok;
+        pkgs.runCommand "superposition-nixos-module" { } "touch $out";
+
       devShells = forAllSystems (
         pkgs:
         let
@@ -36,7 +72,7 @@
           linux = pkgs.stdenv.hostPlatform.isLinux;
           # The one pinned Wine build. Licences in the shared prefix and the
           # sp-wine-bridge unixlib ABI both depend on it; change it deliberately.
-          wine = pkgs.wineWow64Packages.staging;
+          wine = pinnedWine pkgs.stdenv.hostPlatform.system;
           mingw = pkgs.pkgsCross.mingwW64;
           # zig's bundled macOS libc headers let C build scripts (zstd-sys, ring) run for
           # `--target aarch64-apple-darwin`, so Linux can type-check the macOS code.

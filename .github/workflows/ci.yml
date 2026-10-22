@@ -109,6 +109,9 @@ jobs:
       - name: Check formatting
         run: nix develop -c cargo fmt --all -- --check
 
+      - name: Check the NixOS module
+        run: nix build .#checks.x86_64-linux.nixos-module
+
       - name: Run Clippy
         run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
 
