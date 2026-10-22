@@ -13,6 +13,7 @@ members = [
     "crates/sp-audio-io",
     "crates/sp-audio-io-macos",
     "crates/sp-audio-io-linux",
+    "crates/sp-audio-io-tunnel",
     "crates/sp-vst3",
     "crates/sp-supervisor",
     "crates/sp-session",
