@@ -35,12 +35,16 @@ const WIDTH: u16 = 800;
 const HEIGHT: u16 = 600;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Kills the child on drop so a failed assertion leaves no X server behind.
+/// Stops the child on drop so a failed assertion leaves no X server behind. SIGTERM lets Xvfb
+/// remove its socket and the streamer remove its own.
 struct Process(Child);
 
 impl Drop for Process {
     fn drop(&mut self) {
-        let _ = self.0.kill();
+        let pid = rustix::process::Pid::from_child(&self.0);
+        if rustix::process::kill_process(pid, rustix::process::Signal::TERM).is_err() {
+            let _ = self.0.kill();
+        }
         let _ = self.0.wait();
     }
 }
