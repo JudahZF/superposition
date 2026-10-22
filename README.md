@@ -31,7 +31,10 @@ nix develop -c cargo build --workspace
 nix develop -c cargo xtask windows-helpers   # Windows worker, scanner, and Wine bridge
 nix develop -c cargo run -p superposition
 nix develop -c cargo xtask wine-check        # Windows worker boundary under Wine
+nix develop -c cargo xtask bundle-linux      # tarball and AppImage in target/bundle-linux (needs docker)
 ```
+
+The tarball and the AppImage hold the same tree: the app, its helpers, the Wine bridge, and the pinned Wine build. They build in a Debian 12 container, so they need glibc 2.36 or newer. See [packaging/linux/README-linux.md](packaging/linux/README-linux.md) for what the system must provide.
 
 Windows VST3 plug-ins run in one shared Wine prefix (`<app support>/wine`, or `SUPERPOSITION_WINE_PREFIX`). Install them with **Setup → Plug-ins → Run Windows program…** (an `.exe` or `.msi`; its windows appear in the editor area), then **Rescan plug-ins**. Bundles in the prefix's `Program Files/Common Files/VST3` folder, and in any folder listed in `SUPERPOSITION_WINDOWS_VST3_PATH`, are scanned under Wine. A rack can mix Linux and Windows plug-ins. A rack that holds any Windows plug-in is heard one buffer late.
 

@@ -134,6 +134,7 @@
                   pkgs.libxcb
                   pkgs.xorg-server # Xvfb, the engine-owned editor display
                   pkgs.xdotool
+                  pkgs.squashfsTools # mksquashfs for the AppImage
                   wine
                 ]
                 ++ runtimeLibs

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Superposition
+Comment=Live VST3 host for Linux and Windows plug-ins
+Exec=superposition
+Icon=superposition
+Categories=AudioVideo;Audio;
+Terminal=false

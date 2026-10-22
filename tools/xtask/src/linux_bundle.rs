@@ -1,4 +1,4 @@
-//! `cargo xtask bundle-linux`: a relocatable Linux tarball.
+//! `cargo xtask bundle-linux`: a relocatable Linux tarball and an AppImage of the same tree.
 //!
 //! The Linux binaries build in a Debian 12 container (glibc 2.36) against a source tree vendored
 //! on the host, so the container needs no SSH access to the git dependencies. The Wine bridge's
@@ -7,6 +7,10 @@
 //!
 //! Layout: `bin/superposition` (launcher), `lib/superposition/{superposition, helpers/, wine/}`,
 //! `share/doc/superposition/README-linux.md`.
+//!
+//! The AppImage is the pinned AppImage type-2 runtime followed by a zstd squashfs of that tree,
+//! with `AppRun` linked to the launcher and the desktop entry and icon at its root. It needs
+//! `mksquashfs` (the Nix dev shell provides it).
 
 use std::{
     io::Read,
@@ -19,6 +23,10 @@ use sha2::{Digest, Sha256};
 const IMAGE: &str = "superposition-linux-build:bookworm";
 const WINE_URL: &str = "https://github.com/Kron4ek/Wine-Builds/releases/download/11.18/wine-11.18-staging-amd64-wow64.tar.xz";
 const WINE_SHA256: &str = "15f312effe798838d4877a37126509618b3f98759744b37aeda0c6f55875d99a";
+const APPIMAGE_RUNTIME_URL: &str =
+    "https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64";
+const APPIMAGE_RUNTIME_SHA256: &str =
+    "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d";
 const LINUX_HELPERS: [&str; 3] = [
     "sp-plugin-worker",
     "sp-plugin-scanner",
@@ -70,10 +78,10 @@ fn sha256(path: &Path) -> Result<String, String> {
         }))
 }
 
-/// Downloads the pinned Wine build once and verifies it.
-fn wine_archive(cache: &Path) -> Result<PathBuf, String> {
-    let archive = cache.join("wine-11.18-staging-amd64-wow64.tar.xz");
-    if !archive.is_file() || sha256(&archive)? != WINE_SHA256 {
+/// Downloads a pinned file into `cache` once and verifies its SHA-256.
+fn pinned_download(cache: &Path, name: &str, url: &str, expected: &str) -> Result<PathBuf, String> {
+    let file = cache.join(name);
+    if !file.is_file() || sha256(&file)? != expected {
         std::fs::create_dir_all(cache).map_err(|error| error.to_string())?;
         run(Command::new("curl")
             .args([
@@ -83,16 +91,61 @@ fn wine_archive(cache: &Path) -> Result<PathBuf, String> {
                 "--show-error",
                 "--output",
             ])
-            .arg(&archive)
-            .arg(WINE_URL))?;
-        let digest = sha256(&archive)?;
-        if digest != WINE_SHA256 {
-            return Err(format!(
-                "the Wine archive has SHA-256 {digest}, expected {WINE_SHA256}"
-            ));
+            .arg(&file)
+            .arg(url))?;
+        let digest = sha256(&file)?;
+        if digest != expected {
+            return Err(format!("{name} has SHA-256 {digest}, expected {expected}"));
         }
     }
-    Ok(archive)
+    Ok(file)
+}
+
+/// Packs `tree` (the tarball's top folder) into `<work>/<name>.AppImage`.
+fn build_appimage(workspace_root: &Path, work: &Path, tree: &Path) -> Result<PathBuf, String> {
+    let version = env!("CARGO_PKG_VERSION");
+    let runtime = pinned_download(
+        &work.join("cache"),
+        "appimage-runtime-x86_64",
+        APPIMAGE_RUNTIME_URL,
+        APPIMAGE_RUNTIME_SHA256,
+    )?;
+    let packaging = workspace_root.join("packaging/linux");
+    let image = work.join("appimage.squashfs");
+    let _ = std::fs::remove_file(&image);
+    // Pseudo files add the AppImage's root entries without copying the tree.
+    let pseudo = [
+        "AppRun s 755 0 0 bin/superposition".to_owned(),
+        format!(
+            "superposition.desktop f 644 0 0 cat {}",
+            packaging.join("superposition.desktop").display()
+        ),
+        format!(
+            "superposition.png f 644 0 0 cat {}",
+            packaging.join("superposition.png").display()
+        ),
+        ".DirIcon s 644 0 0 superposition.png".to_owned(),
+    ];
+    let mut mksquashfs = Command::new("mksquashfs");
+    mksquashfs
+        .arg(tree)
+        .arg(&image)
+        .args(["-comp", "zstd", "-root-owned", "-noappend", "-quiet"]);
+    for definition in &pseudo {
+        mksquashfs.arg("-p").arg(definition);
+    }
+    run(&mut mksquashfs)?;
+    let appimage = work.join(format!("Superposition-{version}-x86_64.AppImage"));
+    let mut bytes = std::fs::read(&runtime).map_err(|error| error.to_string())?;
+    bytes.extend(std::fs::read(&image).map_err(|error| error.to_string())?);
+    std::fs::write(&appimage, bytes).map_err(|error| error.to_string())?;
+    std::fs::remove_file(&image).map_err(|error| error.to_string())?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&appimage, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(appimage)
 }
 
 fn id(flag: &str) -> Result<String, String> {
@@ -143,7 +196,12 @@ pub(crate) fn run_bundle(workspace_root: &Path, arguments: &[String]) -> Result<
         &workspace_root.join("packaging/linux/README-linux.md"),
         &staging.join("share/doc/superposition/README-linux.md"),
     )?;
-    let wine = wine_archive(&work.join("cache"))?;
+    let wine = pinned_download(
+        &work.join("cache"),
+        "wine-11.18-staging-amd64-wow64.tar.xz",
+        WINE_URL,
+        WINE_SHA256,
+    )?;
     std::fs::create_dir_all(lib.join("wine")).map_err(|error| error.to_string())?;
     run(Command::new("tar")
         .arg("-xJf")
@@ -158,6 +216,8 @@ pub(crate) fn run_bundle(workspace_root: &Path, arguments: &[String]) -> Result<
         .arg(&work)
         .arg(&name))?;
     println!("built {}", tarball.display());
+    let appimage = build_appimage(workspace_root, &work, &staging)?;
+    println!("built {}", appimage.display());
     Ok(())
 }
 

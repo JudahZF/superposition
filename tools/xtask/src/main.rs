@@ -258,7 +258,7 @@ fn run(arguments: &[String]) -> Result<u8, XtaskError> {
 fn usage() -> String {
     format!(
         "Usage: cargo xtask <command>\n\nCommands:\n  doctor\n  \
-         bundle-linux  build the relocatable Linux tarball (needs docker)\n  \
+         bundle-linux  build the Linux tarball and AppImage (needs docker)\n  \
          wine-bridge   build the sp_wine_bridge unixlib into target/wine-bridge\n  \
          wine-check    run the Windows shared-memory client under Wine and time its wakes\n  \
          windows-helpers [--release] [--out DIR]\n                build the Windows plug-in helpers and bridge into DIR/windows and DIR/wine-bridge\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}",

@@ -1,8 +1,12 @@
 # Superposition for Linux (x86_64)
 
-Run `bin/superposition`. Run `bin/superposition --doctor` to check the system settings below;
-the engine also prints any unmet setting when it starts. Plug-in editors, Windows plug-ins, and remote serving need nothing else
-from this folder; the system must provide:
+Run `bin/superposition` from the tarball, or run the AppImage
+(`Superposition-<version>-x86_64.AppImage`). The AppImage needs FUSE; without FUSE, add
+`--appimage-extract-and-run`. Both hold the same files.
+
+Run `superposition --doctor` to check the system settings below. The engine also prints any
+unmet setting when it starts. Plug-in editors, Windows plug-ins, and remote serving need nothing
+else from this package; the system must provide:
 
 - **Audio:** a JACK server (jackd, or PipeWire with its JACK library, `pipewire-jack`). The
   server's rate and quantum must match the session, for example
