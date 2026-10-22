@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 // Every fallible function returns this crate's self-describing error types.
 #![allow(clippy::missing_errors_doc)]
-//! Streams windows of Superposition's private X server to egui clients.
+//! Streams plug-in editor windows to egui clients.
 //!
-//! The streamer (`sp-window-streamer`) sends every mapped top-level window as lossless damage
-//! tiles; clients send input back. The byte stream is transport-neutral: a local Unix socket now,
-//! one QUIC stream later.
+//! On Linux the streamer (`sp-window-streamer`) sends every mapped top-level window of
+//! Superposition's private X server as lossless damage tiles. On macOS each rack worker streams
+//! its own editor windows with [`WindowSource`]: it connects to the socket the app names in
+//! [`EDITOR_STREAM_ENV`] and serves the same session there. Clients send input back. The byte
+//! stream is transport-neutral.
 //!
 //! # Framing
 //!
@@ -33,8 +35,13 @@
 
 mod client;
 mod message;
+mod source;
 mod tile;
 mod wire;
+
+/// macOS: the environment variable that gives a rack worker the app's editor-stream socket. The
+/// worker connects to it and serves its own editor windows; the app speaks first, as a client.
+pub const EDITOR_STREAM_ENV: &str = "SUPERPOSITION_EDITOR_STREAM";
 
 pub use client::{
     ApplyError, ScrollAccumulator, StreamedWindow, WindowStreamClient, keysym_for_char,
@@ -46,5 +53,6 @@ pub use message::{
     PROTOCOL_VERSION, PointerButton, Rect, Role, ServerMessage, Tile, TileEncoding, WindowId,
     WindowInfo, WindowKind,
 };
-pub use tile::{TILE_SIZE, TileEncoder, tile_grid};
+pub use source::{SOURCE_CLIENT, SourceAction, WindowSource};
+pub use tile::{TILE_SIZE, TileEncoder, changed_tiles, tile_grid};
 pub use wire::{MAX_MESSAGE_BYTES, WireError, WireMessage};

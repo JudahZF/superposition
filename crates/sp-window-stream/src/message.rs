@@ -26,7 +26,8 @@ pub const MAX_TEXT_BYTES: usize = 256;
 /// Error message bytes.
 pub const MAX_ERROR_BYTES: usize = 512;
 
-/// An X window ID on the private X server.
+/// A window ID: an X window ID on Linux, an `AppKit` window number from a macOS worker. Both are
+/// unique across the processes of one display.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WindowId(pub u32);
 
@@ -101,17 +102,17 @@ pub struct WindowInfo {
     pub kind: WindowKind,
     /// `_NET_WM_NAME`, else `WM_NAME`; may be empty.
     pub title: String,
-    /// Left edge in root coordinates.
+    /// Left edge in root coordinates. macOS workers send 0: only popups need a position.
     pub x: i16,
-    /// Top edge in root coordinates.
+    /// Top edge in root coordinates; 0 from macOS workers.
     pub y: i16,
     /// Width in pixels, `1..=MAX_WINDOW_DIMENSION`.
     pub width: u16,
     /// Height in pixels, `1..=MAX_WINDOW_DIMENSION`.
     pub height: u16,
-    /// `_SUPERPOSITION_RACK` (`CARDINAL`, format 32), set by the worker that owns the window.
+    /// The owning worker's rack: `_SUPERPOSITION_RACK` (`CARDINAL`, format 32) on X.
     pub rack: Option<u32>,
-    /// `_SUPERPOSITION_SLOT` (`CARDINAL`, format 32).
+    /// The editor's slot: `_SUPERPOSITION_SLOT` (`CARDINAL`, format 32) on X.
     pub slot: Option<u32>,
     /// `_NET_WM_PID` of the owning process.
     pub pid: Option<u32>,
