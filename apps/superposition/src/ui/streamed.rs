@@ -191,7 +191,7 @@ impl StreamedWindows {
         let mut image_rects: HashMap<WindowId, egui::Rect> = HashMap::new();
         for window in windows
             .iter()
-            .filter(|window| window.info.kind == WindowKind::Normal)
+            .filter(|window| window.info.kind == WindowKind::Normal && !is_decoration(&window.info))
         {
             let Some(texture) = self.textures.get(&window.info.id) else {
                 continue;
@@ -437,6 +437,14 @@ fn upload(
     }
 }
 
+/// Untitled, very thin top-level windows are window decorations a toolkit draws itself, such
+/// as JUCE's drop shadows, which Wine maps as separate windows and fills black. Editors and
+/// dialogs are never this thin.
+fn is_decoration(info: &WindowInfo) -> bool {
+    const THIN: u16 = 32;
+    info.title.trim().is_empty() && info.rack.is_none() && info.width.min(info.height) <= THIN
+}
+
 /// A window's pixel size in egui points. X window sizes fit `u16`.
 fn points([width, height]: [usize; 2], pixels_per_point: f32) -> egui::Vec2 {
     let pixels = |value: usize| f32::from(u16::try_from(value).unwrap_or(u16::MAX));
@@ -533,7 +541,29 @@ fn keysym(key: Key, shortcut: bool) -> Option<u32> {
 mod tests {
     use egui::Key;
 
-    use super::keysym;
+    use sp_window_stream::{WindowId, WindowInfo, WindowKind};
+
+    use super::{is_decoration, keysym};
+
+    #[test]
+    fn only_untitled_thin_windows_are_decorations() {
+        let window = |title: &str, width, height| WindowInfo {
+            id: WindowId(1),
+            kind: WindowKind::Normal,
+            title: title.into(),
+            x: 0,
+            y: 0,
+            width,
+            height,
+            rack: None,
+            slot: None,
+            pid: None,
+            transient_for: None,
+        };
+        assert!(is_decoration(&window("", 615, 20)));
+        assert!(!is_decoration(&window("", 400, 300)));
+        assert!(!is_decoration(&window("Toolbar", 615, 20)));
+    }
 
     #[test]
     fn printable_keys_map_only_as_shortcuts() {
