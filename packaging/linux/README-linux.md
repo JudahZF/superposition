@@ -20,8 +20,9 @@ else from this package; the system must provide:
 
 Grant real-time priority, or plug-in racks will miss deadlines on a busy system: add
 `@audio - rtprio 95` and `@audio - memlock unlimited` to `/etc/security/limits.d/audio.conf` and
-add your user to `audio` (on NixOS: the flake's module). Without the limit, native plug-in
-threads ask rtkit, if it runs, but Windows plug-ins under Wine still need it. Superposition warns
+add your user to `audio` (on NixOS: the flake's module). Without the limit, Superposition asks
+rtkit, if it runs, for its JACK callback thread and every plug-in worker, Windows ones included,
+at rtkit's lower priority (usually 20). Superposition warns
 once when it runs without real-time priority; `SUPERPOSITION_REQUIRE_REALTIME=1` makes that an
 error.
 

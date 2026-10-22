@@ -110,9 +110,11 @@ fn promote_callback(telemetry: Arc<TelemetryCell>) {
                     None => return,
                 }
             };
-            if let Err(error) =
-                sp_shared_memory_os::promote_thread(thread, sp_shared_memory_os::realtime_priority())
-            {
+            if let Err(error) = sp_shared_memory_os::promote_thread(
+                std::process::id(),
+                thread,
+                sp_shared_memory_os::realtime_priority(),
+            ) {
                 eprintln!(
                     "superposition: the JACK callback thread runs without real-time priority: {error}"
                 );

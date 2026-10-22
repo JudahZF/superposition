@@ -3805,6 +3805,7 @@ dependencies = [
  "sha2 0.11.0",
  "sp-model",
  "sp-protocol",
+ "sp-shared-memory-os",
  "sp-window-stream",
  "sp-wine",
 ]

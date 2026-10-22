@@ -768,6 +768,10 @@ impl WorkerControlSession {
             }
             Err(error) => return Err(error),
         };
+        #[cfg(target_os = "linux")]
+        if configuration.launch.wine.is_some() {
+            promote_wine_processing_thread(process_id);
+        }
         Ok(Self {
             process_id,
             client,
@@ -812,6 +816,46 @@ impl WorkerControlSession {
                 Err(error)
             }
         }
+    }
+}
+
+/// Linux: makes a Wine worker's processing thread real-time through rtkit, on a short-lived
+/// thread. The worker cannot reach rtkit from inside Wine, so without `RLIMIT_RTPRIO` it would
+/// run at ordinary priority. Wine passes the thread's name to Linux, which shows its first 15
+/// bytes, so the thread is found by that name.
+#[cfg(target_os = "linux")]
+fn promote_wine_processing_thread(process_id: u64) {
+    let spawned = std::thread::Builder::new()
+        .name("sp-wine-rt".into())
+        .spawn(move || {
+            let name = &sp_protocol::WORKER_PROCESSING_THREAD
+                [..sp_protocol::WORKER_PROCESSING_THREAD.len().min(15)];
+            let thread = std::fs::read_dir(format!("/proc/{process_id}/task"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .find(|task| {
+                    std::fs::read_to_string(task.path().join("comm"))
+                        .is_ok_and(|comm| comm.trim_end() == name)
+                })
+                .and_then(|task| task.file_name().to_str()?.parse::<u64>().ok());
+            let result = match (thread, u32::try_from(process_id)) {
+                (Some(thread), Ok(process)) => sp_shared_memory_os::promote_thread(
+                    process,
+                    thread,
+                    sp_shared_memory_os::realtime_priority(),
+                )
+                .map(|_| ()),
+                _ => Err(std::io::Error::other("its processing thread was not found")),
+            };
+            if let Err(error) = result {
+                eprintln!(
+                    "superposition: Wine worker {process_id} runs without real-time priority: {error}"
+                );
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("superposition: could not start the Wine priority helper: {error}");
     }
 }
 

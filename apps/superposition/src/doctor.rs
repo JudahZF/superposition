@@ -79,10 +79,9 @@ fn realtime() -> Check {
     match sp_shared_memory_os::rtkit_max_priority() {
         Ok(priority) => Check::new(
             NAME,
-            Status::Warn,
+            Status::Pass,
             format!(
-                "native threads get SCHED_RR {priority} from rtkit; Windows workers under Wine need \
-                 RLIMIT_RTPRIO {PROCESSING_PRIORITY} or more (now {rtprio})"
+                "RLIMIT_RTPRIO is {rtprio}, so audio threads get SCHED_RR {priority} from rtkit"
             ),
         ),
         Err(error) => Check::new(

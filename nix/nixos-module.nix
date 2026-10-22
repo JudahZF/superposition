@@ -30,7 +30,7 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    # Windows workers under Wine cannot reach rtkit, so they need the limit itself.
+    # SCHED_FIFO at Superposition's priority (70) needs the limit; rtkit grants at most 20.
     security.pam.loginLimits = [
       {
         domain = "@audio";

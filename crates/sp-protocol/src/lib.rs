@@ -22,6 +22,9 @@ pub const PROTOCOL_MAGIC: u32 = u32::from_le_bytes(*b"SP00");
 /// the mixed-rack segment latency and chain-link failure counter to the header. Older mappings
 /// are rejected.
 pub const PROTOCOL_VERSION: u32 = 10;
+/// The name of a worker's processing thread. The host finds a Wine worker's processing thread
+/// by this name, which Wine passes to Linux, to make it real-time.
+pub const WORKER_PROCESSING_THREAD: &str = "sp-worker-processing";
 /// Worker is scanning shared request slots.
 pub const WORKER_PHASE_SCANNING: u32 = 0;
 /// Worker is servicing control requests.

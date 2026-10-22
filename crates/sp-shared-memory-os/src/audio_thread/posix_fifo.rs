@@ -25,7 +25,8 @@ pub struct AudioThreadPolicy {
 /// What rtkit did for this thread.
 #[cfg_attr(windows, allow(dead_code, reason = "a Wine worker never asks rtkit"))]
 enum Rtkit {
-    /// Not asked: `SCHED_FIFO` is permitted, or this is a Wine worker, which cannot reach rtkit.
+    /// Not asked: `SCHED_FIFO` is permitted, or this is a Wine worker, which cannot reach rtkit
+    /// itself (the host asks rtkit for it).
     NotAsked,
     /// The thread runs `SCHED_RR` for its lifetime. Lowering it would need rtkit again.
     Granted,
@@ -175,7 +176,12 @@ fn fifo_permitted() -> bool {
 #[cfg(target_os = "linux")]
 fn request_from_rtkit(priority: i32) -> io::Result<()> {
     let connection = zbus::blocking::Connection::system().map_err(io::Error::other)?;
-    super::rtkit::make_thread_realtime(&connection, super::rtkit::current_thread_id(), priority)
+    super::rtkit::make_thread_realtime(
+        &connection,
+        std::process::id(),
+        super::rtkit::current_thread_id(),
+        priority,
+    )
 }
 
 #[cfg(target_os = "linux")]

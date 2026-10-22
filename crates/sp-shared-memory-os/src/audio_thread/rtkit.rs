@@ -38,9 +38,10 @@ pub fn current_thread_id() -> u64 {
     u64::try_from(unsafe { libc::gettid() }).unwrap_or(0)
 }
 
-/// Asks rtkit to make `thread` of this process real-time, at `priority` or rtkit's maximum.
+/// Asks rtkit to make `thread` of `process` real-time, at `priority` or rtkit's maximum.
 pub(super) fn make_thread_realtime(
     connection: &Connection,
+    process: u32,
     thread: u64,
     priority: i32,
 ) -> io::Result<()> {
@@ -52,20 +53,21 @@ pub(super) fn make_thread_realtime(
     let priority = priority.min(rtkit.max_realtime_priority().map_err(io::Error::other)?);
     rtkit
         .make_thread_realtime_with_pid(
-            u64::from(std::process::id()),
+            u64::from(process),
             thread,
             u32::try_from(priority).map_err(io::Error::other)?,
         )
         .map_err(io::Error::other)
 }
 
-/// Makes another thread of this process real-time through rtkit, unless it already is: for
-/// threads a library creates, such as a JACK callback thread. It waits for D-Bus, so call it off
-/// the audio path. Returns whether it changed the thread.
+/// Makes `thread` of `process` real-time through rtkit, unless it already is: for threads a
+/// library or another of this user's processes created, such as a JACK callback thread or a
+/// Wine worker's processing thread. It waits for D-Bus, so call it off the audio path. Returns
+/// whether it changed the thread.
 ///
 /// # Errors
 /// Returns an error when the thread does not exist, or rtkit is unreachable or refuses.
-pub fn promote_thread(thread: u64, priority: i32) -> io::Result<bool> {
+pub fn promote_thread(process: u32, thread: u64, priority: i32) -> io::Result<bool> {
     let tid = libc::pid_t::try_from(thread).map_err(io::Error::other)?;
     // SAFETY: `sched_getscheduler` only reads the scheduling policy of `tid`.
     let policy = unsafe { libc::sched_getscheduler(tid) };
@@ -79,7 +81,7 @@ pub fn promote_thread(thread: u64, priority: i32) -> io::Result<bool> {
         return Ok(false);
     }
     let connection = Connection::system().map_err(io::Error::other)?;
-    make_thread_realtime(&connection, thread, priority).map(|()| true)
+    make_thread_realtime(&connection, process, thread, priority).map(|()| true)
 }
 
 /// The highest priority rtkit grants, which also shows that rtkit answers on the system bus.
@@ -191,7 +193,7 @@ mod tests {
         let _server = server.join().expect("fake rtkit thread");
 
         let thread = current_thread_id();
-        make_thread_realtime(&client, thread, 70).expect("rtkit request");
+        make_thread_realtime(&client, std::process::id(), thread, 70).expect("rtkit request");
 
         assert_eq!(
             *calls.lock().expect("calls lock"),

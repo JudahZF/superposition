@@ -1413,7 +1413,7 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
         publish_worker_telemetry(region.bank(), &mut runtime);
         let sample_rate = configuration.sample_rate;
         let processing = thread::Builder::new()
-            .name("sp-worker-processing".to_owned())
+            .name(sp_protocol::WORKER_PROCESSING_THREAD.to_owned())
             .spawn(move || {
                 let mut runtime = Some(runtime);
                 let result = run_production_processing_thread(
