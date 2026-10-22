@@ -16,7 +16,7 @@
 
 use std::{io, sync::atomic::Ordering, time::Duration};
 
-use sp_shared_memory::{BlockRequest, BlockSlot, BlockTicket, SlotState};
+use sp_shared_memory::{BlockRequest, BlockSlot, BlockTicket, ProtocolError, SlotState};
 
 use crate::{MonotonicClock, SharedMemoryRegion};
 
@@ -117,8 +117,9 @@ impl ChainLink {
             let slot = &self.region.bank().slots[slot_index];
             match slot.completion_snapshot() {
                 Ok(Some(snapshot)) if snapshot.ticket == ticket => return Forwarded::Completed,
+                // The worker publishes the completion just before it releases the slot.
+                Ok(None) | Err(ProtocolError::Owned) => {}
                 Ok(Some(_)) | Err(_) => return self.fail(),
-                Ok(None) => {}
             }
             let now = self.clock.now_ticks();
             if now >= deadline_tick {
@@ -143,6 +144,13 @@ impl ChainLink {
     pub fn with_completion<R>(&self, read: impl FnOnce(&BlockSlot) -> R) -> Option<R> {
         let (slot_index, _) = self.live?;
         Some(read(&self.region.bank().slots[slot_index]))
+    }
+
+    /// Clears a failure, for a caller that tolerates a miss (a segment's first blocks can be
+    /// slow). The missed request stays with the downstream worker; the link reclaims its slot
+    /// once it completes. Real-time safe.
+    pub fn forgive(&mut self) {
+        self.failed = false;
     }
 
     /// Frees the completed slot for the next block. `forward` also does this first.
@@ -303,6 +311,17 @@ mod tests {
             link.forward(clock.now_ticks(), later, |_| request(64)),
             Forwarded::Bypass
         );
+        // A forgiven link forwards again; the late worker then serves both requests.
+        link.forgive();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = spawn_doubler(host.name().to_owned(), Arc::clone(&stop));
+        assert_eq!(
+            link.forward(clock.now_ticks(), later, |_| request(64)),
+            Forwarded::Completed
+        );
+        stop.store(true, Ordering::Release);
+        let _ = host.notify_request();
+        worker.join().unwrap();
     }
 
     /// A replaced upstream worker reuses the bank that its failed predecessors filled.
