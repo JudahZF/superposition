@@ -1,0 +1,16 @@
+[package]
+name = "sp-window-stream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Wire protocol, client framebuffer, and single-client source for streaming editor windows"
+
+[dependencies]
+thiserror.workspace = true
+zstd = { version = "0.13", default-features = false }
+
+[lints]
+workspace = true

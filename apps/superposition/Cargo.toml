@@ -16,17 +16,28 @@ sp-engine = { path = "../../crates/sp-engine" }
 sp-midi = { path = "../../crates/sp-midi" }
 sp-model = { path = "../../crates/sp-model" }
 sp-protocol = { path = "../../crates/sp-protocol" }
+sp-remote = { path = "../../crates/sp-remote" }
 sp-session = { path = "../../crates/sp-session" }
-sp-shared-memory-macos = { path = "../../crates/sp-shared-memory-macos" }
+sp-shared-memory-os = { path = "../../crates/sp-shared-memory-os" }
 sp-supervisor = { path = "../../crates/sp-supervisor" }
 sp-ui = { path = "../../crates/sp-ui" }
+serde.workspace = true
+serde_json.workspace = true
+signal-hook = "0.3.18"
+sp-wine = { path = "../../crates/sp-wine" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Reads the system reduced-motion preference; already in the graph through winit.
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSAccessibility", "NSWorkspace"] }
 sp-audio-io-macos = { path = "../../crates/sp-audio-io-macos" }
+sp-window-stream = { path = "../../crates/sp-window-stream" }
 
-[target.'cfg(target_os = "macos")'.dev-dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
+sp-audio-io-linux = { path = "../../crates/sp-audio-io-linux" }
+sp-audio-io-tunnel = { path = "../../crates/sp-audio-io-tunnel" }
+sp-window-stream = { path = "../../crates/sp-window-stream" }
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dev-dependencies]
 midir = "0.10.1"
 
 [lints]

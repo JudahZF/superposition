@@ -19,11 +19,42 @@ high-level-sdk = ["sdk"]
 rtrb.workspace = true
 sp-protocol = { path = "../../crates/sp-protocol" }
 sp-shared-memory = { path = "../../crates/sp-shared-memory" }
-sp-shared-memory-macos = { path = "../../crates/sp-shared-memory-macos" }
+sp-shared-memory-os = { path = "../../crates/sp-shared-memory-os" }
 sp-vst3 = { path = "../../crates/sp-vst3" }
 
-[dev-dependencies]
-sp-supervisor = { path = "../../crates/sp-supervisor" }
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.186"
 
-[lints]
-workspace = true
+[target.'cfg(target_os = "macos")'.dependencies]
+sp-window-stream = { path = "../../crates/sp-window-stream" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+sp-audio-io = { path = "../../crates/sp-audio-io" }
+sp-engine = { path = "../../crates/sp-engine" }
+sp-supervisor = { path = "../../crates/sp-supervisor" }
+sp-window-stream = { path = "../../crates/sp-window-stream" }
+sp-wine = { path = "../../crates/sp-wine" }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+png = "0.18.1"
+xcb = "1.7"
+
+[lints.rust]
+# Only control_stdio.rs takes the standard streams over as the control channel.
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"

@@ -1,0 +1,16 @@
+[package]
+name = "sp-audio-io-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+quanta-audio-io = { git = "ssh://git@origin.cursor.com/judahzf/quanta-audio-io.git", rev = "10b300ab60968af1e8fba79e35ba54b8ab88d796" }
+sp-audio-io = { path = "../sp-audio-io" }
+sp-engine = { path = "../sp-engine" }
+sp-shared-memory-os = { path = "../sp-shared-memory-os" }
+
+[lints]
+workspace = true

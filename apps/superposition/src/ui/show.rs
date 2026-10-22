@@ -168,7 +168,7 @@ impl LiveRackApp {
         readout(
             ui,
             "Latency",
-            &latency_label(frames),
+            &latency_label(frames, self.sample_rate_value()),
             ColorToken::Text,
             f32::INFINITY,
         );
@@ -208,7 +208,7 @@ impl LiveRackApp {
     }
 
     pub(super) fn output_device_name(&self) -> String {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         if let Some(route) = &self.selected_route
             && let Some(device) = self
                 .audio_devices
@@ -221,10 +221,17 @@ impl LiveRackApp {
     }
 
     pub(super) fn buffer_frames_value(&self) -> u32 {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         return self.buffer_frames;
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(audio_backend))]
         128
+    }
+
+    pub(super) fn sample_rate_value(&self) -> u32 {
+        #[cfg(audio_backend)]
+        return self.sample_rate_hz;
+        #[cfg(not(audio_backend))]
+        sp_audio_io::PRODUCT_SAMPLE_RATE_HZ
     }
 
     pub(super) fn draw_fault_line(&mut self, ctx: &egui::Context) {
@@ -947,18 +954,18 @@ impl LiveRackApp {
 
     /// Three LED columns: rack input, then output L and R.
     fn draw_meters(&self, ui: &mut Ui, inner: Rect, top: f32, rack_index: usize, online: bool) {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         let (input, output) = (
             self.rack_input_meters[rack_index],
             self.rack_output_meters[rack_index],
         );
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         let levels = [
             (input.fill_fraction(), input.held_fraction(), "in"),
             (output.channel_fraction(0), output.held_fraction(), "L"),
             (output.channel_fraction(1), output.held_fraction(), "R"),
         ];
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(audio_backend))]
         let levels = [(0.0, 0.0, "in"), (0.0, 0.0, "L"), (0.0, 0.0, "R")];
         let width = px(Layout::MeterWidth);
         let segment = px(Layout::MeterSegment);
@@ -1196,6 +1203,9 @@ pub(super) fn elapsed_label(elapsed: std::time::Duration) -> String {
 }
 
 /// Buffer latency at 48 kHz, as `1.3 ms`.
-pub(super) fn latency_label(frames: u32) -> String {
-    format!("{:.1} ms", f64::from(frames) / 48.0)
+pub(super) fn latency_label(frames: u32, sample_rate_hz: u32) -> String {
+    format!(
+        "{:.1} ms",
+        f64::from(frames) * 1_000.0 / f64::from(sample_rate_hz)
+    )
 }

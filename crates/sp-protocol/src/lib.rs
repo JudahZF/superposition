@@ -18,9 +18,13 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 pub const PROTOCOL_MAGIC: u32 = u32::from_le_bytes(*b"SP00");
 /// Version of the shared-bank binary layout.
 ///
-/// Version 8 adds a stereo sidechain region per plug-in slot to every block slot. Older mappings
+/// Version 8 adds a stereo sidechain region per plug-in slot to every block slot. Version 10 adds
+/// the mixed-rack segment latency and chain-link failure counter to the header. Older mappings
 /// are rejected.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
+/// The name of a worker's processing thread. The host finds a Wine worker's processing thread
+/// by this name, which Wine passes to Linux, to make it real-time.
+pub const WORKER_PROCESSING_THREAD: &str = "sp-worker-processing";
 /// Worker is scanning shared request slots.
 pub const WORKER_PHASE_SCANNING: u32 = 0;
 /// Worker is servicing control requests.
@@ -1259,6 +1263,12 @@ pub struct ProtocolHeader {
     pub worker_latency_samples: AtomicU32,
     /// Latched VST3 change-notification bitmask; the host clears it after observing it.
     pub worker_restart_requested: AtomicU32,
+    /// Latency of this worker's own plug-ins, in samples. `worker_latency_samples` also counts
+    /// the mixed-rack segments this worker forwards to; this field does not.
+    pub segment_latency_samples: AtomicU32,
+    /// Times this worker's link to the next mixed-rack segment failed (a missed deadline or a
+    /// broken bank). The host replaces that segment when the count changes.
+    pub chain_link_failures: AtomicU32,
 }
 
 impl ProtocolHeader {
@@ -1293,6 +1303,8 @@ impl ProtocolHeader {
             worker_loop_tick: AtomicU64::new(0),
             worker_latency_samples: AtomicU32::new(0),
             worker_restart_requested: AtomicU32::new(0),
+            segment_latency_samples: AtomicU32::new(0),
+            chain_link_failures: AtomicU32::new(0),
         }
     }
 
@@ -1564,7 +1576,7 @@ mod tests {
 
     #[test]
     fn fixed_capacities_are_part_of_the_contract() {
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
         assert_eq!(MAX_RACKS, 64);
         assert_eq!(MAX_PLUGINS_PER_RACK, 8);
         assert_eq!(MAX_CHANNELS, 2);
@@ -1600,6 +1612,8 @@ mod tests {
         assert_eq!(offset_of!(ProtocolHeader, worker_loop_tick), 120);
         assert_eq!(offset_of!(ProtocolHeader, worker_latency_samples), 128);
         assert_eq!(offset_of!(ProtocolHeader, worker_restart_requested), 132);
+        assert_eq!(offset_of!(ProtocolHeader, segment_latency_samples), 136);
+        assert_eq!(offset_of!(ProtocolHeader, chain_link_failures), 140);
         assert_eq!(size_of::<BlockMetadata>() % 64, 0);
         assert_eq!(size_of::<BlockSlot>() % 64, 0);
         assert_eq!(size_of::<ProtocolHeader>() % 64, 0);

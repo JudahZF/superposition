@@ -2,11 +2,16 @@
 version = 2
 yanked = "deny"
 ignore = [
-    # Linux-only xcb/Wayland edges; Superposition ships aarch64 macOS only.
-    { id = "RUSTSEC-2026-0194", reason = "quick-xml is present only through Linux-specific xcb/Wayland dependencies" },
-    { id = "RUSTSEC-2026-0195", reason = "quick-xml is present only through Linux-specific xcb/Wayland dependencies" },
-    { id = "RUSTSEC-2024-0436", reason = "paste is present only through non-macOS target dependencies" },
+    # Build-time code generators on Linux: they parse the trusted Wayland/XCB protocol XML, never
+    # runtime input, so the quick-xml denial-of-service issues do not reach the app.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml only parses trusted Wayland/XCB protocol XML at build time" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml only parses trusted Wayland/XCB protocol XML at build time" },
+    { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained proc-macro used only at build time by non-macOS dependencies" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser is an unmaintained egui dependency with no reported vulnerability or available safe upgrade" },
+    # eframe's Linux accessibility bridge (accesskit → AT-SPI over D-Bus); no vulnerability.
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names/zvariant are unmaintained, reached only through eframe's Linux AT-SPI accessibility; no reported vulnerability" },
+    { id = "RUSTSEC-2026-0370", reason = "zbus_names/zvariant are unmaintained, reached only through eframe's Linux AT-SPI accessibility; no reported vulnerability" },
+    { id = "RUSTSEC-2026-0372", reason = "zbus_names/zvariant are unmaintained, reached only through eframe's Linux AT-SPI accessibility; no reported vulnerability" },
 ]
 
 [bans]
@@ -25,6 +30,11 @@ allow = [
     "BSL-1.0",
     "ISC",
     "MIT",
+    # minicbor, through the Tunnel crates. Permissive.
+    "BlueOak-1.0.0",
+    # audio_thread_priority, unmodified, through tunnel-host. File-level copyleft: changes to its
+    # files would have to be published; using it does not affect Superposition's licence.
+    "MPL-2.0",
     "OFL-1.1",
     "Ubuntu-font-1.0",
     "Unicode-3.0",
@@ -35,3 +45,8 @@ allow = [
 unknown-git = "deny"
 unknown-registry = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Quanta's own crates for Linux audio (JACK) and Tunnel network audio.
+allow-git = [
+    "ssh://git@origin.cursor.com/judahzf/quanta-audio-io.git",
+    "ssh://git@origin.cursor.com/judahzf/tunnel.git",
+]

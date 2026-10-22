@@ -39,6 +39,19 @@ Keep minimal legal fixtures and generated protocol/session corpus inputs under s
 
 No test result grants broad plug-in compatibility. VST3 SDK samples and installed plug-ins run through scanner/worker helpers only. The main app and engine remain outside every `sp-vst3`, `vst3`, and `vst3-host` dependency path, which `cargo xtask doctor` checks from Cargo metadata.
 
+## Windows plug-ins under Wine
+
+These Linux tests need the dev shell's Wine and Xvfb, the Windows helpers (`cargo xtask windows-helpers`), and a Windows VST3 bundle. Each creates its own prefix under `target/tmp` and deletes it afterwards.
+
+```sh
+SUPERPOSITION_TEST_WINDOWS_VST3="/path/to/Plugin.vst3" \
+  cargo test -p sp-plugin-worker --test wine_worker_e2e -- --ignored --nocapture
+SUPERPOSITION_HELPERS_DIR="$PWD/target/debug" SUPERPOSITION_TEST_WINDOWS_VST3="/path/to/Plugin.vst3" \
+  cargo test -p superposition wine_tests -- --ignored
+```
+
+The first scans the bundle with the Windows scanner under Wine, launches the Windows worker through the supervisor, runs 400 pipelined blocks at 128 frames and 48 kHz (it fails on any deadline miss and prints round-trip percentiles), pictures the editor on a private Xvfb, checks the editor's X11 labels, and shuts the worker down. The second runs the app's own path: scan, catalog platform, Wine worker launch for a Windows rack, the pipelined lane at audio start, and a restart at 96 kHz. `cargo xtask wine-check` times the bridge's futex round trips without a plug-in.
+
 ## Hardware verification commands
 
 These commands are evidence gates, not success-reporting scaffolds. `compatibility` structurally parses `compatibility/corpus.toml` schema version 2 and requires every mandatory fixture to exist, scan, and meet `expected = "pass"`. The checked-in mandatory entry deliberately names a licensed installed fixture, so it fails closed until that fixture is provided.

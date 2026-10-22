@@ -10,7 +10,7 @@ use super::style::{
     Mark, action, choice_row, color, hairline, line, note, paint_text, px, sp, title,
 };
 use super::{LiveRackApp, SetupTab, show::latency_label};
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 use sp_audio_io::{AudioFormat, AudioRouteConfig};
 
 const TABS: [(SetupTab, &str); 4] = [
@@ -20,6 +20,7 @@ const TABS: [(SetupTab, &str); 4] = [
     (SetupTab::Diagnostics, "Diagnostics"),
 ];
 const BUFFER_CHOICES: [u32; 4] = [32, 64, 128, 256];
+const SAMPLE_RATE_CHOICES: [u32; 2] = [48_000, 96_000];
 
 /// Table column widths in 16 px lines.
 const NARROW: f32 = 3.0;
@@ -76,7 +77,7 @@ impl LiveRackApp {
             });
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     #[allow(
         clippy::too_many_lines,
         reason = "output, input, and buffer choices read top to bottom"
@@ -93,6 +94,7 @@ impl LiveRackApp {
         }
         let previous_route = self.selected_route.clone();
         let previous_buffer = self.buffer_frames;
+        let previous_rate = self.sample_rate_hz;
         section(ui, "Output device");
         let outputs: Vec<_> = self
             .audio_devices
@@ -128,8 +130,8 @@ impl LiveRackApp {
                 self.selected_route = Some(AudioRouteConfig {
                     input,
                     output: id,
-                    format: AudioFormat::product_stereo(self.buffer_frames)
-                        .expect("product buffer size"),
+                    format: AudioFormat::product(self.sample_rate_hz, self.buffer_frames)
+                        .expect("product rate and buffer size"),
                 });
             }
         }
@@ -184,7 +186,30 @@ impl LiveRackApp {
                 ColorToken::Warn,
             );
         }
-        section(ui, "Buffer at 48 kHz");
+        section(ui, "Sample rate");
+        for rate in SAMPLE_RATE_CHOICES {
+            if choice_row(
+                ui,
+                Mark::Radio,
+                self.sample_rate_hz == rate,
+                &format!("{} kHz", rate / 1_000),
+                "",
+                !locked,
+            )
+            .clicked()
+            {
+                self.sample_rate_hz = rate;
+                // Racks loaded from now on start at this rate; loaded ones restart when audio
+                // starts.
+                if let Ok(product) = self.product.as_mut() {
+                    product.set_sample_rate(rate);
+                }
+            }
+        }
+        section(
+            ui,
+            &format!("Buffer at {} kHz", self.sample_rate_hz / 1_000),
+        );
         let buffers = self
             .selected_route
             .as_ref()
@@ -200,7 +225,7 @@ impl LiveRackApp {
                 Mark::Radio,
                 self.buffer_frames == frames,
                 &format!("{frames} samples"),
-                &latency_label(frames),
+                &latency_label(frames, self.sample_rate_hz),
                 enabled,
             )
             .clicked()
@@ -211,7 +236,7 @@ impl LiveRackApp {
         if self.selected_route.is_some() && buffers.is_empty() {
             note(
                 ui,
-                "These devices share no 48 kHz buffer size.",
+                "These devices share no product buffer size.",
                 ColorToken::Warn,
             );
         }
@@ -228,16 +253,21 @@ impl LiveRackApp {
         if action(ui, "Refresh devices", None, !locked).clicked() {
             self.refresh_audio_devices();
         }
-        if self.selected_route != previous_route || self.buffer_frames != previous_buffer {
+        #[cfg(target_os = "linux")]
+        self.draw_tunnel(ui, locked);
+        if self.selected_route != previous_route
+            || self.buffer_frames != previous_buffer
+            || self.sample_rate_hz != previous_rate
+        {
             self.persist_audio_settings();
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(audio_backend))]
     fn draw_audio_setup(&mut self, ui: &mut Ui) {
         note(
             ui,
-            "The live audio engine requires Apple Silicon macOS.",
+            "The live audio engine requires macOS or Linux.",
             ColorToken::Warn,
         );
     }
@@ -247,7 +277,7 @@ impl LiveRackApp {
         reason = "input choice, mappings table, and learn controls read top to bottom"
     )]
     fn draw_midi_setup(&mut self, ui: &mut Ui) {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         {
             let locked = self.online();
             if locked {
@@ -353,7 +383,7 @@ impl LiveRackApp {
             );
         }
         ui.add_space(sp(Spacing::S10));
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         if self.midi_learn_armed {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = sp(Spacing::S20);
@@ -445,24 +475,28 @@ impl LiveRackApp {
             ],
             ColorToken::Hairline,
         );
-        let plugins: Vec<(String, String)> = self
+        let plugins: Vec<(String, String, bool)> = self
             .catalog_plugins
             .iter()
             .map(|plugin| {
                 (
                     plugin.descriptor.identity.name.clone(),
                     plugin.descriptor.identity.vendor.clone(),
+                    plugin.windows,
                 )
             })
             .collect();
-        for (name, vendor) in &plugins {
+        for (name, vendor, windows) in &plugins {
             table_row(
                 ui,
                 &widths,
                 &[
                     (name, ColorToken::Text),
                     (vendor, ColorToken::Text),
-                    ("OK", ColorToken::Dim),
+                    (
+                        if *windows { "OK, Windows (Wine)" } else { "OK" },
+                        ColorToken::Dim,
+                    ),
                     ("", ColorToken::Dim),
                 ],
                 ColorToken::HoverFill,
@@ -517,6 +551,51 @@ impl LiveRackApp {
             "Allow retry clears only that plug-in's failure history. Other quarantines stay unchanged.",
             ColorToken::Dim,
         );
+        if self
+            .product
+            .as_ref()
+            .is_ok_and(crate::ProductRuntime::windows_available)
+        {
+            self.draw_windows_programs(ui);
+        }
+    }
+
+    /// Runs Windows installers and licence managers in the shared Wine prefix. Their windows
+    /// appear in the editor area; a rescan then finds the plug-ins they installed.
+    fn draw_windows_programs(&mut self, ui: &mut Ui) {
+        section(ui, "Windows plug-ins");
+        note(
+            ui,
+            "Windows plug-ins run under Wine in one shared prefix, so each licence is activated once. Racks with Windows plug-ins are heard one buffer late.",
+            ColorToken::Dim,
+        );
+        ui.add_space(sp(Spacing::S8));
+        let id = ui.id().with("windows_program_path");
+        let mut path = ui.data_mut(|data| data.get_temp::<String>(id).unwrap_or_default());
+        let mut run = false;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = sp(Spacing::S20);
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut path)
+                    .hint_text("/path/to/Setup.exe or Package.msi")
+                    .desired_width(WIDE * line() * 1.5),
+            );
+            run = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            run |= action(ui, "Run Windows program…", None, !path.trim().is_empty()).clicked();
+        });
+        if run {
+            let program = std::path::PathBuf::from(path.trim());
+            match self
+                .product_mut()
+                .and_then(|product| product.run_windows_program(&program))
+            {
+                Ok(()) => self.set_status(
+                    "Windows program started; its windows appear in the editor area. Rescan plug-ins when it finishes.",
+                ),
+                Err(error) => self.set_status(&error),
+            }
+        }
+        ui.data_mut(|data| data.insert_temp(id, path));
     }
 
     #[allow(
@@ -574,12 +653,12 @@ impl LiveRackApp {
                 _ => ("Unloaded", ColorToken::Dim),
             };
             let restarts = product.map_or(0, |product| product.rack_restart_count(index));
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             let diagnostics = self
                 .telemetry
                 .as_ref()
                 .and_then(|telemetry| telemetry.rack_diagnostics(index));
-            #[cfg(target_os = "macos")]
+            #[cfg(audio_backend)]
             let (misses, rejections) = diagnostics.map_or_else(
                 || ("--".to_owned(), "--".to_owned()),
                 |diagnostics| {
@@ -589,7 +668,7 @@ impl LiveRackApp {
                     )
                 },
             );
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(audio_backend))]
             let (misses, rejections) = ("--".to_owned(), "--".to_owned());
             let number = format!("{:02}", index + 1);
             let restarts_text = restarts.to_string();
@@ -659,6 +738,27 @@ impl LiveRackApp {
                 ColorToken::Warn,
             );
         }
+        let pipelined: Vec<String> = (0..racks.len().min(MAX_RACKS))
+            .filter(|&rack| {
+                self.product
+                    .as_ref()
+                    .is_ok_and(|product| product.rack_is_pipelined(rack))
+            })
+            .map(|rack| racks[rack].0.clone())
+            .collect();
+        if !pipelined.is_empty() {
+            let frames = self.buffer_frames_value();
+            ui.add_space(sp(Spacing::S8));
+            note(
+                ui,
+                &format!(
+                    "{} run Windows plug-ins under Wine and are heard one buffer late: +{frames} samples ({}).",
+                    pipelined.join(", "),
+                    latency_label(frames, self.sample_rate_value())
+                ),
+                ColorToken::Dim,
+            );
+        }
         let over_dry_limit: Vec<String> = (0..racks.len().min(MAX_RACKS))
             .filter(|&rack| {
                 self.product
@@ -688,7 +788,13 @@ impl LiveRackApp {
         let frames = self.buffer_frames_value();
         let load = self.callback_load().map_or_else(
             || "--".to_owned(),
-            |load| format!("{:.0} % of {}", load * 100.0, latency_label(frames)),
+            |load| {
+                format!(
+                    "{:.0} % of {}",
+                    load * 100.0,
+                    latency_label(frames, self.sample_rate_value())
+                )
+            },
         );
         let misses = self
             .deadline_misses()
@@ -721,7 +827,7 @@ impl LiveRackApp {
 
     /// Whether the engine needs a private aggregate for separate input and output devices.
     fn aggregate_label(&self) -> &'static str {
-        #[cfg(target_os = "macos")]
+        #[cfg(audio_backend)]
         if let Some(route) = &self.selected_route
             && route
                 .input
@@ -765,7 +871,7 @@ fn setup_tab(ui: &mut Ui, label: &str, active: bool) -> Response {
 }
 
 /// A section title with space above it.
-fn section(ui: &mut Ui, text: &str) {
+pub(super) fn section(ui: &mut Ui, text: &str) {
     ui.add_space(sp(Spacing::S16));
     title(ui, text);
     ui.add_space(sp(Spacing::S4));

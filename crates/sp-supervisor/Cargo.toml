@@ -12,6 +12,14 @@ serde_json.workspace = true
 sha2.workspace = true
 sp-model = { path = "../sp-model" }
 sp-protocol = { path = "../sp-protocol" }
+sp-wine = { path = "../sp-wine" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", features = ["process"] }
+sp-shared-memory-os = { path = "../sp-shared-memory-os" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sp-window-stream = { path = "../sp-window-stream" }
 
 [lints]
 workspace = true

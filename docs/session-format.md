@@ -21,7 +21,9 @@ My Set.superposition/
 `session.json` is a `SessionDocument`: document schema version plus the host-owned `sp_model::Session` (topology, rack gain/mute/bypass, ordered plug-in identities/fingerprints and bypass states, normalized parameters, scenes, MIDI mappings, audio device settings, per-rack channel routes, and state references). `manifest.json` has the package schema version, a generated revision ID, optional writer metadata, and one plugin-state declaration per instance. `metadata.json` records the instance ID, captured fingerprint, byte counts, state-capture schema, last known activation result, and an optional `preview` declaration (`bytes`, `captured_at_unix_ms`) for `preview.png`. Component and controller VST3 streams are separate opaque byte files. Rack controls, `audio_settings`, and `rack_routes` use serde defaults, so version-1 packages written before those fields existed remain readable without a schema bump.
 
 `audio_settings` saves optional input and required output device IDs and names,
-plus the preferred 32-, 64-, 128-, or 256-frame block size. On load, the app
+plus the preferred 32-, 64-, 128-, or 256-frame block size and the session sample
+rate (`sample_rate_hz`: 48000 or 96000; absent in older sessions, which load at
+48 kHz). On load, the app
 matches ID and name, or a unique matching name; an unavailable or ambiguous
 device must be selected again. `rack_routes` assigns each rack an optional mono
 or stereo input and a mono or stereo output. Channel indices are zero-based in
@@ -58,16 +60,20 @@ supports that representation.
 
 `preview.png` is a 320×200 PNG of the instance's native editor as it last looked:
 the editor's content area scaled to cover and centre-cropped, without the title
-bar. The worker takes it on its `AppKit` thread, never the audio thread: about
-0.5 s after the editor opens, then at most every 2 s while the plug-in reports
-changed parameter values (editor edits or its own output), and once as the
-editor closes (red button, close request, slot unload, or shutdown). Parameter
+bar. The worker takes it on its `AppKit` or X11 editor thread, never the audio
+thread: about 0.5 s after the editor opens, then at most every 2 s while the
+plug-in reports changed parameter values (editor edits or its own output), and
+once as the editor closes (red button, close request, slot unload, or shutdown). Parameter
 changes made by the host (scenes, MIDI) do not trigger a picture by themselves.
 The worker uses the window server's image of its own window
 (`CGWindowListCreateImage`, looked up at run time), which includes Metal and
 OpenGL layers. On macOS 27 this needs no screen-recording permission and shows
 no prompt: the window server only preflights the check. A drawn view cache is
 the fallback if that call is unavailable, but it misses layer-backed content.
+On Linux the worker reads its window from the private X server with
+`GetImage`, which includes the plug-in's embedded window, and scales it by
+area averaging. A `WM_DELETE_WINDOW` request closes the editor as the red
+button does.
 
 An explicit save stores the newest picture per instance, declared in that
 instance's `metadata.json` and committed with the manifest like the state
@@ -150,7 +156,7 @@ Package and document schemas migrate independently through explicit, directional
 
 ## Activation and placeholders
 
-At restore, the app/supervisor compares the session fingerprint and `metadata.json` capture fingerprint with scanner results and quarantine state. Missing, changed, quarantined, or restore-failed plug-ins remain inert and bypassed; the host retains their slots, parameters, state files, and diagnostics for a user decision. No automatic replacement is selected from a display name. A compatible worker restores only while stopped/muted, in component state → controller synchronization → controller state order; failures keep the rack gated and report the recorded activation state.
+At open, a slot whose exact build (fingerprint) is not installed is rebound to an installed build of the same VST3 class ID, a native build before a Windows one, and its saved state is restored into that build. Sessions therefore move between machines and between macOS and Linux; saving records the new build. The app/supervisor then compares fingerprints with scanner results and quarantine state. A plug-in whose class is not installed, or that is quarantined or fails to restore, remains inert and bypassed; the host retains its slot, parameters, state files, and diagnostics for a user decision. No replacement is ever selected from a display name. A compatible worker restores only while stopped/muted, in component state → controller synchronization → controller state order; failures keep the rack gated and report the recorded activation state.
 
 Parameter scenes remain host-owned normalized snapshots. They may change rack gain,
 mute, rack bypass, plug-in-slot bypass, and selected parameter values. Each parameter

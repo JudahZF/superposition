@@ -1,11 +1,12 @@
-//! Opt-in `CoreMIDI` ingress check using a temporary virtual source, with no audio device or plug-in.
+//! Opt-in system MIDI ingress check (`CoreMIDI` on macOS, the ALSA sequencer on Linux) using a
+//! temporary virtual source, with no audio device or plug-in.
 
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use midir::os::unix::VirtualOutput;
-use sp_audio_io_macos::{
+use sp_audio_io::{
     BlockFrames, InterleavedStereoF32, OutputRenderer, ProductControl, ProductRenderer,
     prepare_product_scenes,
 };

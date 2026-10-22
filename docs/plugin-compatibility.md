@@ -4,7 +4,7 @@
 
 The initial plug-in format is VST3, behind `sp-vst3` and executed only in scanner/worker helpers. The adapter translates declared audio buses, bounded event/MIDI data, parameter changes, processing calls, and state transfer into host-owned types. The engine and session layer do not depend on VST3 SDK types or lifetime rules.
 
-The disposable scanner validates bundle layout and Mach-O architecture before optional SDK enumeration. The parent computes a SHA-256 fingerprint over canonical path, entry metadata, and bundle file contents; unchanged results are reused from an atomically replaced JSON cache. Retained worker helpers rebuild and process fixed serial multi-slot racks, while editor lifecycle is isolated in worker-owned AppKit windows. Passing the alpha path does not certify all VST3 plug-ins.
+The disposable scanner validates bundle layout and the executable's architecture (Mach-O on macOS, ELF in `Contents/<arch>-linux` on Linux, PE in `Contents/<arch>-win` or a single-file `.vst3` for Windows bundles under Wine) before optional SDK enumeration. The parent computes a SHA-256 fingerprint over canonical path, entry metadata, and bundle file contents; unchanged results are reused from an atomically replaced JSON cache. Retained worker helpers rebuild and process fixed serial multi-slot racks, while editor lifecycle is isolated in worker-owned AppKit, X11, or (Windows worker under Wine) Win32 windows. Passing the alpha path does not certify all VST3 plug-ins.
 
 Scanner reports use a private temporary file, bounded to 4 MiB, so plug-in log
 output cannot corrupt the report or hold its output pipe open. Catalog version 3
@@ -35,6 +35,34 @@ misses, fallback, or recovery. Each reported seven queue-full visualization
 messages; all queued messages were accepted by the plug-in. These are targeted
 compatibility checks, not long-run or all-device certification. See
 [live validation](live-validation.md) for the evidence and limits.
+
+## Windows plug-ins under Wine
+
+On Linux, Windows VST3 plug-ins run in the Windows build of the worker under the
+pinned Wine (11.18 staging in the dev shell), in one shared prefix. A rack holds
+plug-ins of one platform and a Windows rack is heard one block late. Wine Mono
+and Gecko are not installed into the prefix automatically; a plug-in or
+installer that needs .NET or the HTML engine needs its installer run through
+Setup first.
+
+Surge XT Effects 1.3.4 (win64, JUCE), 22 October 2026, on an x86_64 NixOS
+workstation without real-time priority, in a fresh prefix on a private Xvfb
+display (`wine_worker_e2e`, debug build):
+
+- The Windows scanner under Wine cataloged one class with 2-in/2-out main buses
+  in about 0.25 s.
+- The Wine worker answered its first health request about 0.1 s after launch.
+- 400 blocks of 128 frames at 48 kHz through the pipelined dispatcher: 399
+  completions (the last block's result is mixed with the next), no deadline
+  miss. Publish-to-completion round trip p50 45 µs, p99 68 µs, p99.9 72 µs,
+  max 106 µs; plug-in processing p50 30 µs, max 100 µs.
+- The editor opened in a Win32 window, painted, and was pictured; its X11
+  window carried the worker's PID, rack, slot, and title. The worker shut down
+  in order.
+
+This is one targeted check, not a compatibility certification: no licence
+manager, iLok, or GPU-heavy editor has been tried, and no Linux timing is
+claimed for real audio hardware.
 
 ## Compatibility tiers
 

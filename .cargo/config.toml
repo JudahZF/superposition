@@ -1,2 +1,6 @@
 [alias]
 xtask = "run --locked --package xtask --"
+
+[net]
+# quanta-audio-io is a git dependency on an SSH remote; use the system git and ssh agent.
+git-fetch-with-cli = true

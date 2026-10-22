@@ -41,7 +41,7 @@ enum SlotCommand {
 struct PickerRow {
     vendor: String,
     name: String,
-    /// Why it cannot be added, if it cannot.
+    /// A note beside the name: why it cannot be added, or that it runs under Wine.
     reason: Option<&'static str>,
     plugin: Option<CatalogPlugin>,
 }
@@ -452,7 +452,7 @@ impl LiveRackApp {
                     ui,
                     &format!(
                         "Rack sources arrive one buffer late, {} at {frames} samples. Physical inputs are sample aligned.",
-                        latency_label(frames)
+                        latency_label(frames, self.sample_rate_value())
                     ),
                     ColorToken::Dim,
                 );
@@ -638,7 +638,8 @@ impl LiveRackApp {
             .map(|plugin| PickerRow {
                 vendor: plugin.descriptor.identity.vendor.clone(),
                 name: plugin.descriptor.identity.name.clone(),
-                reason: None,
+                // Windows plug-ins run under Wine, and their rack is heard one buffer late.
+                reason: plugin.windows.then_some("Windows, +1 buffer"),
                 plugin: Some(plugin.clone()),
             })
             .collect();

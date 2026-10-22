@@ -1,0 +1,27 @@
+[package]
+name = "sp-audio-io-tunnel"
+description = "Superposition as a Tunnel network-audio device."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rtrb.workspace = true
+sp-audio-io = { path = "../sp-audio-io" }
+sp-engine = { path = "../sp-engine" }
+sp-shared-memory-os = { path = "../sp-shared-memory-os" }
+thiserror.workspace = true
+# The same Tunnel revision as Lambda's lambda-host.
+tunnel-types = { git = "ssh://git@origin.cursor.com/judahzf/tunnel.git", rev = "170499eddadac58b36eee0c00e3477c40156fa24" }
+tunnel-host = { git = "ssh://git@origin.cursor.com/judahzf/tunnel.git", rev = "170499eddadac58b36eee0c00e3477c40156fa24" }
+tunnel-device = { git = "ssh://git@origin.cursor.com/judahzf/tunnel.git", rev = "170499eddadac58b36eee0c00e3477c40156fa24" }
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+assert_no_alloc = "1.1.2"
+sp-model = { path = "../sp-model" }
+
+[lints]
+workspace = true

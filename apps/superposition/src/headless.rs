@@ -1,4 +1,5 @@
-//! Command-line host for a saved session and explicitly selected `CoreAudio` devices.
+//! Command-line host for a saved session and explicitly selected audio devices (`CoreAudio` on
+//! macOS, JACK on Linux).
 
 use std::path::PathBuf;
 
@@ -10,7 +11,8 @@ const USAGE: &str = "Usage:
   superposition --headless --session <package> --device <id-or-unique-name> --duration-seconds <N> [--frames 32|64|128|256] [--midi-port <id-or-unique-name>]
   superposition --headless --session <package> --input-device <id-or-unique-name|none> --output-device <id-or-unique-name> --duration-seconds <N> [--frames 32|64|128|256] [--midi-port <id-or-unique-name>]
 
-The device ID printed by --list-devices is a CoreAudio object ID (coreaudio:<number>).
+The device ID printed by --list-devices is a CoreAudio object ID (coreaudio:<number>) on macOS
+and a JACK server (jack:<name>) on Linux.
 Use --input-device none for an output-only route. Both device choices must be explicit.
 The MIDI port ID printed by --list-midi-ports selects one input; no MIDI input is opened by default.
 The live host requires a saved session with at least one loaded plug-in rack.
@@ -165,7 +167,7 @@ fn parse(arguments: &[String]) -> Result<Command, String> {
         (if input == "none" { None } else { Some(input) }, output)
     };
     if output_device == "none" {
-        return Err("--output-device must select a CoreAudio device".to_owned());
+        return Err("--output-device must select an audio device".to_owned());
     }
     let duration_seconds = duration_seconds
         .ok_or("--headless requires --duration-seconds <N>")?
@@ -218,12 +220,12 @@ fn scan() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 fn list_devices() -> Result<(), String> {
-    let devices = sp_audio_io_macos::enumerate_devices()
-        .map_err(|error| format!("CoreAudio device discovery failed: {error}"))?;
+    let devices = crate::platform_audio::enumerate_devices()
+        .map_err(|error| format!("audio device discovery failed: {error}"))?;
     if devices.is_empty() {
-        println!("No CoreAudio devices were found.");
+        println!("No audio devices were found.");
     }
     for device in devices {
         let frames = device
@@ -244,15 +246,15 @@ fn list_devices() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(audio_backend))]
 fn list_devices() -> Result<(), String> {
-    Err("CoreAudio device discovery requires macOS".to_owned())
+    Err("audio device discovery requires macOS or Linux".to_owned())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 fn list_midi_ports() -> Result<(), String> {
     let ports = sp_midi::MidirInput::enumerate_ports()
-        .map_err(|error| format!("CoreMIDI input discovery failed: {error}"))?;
+        .map_err(|error| format!("MIDI input discovery failed: {error}"))?;
     if ports.is_empty() {
         println!("No MIDI input ports were found.");
     }
@@ -262,19 +264,19 @@ fn list_midi_ports() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(audio_backend))]
 fn list_midi_ports() -> Result<(), String> {
-    Err("CoreMIDI input discovery requires macOS".to_owned())
+    Err("MIDI input discovery requires macOS or Linux".to_owned())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 #[allow(
     clippy::too_many_lines,
     reason = "live host lifetime and teardown stay together"
 )]
 fn host(options: &HostOptions) -> Result<(), String> {
+    use crate::platform_audio::PlatformAudioEndpoint;
     use sp_audio_io::{AudioEndpoint, AudioEndpointEvent, AudioFormat, AudioRouteConfig};
-    use sp_audio_io_macos::MacOsAudioEndpoint;
     use sp_session::{AtomicFileSessionStore, CapturedPluginState, SessionController};
     use std::time::{Duration, Instant};
 
@@ -297,8 +299,8 @@ fn host(options: &HostOptions) -> Result<(), String> {
     if !model.racks.iter().any(|rack| !rack.slots.is_empty()) {
         return Err("saved session has no plug-in racks to host".to_owned());
     }
-    let devices = sp_audio_io_macos::enumerate_devices()
-        .map_err(|error| format!("CoreAudio device discovery failed: {error}"))?;
+    let devices = crate::platform_audio::enumerate_devices()
+        .map_err(|error| format!("audio device discovery failed: {error}"))?;
     let output = select_device_for_direction(
         &devices,
         &options.output_device,
@@ -312,7 +314,13 @@ fn host(options: &HostOptions) -> Result<(), String> {
             select_device_for_direction(&devices, requested, options.frames, DeviceDirection::Input)
         })
         .transpose()?;
-    let mut format = AudioFormat::product_stereo(options.frames)
+    let sample_rate_hz = model
+        .audio_settings
+        .as_ref()
+        .map_or(sp_audio_io::PRODUCT_SAMPLE_RATE_HZ, |settings| {
+            settings.sample_rate_hz
+        });
+    let mut format = AudioFormat::product(sample_rate_hz, options.frames)
         .map_err(|error| format!("invalid audio format: {error}"))?;
     format.channel_count = output.capabilities.max_output_channels.min(64);
     let route = AudioRouteConfig {
@@ -322,6 +330,12 @@ fn host(options: &HostOptions) -> Result<(), String> {
     };
 
     let mut product = crate::ProductRuntime::open(crate::default_application_support())?;
+    let mut rebound = model.clone();
+    product.rebind_session(&mut rebound);
+    let model = &rebound;
+    for note in product.diagnostics() {
+        eprintln!("host: {note}");
+    }
     let mut loaded_racks = Vec::new();
     for (rack_index, rack) in model.racks.iter().enumerate() {
         if rack.slots.is_empty() {
@@ -359,7 +373,7 @@ fn host(options: &HostOptions) -> Result<(), String> {
     let mut renderer = prepared.renderer;
     if let Some(requested) = options.midi_port.as_deref() {
         let ports = sp_midi::MidirInput::enumerate_ports()
-            .map_err(|error| format!("CoreMIDI input discovery failed: {error}"))?;
+            .map_err(|error| format!("MIDI input discovery failed: {error}"))?;
         let selected = select_midi_port(&ports, requested)?;
         let mut midi = sp_midi::MidirInput::new();
         midi.open_port(&selected.id)
@@ -371,12 +385,13 @@ fn host(options: &HostOptions) -> Result<(), String> {
     let mut control = prepared.control;
     let _mapping_publisher = prepared.mapping_publisher;
     let _mappings = prepared.mappings;
-    let mut endpoint = MacOsAudioEndpoint::with_renderer(renderer).allow_device_reconfiguration();
+    let mut endpoint =
+        PlatformAudioEndpoint::with_renderer(renderer).allow_device_reconfiguration();
     endpoint
         .start_route(route)
-        .map_err(|error| format!("CoreAudio could not start: {error}"))?;
+        .map_err(|error| format!("audio could not start: {error}"))?;
     println!(
-        "host: session={} input_device={} output_device={} input_name={:?} output_name={:?} input_channels={} output_channels={} sample_rate=48000 frames={} loaded_racks={} duration_seconds={}",
+        "host: session={} input_device={} output_device={} input_name={:?} output_name={:?} input_channels={} output_channels={} sample_rate={sample_rate_hz} frames={} loaded_racks={} duration_seconds={}",
         options.session.display(),
         input.map_or("none", |device| device.info.id.as_str()),
         output.info.id,
@@ -406,6 +421,12 @@ fn host(options: &HostOptions) -> Result<(), String> {
         let mut device_error = None;
         'host: while start.elapsed() < duration {
             product.poll();
+            for rack in product.take_rack_reloads() {
+                if let Err(error) = product.reload_rack_live(&mut control, model, rack) {
+                    eprintln!("host: rack {} reload failed: {error}", rack + 1);
+                }
+            }
+            product.finish_live_topology(&mut control);
             let meter = renderer_telemetry.output_meter();
             for channel in 0..2 {
                 max_peak[channel] = max_peak[channel].max(meter.peak[channel]);
@@ -470,7 +491,7 @@ fn host(options: &HostOptions) -> Result<(), String> {
         }
         let callback = endpoint
             .callback_telemetry()
-            .ok_or("CoreAudio stopped before final telemetry was available")?;
+            .ok_or("audio stopped before final telemetry was available")?;
         println!(
             "audio: callbacks={} rendered={} silenced={} invalid_frames={} invalid_buffers={} invalid_channels={} invalid_bytes={} frames_32={} frames_64={} frames_128={} frames_256={}",
             callback.callbacks,
@@ -599,7 +620,7 @@ fn host(options: &HostOptions) -> Result<(), String> {
             return Err(error);
         }
         if callback.callbacks == 0 || callback.rendered == 0 {
-            return Err("CoreAudio did not render any callbacks".to_owned());
+            return Err("the audio device rendered no callbacks".to_owned());
         }
         if callback.silenced > 0
             || callback.invalid_frames > 0
@@ -607,7 +628,7 @@ fn host(options: &HostOptions) -> Result<(), String> {
             || callback.invalid_channels > 0
             || callback.invalid_bytes > 0
         {
-            return Err("CoreAudio reported silent or invalid callbacks".to_owned());
+            return Err("the audio device reported silent or invalid callbacks".to_owned());
         }
         if !incomplete_racks.is_empty() {
             return Err(format!(
@@ -625,13 +646,13 @@ fn host(options: &HostOptions) -> Result<(), String> {
             ));
         }
         if !callback.is_coherent() {
-            return Err("CoreAudio callback telemetry is inconsistent".to_owned());
+            return Err("audio callback telemetry is inconsistent".to_owned());
         }
         Ok(())
     })();
     let stop_result = endpoint
         .stop()
-        .map_err(|error| format!("CoreAudio could not stop cleanly: {error}"));
+        .map_err(|error| format!("audio could not stop cleanly: {error}"));
     match (run_result, stop_result) {
         (Ok(()), Ok(())) => {
             println!("host: complete");
@@ -642,7 +663,7 @@ fn host(options: &HostOptions) -> Result<(), String> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 fn record_meter_max(
     meter: sp_engine::RackMeterSnapshot,
     peaks: &mut [f32; 2],
@@ -656,7 +677,7 @@ fn record_meter_max(
     *clipped |= meter.clipped;
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 #[derive(Clone, Copy)]
 enum DeviceDirection {
     Input,
@@ -665,22 +686,22 @@ enum DeviceDirection {
 
 #[cfg(all(test, target_os = "macos"))]
 fn select_device<'a>(
-    devices: &'a [sp_audio_io_macos::MacOsAudioDevice],
+    devices: &'a [crate::platform_audio::PlatformAudioDevice],
     requested: &str,
     frames: u32,
-) -> Result<&'a sp_audio_io_macos::MacOsAudioDevice, String> {
+) -> Result<&'a crate::platform_audio::PlatformAudioDevice, String> {
     let device = select_device_for_direction(devices, requested, frames, DeviceDirection::Input)?;
     select_device_for_direction(devices, requested, frames, DeviceDirection::Output)?;
     Ok(device)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 fn select_device_for_direction<'a>(
-    devices: &'a [sp_audio_io_macos::MacOsAudioDevice],
+    devices: &'a [crate::platform_audio::PlatformAudioDevice],
     requested: &str,
     frames: u32,
     direction: DeviceDirection,
-) -> Result<&'a sp_audio_io_macos::MacOsAudioDevice, String> {
+) -> Result<&'a crate::platform_audio::PlatformAudioDevice, String> {
     let selected = if let Some(device) = devices
         .iter()
         .find(|device| device.info.id.as_str() == requested)
@@ -716,13 +737,13 @@ fn select_device_for_direction<'a>(
     }
     if !selected.supported_buffer_frames.contains(&frames) {
         return Err(format!(
-            "device {requested:?} does not support {frames}-frame audio at 48 kHz"
+            "device {requested:?} does not support {frames}-frame audio"
         ));
     }
     Ok(selected)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(audio_backend)]
 fn select_midi_port<'a>(
     ports: &'a [sp_midi::MidiPortInfo],
     requested: &str,
@@ -742,9 +763,9 @@ fn select_midi_port<'a>(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(audio_backend))]
 fn host(_options: &HostOptions) -> Result<(), String> {
-    Err("live audio requires macOS".to_owned())
+    Err("live audio requires macOS or Linux".to_owned())
 }
 
 #[cfg(test)]
@@ -985,14 +1006,14 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     #[test]
     fn validates_selected_device_direction_and_buffer_size() {
+        use crate::platform_audio::PlatformAudioDevice;
         use sp_audio_io::{AudioDeviceCapabilities, AudioDeviceId, AudioDeviceInfo};
-        use sp_audio_io_macos::MacOsAudioDevice;
 
         let devices = [
-            MacOsAudioDevice {
+            PlatformAudioDevice {
                 info: AudioDeviceInfo {
                     id: AudioDeviceId::new("coreaudio:1"),
                     name: "Capture".to_owned(),
@@ -1006,7 +1027,7 @@ mod tests {
                 },
                 supported_buffer_frames: vec![32, 64],
             },
-            MacOsAudioDevice {
+            PlatformAudioDevice {
                 info: AudioDeviceInfo {
                     id: AudioDeviceId::new("coreaudio:2"),
                     name: "Playback".to_owned(),
@@ -1068,7 +1089,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(audio_backend)]
     #[test]
     fn selects_only_an_exact_or_unique_midi_input() {
         use sp_midi::{MidiPortId, MidiPortInfo};

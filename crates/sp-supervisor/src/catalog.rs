@@ -190,6 +190,7 @@ mod tests {
         catalog.insert(CachedScan {
             bundle: canonical.clone(),
             fingerprint: fingerprint.clone(),
+            platform: crate::PluginPlatform::Native,
             metadata: PluginScanMetadata::new(
                 PluginArchitecture::Arm64,
                 PluginScanOutcome::Supported,
@@ -228,6 +229,7 @@ mod tests {
                     algorithm: "sha256".to_owned(),
                     digest: "old".to_owned(),
                 },
+                platform: crate::PluginPlatform::Native,
                 metadata: PluginScanMetadata::new(
                     PluginArchitecture::Arm64,
                     PluginScanOutcome::Crashed,

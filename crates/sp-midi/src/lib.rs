@@ -676,7 +676,7 @@ fn ingress_queues() -> (
     )
 }
 
-/// `CoreMIDI` / system MIDI input backed by `midir`, feeding fixed callback-safe queues.
+/// System MIDI input (`CoreMIDI` on macOS, the ALSA sequencer on Linux) backed by `midir`, feeding fixed callback-safe queues.
 pub struct MidirInput {
     connection: Option<midir::MidiInputConnection<()>>,
     regular: Consumer<RealtimeMidiPacket>,
@@ -801,7 +801,9 @@ impl MidirInput {
                 }
             },
             (),
-        )?;
+        )
+        // The ALSA error carries the `MidiInput`, which is not `Sync`; keep only its kind.
+        .map_err(|error| error.kind().to_string())?;
         self.selected_port = Some(info.id.clone());
         self.port = Some(info);
         self.connection = Some(connection);

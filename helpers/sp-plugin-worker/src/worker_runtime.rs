@@ -65,20 +65,38 @@ impl PlanarBlock {
         }
     }
 
+    /// Copies the slot's output audio, as the rack left it, into this block.
+    pub(crate) fn copy_from_output(
+        &mut self,
+        slot: &BlockSlot,
+        channels: usize,
+        frame_count: usize,
+    ) {
+        for channel in 0..channels {
+            self.channels[channel][..frame_count]
+                .copy_from_slice(&slot.output_audio[channel][..frame_count]);
+        }
+    }
+
     fn clear(&mut self, frame_count: usize) {
         for channel in &mut self.channels {
             channel[..frame_count].fill(0.0);
         }
     }
 
-    fn copy_to_slot(&self, slot: &mut BlockSlot, output_channels: usize, frame_count: usize) {
+    pub(crate) fn copy_to_slot(
+        &self,
+        slot: &mut BlockSlot,
+        output_channels: usize,
+        frame_count: usize,
+    ) {
         for channel in 0..output_channels {
             slot.output_audio[channel][..frame_count]
                 .copy_from_slice(&self.channels[channel][..frame_count]);
         }
     }
 
-    fn is_finite(&self, channels: usize, frame_count: usize) -> bool {
+    pub(crate) fn is_finite(&self, channels: usize, frame_count: usize) -> bool {
         self.channels[..channels].iter().all(|channel| {
             channel[..frame_count]
                 .iter()
@@ -89,14 +107,15 @@ impl PlanarBlock {
 
 /// Planar history of the audio entering one slot position. A bypassed or warming plug-in's
 /// output is replaced by this input, delayed by the plug-in's latency, so the chain keeps the
-/// same timing whether the plug-in is heard or not.
-struct BypassDelay {
+/// same timing whether the plug-in is heard or not. A mixed-rack segment keeps one for the
+/// segments it forwards to.
+pub(crate) struct BypassDelay {
     channels: [Box<[f32]>; MAX_CHANNELS],
     write: usize,
 }
 
 impl BypassDelay {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             channels: array::from_fn(|_| {
                 vec![0.0; BYPASS_DELAY_CAPACITY_FRAMES].into_boxed_slice()
@@ -105,7 +124,7 @@ impl BypassDelay {
         }
     }
 
-    fn write(&mut self, input: &PlanarBlock, frame_count: usize) {
+    pub(crate) fn write(&mut self, input: &PlanarBlock, frame_count: usize) {
         for (history, input) in self.channels.iter_mut().zip(input.channels()) {
             for (frame, sample) in input[..frame_count].iter().enumerate() {
                 history[(self.write + frame) % BYPASS_DELAY_CAPACITY_FRAMES] = *sample;
@@ -115,7 +134,7 @@ impl BypassDelay {
     }
 
     /// Reads the block just written, `latency` frames late.
-    fn read(&self, output: &mut PlanarBlock, latency: usize, frame_count: usize) {
+    pub(crate) fn read(&self, output: &mut PlanarBlock, latency: usize, frame_count: usize) {
         for (history, output) in self.channels.iter().zip(output.channels_mut()) {
             if latency > MAX_BYPASS_DELAY_FRAMES {
                 output[..frame_count].fill(0.0);
@@ -141,7 +160,7 @@ impl Default for PlanarBlock {
     clippy::cast_precision_loss,
     reason = "fade positions are bounded far below f32 precision limits"
 )]
-fn crossfade(
+pub(crate) fn crossfade(
     output: &mut PlanarBlock,
     input: &PlanarBlock,
     channels: usize,

@@ -40,16 +40,16 @@ pub(crate) fn scan_bundle_isolated(
     timeout: Duration,
 ) -> Result<IsolatedScanReport, CommandError> {
     let mut supervisor = ProcessSupervisor::new();
-    let launch = HelperLaunch {
-        kind: HelperKind::PluginScanner,
-        executable: scanner.to_path_buf(),
-        arguments: vec![
+    let launch = HelperLaunch::native(
+        HelperKind::PluginScanner,
+        scanner,
+        vec![
             "--bundle".to_owned(),
             bundle.display().to_string(),
             "--json".to_owned(),
             "--sdk-enumerate".to_owned(),
         ],
-    };
+    );
     let captured = supervisor
         .launch_and_wait_capturing(&launch, timeout)
         .map_err(|error| {

@@ -1,6 +1,6 @@
 # Superposition
 
-Superposition is a macOS-native live VST3 host. It runs each rack's plug-ins in a separate worker process, so a plug-in that crashes or misses its deadline affects only its own rack. The audio engine keeps bounded latency and keeps the other racks playing.
+Superposition is a live VST3 host for macOS and Linux. On Linux it can also run Windows VST3 plug-ins under Wine. It runs each rack's plug-ins in a separate worker process, so a plug-in that crashes or misses its deadline affects only its own rack. The audio engine keeps bounded latency and keeps the other racks playing.
 
 **Status: alpha.** It runs real plug-ins live on Apple Silicon, but it is not a certified release. Notarized bundles, approved brand assets, and long-run hardware testing are still incomplete. Worker isolation protects availability; it is not a security sandbox.
 
@@ -17,14 +17,42 @@ Superposition is a macOS-native live VST3 host. It runs each rack's plug-ins in 
 
 ## Build and run
 
-Requires an Apple Silicon Mac, macOS 14.4 or later, and the Rust toolchain in `rust-toolchain.toml` (rustup installs it automatically).
+macOS requires an Apple Silicon Mac, macOS 14.4 or later, and the Rust toolchain in `rust-toolchain.toml` (rustup installs it automatically).
 
 ```sh
 cargo build --workspace
 cargo run -p superposition
 ```
 
-The app finds its helper executables beside its own executable. Packaged builds use the bundle's `Helpers` directory. `SUPERPOSITION_HELPERS_DIR` overrides both, and `SUPERPOSITION_APP_SUPPORT` selects a separate catalog and quarantine directory.
+Linux (x86_64) builds inside the Nix dev shell, which pins Rust, JACK, Xvfb, mingw, and the Wine build that Windows plug-ins use:
+
+```sh
+nix develop -c cargo build --workspace
+nix develop -c cargo xtask windows-helpers   # Windows worker, scanner, and Wine bridge
+nix develop -c cargo run -p superposition
+nix develop -c cargo xtask wine-check        # Windows worker boundary under Wine
+nix develop -c cargo xtask bundle-linux      # tarball and AppImage in target/bundle-linux (needs docker)
+```
+
+The tarball and the AppImage hold the same tree: the app, its helpers, the Wine bridge, and the pinned Wine build. They build in a Debian 12 container, so they need glibc 2.36 or newer. See [packaging/linux/README-linux.md](packaging/linux/README-linux.md) for what the system must provide.
+
+Windows VST3 plug-ins run in one shared Wine prefix (`<app support>/wine`, or `SUPERPOSITION_WINE_PREFIX`). Install them with **Setup → Plug-ins → Run Windows program…** (an `.exe` or `.msi`; its windows appear in the editor area), then **Rescan plug-ins**. Bundles in the prefix's `Program Files/Common Files/VST3` folder, and in any folder listed in `SUPERPOSITION_WINDOWS_VST3_PATH`, are scanned under Wine. A rack can mix Linux and Windows plug-ins. A rack that holds any Windows plug-in is heard one buffer late.
+
+Audio runs through JACK (PipeWire's JACK library works). The server's rate and quantum must match the session, for example `pw-metadata -n settings 0 clock.force-quantum 128`. For real-time scheduling, grant `RLIMIT_RTPRIO` (the NixOS module below does this). Without it, Superposition asks rtkit, if it runs, for its JACK callback thread and every plug-in worker, Windows ones included, at rtkit's lower priority (usually 20).
+
+`superposition --doctor` checks these settings (real-time priority, helpers, Xvfb, Wine, and `ntsync`), and the engine prints any that are not met when it starts.
+
+On NixOS, the flake's module applies the system settings: `rtprio` 95 for the `audio` group, rtkit, `preempt=full threadirqs` on the kernel command line (`programs.superposition.lowLatencyKernel`), the `ntsync` driver, the pinned Wine build (`SUPERPOSITION_WINE`), and Xvfb. Add your user to the `audio` group and log in again.
+
+```nix
+{
+  imports = [ superposition.nixosModules.default ];
+  programs.superposition.enable = true;
+  users.users.<name>.extraGroups = [ "audio" ];
+}
+```
+
+The app finds its helper executables beside its own executable, the Windows ones in `windows/` and the Wine bridge in `wine-bridge/` there. Packaged builds use the bundle's `Helpers` directory. `SUPERPOSITION_HELPERS_DIR` overrides both, and `SUPERPOSITION_APP_SUPPORT` selects a separate catalog and quarantine directory.
 
 ## Using the app
 
@@ -68,6 +96,19 @@ target/debug/superposition --headless --session /path/to/Live.superposition \
 
 Headless mode needs an explicit device and a saved session with at least one loaded rack. Use names or IDs from `--list-devices`. `--input-device none` selects output-only processing, and `--midi-port <id-or-name>` opens one MIDI input. At the end it reports callbacks, rack completions, deadline misses, fallback, closed gates, and output levels. It fails on callback errors, deadline misses, protocol faults, or an unhealthy worker. Use `--release` builds for timing checks. See [live validation](docs/live-validation.md) for measured results.
 
+## Remote operation
+
+```sh
+superposition --serve [--bind ADDR] [--name NAME] [--pair]   # engine without a window
+superposition --connect HOST[:PORT] [--pair CODE] [--viewer] # show and drive it
+```
+
+The engine prints a six-digit pairing code on its first start (or with `--pair`); a client uses it
+once, then both sides remember each other. The client shows the engine's whole UI, including
+plug-in editors. A Mac engine streams its editors only while a client is connected, and their
+native windows stay open on the Mac. One client controls at a time; others watch and may take
+control.
+
 ## Development
 
 ```sh
@@ -83,7 +124,13 @@ To render the show screen to PNGs for visual review:
 SUPERPOSITION_UI_SNAPSHOT=<dir> cargo test -p superposition --bin superposition render_show_screen_snapshots -- --ignored
 ```
 
-CI (`.github/workflows/ci.yml`) runs doctor, formatting, Clippy, tests, coverage, `cargo-deny`, and `cargo-audit` on macOS. Live timing needs real Apple Silicon hardware and does not run in CI.
+On Linux, the dev shell can type-check the macOS code. zig supplies the C headers, and the Objective-C shims are skipped, so nothing links:
+
+```sh
+nix develop -c env SUPERPOSITION_SKIP_NATIVE_SHIMS=1 cargo clippy --workspace --all-targets --target aarch64-apple-darwin
+```
+
+CI (`.github/workflows/ci.yml`) runs doctor, formatting, Clippy, tests, coverage, `cargo-deny`, and `cargo-audit` on macOS. On Linux, it runs doctor, formatting, the NixOS module check, Clippy for Linux and macOS, the tests, the JACK test, and the Wine check. Live timing needs real audio hardware and does not run in CI.
 
 ## Documentation
 

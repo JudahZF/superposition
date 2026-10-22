@@ -2,7 +2,9 @@
 //!
 //! The parent only discovers canonical bundle paths, fingerprints bytes, and launches one
 //! disposable scanner helper per bundle. Layout inspection and all SDK activity stay inside the
-//! helper, so the application process never loads third-party plug-in code.
+//! helper, so the application process never loads third-party plug-in code. On Linux, Windows
+//! bundles in the shared Wine prefix are scanned the same way by the Windows build of the
+//! scanner under Wine, and the catalog records which platform hosts each plug-in.
 
 use std::{
     env,
@@ -24,6 +26,8 @@ use sp_model::{
     PluginScanOutcome,
 };
 
+use sp_wine::{WineEnvironment, WineLauncher};
+
 use crate::{
     HelperKind, HelperLaunch, ProcessSupervisor, TimedHelperResult,
     catalog::PluginCatalog,
@@ -32,6 +36,8 @@ use crate::{
 
 /// The bounded scanner deadline used when a deployment does not provide one.
 pub const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+/// A Windows scan also starts a Wine process, so it gets a longer deadline.
+const WINDOWS_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SCAN_REPORT_BYTES: u64 = 4 * 1024 * 1024;
 static NEXT_REPORT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -51,6 +57,17 @@ pub type ScanStatus = PluginScanOutcome;
 /// Compatibility alias for the persistent, versioned plug-in catalog.
 pub type ScanCache = PluginCatalog;
 
+/// Which build of the worker hosts a plug-in.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginPlatform {
+    /// The host's own platform: a macOS or Linux bundle.
+    #[default]
+    Native,
+    /// A Windows bundle, hosted by the Windows worker under Wine on Linux.
+    Windows,
+}
+
 /// Persisted outcome for one exact bundle fingerprint.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CachedScan {
@@ -58,6 +75,9 @@ pub struct CachedScan {
     pub bundle: PathBuf,
     /// Fingerprint that produced this result.
     pub fingerprint: BundleFingerprint,
+    /// Which worker build hosts the bundle. Catalogs from before Windows support are native.
+    #[serde(default)]
+    pub platform: PluginPlatform,
     /// Versioned, SDK-free metadata produced by the disposable helper.
     pub metadata: PluginScanMetadata,
 }
@@ -69,14 +89,16 @@ impl CachedScan {
         self.metadata.outcome
     }
 
-    /// Returns whether this exact bundle can launch on Apple Silicon.
+    /// Returns whether this exact bundle has code this host runs natively.
     #[must_use]
     pub fn is_supported(&self) -> bool {
         self.metadata.outcome == PluginScanOutcome::Supported
-            && matches!(
-                self.metadata.architecture,
-                PluginArchitecture::Arm64 | PluginArchitecture::Universal
-            )
+            && match self.metadata.architecture {
+                PluginArchitecture::Universal => true,
+                PluginArchitecture::Arm64 => cfg!(target_arch = "aarch64"),
+                PluginArchitecture::X86_64 => cfg!(target_arch = "x86_64"),
+                PluginArchitecture::Unknown => false,
+            }
     }
 }
 
@@ -87,6 +109,17 @@ pub struct Scanner {
     timeout: Duration,
     catalog: PluginCatalog,
     quarantine: Option<PersistentQuarantine>,
+    windows: Option<WindowsScanner>,
+}
+
+/// The Windows build of the scanner and how it runs under Wine.
+#[derive(Debug)]
+struct WindowsScanner {
+    executable: PathBuf,
+    wine: WineLauncher,
+    /// Plug-ins may open dialogs while they load; those go to the private display.
+    #[cfg(target_os = "linux")]
+    display: Option<crate::DisplayEnvironment>,
 }
 
 impl Scanner {
@@ -100,6 +133,7 @@ impl Scanner {
             timeout,
             catalog,
             quarantine: None,
+            windows: None,
         }
     }
 
@@ -114,6 +148,37 @@ impl Scanner {
     pub fn with_quarantine(mut self, quarantine: PersistentQuarantine) -> Self {
         self.quarantine = Some(quarantine);
         self
+    }
+
+    /// Also scans Windows bundles in `wine`'s VST3 folders, with `executable` (the Windows build
+    /// of the scanner) under Wine. The caller keeps the prefix prepared while it scans.
+    #[must_use]
+    pub fn with_windows_scanner(
+        mut self,
+        executable: impl Into<PathBuf>,
+        wine: WineLauncher,
+    ) -> Self {
+        self.windows = Some(WindowsScanner {
+            executable: executable.into(),
+            wine,
+            #[cfg(target_os = "linux")]
+            display: None,
+        });
+        self
+    }
+
+    /// Gives Windows scans the private display, or none.
+    #[cfg(target_os = "linux")]
+    pub fn set_windows_display(&mut self, display: Option<crate::DisplayEnvironment>) {
+        if let Some(windows) = self.windows.as_mut() {
+            windows.display = display;
+        }
+    }
+
+    /// Whether Windows bundles are scanned.
+    #[must_use]
+    pub const fn scans_windows(&self) -> bool {
+        self.windows.is_some()
     }
 
     /// Returns the persistent catalog.
@@ -148,7 +213,16 @@ impl Scanner {
     /// Returns an error when the bundle cannot be fingerprinted or persistent state cannot be
     /// updated. A scanner launch failure is cached as a `crashed` outcome instead.
     pub fn scan(&mut self, bundle: &Path) -> std::io::Result<CachedScan> {
-        self.scan_inner(bundle, false)
+        self.scan_inner(bundle, PluginPlatform::Native, false)
+    }
+
+    /// Like [`Self::scan`] for a Windows bundle, with the Windows scanner under Wine.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Unsupported` without a Windows scanner, or the errors of [`Self::scan`].
+    pub fn scan_windows(&mut self, bundle: &Path) -> std::io::Result<CachedScan> {
+        self.scan_inner(bundle, PluginPlatform::Windows, false)
     }
 
     /// Invalidates a selected catalog entry and launches a fresh isolated scan.
@@ -157,10 +231,15 @@ impl Scanner {
     ///
     /// Returns an error when the bundle cannot be fingerprinted or state cannot be persisted.
     pub fn rescan(&mut self, bundle: &Path) -> std::io::Result<CachedScan> {
-        self.scan_inner(bundle, true)
+        let platform = fs::canonicalize(bundle)
+            .ok()
+            .and_then(|bundle| self.catalog.get_by_path(&bundle).map(|scan| scan.platform))
+            .unwrap_or_default();
+        self.scan_inner(bundle, platform, true)
     }
 
-    /// Discovers standard VST3 directories and scans each bundle independently.
+    /// Discovers standard VST3 directories, and with a Windows scanner the prefix's Windows VST3
+    /// folders, and scans each bundle independently.
     ///
     /// # Errors
     ///
@@ -170,9 +249,21 @@ impl Scanner {
         &mut self,
         home: Option<&Path>,
     ) -> std::io::Result<Vec<CachedScan>> {
-        discover_vst3_bundles(home)
+        let windows = self
+            .windows
+            .as_ref()
+            .map(|windows| discover_windows_vst3_bundles(&windows.wine.vst3_dirs()))
+            .unwrap_or_default();
+        let native = discover_vst3_bundles(home)
             .into_iter()
-            .map(|bundle| self.scan(&bundle))
+            .map(|bundle| (bundle, PluginPlatform::Native));
+        native
+            .chain(
+                windows
+                    .into_iter()
+                    .map(|bundle| (bundle, PluginPlatform::Windows)),
+            )
+            .map(|(bundle, platform)| self.scan_inner(&bundle, platform, false))
             .collect()
     }
 
@@ -217,39 +308,75 @@ impl Scanner {
         quarantine.clear_all()
     }
 
-    fn scan_inner(&mut self, bundle: &Path, force: bool) -> std::io::Result<CachedScan> {
+    fn scan_inner(
+        &mut self,
+        bundle: &Path,
+        platform: PluginPlatform,
+        force: bool,
+    ) -> std::io::Result<CachedScan> {
         let bundle = fs::canonicalize(bundle)?;
         let fingerprint = fingerprint_bundle(&bundle)?;
         if !force
             && let Some(cached) = self.catalog.get(&bundle, &fingerprint)
             && cached.metadata.version == PLUGIN_SCAN_METADATA_VERSION
+            && cached.platform == platform
         {
             return Ok(cached.clone());
         }
 
         let report_path = TemporaryScanReport::create()?;
-        let launch = HelperLaunch {
-            kind: HelperKind::PluginScanner,
-            executable: self.executable.clone(),
-            arguments: vec![
-                "--bundle".to_owned(),
-                bundle.display().to_string(),
-                "--sdk-enumerate".to_owned(),
-                "--report-path".to_owned(),
-                report_path.path().display().to_string(),
-            ],
+        // The helper names the bundle in its report the way it received it.
+        let path_argument = |path: &Path| match platform {
+            PluginPlatform::Native => path.display().to_string(),
+            PluginPlatform::Windows => WineEnvironment::windows_path(path),
         };
-        let scan = match ProcessSupervisor::new().launch_and_wait_silenced(&launch, self.timeout) {
+        let reported_bundle = PathBuf::from(path_argument(&bundle));
+        let arguments = vec![
+            "--bundle".to_owned(),
+            path_argument(&bundle),
+            "--sdk-enumerate".to_owned(),
+            "--report-path".to_owned(),
+            path_argument(&report_path.path()),
+        ];
+        #[allow(unused_mut, reason = "only Linux gives Windows scans a display")]
+        let mut processes = ProcessSupervisor::new();
+        let (launch, timeout) = match platform {
+            PluginPlatform::Native => (
+                HelperLaunch::native(HelperKind::PluginScanner, &self.executable, arguments),
+                self.timeout,
+            ),
+            PluginPlatform::Windows => {
+                let windows = self.windows.as_ref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "Windows bundles need the Windows scanner and Wine",
+                    )
+                })?;
+                #[cfg(target_os = "linux")]
+                processes.set_display(windows.display.clone());
+                (
+                    HelperLaunch {
+                        kind: HelperKind::PluginScanner,
+                        executable: windows.executable.clone(),
+                        arguments,
+                        wine: Some(windows.wine.clone()),
+                    },
+                    self.timeout.max(WINDOWS_SCAN_TIMEOUT),
+                )
+            }
+        };
+        let mut scan = match processes.launch_and_wait_silenced(&launch, timeout) {
             Ok(result) => {
                 let report = match &result {
                     TimedHelperResult::TimedOut { .. } => None,
                     TimedHelperResult::Exited { .. } => Some(report_path.read_bounded()),
                 };
-                map_scan(bundle, fingerprint, &result, report)
+                map_scan(bundle, &reported_bundle, fingerprint, &result, report)
             }
             Err(error) => CachedScan {
                 bundle,
                 fingerprint,
+                platform,
                 metadata: metadata_with_detail(
                     PluginArchitecture::Unknown,
                     PluginScanOutcome::Crashed,
@@ -257,6 +384,7 @@ impl Scanner {
                 ),
             },
         };
+        scan.platform = platform;
         self.catalog.insert(scan.clone());
         self.catalog.save()?;
         self.ingest_scan_failure(&scan)?;
@@ -389,7 +517,25 @@ pub fn fingerprint_bundle(bundle: &Path) -> std::io::Result<BundleFingerprint> {
     })
 }
 
-/// Discovers direct VST3 bundle children in the standard user and system macOS locations.
+/// The per-user VST3 folder, relative to `HOME`.
+#[cfg(not(target_os = "linux"))]
+const USER_VST3_DIRECTORY: &str = "Library/Audio/Plug-Ins/VST3";
+#[cfg(target_os = "linux")]
+const USER_VST3_DIRECTORY: &str = ".vst3";
+
+/// Discovers direct Windows VST3 children of `roots`: bundle folders, and the single-file
+/// `.vst3` DLLs that older Windows plug-ins install. Discovery never opens a bundle.
+#[must_use]
+pub fn discover_windows_vst3_bundles(roots: &[PathBuf]) -> Vec<PathBuf> {
+    vst3_children(roots.iter().cloned(), true)
+}
+
+/// Discovers direct VST3 bundle children in the standard user and system locations.
+///
+/// macOS searches `/Library/Audio/Plug-Ins/VST3` and `~/Library/Audio/Plug-Ins/VST3`. Linux
+/// searches each absolute folder in the colon-separated `VST3_PATH` first (`NixOS` profiles keep
+/// plug-ins outside the standard folders), then `~/.vst3`, `/usr/lib/vst3`, and
+/// `/usr/local/lib/vst3`. Symbolic links to bundles are followed.
 ///
 /// Passing `Some(home)` makes user-directory discovery deterministic for functional tests. With
 /// `None`, the current process's `HOME` is used when available. Discovery never opens a bundle.
@@ -398,10 +544,22 @@ pub fn discover_vst3_bundles(home: Option<&Path>) -> Vec<PathBuf> {
     let user_home = home
         .map(Path::to_path_buf)
         .or_else(|| env::var_os("HOME").map(PathBuf::from));
-    let mut roots = vec![PathBuf::from("/Library/Audio/Plug-Ins/VST3")];
-    if let Some(home) = user_home {
-        roots.push(home.join("Library/Audio/Plug-Ins/VST3"));
-    }
+    #[cfg(target_os = "linux")]
+    let roots = linux_vst3_roots(env::var_os("VST3_PATH").as_deref(), user_home.as_deref());
+    #[cfg(not(target_os = "linux"))]
+    let roots = {
+        let mut roots = vec![PathBuf::from("/Library/Audio/Plug-Ins/VST3")];
+        if let Some(home) = user_home {
+            roots.push(home.join(USER_VST3_DIRECTORY));
+        }
+        roots
+    };
+    vst3_children(roots, false)
+}
+
+/// The `.vst3` children of `roots`, canonical, sorted, and deduplicated. Single files count
+/// only when `files` is set.
+fn vst3_children(roots: impl IntoIterator<Item = PathBuf>, files: bool) -> Vec<PathBuf> {
     let mut bundles = roots
         .into_iter()
         .filter_map(|root| fs::read_dir(root).ok())
@@ -412,14 +570,28 @@ pub fn discover_vst3_bundles(home: Option<&Path>) -> Vec<PathBuf> {
                 .extension()
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("vst3"));
-            (extension_is_vst3 && entry.file_type().ok().is_some_and(|kind| kind.is_dir()))
-                .then_some(path)
+            (extension_is_vst3 && (path.is_dir() || files && path.is_file())).then_some(path)
         })
         .filter_map(|path| fs::canonicalize(path).ok())
         .collect::<Vec<_>>();
     bundles.sort();
     bundles.dedup();
     bundles
+}
+
+/// Linux VST3 roots in search order. Relative `VST3_PATH` entries are ignored.
+#[cfg(target_os = "linux")]
+fn linux_vst3_roots(vst3_path: Option<&std::ffi::OsStr>, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = vst3_path
+        .map(|paths| {
+            env::split_paths(paths)
+                .filter(|path| path.is_absolute())
+                .collect()
+        })
+        .unwrap_or_default();
+    roots.extend(home.map(|home| home.join(USER_VST3_DIRECTORY)));
+    roots.extend(["/usr/lib/vst3", "/usr/local/lib/vst3"].map(PathBuf::from));
+    roots
 }
 
 fn collect_regular_files(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
@@ -445,8 +617,10 @@ fn update_modified_time(hasher: &mut Sha256, metadata: &fs::Metadata) {
     }
 }
 
+/// `reported_bundle` is the bundle path as the helper received it.
 fn map_scan(
     bundle: PathBuf,
+    reported_bundle: &Path,
     fingerprint: BundleFingerprint,
     result: &TimedHelperResult,
     report: Option<io::Result<Vec<u8>>>,
@@ -473,7 +647,7 @@ fn map_scan(
                 PluginScanOutcome::InvalidReport,
                 format!("could not read scanner report: {error}"),
             ),
-            Some(Ok(bytes)) => match parse_child_report(&bundle, &bytes) {
+            Some(Ok(bytes)) => match parse_child_report(reported_bundle, &bytes) {
                 Err(detail) => metadata_with_detail(
                     PluginArchitecture::Unknown,
                     PluginScanOutcome::InvalidReport,
@@ -495,6 +669,7 @@ fn map_scan(
     CachedScan {
         bundle,
         fingerprint,
+        platform: PluginPlatform::Native,
         metadata,
     }
 }
@@ -547,7 +722,7 @@ mod tests {
 
     use super::{
         BundleFingerprint, CachedScan, ScanCache, Scanner, TemporaryScanReport,
-        discover_vst3_bundles, fingerprint_bundle, map_scan,
+        USER_VST3_DIRECTORY, discover_vst3_bundles, fingerprint_bundle, map_scan,
     };
     use crate::TimedHelperResult;
 
@@ -591,6 +766,7 @@ mod tests {
         catalog.insert(CachedScan {
             bundle: canonical.clone(),
             fingerprint: fingerprint.clone(),
+            platform: super::PluginPlatform::Native,
             metadata: PluginScanMetadata::new(
                 PluginArchitecture::Arm64,
                 PluginScanOutcome::Supported,
@@ -616,6 +792,7 @@ mod tests {
         catalog.insert(CachedScan {
             bundle: bundle.clone(),
             fingerprint: fingerprint.clone(),
+            platform: super::PluginPlatform::Native,
             metadata: stale,
         });
         catalog.save().expect("save stale catalog");
@@ -698,11 +875,31 @@ mod tests {
     #[test]
     fn discovers_user_directory_without_scanning_a_bundle() {
         let root = temporary_root();
-        let bundle = root.join("Library/Audio/Plug-Ins/VST3/Fixture.vst3");
+        let bundle = root.join(USER_VST3_DIRECTORY).join("Fixture.vst3");
         fs::create_dir_all(&bundle).expect("create test bundle");
         let discovered = discover_vst3_bundles(Some(&root));
         assert!(discovered.contains(&fs::canonicalize(&bundle).expect("canonical bundle")));
         fs::remove_dir_all(root).expect("remove temporary root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_roots_put_vst3_path_overrides_before_standard_folders() {
+        let roots = super::linux_vst3_roots(
+            Some("/nix/profile/lib/vst3:relative/vst3::/opt/vst3".as_ref()),
+            Some("/home/user".as_ref()),
+        );
+        assert_eq!(
+            roots,
+            [
+                "/nix/profile/lib/vst3",
+                "/opt/vst3",
+                "/home/user/.vst3",
+                "/usr/lib/vst3",
+                "/usr/local/lib/vst3",
+            ]
+            .map(PathBuf::from)
+        );
     }
 
     #[cfg(unix)]
@@ -741,6 +938,59 @@ mod tests {
         fs::remove_dir_all(root).expect("remove temporary root");
     }
 
+    /// A Windows scanner that dies is caught, cataloged as Windows, and quarantined exactly like
+    /// a native one. `/bin/sh` stands in for Wine here, so no Windows code runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_crashing_windows_scan_is_quarantined_and_cataloged_as_windows() {
+        use crate::{PersistentQuarantine, PluginPlatform};
+        use sp_wine::WineLauncher;
+
+        let root = temporary_root();
+        let vst3 = root.join("prefix").join(sp_wine::VST3_DIR_IN_PREFIX);
+        let bundle = vst3.join("Crashy.vst3");
+        fs::create_dir_all(bundle.join("Contents/x86_64-win")).expect("create bundle");
+        fs::write(vst3.join("Legacy.vst3"), b"MZ").expect("single-file bundle");
+        let scanner_exe = root.join("sp-plugin-scanner.exe");
+        fs::write(
+            &scanner_exe,
+            "case \"$2\" in Z:\\\\*) exit 3;; *) exit 4;; esac\n",
+        )
+        .expect("fake scanner");
+        let wine = WineLauncher::new("/bin/sh".into(), root.join("prefix"), root.clone());
+        assert_eq!(
+            super::discover_windows_vst3_bundles(&wine.vst3_dirs()).len(),
+            2,
+            "bundle folders and single-file DLLs are both Windows plug-ins"
+        );
+        let catalog = ScanCache::open(root.join("catalog.json")).expect("open catalog");
+        let quarantine =
+            PersistentQuarantine::open(root.join("quarantine.json"), 1).expect("open quarantine");
+        let mut scanner = Scanner::new(root.join("missing"), Duration::from_secs(5), catalog)
+            .with_quarantine(quarantine)
+            .with_windows_scanner(&scanner_exe, wine);
+        let scan = scanner.scan_windows(&bundle).expect("scan under fake Wine");
+        assert_eq!(scan.platform, PluginPlatform::Windows);
+        assert_eq!(scan.outcome(), PluginScanOutcome::Crashed);
+        assert!(
+            scan.metadata
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("code 3"),
+            "the scanner received a Z: path: {:?}",
+            scan.metadata.detail
+        );
+        assert!(
+            scanner
+                .quarantine()
+                .unwrap()
+                .ensure_launch_permitted(&scan.fingerprint)
+                .is_err()
+        );
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
     #[test]
     fn malformed_report_is_rejected() {
         let result = TimedHelperResult::Exited {
@@ -749,6 +999,7 @@ mod tests {
         };
         let scan = map_scan(
             PathBuf::from("/tmp/Example.vst3"),
+            &PathBuf::from("/tmp/Example.vst3"),
             BundleFingerprint {
                 algorithm: "sha256".to_owned(),
                 digest: "example".to_owned(),

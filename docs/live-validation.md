@@ -25,6 +25,115 @@ ValhallaSupermassive, and UADx 1176. Capture comparison through the BlackHole lo
 matched the source at one buffer of delay (256 samples at 64 frames, 128 at 32).
 That is the virtual loop's delay, not a physical round-trip latency.
 
+## Linux software rig (22 October 2026)
+
+No Linux audio hardware has been tested yet, so these are software results only. Setup:
+
+- x86_64 NixOS, 12 cores, no real-time priority (`RLIMIT_RTPRIO` 0, no rtkit).
+- A private `jackd --no-realtime` dummy server at 48 kHz.
+- One rack with Dragonfly Plate Reverb (Linux VST3).
+- Release build, `superposition --headless … --duration-seconds 30`.
+
+| Block | Machine load | Blocks | Deadline misses |
+| ---: | --- | ---: | ---: |
+| 256 | idle (0.4) | 5 625 | 0 |
+| 128 | idle (0.3) | 11 250 | 0 |
+| 64 | light (1.3) | 22 474 | 6 |
+| 32 | busy (6.0) | 37 622 | 211 |
+| 256 | busy (≈5, parallel builds) | 5 619 | 2 |
+| 256 | overloaded (≈25) | — | repeated misses; the rack gave up after 3 recoveries |
+
+Every miss was a worker that had been woken but not scheduled before the deadline (`unclaimed`),
+or a wake syscall delayed by several milliseconds. Neither is a protocol fault. A single hard miss
+replaces the worker, so on an overloaded system without real-time priority, misses cascade. Below
+128 frames, Linux needs real-time scheduling (see the README).
+
+The same rig ran the desktop UI through `--serve`/`--connect` on Xvfb:
+- device selection, the plug-in scan, adding a rack and plug-in, and starting audio all worked;
+- X programs on the private display appeared as windows in the app and took clicks.
+
+`cargo xtask wine-check` measured futex round trips through `sp_wine_bridge` with a Windows
+client under Wine 11.18: p50 5 µs; p99 1.1 ms while the machine was busy compiling.
+
+The ignored `wine_tests` in the app (debug build, Surge XT Effects for Windows, Dragonfly for
+Linux, 48 kHz, 128 frames) give these results:
+- A Windows rack ran pipelined in the Wine worker for 400 blocks with 0 deadline misses. The
+  rack round trip had a p50 of 45 µs and a p99.9 of 72 µs.
+- A mixed Linux → Wine → Linux rack completed 1 141 blocks with 0 deadline misses. The round
+  trip from host publish to the first segment's completion had a p50 of 111 µs and a p99 of
+  165 µs. When the test killed a segment's worker, only that segment played bypassed, with its
+  latency kept, and its worker was replaced in about 115 ms.
+
+These runs last seconds, not 30 minutes, and do not prove licensed plug-ins (iLok, FabFilter,
+Neural DSP) under Wine.
+
+A test that publishes a planned-restart request from the Windows plug-in in that mixed rack,
+under the product renderer, saw the rack reload live: all three segment workers were replaced,
+and the rack processed on.
+
+### Real-time rig: 30-minute runs (22 October 2026)
+
+Setup:
+- A private PipeWire 1.6 daemon (its own runtime directory, never the desktop's), 48 kHz.
+- A null sink and a `pw-cat` sine source, both marked as physical ports.
+- The app joins through PipeWire's JACK library as `jack:default`.
+- The session has a native Dragonfly rack and a Linux → Wine (Surge XT Effects) → Linux rack.
+- The kernel is the stock NixOS desktop kernel (`PREEMPT_DYNAMIC`, no `threadirqs`, no CPU
+  isolation). `RLIMIT_RTPRIO` is 0, so real-time priority comes from rtkit, at `SCHED_RR` 20.
+- Release build: `superposition --headless … --frames <N> --duration-seconds 1800`.
+
+| Run | Block | Real-time threads | Rack 1 misses | Rack 2 misses | Recoveries | Longest wake |
+| --- | ---: | --- | ---: | ---: | --- | ---: |
+| 1 | 64 | workers only (JACK callback and Wine worker at ordinary priority); other sessions compiling, load about 6 | 14 | 2 | 3 worker replacements, 4 segment bypasses | 5.9 ms |
+| 2 | 64 | JACK callback, three native workers, Wine worker; load under 1 | 8 | 2 | 1 worker replacement, 5 segment bypasses | 0.10 ms |
+| 3 | 128 | as run 2 | 0 | 0 | none | 0.01 ms |
+
+Each rack completed about 1.35 million blocks in runs 1 and 2, and 675 000 in run 3. In run 2, every miss was `unclaimed`: the
+worker was woken but not scheduled within the 1 ms deadline, even at real-time priority. That is
+the stock kernel's scheduling latency, not the protocol. The NixOS module now boots hosts with
+`preempt=full threadirqs`; that change has not been measured, because this machine was not
+rebooted. Zero misses at 64 frames for 30 minutes is not shown on this machine.
+
+Run 1 found two real faults, both fixed before run 2:
+- The first rtkit fallback asked rtkit inside the first block. That D-Bus call missed the
+  deadline, and so did every replacement worker.
+- PipeWire's JACK library logged an rtkit grant for its callback thread that never reached rtkit.
+  The JACK endpoint now asks rtkit for that thread itself, and the host does the same for Wine
+  workers.
+
+At 96 kHz on the same rig, 60 s per block size:
+
+| Block | Deadline | Rack 1 misses | Rack 2 misses |
+| ---: | ---: | ---: | ---: |
+| 128 | 1.0 ms | 0 | 0 |
+| 64 | 0.5 ms | 3 | 0 |
+| 32 | 0.25 ms | 8 | 2 |
+
+On this kernel, the smallest safe block at 96 kHz is 128 frames.
+
+### Linux packages on Debian (22 October 2026)
+
+`cargo xtask bundle-linux` output ran in clean `debian:trixie` containers (glibc 2.41) with
+Debian's `jackd2` (dummy driver, 48 kHz, 128 frames), `xvfb`, and `dragonfly-reverb-vst3`. The
+tarball and the AppImage (with `--appimage-extract-and-run`, as containers have no FUSE) gave
+the same results:
+
+- `--doctor` reported the container's real state: no real-time priority, no `ntsync`, helpers,
+  Xvfb, and the bundled Wine present.
+- `--scan` cataloged Debian's Dragonfly bundles and the Windows Surge XT Effects bundle under
+  the bundled Wine.
+- A session saved on NixOS opened with Debian's own Dragonfly build (rebound by VST3 class ID)
+  and ran 20 s: 7 500 blocks, 0 deadline misses.
+- A session with a Windows Surge XT Effects rack ran 20 s under the bundled Wine: 7 499 blocks,
+  0 deadline misses.
+- The containers have no real-time priority and no system bus. Of 9 repeated 20 s runs of the
+  native session from the final tarball, 7 had 0 misses; 2 had a few misses early in the run,
+  each followed by worker replacements and several seconds of dry fallback.
+
+On `debian:bookworm` (glibc 2.36) both packages started, listed devices, and scanned, but
+Debian 12 ships no VST3 plug-ins, and Nix-built ones need a newer `libstdc++`. These are
+containers on the NixOS host's kernel, not a separate distribution in a VM.
+
 ## Known limits
 
 - Eight racks at 128 frames failed some earlier runs under load. The failed blocks
@@ -63,5 +172,4 @@ SUPERPOSITION_HELPERS_DIR="$PWD/target/release" \
 cargo test --release -p superposition live_save_check -- --ignored --nocapture
 ```
 
-The checks copy the session to `/tmp` and never modify the source. Worker sockets
-need short paths, so keep test directories under `/tmp`, not `$TMPDIR`.
+The checks copy the session to `/tmp` and never modify the source.

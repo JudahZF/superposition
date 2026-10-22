@@ -1,0 +1,228 @@
+//! `SCHED_FIFO` for the processing thread on Linux, or under Wine through `sp_wine_bridge`.
+//! On Linux, rtkit is the fallback when `RLIMIT_RTPRIO` denies it. rtkit answers over D-Bus,
+//! too slowly for a block, so the policy asks it once, when it is created before audio starts,
+//! and the thread keeps rtkit's `SCHED_RR` until it exits.
+
+use std::{io, marker::PhantomData, rc::Rc, sync::Once};
+
+use super::{SchedulingMode, validate_format};
+
+/// Default `SCHED_FIFO` priority. Override with `SUPERPOSITION_RT_PRIORITY` (1–99).
+const DEFAULT_PRIORITY: i32 = 70;
+const EPERM: i32 = 1;
+
+/// Owns the current thread's real-time scheduling state.
+///
+/// Construct, enter, and leave this on the same thread. It cannot be sent to another thread.
+/// `Drop` restores ordinary scheduling if `leave` was not called, unless rtkit granted it.
+pub struct AudioThreadPolicy {
+    active: Option<(u32, u32)>,
+    mode: SchedulingMode,
+    rtkit: Rtkit,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+/// What rtkit did for this thread.
+#[cfg_attr(windows, allow(dead_code, reason = "a Wine worker never asks rtkit"))]
+enum Rtkit {
+    /// Not asked: `SCHED_FIFO` is permitted, or this is a Wine worker, which cannot reach rtkit
+    /// itself (the host asks rtkit for it).
+    NotAsked,
+    /// The thread runs `SCHED_RR` for its lifetime. Lowering it would need rtkit again.
+    Granted,
+    /// rtkit refused or did not answer.
+    Refused(io::Error),
+}
+
+impl AudioThreadPolicy {
+    /// Captures the current thread.
+    ///
+    /// # Errors
+    /// Under Wine, returns `Unsupported` when `sp_wine_bridge.dll` is not loaded.
+    pub fn new() -> io::Result<Self> {
+        #[cfg(windows)]
+        if crate::sys::bridge().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "sp_wine_bridge.dll is required for worker scheduling",
+            ));
+        }
+        #[cfg(windows)]
+        let rtkit = Rtkit::NotAsked;
+        #[cfg(target_os = "linux")]
+        let rtkit = if fifo_permitted() {
+            Rtkit::NotAsked
+        } else {
+            request_from_rtkit(priority()).map_or_else(Rtkit::Refused, |()| Rtkit::Granted)
+        };
+        Ok(Self {
+            active: None,
+            mode: SchedulingMode::RealTime,
+            rtkit,
+            _thread_bound: PhantomData,
+        })
+    }
+
+    /// Applies `SCHED_FIFO` for the given processing format.
+    ///
+    /// Repeated calls with the same format do not reapply the policy.
+    ///
+    /// # Errors
+    /// Returns an error for an unsupported format, for a scheduler failure other than a
+    /// permission denial, or for a denial that rtkit does not lift when
+    /// `SUPERPOSITION_REQUIRE_REALTIME=1`.
+    pub fn enter(&mut self, frames: u32, sample_rate: u32) -> io::Result<()> {
+        validate_format(frames, sample_rate)?;
+        if self.active == Some((frames, sample_rate)) {
+            return Ok(());
+        }
+        if self.mode == SchedulingMode::RealTime && !matches!(self.rtkit, Rtkit::Granted) {
+            match set_fifo(priority()) {
+                0 => {}
+                EPERM if realtime_required() => return Err(io::Error::from_raw_os_error(EPERM)),
+                EPERM => {
+                    self.mode = SchedulingMode::Normal;
+                    warn_normal_scheduling(match &self.rtkit {
+                        Rtkit::Refused(error) => Some(error),
+                        Rtkit::NotAsked | Rtkit::Granted => None,
+                    });
+                }
+                code => return Err(io::Error::from_raw_os_error(code)),
+            }
+        }
+        self.active = Some((frames, sample_rate));
+        Ok(())
+    }
+
+    /// The scheduling this thread received.
+    #[must_use]
+    pub fn mode(&self) -> SchedulingMode {
+        self.mode
+    }
+
+    /// Restores ordinary scheduling after real-time processing. A thread rtkit made real-time
+    /// stays real-time.
+    ///
+    /// # Errors
+    /// Returns an operating-system error if the scheduler rejects the restoration.
+    pub fn leave(&mut self) -> io::Result<()> {
+        if self.active.take().is_some()
+            && self.mode == SchedulingMode::RealTime
+            && !matches!(self.rtkit, Rtkit::Granted)
+        {
+            match set_other() {
+                0 => {}
+                code => return Err(io::Error::from_raw_os_error(code)),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AudioThreadPolicy {
+    fn drop(&mut self) {
+        let _ = self.leave();
+    }
+}
+
+/// The highest `SCHED_FIFO` priority this process may set itself (`RLIMIT_RTPRIO`).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn realtime_priority_limit() -> u64 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid, writable record.
+    if unsafe { libc::getrlimit(libc::RLIMIT_RTPRIO, &raw mut limit) } == 0 {
+        limit.rlim_cur
+    } else {
+        0
+    }
+}
+
+/// The real-time priority Superposition's processing threads use (`SUPERPOSITION_RT_PRIORITY`).
+pub fn priority() -> i32 {
+    std::env::var("SUPERPOSITION_RT_PRIORITY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|priority| (1..=99).contains(priority))
+        .unwrap_or(DEFAULT_PRIORITY)
+}
+
+fn realtime_required() -> bool {
+    std::env::var_os("SUPERPOSITION_REQUIRE_REALTIME").is_some_and(|value| value == "1")
+}
+
+fn warn_normal_scheduling(rtkit_error: Option<&io::Error>) {
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        let rtkit = rtkit_error.map_or_else(String::new, |error| format!("; rtkit: {error}"));
+        eprintln!(
+            "superposition: real-time priority denied (raise RLIMIT_RTPRIO{rtkit}); \
+             the processing thread uses ordinary scheduling"
+        );
+    });
+}
+
+/// Whether the kernel lets this thread set `SCHED_FIFO` at the configured priority itself.
+#[cfg(target_os = "linux")]
+fn fifo_permitted() -> bool {
+    // SAFETY: `geteuid` has no preconditions.
+    let root = unsafe { libc::geteuid() } == 0;
+    root || realtime_priority_limit() >= u64::try_from(priority()).unwrap_or(u64::MAX)
+}
+
+#[cfg(target_os = "linux")]
+fn request_from_rtkit(priority: i32) -> io::Result<()> {
+    let connection = zbus::blocking::Connection::system().map_err(io::Error::other)?;
+    super::rtkit::make_thread_realtime(
+        &connection,
+        std::process::id(),
+        super::rtkit::current_thread_id(),
+        priority,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn set_fifo(priority: i32) -> i32 {
+    let parameter = libc::sched_param {
+        sched_priority: priority,
+    };
+    // SAFETY: `pthread_self` is the calling thread and `parameter` is a valid record.
+    unsafe {
+        libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &raw const parameter)
+    }
+}
+
+/// rtkit sets `SCHED_RESET_ON_FORK`, which an unprivileged thread cannot clear, so it is kept.
+#[cfg(target_os = "linux")]
+fn set_other() -> i32 {
+    // SAFETY: 0 names the calling thread.
+    let current = unsafe { libc::sched_getscheduler(0) };
+    if current < 0 {
+        return io::Error::last_os_error().raw_os_error().unwrap_or(EPERM);
+    }
+    let parameter = libc::sched_param { sched_priority: 0 };
+    let policy = libc::SCHED_OTHER | (current & libc::SCHED_RESET_ON_FORK);
+    // SAFETY: 0 names the calling thread and `parameter` is a valid record.
+    if unsafe { libc::sched_setscheduler(0, policy, &raw const parameter) } == 0 {
+        0
+    } else {
+        io::Error::last_os_error().raw_os_error().unwrap_or(EPERM)
+    }
+}
+
+#[cfg(windows)]
+fn set_fifo(priority: i32) -> i32 {
+    let bridge = crate::sys::bridge().expect("checked in AudioThreadPolicy::new");
+    // SAFETY: the bridge applies the policy to the calling Linux thread.
+    unsafe { (bridge.set_scheduler)(1, priority) }
+}
+
+#[cfg(windows)]
+fn set_other() -> i32 {
+    let bridge = crate::sys::bridge().expect("checked in AudioThreadPolicy::new");
+    // SAFETY: the bridge applies the policy to the calling Linux thread.
+    unsafe { (bridge.set_scheduler)(0, 0) }
+}

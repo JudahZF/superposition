@@ -1,15 +1,18 @@
 //! End-to-end production worker tests.
 //!
 //! These tests exercise the exact surface the application uses: the real `sp-plugin-worker`
-//! binary in `--worker` mode, a real POSIX shared-memory bank, the real Unix-domain control
-//! socket, and — when a supported plug-in is installed — a real VST3 plug-in.
+//! binary in `--worker` mode, a real POSIX shared-memory bank, the real control pipes (the
+//! worker's stdin and stdout), and — when a supported plug-in is installed — a real VST3 plug-in. On Linux the
+//! worker never sees the desktop's display; the editor test starts a private Xvfb display.
 //!
 //! Plug-in discovery order:
 //! 1. `SUPERPOSITION_TEST_VST3` (bundle path) with optional `SUPERPOSITION_TEST_VST3_CLASS`.
 //! 2. A small allowlist of well-behaved free plug-ins under the standard VST3 directories.
 //!
 //! Every test that needs a plug-in skips silently when none is available, mirroring the
-//! repository's other environment-gated tests.
+//! repository's other environment-gated tests. On NixOS, build the plug-in from the dev
+//! shell's nixpkgs (`nix build --inputs-from . nixpkgs#dragonfly-reverb`): a plug-in linked
+//! against a newer glibc than the worker's does not load.
 
 use std::{
     io::Read,
@@ -32,7 +35,12 @@ use sp_protocol::{
         RackTopology,
     },
 };
-use sp_shared_memory_macos::{MonotonicClock, SharedMemoryRegion};
+use sp_shared_memory_os::{MonotonicClock, SharedMemoryRegion};
+
+#[cfg(target_os = "linux")]
+mod common;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use sp_supervisor::EditorPreviewPoll;
 use sp_supervisor::{PluginCatalog, Scanner, WorkerControlClient};
 
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -43,12 +51,15 @@ const RACK_GENERATION: u64 = 1;
 
 /// Well-behaved free plug-ins used when no explicit test bundle is selected. Every candidate
 /// is described in an isolated scanner helper, never in the test process.
+#[cfg(not(target_os = "linux"))]
 const KNOWN_SIMPLE_PLUGINS: &[&str] = &[
     "ValhallaSupermassive.vst3",
     "ValhallaFreqEcho.vst3",
     "ValhallaSpaceModulator.vst3",
     "FetDrive.vst3",
 ];
+#[cfg(target_os = "linux")]
+const KNOWN_SIMPLE_PLUGINS: &[&str] = &["DragonflyPlateReverb.vst3", "DragonflyRoomReverb.vst3"];
 
 #[derive(Clone)]
 struct TestPlugin {
@@ -60,11 +71,22 @@ struct TestPlugin {
     writable_parameters: Vec<u32>,
 }
 
+#[cfg(not(target_os = "linux"))]
 fn plugin_directories() -> Vec<PathBuf> {
     let mut directories = vec![PathBuf::from("/Library/Audio/Plug-Ins/VST3")];
     if let Some(home) = std::env::var_os("HOME") {
         directories.push(PathBuf::from(home).join("Library/Audio/Plug-Ins/VST3"));
     }
+    directories
+}
+
+#[cfg(target_os = "linux")]
+fn plugin_directories() -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        directories.push(PathBuf::from(home).join(".vst3"));
+    }
+    directories.extend(["/usr/lib/vst3", "/usr/local/lib/vst3"].map(PathBuf::from));
     directories
 }
 
@@ -227,8 +249,9 @@ fn continuous_writable_parameter(
     Ok(None)
 }
 
-/// Uses the same shared Darwin monotonic clock as the worker; timestamps from any other
-/// clock domain are rejected by the shared-memory protocol as out of order.
+/// Uses the same shared monotonic clock as the worker (Darwin continuous time or Linux
+/// `CLOCK_MONOTONIC`); timestamps from any other clock domain are rejected by the
+/// shared-memory protocol as out of order.
 fn now_tick() -> u64 {
     MonotonicClock::new().expect("timebase").now_ticks().max(1)
 }
@@ -238,18 +261,31 @@ struct WorkerHarness {
     child: Child,
     region: SharedMemoryRegion,
     client: WorkerControlClient,
-    socket: PathBuf,
 }
 
 impl WorkerHarness {
     /// Launches the deployed worker exactly as the application does and completes the same
-    /// connect-then-initial-health handshake.
+    /// initial health handshake over its control pipes.
     fn launch(plugin: &TestPlugin) -> Result<Self, String> {
+        Self::launch_with(plugin, |_| {})
+    }
+
+    /// Launches like [`Self::launch`] after `configure` adjusts the worker command.
+    fn launch_with(
+        plugin: &TestPlugin,
+        configure: impl FnOnce(&mut Command),
+    ) -> Result<Self, String> {
         let region =
             SharedMemoryRegion::create(BANK_GENERATION).map_err(|error| error.to_string())?;
-        let socket = std::env::temp_dir().join(format!("sp-e2e-{}.sock", unique_suffix()));
-        let _ = std::fs::remove_file(&socket);
-        let child = Command::new(env!("CARGO_BIN_EXE_sp-plugin-worker"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sp-plugin-worker"));
+        // As under the supervisor, plug-ins never reach the desktop's display.
+        #[cfg(target_os = "linux")]
+        command
+            .env_remove("DISPLAY")
+            .env_remove("XAUTHORITY")
+            .env_remove("WAYLAND_DISPLAY");
+        configure(&mut command);
+        let child = command
             .args([
                 "--worker",
                 "--bank",
@@ -264,37 +300,30 @@ impl WorkerHarness {
                 "0",
                 "--bank-generation",
                 &BANK_GENERATION.to_string(),
-                "--control-socket",
-                &socket.display().to_string(),
+                "--sample-rate",
+                "48000",
                 "--bundle",
                 &plugin.bundle.display().to_string(),
                 "--class-id",
                 &plugin.class_id,
             ])
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("could not spawn worker: {error}"))?;
-        let client = match connect_with_retry(&socket) {
-            Ok(client) => client,
-            Err(error) => {
-                let mut child = child;
-                let _ = child.kill();
-                let status = child.wait();
-                let mut stderr = String::new();
-                if let Some(output) = child.stderr.as_mut() {
-                    let _ = output.read_to_string(&mut stderr);
-                }
-                let _ = std::fs::remove_file(&socket);
-                return Err(format!("{error}; worker status {status:?}; {stderr}"));
-            }
-        };
+        let mut child = child;
+        let client = WorkerControlClient::from_streams(
+            child.stdin.take().expect("piped stdin"),
+            child.stdout.take().expect("piped stdout"),
+            target(),
+            REQUEST_TIMEOUT,
+        )
+        .map_err(|error| format!("could not attach to worker pipes: {error}"))?;
         let mut harness = Self {
             child,
             region,
             client,
-            socket,
         };
         let health = match harness.request(ControlOperation::QueryHealth, None, &[]) {
             Ok(health) => health,
@@ -479,18 +508,6 @@ impl Drop for WorkerHarness {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.socket);
-    }
-}
-
-fn connect_with_retry(socket: &Path) -> Result<WorkerControlClient, String> {
-    let deadline = Instant::now() + LAUNCH_TIMEOUT;
-    loop {
-        match WorkerControlClient::connect(socket, target(), REQUEST_TIMEOUT) {
-            Ok(client) => return Ok(client),
-            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
-            Err(error) => return Err(format!("could not connect control socket: {error}")),
-        }
     }
 }
 
@@ -758,6 +775,49 @@ fn native_editor_opens_resizes_and_closes_without_stopping_worker() {
         .rebuild_topology(&plugin, &[0])
         .expect("rebuild with real plug-in");
     let slot = slot_identity(0);
+    let opened = open_editor_and_picture(&mut harness, slot);
+    resize_and_close_editor(&mut harness, slot, &opened);
+    harness.shutdown().expect("clean shutdown");
+}
+
+/// The Linux editor path end to end: the worker draws the editor on a private X server while
+/// audio blocks keep flowing, labels its window for the streamer, and pictures it.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "starts a private Xvfb display; set SUPERPOSITION_TEST_VST3 to a plug-in with an editor"]
+fn native_editor_renders_on_the_private_display_while_audio_runs() {
+    let Some(plugin) = discover_plugin() else {
+        eprintln!("skipping: no Linux VST3 test plug-in");
+        return;
+    };
+    let display = sp_supervisor::PrivateDisplay::start().expect("start private Xvfb display");
+    let environment = display.environment();
+    let mut harness = WorkerHarness::launch_with(&plugin, |command| {
+        command
+            .env("DISPLAY", &environment.display)
+            .env("XAUTHORITY", &environment.authority);
+    })
+    .expect("launch worker on the private display");
+    harness
+        .rebuild_topology(&plugin, &[0])
+        .expect("rebuild with real plug-in");
+    let slot = slot_identity(0);
+    let opened = open_editor_and_picture(&mut harness, slot);
+    assert_painted(opened.png.as_deref().expect("opened editor is pictured"));
+    for _ in 0..8 {
+        let output = harness
+            .process_block(128, 0.25)
+            .expect("audio block while the editor is open");
+        assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+    common::assert_editor_window_identity(&display, harness.child.id());
+    resize_and_close_editor(&mut harness, slot, &opened);
+    harness.shutdown().expect("clean shutdown");
+}
+
+/// Opens `slot`'s editor at a fixed position and returns its first picture.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn open_editor_and_picture(harness: &mut WorkerHarness, slot: SlotIdentity) -> EditorPreviewPoll {
     let position = EditorPosition {
         left: 120.0,
         top: 160.0,
@@ -768,7 +828,9 @@ fn native_editor_opens_resizes_and_closes_without_stopping_worker() {
             Some(slot),
             &position.encode().expect("valid editor position"),
         )
-        .expect("attach native editor");
+        .unwrap_or_else(|error| {
+            panic!("attach native editor: {error}; {}", harness.drain_output())
+        });
     // The first picture follows the editor's first paint.
     thread::sleep(Duration::from_secs(1));
     let opened = harness
@@ -776,8 +838,7 @@ fn native_editor_opens_resizes_and_closes_without_stopping_worker() {
         .capture_editor_preview(slot, 0)
         .expect("poll opened editor picture");
     assert!(opened.editor_open);
-    let png = opened.png.expect("opened editor is pictured");
-    assert_png_preview(&png);
+    assert_png_preview(opened.png.as_deref().expect("opened editor is pictured"));
     assert!(
         harness
             .client
@@ -786,6 +847,16 @@ fn native_editor_opens_resizes_and_closes_without_stopping_worker() {
             .png
             .is_none()
     );
+    opened
+}
+
+/// Resizes and closes `slot`'s editor, then checks the closing picture and the worker.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn resize_and_close_editor(
+    harness: &mut WorkerHarness,
+    slot: SlotIdentity,
+    opened: &EditorPreviewPoll,
+) {
     let geometry = EditorGeometry {
         width: 900,
         height: 600,
@@ -813,7 +884,23 @@ fn native_editor_opens_resizes_and_closes_without_stopping_worker() {
     harness
         .request_ok(ControlOperation::QueryHealth, None, &[])
         .expect("worker remains healthy after editor close");
-    harness.shutdown().expect("clean shutdown");
+}
+
+/// A picture of more than one colour shows the plug-in drew into its window: X11 editors draw
+/// only while the worker services their run loop.
+#[cfg(target_os = "linux")]
+fn assert_painted(png: &[u8]) {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(png))
+        .read_info()
+        .expect("PNG header");
+    let mut pixels = vec![0; reader.output_buffer_size().expect("PNG size")];
+    let frame = reader.next_frame(&mut pixels).expect("PNG pixels");
+    let pixels = &pixels[..frame.buffer_size()];
+    let first = &pixels[..3];
+    assert!(
+        pixels.chunks_exact(3).any(|pixel| pixel != first),
+        "the editor picture is one flat colour; the plug-in did not draw"
+    );
 }
 
 /// Editor pictures are 320×200 PNGs.

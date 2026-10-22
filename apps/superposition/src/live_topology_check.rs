@@ -7,8 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::platform_audio::{PlatformAudioEndpoint, enumerate_devices};
+use sp_audio_io::ProductTelemetry;
 use sp_audio_io::{AudioEndpoint, AudioFormat, AudioRouteConfig};
-use sp_audio_io_macos::{MacOsAudioEndpoint, ProductTelemetry, enumerate_devices};
 use sp_model::{PhysicalChannels, RackChannelRoute, RackId};
 use sp_session::SessionController;
 
@@ -113,7 +114,7 @@ fn rack_edits_keep_other_racks_playing() {
     let mut control = prepared.control;
     let _mapping_publisher = prepared.mapping_publisher;
     let mut endpoint =
-        MacOsAudioEndpoint::with_renderer(prepared.renderer).allow_device_reconfiguration();
+        PlatformAudioEndpoint::with_renderer(prepared.renderer).allow_device_reconfiguration();
     endpoint
         .start_route(AudioRouteConfig {
             input: Some(device.info.id.clone()),

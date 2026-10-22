@@ -1,18 +1,23 @@
 //! Process supervision for isolated helper binaries.
 
 mod catalog;
+#[cfg(target_os = "linux")]
+mod private_display;
 mod quarantine;
 mod scanner;
 mod worker_control;
 
 pub use catalog::{CATALOG_SCHEMA_VERSION, PluginCatalog};
+#[cfg(target_os = "linux")]
+pub use private_display::{DisplayEnvironment, PrivateDisplay};
 pub use quarantine::{
     PersistentQuarantine, PluginFailureKind, QuarantineRecord, QuarantineTable, QuarantinedPlugin,
 };
 pub use scanner::{
-    BundleFingerprint, CachedScan, ScanCache, ScanDescriptor, ScanStatus, Scanner,
-    discover_vst3_bundles, fingerprint_bundle,
+    BundleFingerprint, CachedScan, PluginPlatform, ScanCache, ScanDescriptor, ScanStatus, Scanner,
+    discover_vst3_bundles, discover_windows_vst3_bundles, fingerprint_bundle,
 };
+pub use sp_wine::WineLauncher;
 pub use worker_control::{
     EditorPreviewPoll, WorkerControlClient, WorkerControlError, WorkerControlLaunch,
     WorkerControlSession,
@@ -22,7 +27,7 @@ use std::{
     collections::HashMap,
     io::{Read, Write},
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -59,9 +64,26 @@ pub struct HelperLaunch {
     pub executable: PathBuf,
     /// Arguments passed without shell expansion.
     pub arguments: Vec<String>,
+    /// Runs `executable`, the Windows build of the helper, under Wine.
+    pub wine: Option<WineLauncher>,
 }
 
 impl HelperLaunch {
+    /// A helper that runs natively.
+    #[must_use]
+    pub fn native(
+        kind: HelperKind,
+        executable: impl Into<PathBuf>,
+        arguments: Vec<String>,
+    ) -> Self {
+        Self {
+            kind,
+            executable: executable.into(),
+            arguments,
+            wine: None,
+        }
+    }
+
     /// Validates that a control-plane launch targets its dedicated deployed helper.
     ///
     /// The generic process supervisor also serves development tooling, so this check is
@@ -73,7 +95,8 @@ impl HelperLaunch {
     /// # Errors
     ///
     /// Returns `InvalidInput` unless `executable` is an absolute path whose filename exactly
-    /// matches the selected helper role.
+    /// matches the selected helper role: `sp-plugin-worker` natively, `sp-plugin-worker.exe`
+    /// under Wine.
     pub fn validate_helper_only(&self) -> std::io::Result<()> {
         if !self.executable.is_absolute() {
             return Err(std::io::Error::new(
@@ -81,19 +104,32 @@ impl HelperLaunch {
                 "helper executable must be an absolute deployment path",
             ));
         }
+        let expected = if self.wine.is_some() {
+            format!("{}.exe", self.kind.executable_name())
+        } else {
+            self.kind.executable_name().to_owned()
+        };
         let actual_name = self.executable.file_name().and_then(|name| name.to_str());
-        if actual_name != Some(self.kind.executable_name()) {
+        if actual_name != Some(expected.as_str()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "helper role requires executable `{}`, not `{}`",
-                    self.kind.executable_name(),
+                    "helper role requires executable `{expected}`, not `{}`",
                     self.executable.display()
                 ),
             ));
         }
         Ok(())
     }
+}
+
+/// A worker's control channel: the pipes to its stdin and from its stdout.
+#[derive(Debug)]
+pub struct WorkerPipes {
+    /// Requests go here.
+    pub stdin: ChildStdin,
+    /// Responses come from here.
+    pub stdout: ChildStdout,
 }
 
 /// Observable lifecycle state of a helper process.
@@ -477,6 +513,8 @@ struct ManagedChild {
     launch: HelperLaunch,
     restarts: u32,
     stop_requested: bool,
+    /// Its control pipes belong to a caller, so a replacement would have no reader.
+    piped: bool,
 }
 
 struct PendingRestart {
@@ -494,6 +532,12 @@ pub struct ProcessSupervisor {
     restart_policy: Option<RestartPolicy>,
     shutdown_line: Option<String>,
     shutdown_timeout: Duration,
+    /// Private X server for children on Linux. `None` gives children no display at all.
+    #[cfg(target_os = "linux")]
+    display: Option<DisplayEnvironment>,
+    /// macOS: the socket workers stream their editor windows to, while remote clients watch.
+    #[cfg(target_os = "macos")]
+    editor_stream: Option<std::path::PathBuf>,
 }
 
 impl ProcessSupervisor {
@@ -507,7 +551,52 @@ impl ProcessSupervisor {
             restart_policy: None,
             shutdown_line: None,
             shutdown_timeout: Duration::from_millis(100),
+            #[cfg(target_os = "linux")]
+            display: None,
+            #[cfg(target_os = "macos")]
+            editor_stream: None,
         }
+    }
+
+    /// Points children launched from now on at a private display, or at none.
+    ///
+    /// Children never inherit the user's `DISPLAY`, `XAUTHORITY`, or `WAYLAND_DISPLAY`, so a
+    /// plug-in cannot open a window on the desktop. Pass [`PrivateDisplay::environment`] again
+    /// after the display restarts; running children keep the environment they started with.
+    #[cfg(target_os = "linux")]
+    pub fn set_display(&mut self, display: Option<DisplayEnvironment>) {
+        self.display = display;
+    }
+
+    /// macOS: gives children launched from now on the socket that they stream their editor
+    /// windows to (`sp_window_stream::EDITOR_STREAM_ENV`), or none.
+    #[cfg(target_os = "macos")]
+    pub fn set_editor_stream(&mut self, socket: Option<std::path::PathBuf>) {
+        self.editor_stream = socket;
+    }
+
+    /// Creates a command for `launch` with this supervisor's child environment.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        expect(
+            clippy::unused_self,
+            reason = "only Linux and macOS children get editor-display settings"
+        )
+    )]
+    fn command(&self, launch: &HelperLaunch) -> Command {
+        let mut command = match &launch.wine {
+            Some(wine) => wine.command(&launch.executable),
+            None => Command::new(&launch.executable),
+        };
+        command.args(&launch.arguments);
+        #[cfg(target_os = "linux")]
+        private_display::apply_display(&mut command, self.display.as_ref());
+        #[cfg(target_os = "macos")]
+        match &self.editor_stream {
+            Some(socket) => command.env(sp_window_stream::EDITOR_STREAM_ENV, socket),
+            None => command.env_remove(sp_window_stream::EDITOR_STREAM_ENV),
+        };
+        command
     }
 
     /// Enables replacement launches after unexpected exits.
@@ -537,7 +626,24 @@ impl ProcessSupervisor {
     ///
     /// Returns an error when the executable cannot be spawned.
     pub fn launch(&mut self, launch: &HelperLaunch) -> std::io::Result<u64> {
-        self.launch_child(launch.clone(), 0)
+        self.launch_child(launch.clone(), 0, false)
+            .map(|(process_id, _)| process_id)
+    }
+
+    /// Starts a worker whose stdin and stdout are its control channel, and returns them.
+    /// Its stderr stays inherited. It is never restarted automatically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the executable cannot be spawned.
+    pub fn launch_with_pipes(
+        &mut self,
+        launch: &HelperLaunch,
+    ) -> std::io::Result<(u64, WorkerPipes)> {
+        let (process_id, pipes) = self.launch_child(launch.clone(), 0, true)?;
+        pipes
+            .map(|pipes| (process_id, pipes))
+            .ok_or_else(|| std::io::Error::other("piped launch returned no pipes"))
     }
 
     /// Returns the known state for a process ID.
@@ -681,8 +787,7 @@ impl ProcessSupervisor {
         launch: &HelperLaunch,
         timeout: Duration,
     ) -> std::io::Result<TimedHelperResult> {
-        let mut command = Command::new(&launch.executable);
-        command.args(&launch.arguments);
+        let mut command = self.command(launch);
         command.stdin(Stdio::null());
         command.stdout(Stdio::null());
         command.stderr(Stdio::null());
@@ -722,8 +827,7 @@ impl ProcessSupervisor {
         launch: &HelperLaunch,
         timeout: Duration,
     ) -> std::io::Result<CapturedHelperOutput> {
-        let mut command = Command::new(&launch.executable);
-        command.args(&launch.arguments);
+        let mut command = self.command(launch);
         command.stdin(Stdio::null());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
@@ -793,16 +897,27 @@ impl ProcessSupervisor {
         std::mem::take(&mut self.events)
     }
 
-    fn launch_child(&mut self, launch: HelperLaunch, restarts: u32) -> std::io::Result<u64> {
-        let mut command = Command::new(&launch.executable);
-        command.args(&launch.arguments);
-        command.stdin(if self.shutdown_line.is_some() {
+    fn launch_child(
+        &mut self,
+        launch: HelperLaunch,
+        restarts: u32,
+        piped: bool,
+    ) -> std::io::Result<(u64, Option<WorkerPipes>)> {
+        let mut command = self.command(&launch);
+        command.stdin(if piped || self.shutdown_line.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
         });
-        let child = command.spawn()?;
+        if piped {
+            command.stdout(Stdio::piped());
+        }
+        let mut child = command.spawn()?;
         let process_id = u64::from(child.id());
+        let control = piped
+            .then(|| child.stdin.take().zip(child.stdout.take()))
+            .flatten()
+            .map(|(stdin, stdout)| WorkerPipes { stdin, stdout });
         self.children.insert(
             process_id,
             ManagedChild {
@@ -810,17 +925,21 @@ impl ProcessSupervisor {
                 launch,
                 restarts,
                 stop_requested: false,
+                piped,
             },
         );
         self.statuses.insert(process_id, HelperStatus::Running);
         self.events.push(SupervisorEvent::Started);
-        Ok(process_id)
+        Ok((process_id, control))
     }
 
     fn schedule_restart(&mut self, managed: ManagedChild) {
         let Some(policy) = &self.restart_policy else {
             return;
         };
+        if managed.piped {
+            return;
+        }
         if managed.restarts >= policy.max_restarts {
             self.events.push(SupervisorEvent::RestartExhausted);
             return;
@@ -839,7 +958,10 @@ impl ProcessSupervisor {
         for restart in std::mem::take(&mut self.pending_restarts) {
             if restart.at > now {
                 remaining.push(restart);
-            } else if self.launch_child(restart.launch, restart.restarts).is_err() {
+            } else if self
+                .launch_child(restart.launch, restart.restarts, false)
+                .is_err()
+            {
                 self.events.push(SupervisorEvent::RestartExhausted);
             }
         }
@@ -899,22 +1021,20 @@ mod tests {
     };
 
     fn launch(executable: &str, arguments: &[&str]) -> HelperLaunch {
-        HelperLaunch {
-            kind: HelperKind::PluginWorker,
-            executable: PathBuf::from(executable),
-            arguments: arguments.iter().map(ToString::to_string).collect(),
-        }
+        HelperLaunch::native(
+            HelperKind::PluginWorker,
+            executable,
+            arguments.iter().map(ToString::to_string).collect(),
+        )
     }
 
     #[test]
     fn helper_only_validation_requires_the_deployed_role_binary() {
-        let worker = HelperLaunch {
-            kind: HelperKind::PluginWorker,
-            executable: PathBuf::from(
-                "/Applications/Superposition.app/Contents/Helpers/sp-plugin-worker",
-            ),
-            arguments: Vec::new(),
-        };
+        let worker = HelperLaunch::native(
+            HelperKind::PluginWorker,
+            "/Applications/Superposition.app/Contents/Helpers/sp-plugin-worker",
+            Vec::new(),
+        );
         assert!(worker.validate_helper_only().is_ok());
 
         let relative = HelperLaunch {
@@ -925,9 +1045,16 @@ mod tests {
 
         let mismatched = HelperLaunch {
             kind: HelperKind::PluginScanner,
-            ..worker
+            ..worker.clone()
         };
         assert!(mismatched.validate_helper_only().is_err());
+
+        // A Windows worker runs only as the `.exe` build, and only under Wine.
+        let windows = HelperLaunch {
+            executable: PathBuf::from("/opt/superposition/helpers/windows/sp-plugin-worker.exe"),
+            ..worker
+        };
+        assert!(windows.validate_helper_only().is_err());
     }
 
     #[test]
@@ -953,13 +1080,11 @@ mod tests {
                 &mut processes,
                 0,
                 "rack-0-a",
-                &HelperLaunch {
-                    kind: HelperKind::PluginWorker,
-                    executable: PathBuf::from(
-                        "/Applications/Superposition.app/Contents/Helpers/sp-plugin-worker",
-                    ),
-                    arguments: Vec::new(),
-                },
+                &HelperLaunch::native(
+                    HelperKind::PluginWorker,
+                    "/Applications/Superposition.app/Contents/Helpers/sp-plugin-worker",
+                    Vec::new(),
+                ),
                 None,
                 &fingerprint,
                 &quarantine,

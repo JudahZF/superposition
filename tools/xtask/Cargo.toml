@@ -12,7 +12,7 @@ serde_json.workspace = true
 sha2.workspace = true
 sp-midi = { path = "../../crates/sp-midi" }
 sp-shared-memory = { path = "../../crates/sp-shared-memory" }
-sp-shared-memory-macos = { path = "../../crates/sp-shared-memory-macos" }
+sp-shared-memory-os = { path = "../../crates/sp-shared-memory-os" }
 sp-supervisor = { path = "../../crates/sp-supervisor" }
 
 [lints]
