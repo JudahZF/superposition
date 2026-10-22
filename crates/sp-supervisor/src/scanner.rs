@@ -69,14 +69,16 @@ impl CachedScan {
         self.metadata.outcome
     }
 
-    /// Returns whether this exact bundle can launch on Apple Silicon.
+    /// Returns whether this exact bundle has code this host runs natively.
     #[must_use]
     pub fn is_supported(&self) -> bool {
         self.metadata.outcome == PluginScanOutcome::Supported
-            && matches!(
-                self.metadata.architecture,
-                PluginArchitecture::Arm64 | PluginArchitecture::Universal
-            )
+            && match self.metadata.architecture {
+                PluginArchitecture::Universal => true,
+                PluginArchitecture::Arm64 => cfg!(target_arch = "aarch64"),
+                PluginArchitecture::X86_64 => cfg!(target_arch = "x86_64"),
+                PluginArchitecture::Unknown => false,
+            }
     }
 }
 
