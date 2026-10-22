@@ -38,7 +38,6 @@ fn runtime() -> ProductRuntime {
         PersistentQuarantine::open(support.join("quarantine.json"), 3).expect("empty quarantine");
     let (maintenance_events_tx, maintenance_events_rx) = mpsc::channel();
     ProductRuntime {
-        app_support: support,
         scanner: Scanner::new("/missing/scanner", Duration::from_secs(1), catalog)
             .with_quarantine(quarantine),
         helpers: HelperBinaries {
@@ -46,6 +45,7 @@ fn runtime() -> ProductRuntime {
             worker: PathBuf::from("/missing/worker"),
             #[cfg(target_os = "linux")]
             streamer: None,
+            windows: None,
         },
         processes: ProcessSupervisor::new(),
         workers: BTreeMap::new(),
@@ -58,6 +58,8 @@ fn runtime() -> ProductRuntime {
         cancelled_banks: Vec::new(),
         retiring_workers: Vec::new(),
         sample_rate_hz: 48_000,
+        wine: None,
+        windows_programs: Vec::new(),
         #[cfg(target_os = "linux")]
         editor_display: None,
     }
@@ -73,8 +75,11 @@ fn fake_session(runtime: &mut ProductRuntime, process_id: u64) -> WorkerControlS
         .expect("health response")
         .write_to(&mut health)
         .expect("encode health response");
-    let response = runtime.app_support.join("health.bin");
-    std::fs::create_dir_all(&runtime.app_support).expect("test directory");
+    let response = std::env::temp_dir().join(format!(
+        "sp-maintenance-health-{}-{}",
+        std::process::id(),
+        NEXT_TEST_PATH.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::write(&response, health).expect("write health response");
     let (_, pipes) = runtime
         .processes
@@ -118,7 +123,10 @@ fn fake_session(runtime: &mut ProductRuntime, process_id: u64) -> WorkerControlS
         target,
         timeout: Duration::from_secs(1),
     };
-    WorkerControlSession::attach(process_id, pipes, &launch).expect("fake worker session")
+    let session =
+        WorkerControlSession::attach(process_id, pipes, &launch).expect("fake worker session");
+    let _ = std::fs::remove_file(response);
+    session
 }
 
 fn quiescent_worker(task_id: u64) -> RetainedWorker {
@@ -127,6 +135,8 @@ fn quiescent_worker(task_id: u64) -> RetainedWorker {
     assert!(recovery.mark_quiescent());
     RetainedWorker {
         wire_index: 0,
+        platform: sp_supervisor::PluginPlatform::Native,
+        sample_rate_hz: 48_000,
         fingerprint: BundleFingerprint {
             algorithm: "sha256".to_owned(),
             digest: "test".to_owned(),
@@ -323,6 +333,7 @@ fn reaped_replacement_cannot_be_installed_even_when_ready() {
     maintenance.new_pid = Some(new_pid);
     maintenance.ready = Some(maintenance::Ready {
         launched: LaunchedWorker {
+            platform: worker.platform,
             fingerprint: worker.fingerprint.clone(),
             session,
             parameters: Vec::new(),

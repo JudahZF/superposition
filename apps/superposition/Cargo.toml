@@ -20,6 +20,7 @@ sp-session = { path = "../../crates/sp-session" }
 sp-shared-memory-os = { path = "../../crates/sp-shared-memory-os" }
 sp-supervisor = { path = "../../crates/sp-supervisor" }
 sp-ui = { path = "../../crates/sp-ui" }
+sp-wine = { path = "../../crates/sp-wine" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Reads the system reduced-motion preference; already in the graph through winit.

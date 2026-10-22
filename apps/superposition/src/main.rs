@@ -14,6 +14,8 @@ mod maintenance_tests;
 #[cfg(audio_backend)]
 mod platform_audio;
 mod ui;
+#[cfg(all(test, target_os = "linux", audio_backend))]
+mod wine_tests;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -49,8 +51,10 @@ use sp_shared_memory_os::{
 };
 use sp_supervisor::{
     BundleFingerprint, HelperKind, HelperLaunch, HelperStatus, PersistentQuarantine, PluginCatalog,
-    PluginFailureKind, ProcessSupervisor, Scanner, WorkerControlLaunch, WorkerControlSession,
+    PluginFailureKind, PluginPlatform, ProcessSupervisor, Scanner, WorkerControlLaunch,
+    WorkerControlSession,
 };
+use sp_wine::WineEnvironment;
 
 use ui::LiveRackApp;
 
@@ -136,7 +140,6 @@ impl RestartBudget {
 
 /// Control-plane state owned by the desktop product, never by the audio callback.
 pub(crate) struct ProductRuntime {
-    app_support: PathBuf,
     scanner: Scanner,
     helpers: HelperBinaries,
     processes: ProcessSupervisor,
@@ -153,6 +156,11 @@ pub(crate) struct ProductRuntime {
     retiring_workers: Vec<RetainedWorker>,
     /// The session rate new workers start at. Each worker runs at one rate for its lifetime.
     sample_rate_hz: u32,
+    /// Linux: the shared Wine prefix for Windows plug-ins, when Wine and the Windows helpers are
+    /// installed. Prepared on first use.
+    wine: Option<WineEnvironment>,
+    /// Installers and licence managers started from Setup, reaped as they exit.
+    windows_programs: Vec<std::process::Child>,
     /// Linux: the private display that editors draw on, and its window streamer.
     #[cfg(target_os = "linux")]
     editor_display: Option<editor_display::EditorDisplay>,
@@ -294,12 +302,26 @@ struct HelperBinaries {
     /// Linux: streams the private editor display. Optional: audio runs without it.
     #[cfg(target_os = "linux")]
     streamer: Option<PathBuf>,
+    /// Linux: the Windows helpers and Wine bridge. Optional: native plug-ins run without them.
+    windows: Option<WindowsHelpers>,
+}
+
+/// The Windows builds of the helpers, run under Wine, and the bridge they load. They live in
+/// `<helpers>/windows/` and `<helpers>/wine-bridge/` (`cargo xtask windows-helpers`).
+struct WindowsHelpers {
+    scanner: PathBuf,
+    worker: PathBuf,
+    bridge: PathBuf,
 }
 
 struct RetainedWorker {
     /// Rack index in this worker's control and bank identity. It stays fixed when the rack
     /// moves to another position during a live layout change.
     wire_index: usize,
+    /// Native, or Windows under Wine. A Windows rack is pipelined: it is heard one block late.
+    platform: PluginPlatform,
+    /// The rate the worker was started at; a session at another rate needs a new worker.
+    sample_rate_hz: u32,
     fingerprint: BundleFingerprint,
     /// Both host-side mappings remain alive across alternating worker generations.
     banks: [SharedMemoryRegion; 2],
@@ -410,6 +432,7 @@ impl RetainedWorker {
 }
 
 pub(crate) struct LaunchedWorker {
+    platform: PluginPlatform,
     fingerprint: BundleFingerprint,
     session: WorkerControlSession,
     parameters: Vec<Vec<sp_model::PluginParameterMetadata>>,
@@ -419,6 +442,7 @@ pub(crate) struct LaunchedWorker {
 #[derive(Clone)]
 pub(crate) struct ResolvedSlot {
     bundle: PathBuf,
+    platform: PluginPlatform,
     fingerprint: BundleFingerprint,
     class_id: String,
     parameters: Vec<sp_model::PluginParameterMetadata>,
@@ -435,6 +459,8 @@ pub(crate) struct CatalogPlugin {
     pub(crate) descriptor: sp_model::PluginDescriptor,
     pub(crate) parameters: sp_model::NormalizedParameters,
     pub(crate) sidechain_capable: bool,
+    /// A Windows plug-in, hosted under Wine. A rack holds plug-ins of one platform.
+    pub(crate) windows: bool,
 }
 
 /// A cataloged plug-in this machine cannot load.
@@ -468,8 +494,9 @@ type AudioBankMapping = (
 type StoppedRackOwnership<'a> = dyn Fn(usize, &Arc<RackRecoverySignal>) -> bool + 'a;
 
 impl ProductRuntime {
-    fn open(app_support: PathBuf) -> Result<Self, String> {
-        fs::create_dir_all(&app_support)
+    fn open(app_support: impl AsRef<Path>) -> Result<Self, String> {
+        let app_support = app_support.as_ref();
+        fs::create_dir_all(app_support)
             .map_err(|error| format!("cannot create Application Support state: {error}"))?;
         let catalog = PluginCatalog::open(app_support.join("plugin-catalog.json"))
             .map_err(|error| format!("cannot open plug-in catalog: {error}"))?;
@@ -493,9 +520,20 @@ impl ProductRuntime {
             diagnostics.push("plug-in editors unavailable: sp-window-streamer is missing".into());
             None
         };
-        Ok(Self {
-            scanner: Scanner::with_default_timeout(&helpers.scanner, catalog)
-                .with_quarantine(quarantine),
+        let mut scanner =
+            Scanner::with_default_timeout(&helpers.scanner, catalog).with_quarantine(quarantine);
+        let wine = helpers.windows.as_ref().and_then(|windows| {
+            WineEnvironment::new(app_support, windows.bridge.clone())
+                .map_err(|error| {
+                    diagnostics.push(format!("Windows plug-ins unavailable: {error}"));
+                })
+                .ok()
+        });
+        if let (Some(windows), Some(wine)) = (&helpers.windows, &wine) {
+            scanner = scanner.with_windows_scanner(&windows.scanner, wine.launcher().clone());
+        }
+        let mut runtime = Self {
+            scanner,
             helpers,
             processes,
             workers: BTreeMap::new(),
@@ -508,10 +546,97 @@ impl ProductRuntime {
             cancelled_banks: Vec::new(),
             retiring_workers: Vec::new(),
             sample_rate_hz: sp_audio_io::PRODUCT_SAMPLE_RATE_HZ,
-            app_support,
+            wine,
+            windows_programs: Vec::new(),
             #[cfg(target_os = "linux")]
             editor_display,
-        })
+        };
+        #[cfg(target_os = "linux")]
+        runtime.share_display_with_wine();
+        Ok(runtime)
+    }
+
+    /// Linux: points Windows programs and Windows scans at the editor display.
+    #[cfg(target_os = "linux")]
+    fn share_display_with_wine(&mut self) {
+        let display = self
+            .editor_display
+            .as_ref()
+            .map(editor_display::EditorDisplay::environment);
+        self.scanner.set_windows_display(display.clone());
+        if let Some(wine) = self.wine.as_mut() {
+            wine.set_display(display.map(|display| sp_wine::WineDisplay {
+                display: display.display.into(),
+                authority: display.authority,
+            }));
+        }
+    }
+
+    /// The shared Wine prefix, prepared with a running `wineserver`. The first call creates the
+    /// prefix, which takes a few seconds.
+    fn prepared_wine(&mut self) -> Result<&WineEnvironment, String> {
+        let wine = self.wine.as_mut().ok_or(
+            "Windows plug-ins need Wine and the Windows helpers (`cargo xtask windows-helpers`)",
+        )?;
+        wine.prepare()
+            .map_err(|error| format!("cannot prepare the Wine prefix: {error}"))?;
+        Ok(wine)
+    }
+
+    /// Whether Windows plug-ins and programs can run here.
+    pub(crate) fn windows_available(&self) -> bool {
+        self.wine.is_some()
+    }
+
+    /// Runs a Windows installer or licence manager (`.exe` or `.msi`) in the shared prefix. Its
+    /// windows appear in the editor area through the window streamer. Rescan plug-ins after it
+    /// installs some.
+    pub(crate) fn run_windows_program(&mut self, program: &Path) -> Result<(), String> {
+        let is_windows_program = program.extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("msi")
+        });
+        if !is_windows_program || !program.is_file() {
+            return Err(format!(
+                "{} is not a Windows program (.exe or .msi)",
+                program.display()
+            ));
+        }
+        let child = self
+            .prepared_wine()?
+            .run_program(program)
+            .map_err(|error| error.to_string())?;
+        self.windows_programs.push(child);
+        self.note(format!("started Windows program {}", program.display()));
+        Ok(())
+    }
+
+    /// The session rate that workers start at.
+    pub(crate) fn set_sample_rate(&mut self, sample_rate_hz: u32) {
+        self.sample_rate_hz = sample_rate_hz;
+    }
+
+    /// Sets the session rate and restarts, with their current state, the workers that run at
+    /// another rate. Call it while audio is stopped.
+    pub(crate) fn apply_sample_rate(&mut self, sample_rate_hz: u32) -> Result<(), String> {
+        self.sample_rate_hz = sample_rate_hz;
+        let stale: Vec<usize> = self
+            .workers
+            .iter()
+            .filter(|(_, worker)| worker.sample_rate_hz != sample_rate_hz)
+            .map(|(&rack, _)| rack)
+            .collect();
+        for rack_index in stale {
+            self.capture_rack_states(rack_index)?;
+            let worker = &self.workers[&rack_index];
+            let (rack, states) = (worker.rack.clone(), worker.saved_states.clone());
+            self.load_rack(rack_index, &rack, &states)?;
+            self.note(format!(
+                "rack {} restarted at {} kHz",
+                rack_index + 1,
+                sample_rate_hz / 1_000
+            ));
+        }
+        Ok(())
     }
 
     /// Linux: the socket of the window streamer that shows plug-in editors.
@@ -532,17 +657,26 @@ impl ProductRuntime {
             Ok(false) => {}
             Ok(true) => {
                 self.processes.set_display(Some(display.environment()));
+                // Wine's desktop keeps its display, so Windows workers restart with the server.
+                self.share_display_with_wine();
                 self.note("the editor display restarted; reopen plug-in editors".to_owned());
             }
             Err(error) => {
                 self.editor_display = None;
                 self.processes.set_display(None);
+                self.share_display_with_wine();
                 self.note(format!("plug-in editors unavailable: {error}"));
             }
         }
     }
 
     pub(crate) fn scan_standard_locations(&mut self, full_rescan: bool) -> Result<usize, String> {
+        // A prepared prefix has its VST3 folder and a warm server for the Windows scans.
+        if self.wine.is_some()
+            && let Err(error) = self.prepared_wine()
+        {
+            self.note(error);
+        }
         if full_rescan {
             self.scanner
                 .clear_catalog()
@@ -595,6 +729,7 @@ impl ProductRuntime {
                         },
                         parameters: sp_model::NormalizedParameters { values },
                         sidechain_capable: class.sidechain_capable,
+                        windows: entry.platform == PluginPlatform::Windows,
                     }
                 })
             })
@@ -742,6 +877,8 @@ impl ProductRuntime {
             }
         }
         self.poll_parameter_feedback();
+        self.windows_programs
+            .retain_mut(|program| program.try_wait().ok().flatten().is_none());
         for event in self.processes.reap() {
             self.note(format!("worker process event: {event:?}"));
         }
@@ -1417,6 +1554,8 @@ impl ProductRuntime {
         let restart_cursors = vec![RestartCursor::default(); launched.parameters.len()];
         let worker = RetainedWorker {
             wire_index: rack_index,
+            platform: launched.platform,
+            sample_rate_hz: self.sample_rate_hz,
             fingerprint: launched.fingerprint,
             banks,
             active_bank_index: 0,
@@ -1522,7 +1661,8 @@ impl ProductRuntime {
                             worker.active_bank_index,
                             Arc::clone(&worker.recovery),
                         )
-                        .map_err(|error| format!("cannot prepare rack for audio: {error}"))?,
+                        .map_err(|error| format!("cannot prepare rack for audio: {error}"))?
+                        .with_pipelined(worker.platform == PluginPlatform::Windows),
                     )
                 }
                 _ => LaneWorker::Dry,
@@ -1602,7 +1742,11 @@ impl ProductRuntime {
         };
         if worker.loaded_slots.len() != slots_before
             || !worker.loaded_slots.iter().all(|&loaded| loaded)
+            || candidate
+                .as_ref()
+                .is_some_and(|candidate| candidate.platform != worker.platform)
         {
+            // Another platform's plug-in needs a rebuild, which reports the mixed rack.
             return Ok(false);
         }
         if let Err(error) = worker.apply_slot_edit(rack, edit, candidate) {
@@ -1707,11 +1851,6 @@ impl ProductRuntime {
         suspected_slot: Option<usize>,
     ) -> Result<LaunchedWorker, String> {
         let candidates = self.resolve_rack_slots(rack)?;
-        let first = candidates
-            .iter()
-            .flatten()
-            .next()
-            .ok_or("rack contains no available plug-ins")?;
         for candidate in candidates.iter().flatten() {
             self.scanner.quarantine().expect("product scanner has quarantine")
                 .ensure_launch_permitted(&candidate.fingerprint)
@@ -1724,21 +1863,10 @@ impl ProductRuntime {
                 })?;
         }
         let target = control_target(rack_index, bank_index, generation)?;
-        let launch = WorkerControlLaunch {
-            launch: HelperLaunch::native(
-                HelperKind::PluginWorker,
-                &self.helpers.worker,
-                worker_arguments(
-                    bank.name(),
-                    target,
-                    self.sample_rate_hz,
-                    &first.bundle,
-                    &first.class_id,
-                ),
-            ),
-            target,
-            timeout: CONTROL_TIMEOUT,
-        };
+        let launch = self.worker_launch(rack_index, &candidates, bank.name(), target)?;
+        if launch.launch.wine.is_some() {
+            self.prepared_wine()?;
+        }
         let session = WorkerControlSession::launch(&mut self.processes, &launch)
             .map_err(|error| format!("could not launch rack worker: {error}"))?;
         let process_id = session.process_id();
@@ -2478,11 +2606,13 @@ impl ProductRuntime {
         Ok(())
     }
 
-    /// Opens callback-owned mappings for every retained rack worker before `CoreAudio` starts.
-    /// The worker and callback have separate mappings of the same POSIX objects.
+    /// Opens callback-owned mappings for every retained same-block (native) rack worker before
+    /// audio starts. The worker and callback have separate mappings of the same POSIX objects.
+    /// Pipelined (Windows) racks join through [`Self::pipelined_rack_lanes`].
     pub(crate) fn audio_bank_mappings(&self) -> Result<Vec<AudioBankMapping>, String> {
         self.workers
             .iter()
+            .filter(|(_, worker)| worker.platform == PluginPlatform::Native)
             .map(|(&rack_index, worker)| {
                 if worker.recovery.state() != RackRecoveryState::Idle
                     || worker.maintenance.as_ref().is_some_and(|maintenance| maintenance.failed)
@@ -2508,6 +2638,34 @@ impl ProductRuntime {
                     worker.active_bank_index,
                     Arc::clone(&worker.recovery),
                 ))
+            })
+            .collect()
+    }
+
+    /// Pipelined dispatch lanes for the Windows rack workers, by rack position. The renderer's
+    /// initial banks cannot be pipelined, so audio start adds these with a topology change
+    /// that the first callback applies; each fades in once it delivers three valid blocks.
+    pub(crate) fn pipelined_rack_lanes(
+        &self,
+    ) -> Result<Vec<(usize, sp_audio_io::PreparedRackLane)>, String> {
+        self.workers
+            .iter()
+            .filter(|(_, worker)| worker.platform == PluginPlatform::Windows)
+            .map(|(&rack_index, worker)| {
+                let regions = [
+                    SharedMemoryRegion::open(worker.banks[0].name())
+                        .map_err(|error| format!("cannot map rack bank for audio: {error}"))?,
+                    SharedMemoryRegion::open(worker.banks[1].name())
+                        .map_err(|error| format!("cannot map rack bank for audio: {error}"))?,
+                ];
+                let lane = sp_audio_io::PreparedRackLane::new(
+                    regions,
+                    worker.active_bank_index,
+                    Arc::clone(&worker.recovery),
+                )
+                .map_err(|error| format!("rack {} cannot join audio: {error}", rack_index + 1))?
+                .with_pipelined(true);
+                Ok((rack_index, lane))
             })
             .collect()
     }
@@ -2646,11 +2804,6 @@ impl ProductRuntime {
                 return Err("previous replacement worker has not exited".to_owned());
             }
             let candidates = self.resolve_rack_slots(&worker.rack)?;
-            let first = candidates
-                .iter()
-                .flatten()
-                .next()
-                .ok_or("rack contains no available plug-ins")?;
             for candidate in candidates.iter().flatten() {
                 self.scanner
                     .quarantine()
@@ -2666,21 +2819,7 @@ impl ProductRuntime {
                 .map_err(|error| format!("cannot reset replacement bank: {error}"))?;
             let bank_name = worker.banks[replacement_index].name();
             let target = control_target(worker.wire_index, replacement_index, generation)?;
-            let launch = WorkerControlLaunch {
-                launch: HelperLaunch::native(
-                    HelperKind::PluginWorker,
-                    &self.helpers.worker,
-                    worker_arguments(
-                        bank_name,
-                        target,
-                        self.sample_rate_hz,
-                        &first.bundle,
-                        &first.class_id,
-                    ),
-                ),
-                target,
-                timeout: CONTROL_TIMEOUT,
-            };
+            let launch = self.worker_launch(rack_index, &candidates, bank_name, target)?;
             launch.validate().map_err(|error| error.to_string())?;
             let task_id = self.next_maintenance_task_id;
             self.next_maintenance_task_id = self
@@ -2864,6 +3003,61 @@ impl ProductRuntime {
         }
     }
 
+    /// The launch of a worker for the resolved slots of rack `rack_index`: the native worker, or
+    /// the Windows worker under Wine for a rack of Windows plug-ins.
+    fn worker_launch(
+        &self,
+        rack_index: usize,
+        candidates: &[Option<ResolvedSlot>],
+        bank_name: &str,
+        target: ControlTarget,
+    ) -> Result<WorkerControlLaunch, String> {
+        let first = candidates
+            .iter()
+            .flatten()
+            .next()
+            .ok_or("rack contains no available plug-ins")?;
+        let platform = rack_platform(rack_index, candidates)?;
+        let arguments = worker_arguments(
+            bank_name,
+            target,
+            self.sample_rate_hz,
+            &first.bundle_argument(),
+            &first.class_id,
+        );
+        let launch = match platform {
+            PluginPlatform::Native => {
+                HelperLaunch::native(HelperKind::PluginWorker, &self.helpers.worker, arguments)
+            }
+            PluginPlatform::Windows => {
+                let (Some(windows), Some(wine)) = (&self.helpers.windows, &self.wine) else {
+                    return Err(format!(
+                        "rack {} holds Windows plug-ins, which need Wine and the Windows helpers",
+                        rack_index + 1
+                    ));
+                };
+                HelperLaunch {
+                    kind: HelperKind::PluginWorker,
+                    executable: windows.worker.clone(),
+                    arguments,
+                    wine: Some(wine.launcher().clone()),
+                }
+            }
+        };
+        Ok(WorkerControlLaunch {
+            launch,
+            target,
+            timeout: CONTROL_TIMEOUT,
+        })
+    }
+
+    /// Windows racks run one block late; their result is mixed with the next block.
+    pub(crate) fn rack_is_pipelined(&self, rack_index: usize) -> bool {
+        self.workers
+            .get(&rack_index)
+            .is_some_and(|worker| worker.platform == PluginPlatform::Windows)
+    }
+
     fn resolve_rack_slots(
         &self,
         rack: &sp_model::Rack,
@@ -2899,6 +3093,7 @@ impl ProductRuntime {
                     .map_or(0, |bus| bus.channels);
                 Ok(Some(ResolvedSlot {
                     bundle: entry.bundle.clone(),
+                    platform: entry.platform,
                     fingerprint: entry.fingerprint.clone(),
                     class_id: class.identity.unique_id.clone(),
                     parameters: class.parameters.clone(),
@@ -3065,6 +3260,7 @@ fn configure_worker_session(
         )?;
     }
     Ok(LaunchedWorker {
+        platform: first.platform,
         fingerprint: first.fingerprint.clone(),
         session,
         parameters: candidates
@@ -3089,9 +3285,40 @@ fn wire_slot_configuration(
         output_channels: candidate.output_channels,
         event_input_active: candidate.event_input_active,
         sidechain_active: candidate.sidechain,
-        bundle_path: candidate.bundle.display().to_string(),
+        bundle_path: candidate.bundle_argument(),
         class_id: Some(candidate.class_id.clone()),
     }
+}
+
+impl ResolvedSlot {
+    /// The bundle path as the worker sees it: through Wine's `Z:` drive for a Windows worker.
+    fn bundle_argument(&self) -> String {
+        match self.platform {
+            PluginPlatform::Native => self.bundle.display().to_string(),
+            PluginPlatform::Windows => WineEnvironment::windows_path(&self.bundle),
+        }
+    }
+}
+
+/// The one platform of a rack's plug-ins. Mixed racks need one worker per platform, which a
+/// later phase adds.
+fn rack_platform(
+    rack_index: usize,
+    candidates: &[Option<ResolvedSlot>],
+) -> Result<PluginPlatform, String> {
+    let mut platforms = candidates
+        .iter()
+        .flatten()
+        .map(|candidate| candidate.platform);
+    let first = platforms.next().unwrap_or_default();
+    if platforms.any(|platform| platform != first) {
+        return Err(format!(
+            "rack {} mixes Linux and Windows plug-ins; a rack runs plug-ins of one platform, so \
+             move the Windows plug-ins to a rack of their own",
+            rack_index + 1
+        ));
+    }
+    Ok(first)
 }
 
 fn request_ok(
@@ -3281,11 +3508,21 @@ impl HelperBinaries {
                 return Err(format!("required helper is missing: {}", helper.display()));
             }
         }
+        let windows = WindowsHelpers {
+            scanner: directory.join("windows/sp-plugin-scanner.exe"),
+            worker: directory.join("windows/sp-plugin-worker.exe"),
+            bridge: directory.join("wine-bridge"),
+        };
         Ok(Self {
             #[cfg(target_os = "linux")]
             streamer: Some(directory.join("sp-window-streamer")).filter(|path| path.is_file()),
             scanner,
             worker,
+            // Windows plug-ins run under Wine on Linux only.
+            windows: (cfg!(target_os = "linux")
+                && windows.scanner.is_file()
+                && windows.worker.is_file())
+            .then_some(windows),
         })
     }
 }
@@ -3322,7 +3559,7 @@ fn worker_arguments(
     bank: &str,
     target: ControlTarget,
     sample_rate_hz: u32,
-    bundle: &Path,
+    bundle: &str,
     class_id: &str,
 ) -> Vec<String> {
     vec![
@@ -3342,7 +3579,7 @@ fn worker_arguments(
         "--sample-rate".to_owned(),
         sample_rate_hz.to_string(),
         "--bundle".to_owned(),
-        bundle.display().to_string(),
+        bundle.to_owned(),
         "--class-id".to_owned(),
         class_id.to_owned(),
     ]
@@ -3361,7 +3598,12 @@ fn main() -> eframe::Result<()> {
     let controller = SessionController::open(&session_root)
         .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?;
     let recovery_offered = controller.recovery_offered();
-    let runtime = ProductRuntime::open(default_application_support());
+    let runtime = ProductRuntime::open(default_application_support()).map(|mut runtime| {
+        if let Some(settings) = &controller.document().model.audio_settings {
+            runtime.set_sample_rate(settings.sample_rate_hz);
+        }
+        runtime
+    });
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 720.0])
@@ -3402,8 +3644,9 @@ fn dirs_fallback() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        HeartbeatWatch, ParameterFeedbackCursor, RAPID_RESTART_LIMIT, RestartBudget,
-        editor_response_requires_recovery,
+        BundleFingerprint, HeartbeatWatch, ParameterFeedbackCursor, PluginPlatform,
+        RAPID_RESTART_LIMIT, ResolvedSlot, RestartBudget, editor_response_requires_recovery,
+        rack_platform,
     };
     use sp_model::PluginParameterMetadata;
     use sp_protocol::control::ControlResponseStatus;
@@ -3421,6 +3664,45 @@ mod tests {
         assert!(!first.allows_restart(start + Duration::from_secs(3)));
         assert!(second.allows_restart(start + Duration::from_secs(3)));
         assert!(first.allows_restart(start + Duration::from_secs(10)));
+    }
+
+    fn resolved(bundle: &str, platform: PluginPlatform) -> ResolvedSlot {
+        ResolvedSlot {
+            bundle: bundle.into(),
+            platform,
+            fingerprint: BundleFingerprint {
+                algorithm: "sha256".to_owned(),
+                digest: bundle.to_owned(),
+            },
+            class_id: "class".to_owned(),
+            parameters: Vec::new(),
+            input_channels: 2,
+            output_channels: 2,
+            event_input_active: false,
+            sidechain: false,
+        }
+    }
+
+    /// A rack runs plug-ins of one platform; a Windows rack's worker sees bundles through `Z:`.
+    #[test]
+    fn a_rack_is_native_or_windows_and_never_both() {
+        let windows = resolved("/prefix/VST3/Effect.vst3", PluginPlatform::Windows);
+        let native = resolved("/usr/lib/vst3/Effect.vst3", PluginPlatform::Native);
+        assert_eq!(
+            rack_platform(0, &[Some(windows.clone()), None, Some(windows.clone())]),
+            Ok(PluginPlatform::Windows)
+        );
+        assert_eq!(
+            rack_platform(0, &[None, Some(native.clone())]),
+            Ok(PluginPlatform::Native)
+        );
+        let mixed = rack_platform(2, &[Some(native.clone()), Some(windows.clone())]).unwrap_err();
+        assert!(
+            mixed.contains("rack 3 mixes Linux and Windows plug-ins"),
+            "{mixed}"
+        );
+        assert_eq!(windows.bundle_argument(), "Z:\\prefix\\VST3\\Effect.vst3");
+        assert_eq!(native.bundle_argument(), "/usr/lib/vst3/Effect.vst3");
     }
 
     #[test]

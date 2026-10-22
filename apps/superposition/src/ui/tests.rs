@@ -272,6 +272,7 @@ fn snapshot_fixture() -> (LiveRackApp, egui::Context) {
             descriptor: slot.plugin.clone(),
             parameters: slot.parameters.clone(),
             sidechain_capable: slot.plugin.identity.name.starts_with("Pro-"),
+            windows: false,
         })
         .collect();
     app.catalog_plugins
