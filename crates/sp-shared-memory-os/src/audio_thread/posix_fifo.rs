@@ -98,6 +98,22 @@ impl Drop for AudioThreadPolicy {
     }
 }
 
+/// The highest `SCHED_FIFO` priority this process may set itself (`RLIMIT_RTPRIO`).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn realtime_priority_limit() -> u64 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid, writable record.
+    if unsafe { libc::getrlimit(libc::RLIMIT_RTPRIO, &raw mut limit) } == 0 {
+        limit.rlim_cur
+    } else {
+        0
+    }
+}
+
 fn priority() -> i32 {
     std::env::var("SUPERPOSITION_RT_PRIORITY")
         .ok()

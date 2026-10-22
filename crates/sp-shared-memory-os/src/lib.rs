@@ -12,6 +12,8 @@ mod sys;
 pub use audio_thread::{
     AudioThreadPolicy, SUPPORTED_BLOCK_FRAMES, SUPPORTED_SAMPLE_RATES, SchedulingMode,
 };
+#[cfg(target_os = "linux")]
+pub use audio_thread::{realtime_priority_limit, rtkit_max_priority};
 pub use chain::{ChainLink, Forwarded};
 
 use std::{

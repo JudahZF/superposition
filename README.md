@@ -37,6 +37,8 @@ Windows VST3 plug-ins run in one shared Wine prefix (`<app support>/wine`, or `S
 
 Audio runs through JACK (PipeWire's JACK library works). The server's rate and quantum must match the session, for example `pw-metadata -n settings 0 clock.force-quantum 128`. For real-time scheduling, grant `RLIMIT_RTPRIO` (the NixOS module below does this). Without it, native threads ask rtkit, if it runs; Windows workers under Wine need `RLIMIT_RTPRIO`.
 
+`superposition --doctor` checks these settings (real-time priority, helpers, Xvfb, Wine, and `ntsync`), and the engine prints any that are not met when it starts.
+
 On NixOS, the flake's module applies the system settings: `rtprio` 95 for the `audio` group, rtkit, the `ntsync` driver, the pinned Wine build (`SUPERPOSITION_WINE`), and Xvfb. Add your user to the `audio` group and log in again.
 
 ```nix

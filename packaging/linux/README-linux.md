@@ -1,6 +1,7 @@
 # Superposition for Linux (x86_64)
 
-Run `bin/superposition`. Plug-in editors, Windows plug-ins, and remote serving need nothing else
+Run `bin/superposition`. Run `bin/superposition --doctor` to check the system settings below;
+the engine also prints any unmet setting when it starts. Plug-in editors, Windows plug-ins, and remote serving need nothing else
 from this folder; the system must provide:
 
 - **Audio:** a JACK server (jackd, or PipeWire with its JACK library, `pipewire-jack`). The
@@ -15,8 +16,10 @@ from this folder; the system must provide:
 
 Grant real-time priority, or plug-in racks will miss deadlines on a busy system: add
 `@audio - rtprio 95` and `@audio - memlock unlimited` to `/etc/security/limits.d/audio.conf` and
-add your user to `audio` (on NixOS: `security.pam.loginLimits`). Superposition warns once when
-it runs without real-time priority; `SUPERPOSITION_REQUIRE_REALTIME=1` makes that an error.
+add your user to `audio` (on NixOS: the flake's module). Without the limit, native plug-in
+threads ask rtkit, if it runs, but Windows plug-ins under Wine still need it. Superposition warns
+once when it runs without real-time priority; `SUPERPOSITION_REQUIRE_REALTIME=1` makes that an
+error.
 
 ## Windows plug-ins
 

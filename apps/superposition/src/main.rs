@@ -4,6 +4,8 @@
 //! in the scanner or one retained worker process per rack.
 
 #[cfg(target_os = "linux")]
+mod doctor;
+#[cfg(target_os = "linux")]
 mod editor_display;
 #[cfg(audio_backend)]
 mod engine;
@@ -4138,6 +4140,15 @@ fn worker_arguments(
 
 fn main() -> eframe::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(target_os = "linux")]
+    if arguments.iter().any(|argument| argument == "--doctor") {
+        std::process::exit(doctor::run());
+    }
+    // A remote client needs none of the engine's system settings.
+    #[cfg(target_os = "linux")]
+    if !arguments.iter().any(|argument| argument == "--connect") {
+        doctor::warn_at_start();
+    }
     if remote::is_remote(&arguments) {
         if let Err(error) = remote::run(&arguments) {
             eprintln!("Superposition: {error}");

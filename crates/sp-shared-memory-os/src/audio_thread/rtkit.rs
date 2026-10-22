@@ -43,6 +43,19 @@ pub(super) fn make_current_thread_realtime(
         .map_err(io::Error::other)
 }
 
+/// The highest priority rtkit grants, which also shows that rtkit answers on the system bus.
+///
+/// # Errors
+/// Returns an error when the system bus or rtkit is unreachable.
+pub fn max_priority() -> io::Result<i32> {
+    let connection = Connection::system().map_err(io::Error::other)?;
+    RealtimeKit1Proxy::builder(&connection)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .and_then(|rtkit| rtkit.max_realtime_priority())
+        .map_err(io::Error::other)
+}
+
 /// rtkit refuses a process that could run a real-time thread longer than `max_us` without
 /// blocking. The processing thread blocks every block, so the limit never triggers.
 fn limit_rttime(max_us: i64) -> io::Result<()> {
