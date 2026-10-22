@@ -69,7 +69,7 @@ int superposition_audio_thread_policy_enter(void *opaque, uint32_t frames,
                                             uint32_t sample_rate) {
     SpAudioThreadPolicy *policy = opaque;
     if (policy == NULL || (frames != 32 && frames != 64 && frames != 128 && frames != 256) ||
-        sample_rate != 48000) {
+        (sample_rate != 48000 && sample_rate != 96000)) {
         return EINVAL;
     }
     if (policy->active && policy->active_frames == frames &&

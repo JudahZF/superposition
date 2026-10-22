@@ -7,7 +7,7 @@ members = [
     "crates/sp-model",
     "crates/sp-protocol",
     "crates/sp-shared-memory",
-    "crates/sp-shared-memory-macos",
+    "crates/sp-shared-memory-os",
     "crates/sp-engine",
     "crates/sp-audio-io",
     "crates/sp-audio-io-macos",

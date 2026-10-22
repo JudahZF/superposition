@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sp_shared_memory::{BlockRequest, BlockTicket};
-use sp_shared_memory_macos::{MonotonicClock, SharedMemoryRegion};
+use sp_shared_memory_os::{MonotonicClock, SharedMemoryRegion};
 
 /// Runs HostChecker-oriented validation against the VST3 SDK tree.
 ///

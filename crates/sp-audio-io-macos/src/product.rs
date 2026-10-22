@@ -25,7 +25,7 @@ use sp_model::{
     MAX_RACKS, MAX_SLOTS_PER_RACK, PhysicalChannels, SceneParameterTransition, Session,
 };
 use sp_shared_memory::{BLOCK_EVENT_PARAMETER, BLOCK_EVENT_SLOT_BYPASS, BlockEvent, MidiEvent};
-use sp_shared_memory_macos::{MonotonicClock, RackRecoverySignal, SharedMemoryRegion};
+use sp_shared_memory_os::{MonotonicClock, RackRecoverySignal, SharedMemoryRegion};
 
 use crate::{
     ActiveMultiChannelDuplex, ActiveOutput, BlockFrames, CallbackTelemetry, CoreAudioError,
@@ -2087,7 +2087,7 @@ mod tests {
     use sp_shared_memory::{
         BLOCK_EVENT_PARAMETER, BLOCK_EVENT_SLOT_BYPASS, BlockEvent, MAX_EVENTS,
     };
-    use sp_shared_memory_macos::SharedMemoryRegion;
+    use sp_shared_memory_os::SharedMemoryRegion;
 
     use super::{
         MacOsAudioEndpoint, PreparedProductScene, ProductControl, ProductRenderer,
@@ -2452,7 +2452,7 @@ mod tests {
             .expect("retirement proof");
         assert!(!access.owns(
             0,
-            &std::sync::Arc::new(sp_shared_memory_macos::RackRecoverySignal::new())
+            &std::sync::Arc::new(sp_shared_memory_os::RackRecoverySignal::new())
         ));
         let renderer = endpoint
             .pending_renderer
@@ -2481,7 +2481,7 @@ mod tests {
 
     #[test]
     fn fresh_renderer_preserves_recovered_bank_index_and_rejects_unfinished_handoff() {
-        use sp_shared_memory_macos::{MappedBankLifecycle, RackRecoverySignal, SharedMemoryRegion};
+        use sp_shared_memory_os::{MappedBankLifecycle, RackRecoverySignal, SharedMemoryRegion};
 
         for unfinished in [false, true] {
             let [bank_zero, bank_one] = match [

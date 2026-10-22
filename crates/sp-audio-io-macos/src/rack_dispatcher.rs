@@ -17,7 +17,7 @@ use sp_shared_memory::{
     BlockEvent, BlockRequest, BlockTicket, MAX_EVENTS, MAX_MIDI_EVENTS, MAX_RACKS, MidiEvent,
     ProtocolError, SlotState,
 };
-use sp_shared_memory_macos::{
+use sp_shared_memory_os::{
     MappedBankMetadata, MappedRackBanks, MonotonicClock, RackRecoverySignal, RackRecoveryState,
     SharedMemoryRegion,
 };
@@ -1222,7 +1222,7 @@ mod tests {
     };
 
     use sp_shared_memory::{BLOCK_EVENT_PARAMETER, BlockEvent, MAX_RACKS, SlotState};
-    use sp_shared_memory_macos::{
+    use sp_shared_memory_os::{
         MappedBankLifecycle, MappedRackBanks, RackRecoverySignal, RackRecoveryState,
         SharedMemoryRegion,
     };

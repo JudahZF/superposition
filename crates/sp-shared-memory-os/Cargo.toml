@@ -1,5 +1,5 @@
 [package]
-name = "sp-shared-memory-macos"
+name = "sp-shared-memory-os"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,19 @@ repository.workspace = true
 
 [dependencies]
 sp-shared-memory = { path = "../sp-shared-memory" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.186"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+] }
 
 [build-dependencies]
 cc = "1.2.57"

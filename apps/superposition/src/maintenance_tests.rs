@@ -15,7 +15,7 @@ use std::{
 
 use sp_model::{EndpointId, GainDb, Rack, RackId, RackTopology, SourceId};
 use sp_protocol::control::{ControlOperation, ControlResponse, unix::UnixControlServer};
-use sp_shared_memory_macos::{RackRecoverySignal, RackRecoveryState, SharedMemoryRegion};
+use sp_shared_memory_os::{RackRecoverySignal, RackRecoveryState, SharedMemoryRegion};
 use sp_supervisor::{
     BundleFingerprint, HelperKind, HelperLaunch, PersistentQuarantine, PluginCatalog,
     ProcessSupervisor, Scanner, WorkerControlLaunch, WorkerControlSession,

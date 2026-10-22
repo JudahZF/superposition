@@ -39,7 +39,7 @@ use sp_session::{
     CapturedPluginState, EditorPreviewFile, PluginActivationMetadata, PluginActivationState,
     PluginStateMetadata, SessionController,
 };
-use sp_shared_memory_macos::{
+use sp_shared_memory_os::{
     PARAMETER_FEEDBACK_CAPACITY_PER_SLOT, RackRecoverySignal, RackRecoveryState, RestartCursor,
     RestartSnapshot, SharedMemoryRegion, reset_reaped_region,
 };

@@ -36,7 +36,7 @@ use sp_shared_memory::{
     BLOCK_SLOT_COUNT, BlockRequest, BlockSlot, BlockTicket, MAX_PLUGINS_PER_RACK,
     ParameterFeedbackBank, ProtocolError, ProtocolHeader, SharedBank, SlotState,
 };
-use sp_shared_memory_macos::{MonotonicClock, SharedMemoryRegion};
+use sp_shared_memory_os::{MonotonicClock, SharedMemoryRegion};
 use sp_vst3::{Vst3BundlePath, adapter::Vst3ClassSelection};
 #[cfg(feature = "sdk")]
 use std::collections::BTreeMap;
@@ -1147,7 +1147,7 @@ impl EditorHost {
 fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result<(), String> {
     #[cfg(feature = "sdk")]
     {
-        if !sp_shared_memory_macos::request_wake_supported() {
+        if !sp_shared_memory_os::request_wake_supported() {
             return Err("live plug-in workers require macOS 14.4 or later".to_owned());
         }
         let listener = bind_control_listener(&configuration.control_socket)?;
@@ -1431,7 +1431,7 @@ fn run_production_processing_thread(
     retired: &SyncSender<Vst3Facade>,
     shutdown_requested: &AtomicBool,
 ) -> Result<(), String> {
-    let mut audio_policy = sp_shared_memory_macos::AudioThreadPolicy::new()
+    let mut audio_policy = sp_shared_memory_os::AudioThreadPolicy::new()
         .map_err(|error| format!("could not initialize worker scheduling: {error}"))?;
     let mut last_audio = None;
     while !shutdown_requested.load(Ordering::Acquire) {
@@ -1575,7 +1575,7 @@ fn drain_production_commands(
     main_request: &SyncSender<MainThreadRequest>,
     main_response: &Receiver<MainThreadResponse>,
     editor_request: &SyncSender<ControlRequest>,
-    audio_policy: &mut sp_shared_memory_macos::AudioThreadPolicy,
+    audio_policy: &mut sp_shared_memory_os::AudioThreadPolicy,
     clock: MonotonicClock,
 ) -> Result<(), String> {
     let Some(request) = endpoint.try_receive() else {
@@ -1777,7 +1777,7 @@ fn process_production_request(
     clock: MonotonicClock,
     heartbeat: &mut HeartbeatPublisher,
     rack: &mut RackProcessor<Vst3Facade>,
-    audio_policy: &mut sp_shared_memory_macos::AudioThreadPolicy,
+    audio_policy: &mut sp_shared_memory_os::AudioThreadPolicy,
 ) -> Result<RequestProgress, String> {
     let Some(observed_ticket) = requested_ticket(slot)? else {
         return Ok(RequestProgress::Idle);

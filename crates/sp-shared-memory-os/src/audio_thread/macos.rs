@@ -1,6 +1,8 @@
-//! Scoped Mach scheduling for the dedicated, paced plug-in processing thread.
+//! Scoped Mach time-constraint scheduling.
 
 use std::{io, marker::PhantomData, ptr::NonNull, rc::Rc};
+
+use super::{SchedulingMode, validate_format};
 
 unsafe extern "C" {
     fn superposition_audio_thread_policy_new(out: *mut *mut std::ffi::c_void) -> i32;
@@ -52,9 +54,10 @@ impl AudioThreadPolicy {
     /// Repeated calls with the same format do not reapply the Mach policy.
     ///
     /// # Errors
-    /// Returns an error unless the format is 48 kHz with 32, 64, 128, or 256 frames, or Mach rejects
-    /// the policy. Call only on the thread that created this value.
+    /// Returns an error for an unsupported format, or when Mach rejects the policy. Call only on
+    /// the thread that created this value.
     pub fn enter(&mut self, frames: u32, sample_rate: u32) -> io::Result<()> {
+        validate_format(frames, sample_rate)?;
         // SAFETY: the handle is owned by this thread-bound value; the shim validates the format.
         let status = unsafe {
             superposition_audio_thread_policy_enter(self.handle.as_ptr(), frames, sample_rate)
@@ -64,6 +67,12 @@ impl AudioThreadPolicy {
         } else {
             Err(io::Error::from_raw_os_error(status))
         }
+    }
+
+    /// macOS always grants the time constraint or fails.
+    #[must_use]
+    pub fn mode(&self) -> SchedulingMode {
+        SchedulingMode::RealTime
     }
 
     /// Restores ordinary scheduling after real-time processing.
@@ -85,33 +94,5 @@ impl Drop for AudioThreadPolicy {
     fn drop(&mut self) {
         // SAFETY: this is the sole owner of the handle; the shim restores scheduling first.
         unsafe { superposition_audio_thread_policy_destroy(self.handle.as_ptr()) };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::AudioThreadPolicy;
-
-    #[test]
-    fn policy_validates_format_and_restores_the_dedicated_thread() {
-        std::thread::spawn(|| {
-            let mut policy = AudioThreadPolicy::new().expect("thread policy");
-            assert!(policy.enter(127, 48_000).is_err());
-            assert!(policy.enter(128, 44_100).is_err());
-            for frames in [32, 64, 128, 256] {
-                policy.enter(frames, 48_000).expect("time constraint");
-                assert!(
-                    AudioThreadPolicy::new().is_err(),
-                    "a second guard cannot restore this thread's active time constraint"
-                );
-                policy
-                    .enter(frames, 48_000)
-                    .expect("cached time constraint");
-                policy.leave().expect("ordinary scheduling");
-                policy.leave().expect("already ordinary");
-            }
-        })
-        .join()
-        .expect("thread joined");
     }
 }

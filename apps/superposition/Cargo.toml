@@ -17,7 +17,7 @@ sp-midi = { path = "../../crates/sp-midi" }
 sp-model = { path = "../../crates/sp-model" }
 sp-protocol = { path = "../../crates/sp-protocol" }
 sp-session = { path = "../../crates/sp-session" }
-sp-shared-memory-macos = { path = "../../crates/sp-shared-memory-macos" }
+sp-shared-memory-os = { path = "../../crates/sp-shared-memory-os" }
 sp-supervisor = { path = "../../crates/sp-supervisor" }
 sp-ui = { path = "../../crates/sp-ui" }
 

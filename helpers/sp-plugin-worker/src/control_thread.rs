@@ -62,7 +62,7 @@ impl ProcessingControlEndpoint {
 pub struct SocketControlEndpoint {
     commands: Producer<ControlRequest>,
     replies: Consumer<ControlResponse>,
-    request_wake: Option<sp_shared_memory_macos::SharedMemoryRegion>,
+    request_wake: Option<sp_shared_memory_os::SharedMemoryRegion>,
 }
 
 impl SocketControlEndpoint {
@@ -71,7 +71,7 @@ impl SocketControlEndpoint {
     /// # Errors
     /// Returns an error when the live worker bank cannot be mapped.
     pub fn set_request_wake(&mut self, bank_name: &str) -> io::Result<()> {
-        self.request_wake = Some(sp_shared_memory_macos::SharedMemoryRegion::open(bank_name)?);
+        self.request_wake = Some(sp_shared_memory_os::SharedMemoryRegion::open(bank_name)?);
         Ok(())
     }
 }

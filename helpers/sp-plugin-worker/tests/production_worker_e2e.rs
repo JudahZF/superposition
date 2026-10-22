@@ -32,7 +32,7 @@ use sp_protocol::{
         RackTopology,
     },
 };
-use sp_shared_memory_macos::{MonotonicClock, SharedMemoryRegion};
+use sp_shared_memory_os::{MonotonicClock, SharedMemoryRegion};
 use sp_supervisor::{PluginCatalog, Scanner, WorkerControlClient};
 
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);

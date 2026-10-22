@@ -16,7 +16,7 @@ use sp_protocol::{
 use sp_session::{
     CapturedPluginState, PluginActivationMetadata, PluginActivationState, PluginStateMetadata,
 };
-use sp_shared_memory_macos::RackRecoverySignal;
+use sp_shared_memory_os::RackRecoverySignal;
 use sp_supervisor::{WorkerControlLaunch, WorkerControlSession};
 
 use crate::{

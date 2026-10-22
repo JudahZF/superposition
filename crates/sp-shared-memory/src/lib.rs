@@ -3,7 +3,7 @@
 //!
 //! This crate owns `SharedBank` values in aligned `Box` allocations. The allocations
 //! provide stable bank addresses and exercise the exact protocol layout without OS
-//! mapping. The macOS mapping lives in `sp-shared-memory-macos`, preserving
+//! mapping. The macOS mapping lives in `sp-shared-memory-os`, preserving
 //! this crate's platform-neutral, safe state-transition contract. The one unsafe module
 //! initializes the enlarged fixed layout directly on the heap to avoid stack overflow.
 

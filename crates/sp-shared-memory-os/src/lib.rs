@@ -1,17 +1,22 @@
-//! macOS POSIX shared-memory mappings for a fixed [`SharedBank`] layout.
+//! Shared-memory mappings for a fixed [`SharedBank`] layout on macOS, Linux, and Wine.
 //!
 //! This crate maps initialized `SharedBank` bytes. Fixed-bank heap initialization has its
 //! own narrow unsafe boundary in `sp-shared-memory`; protocol state changes remain safe APIs.
+//! The host creates banks on macOS and Linux. A Windows worker running under Wine opens a
+//! Linux host's bank; see the `sys` module.
 
 mod audio_thread;
+mod sys;
 
-pub use audio_thread::AudioThreadPolicy;
+pub use audio_thread::{
+    AudioThreadPolicy, SUPPORTED_BLOCK_FRAMES, SUPPORTED_SAMPLE_RATES, SchedulingMode,
+};
 
 use std::{
     ffi::CString,
     io,
-    mem::{MaybeUninit, size_of},
-    os::raw::{c_char, c_int, c_uint, c_void},
+    mem::size_of,
+    os::raw::c_int,
     ptr::{self, NonNull},
     sync::{
         OnceLock,
@@ -25,63 +30,37 @@ pub use sp_shared_memory::{
     SharedBank,
 };
 
-const O_RDWR: c_int = 0x0002;
-const O_CREAT: c_int = 0x0200;
-const O_EXCL: c_int = 0x0800;
-const SHARED_MEMORY_MODE: c_uint = 0o666;
-const PROT_READ: c_int = 0x01;
-const PROT_WRITE: c_int = 0x02;
-const MAP_SHARED: c_int = 0x0001;
-const MAP_FAILED: *mut c_void = (-1_isize) as *mut c_void;
-
-#[repr(C)]
-struct MachTimebaseInfo {
-    numer: u32,
-    denom: u32,
-}
-
-unsafe extern "C" {
-    fn close(file_descriptor: c_int) -> c_int;
-    fn ftruncate(file_descriptor: c_int, length: i64) -> c_int;
-    fn getpagesize() -> c_int;
-    fn mmap(
-        address: *mut c_void,
-        length: usize,
-        protection: c_int,
-        flags: c_int,
-        file_descriptor: c_int,
-        offset: i64,
-    ) -> *mut c_void;
-    fn munmap(address: *mut c_void, length: usize) -> c_int;
-    fn mach_continuous_time() -> u64;
-    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> c_int;
-    fn superposition_shm_open_create(name: *const c_char, flags: c_int, mode: c_uint) -> c_int;
-    fn superposition_shm_length(file_descriptor: c_int, length: *mut i64) -> c_int;
-    fn superposition_request_wake_supported() -> c_int;
-    fn superposition_notify_request(address: *mut c_void) -> c_int;
-    fn superposition_wait_for_request(
-        address: *mut c_void,
-        observed: u32,
-        timeout_ns: u64,
-    ) -> c_int;
-    fn shm_open(name: *const c_char, flags: c_int) -> c_int;
-    fn shm_unlink(name: *const c_char) -> c_int;
-}
-
 static NEXT_REGION_ID: AtomicU64 = AtomicU64::new(1);
 
 static RUN_NONCE: OnceLock<u32> = OnceLock::new();
 
-/// Whether the running macOS supports process-shared address waits (14.4 or later).
+/// Whether this process can wait on and wake a shared address.
+///
+/// macOS needs 14.4 or later. Linux always can. A Windows worker can only under Wine with
+/// `sp_wine_bridge.dll` installed.
 #[must_use]
 pub fn request_wake_supported() -> bool {
-    // SAFETY: the shim has no arguments or side effects and checks OS availability.
-    unsafe { superposition_request_wake_supported() != 0 }
+    sys::wake_supported()
+}
+
+/// Maps a POSIX bank name to the path a Wine worker opens, such as `Z:\dev\shm\sp-1-2-3`.
+///
+/// # Errors
+///
+/// Returns `InvalidInput` unless `name` is a single-component POSIX name.
+#[cfg(windows)]
+pub fn wine_host_path(name: &str) -> io::Result<String> {
+    let name = CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bank name contains NUL"))?;
+    sys::host_path(&name)
 }
 
 const SHARED_MEMORY_CREATE_ATTEMPTS: usize = 64;
 
-/// Conversion and sampling for Darwin's process-independent continuous clock.
+/// Conversion and sampling for the process-independent clock shared by host and workers.
+///
+/// macOS uses the continuous Mach clock. Linux and Wine workers use `CLOCK_MONOTONIC`
+/// nanoseconds, so a Wine worker's ticks compare directly with its Linux host's.
 ///
 /// Construct this value off the real-time thread. Calling [`Self::now_ticks`] performs
 /// one system clock read and does not allocate or lock.
@@ -92,36 +71,23 @@ pub struct MonotonicClock {
 }
 
 impl MonotonicClock {
-    /// Loads the Darwin timebase used to convert shared raw ticks into durations.
+    /// Loads the timebase used to convert shared raw ticks into durations.
     ///
     /// # Errors
     ///
-    /// Returns an operating-system error when Darwin cannot provide a valid timebase.
+    /// Returns an operating-system error when the platform cannot provide a valid timebase.
     pub fn new() -> io::Result<Self> {
-        let mut info = MaybeUninit::<MachTimebaseInfo>::uninit();
-        // SAFETY: Darwin writes one `MachTimebaseInfo` to the valid out pointer.
-        let status = unsafe { mach_timebase_info(info.as_mut_ptr()) };
-        if status != 0 {
-            return Err(io::Error::other(format!(
-                "mach_timebase_info failed with status {status}"
-            )));
+        let (numer, denom) = sys::clock_timebase()?;
+        if numer == 0 || denom == 0 {
+            return Err(io::Error::other("the platform returned an invalid timebase"));
         }
-        // SAFETY: a zero status documents that Darwin initialized the output record.
-        let info = unsafe { info.assume_init() };
-        if info.numer == 0 || info.denom == 0 {
-            return Err(io::Error::other("Darwin returned an invalid timebase"));
-        }
-        Ok(Self {
-            numer: info.numer,
-            denom: info.denom,
-        })
+        Ok(Self { numer, denom })
     }
 
     /// Captures the current raw tick in the system-wide continuous clock domain.
     #[must_use]
     pub fn now_ticks(self) -> u64 {
-        // SAFETY: `mach_continuous_time` takes no arguments and has no preconditions.
-        unsafe { mach_continuous_time() }
+        sys::clock_now()
     }
 
     /// Converts raw continuous-clock ticks into a saturating duration.
@@ -156,7 +122,8 @@ impl MonotonicClock {
 /// launch handshake without leaking a named shared-memory object.
 pub struct SharedMemoryRegion {
     name: CString,
-    file_descriptor: c_int,
+    /// Dropped after `Drop::drop` unmaps the bank.
+    _object: sys::RawObject,
     bank: NonNull<SharedBank>,
     unlink_on_drop: bool,
 }
@@ -183,19 +150,10 @@ impl SharedMemoryRegion {
         let mut last_collision = None;
         for _ in 0..SHARED_MEMORY_CREATE_ATTEMPTS {
             let name = unique_name()?;
-            // SAFETY: `name` is NUL-terminated, and all flags/mode bits are Darwin POSIX
-            // constants. The returned descriptor is checked before further use.
-            let file_descriptor = unsafe {
-                superposition_shm_open_create(
-                    name.as_ptr(),
-                    O_RDWR | O_CREAT | O_EXCL,
-                    SHARED_MEMORY_MODE,
-                )
+            let error = match sys::create_exclusive(&name) {
+                Ok(object) => return initialize_created_region(&name, object, generation),
+                Err(error) => error,
             };
-            if file_descriptor >= 0 {
-                return initialize_created_region(&name, file_descriptor, generation);
-            }
-            let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::AlreadyExists {
                 return Err(error);
             }
@@ -224,29 +182,15 @@ impl SharedMemoryRegion {
                 "shared-memory name contains NUL",
             )
         })?;
-        // SAFETY: `name` is NUL-terminated and `O_RDWR` is a Darwin POSIX constant.
-        let file_descriptor = unsafe { shm_open(name.as_ptr(), O_RDWR) };
-        if file_descriptor < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let bank = match map_bank(file_descriptor) {
-            Ok(bank) => bank,
-            Err(error) => {
-                // SAFETY: `file_descriptor` is valid and has not been closed.
-                unsafe { close(file_descriptor) };
-                return Err(error);
-            }
-        };
+        let object = sys::open_existing(&name)?;
+        let bank = map_bank(&object)?;
         // SAFETY: the creator publishes a fully initialized `SharedBank` before it
         // starts the worker. This immutable borrow only reads header scalars/atomics.
         if !unsafe { bank.as_ref().is_compatible() }
             || unsafe { bank.as_ref().validate_mapped_contents() }.is_err()
         {
-            // SAFETY: this mapping and descriptor were acquired immediately above.
-            unsafe {
-                munmap(bank.as_ptr().cast(), size_of::<SharedBank>());
-                close(file_descriptor);
-            }
+            // SAFETY: this mapping was acquired immediately above and is not referenced again.
+            unsafe { sys::unmap(bank.cast(), size_of::<SharedBank>()) };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "shared-memory bank is not compatible with this build",
@@ -255,7 +199,7 @@ impl SharedMemoryRegion {
 
         Ok(Self {
             name,
-            file_descriptor,
+            _object: object,
             bank,
             unlink_on_drop: false,
         })
@@ -312,9 +256,8 @@ impl SharedMemoryRegion {
     fn notify_request_status(&self) -> c_int {
         let sequence = &self.bank().header.request_wake_sequence;
         sequence.fetch_add(1, Ordering::Release);
-        // SAFETY: `sequence` is a four-byte aligned atomic in this live MAP_SHARED bank.
-        // The shim never stores through the pointer and makes one shared-address wake call.
-        unsafe { superposition_notify_request(ptr::from_ref(sequence).cast_mut().cast()) }
+        // SAFETY: `sequence` is a four-byte aligned atomic in this live shared bank.
+        unsafe { sys::notify(sequence) }
     }
 
     /// Waits until the wake sequence differs from `observed`, a signal arrives, or time expires.
@@ -334,15 +277,8 @@ impl SharedMemoryRegion {
         }
         let timeout_ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
         let sequence = &self.bank().header.request_wake_sequence;
-        // SAFETY: `sequence` is a four-byte aligned atomic in this live MAP_SHARED bank.
-        // The shim compares it without storing and waits for no longer than `timeout_ns`.
-        let status = unsafe {
-            superposition_wait_for_request(
-                ptr::from_ref(sequence).cast_mut().cast(),
-                observed,
-                timeout_ns,
-            )
-        };
+        // SAFETY: `sequence` is a four-byte aligned atomic in this live shared bank.
+        let status = unsafe { sys::wait(sequence, observed, timeout_ns) };
         if status == 0 {
             Ok(())
         } else {
@@ -400,14 +336,11 @@ impl SharedMemoryRegion {
 
 impl Drop for SharedMemoryRegion {
     fn drop(&mut self) {
-        // SAFETY: this value owns the mapping and descriptor exactly once. POSIX
-        // permits unlinking before other mapping owners close their descriptors.
-        unsafe {
-            munmap(self.bank.as_ptr().cast(), size_of::<SharedBank>());
-            close(self.file_descriptor);
-            if self.unlink_on_drop {
-                shm_unlink(self.name.as_ptr());
-            }
+        // SAFETY: this value owns the mapping exactly once and no borrow outlives `self`.
+        unsafe { sys::unmap(self.bank.cast(), size_of::<SharedBank>()) };
+        // POSIX permits unlinking before other mapping owners close their descriptors.
+        if self.unlink_on_drop {
+            sys::unlink(&self.name);
         }
     }
 }
@@ -945,44 +878,40 @@ impl MappedRackBanks {
 
 fn initialize_created_region(
     name: &CString,
-    file_descriptor: c_int,
+    object: sys::RawObject,
     generation: u64,
 ) -> io::Result<SharedMemoryRegion> {
     let result = (|| {
-        let backing_bytes = backing_bytes_i64()?;
-        // SAFETY: `file_descriptor` is open, and `backing_bytes` is the checked positive,
-        // page-aligned size of the single mapping's backing object.
-        if unsafe { ftruncate(file_descriptor, backing_bytes) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        sys::set_len(&object, backing_bytes_i64()?)?;
         let initialized_bank = SharedBank::new(generation).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("invalid shared-memory bank generation: {error}"),
             )
         })?;
-        let bank = map_bank(file_descriptor)?;
+        let bank = map_bank(&object)?;
         // SAFETY: this new mapping is exclusively owned until this function returns. The boxed
         // bank has every atomic and fixed-layout field initialized, and contains no owned
         // pointers or destructors. Copying avoids a bank-sized stack value.
         unsafe { ptr::copy_nonoverlapping(initialized_bank.as_ref(), bank.as_ptr(), 1) };
-        Ok(SharedMemoryRegion {
-            name: name.clone(),
-            file_descriptor,
-            bank,
-            unlink_on_drop: true,
-        })
+        Ok(bank)
     })();
 
-    if result.is_err() {
-        // SAFETY: this process successfully created both resources under O_EXCL, so this
-        // cleanup cannot unlink an unknown prior owner's object.
-        unsafe {
-            close(file_descriptor);
-            shm_unlink(name.as_ptr());
+    match result {
+        Ok(bank) => Ok(SharedMemoryRegion {
+            name: name.clone(),
+            _object: object,
+            bank,
+            unlink_on_drop: true,
+        }),
+        Err(error) => {
+            // This process created the object under O_EXCL, so this cleanup cannot unlink an
+            // unknown prior owner's object.
+            drop(object);
+            sys::unlink(name);
+            Err(error)
         }
     }
-    result
 }
 
 fn unique_name() -> io::Result<CString> {
@@ -990,8 +919,7 @@ fn unique_name() -> io::Result<CString> {
     let region_id = u32::try_from(region_value & u64::from(u32::MAX))
         .expect("masked region identifier fits u32");
     let run_nonce = *RUN_NONCE.get_or_init(|| {
-        // SAFETY: `mach_continuous_time` takes no arguments and has no preconditions.
-        let ticks = unsafe { mach_continuous_time() };
+        let ticks = sys::clock_now();
         let folded = ticks ^ (ticks >> 32);
         u32::try_from(folded & u64::from(u32::MAX)).expect("masked run nonce fits u32") | 1
     });
@@ -1011,10 +939,9 @@ fn bank_bytes_i64() -> io::Result<i64> {
 
 fn backing_bytes_i64() -> io::Result<i64> {
     let bank_bytes = bank_bytes_i64()?;
-    // SAFETY: `getpagesize` takes no arguments and returns the host VM page size.
-    let page_bytes = i64::from(unsafe { getpagesize() });
+    let page_bytes = sys::page_size();
     if page_bytes <= 0 {
-        return Err(io::Error::other("Darwin returned an invalid VM page size"));
+        return Err(io::Error::other("the platform returned an invalid VM page size"));
     }
     bank_bytes
         .checked_add(page_bytes - 1)
@@ -1022,19 +949,9 @@ fn backing_bytes_i64() -> io::Result<i64> {
         .ok_or_else(|| io::Error::other("shared-memory backing length overflows POSIX length"))
 }
 
-fn shared_memory_length(file_descriptor: c_int) -> io::Result<i64> {
-    let mut length = 0_i64;
-    // SAFETY: `file_descriptor` is open, and `length` points to valid writable storage for
-    // the C shim's `int64_t` result. The shim calls `fstat` and writes only on success.
-    if unsafe { superposition_shm_length(file_descriptor, &raw mut length) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(length)
-}
-
-fn map_bank(file_descriptor: c_int) -> io::Result<NonNull<SharedBank>> {
+fn map_bank(object: &sys::RawObject) -> io::Result<NonNull<SharedBank>> {
     let expected_length = backing_bytes_i64()?;
-    let actual_length = shared_memory_length(file_descriptor)?;
+    let actual_length = sys::len(object)?;
     if actual_length != expected_length {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1043,40 +960,15 @@ fn map_bank(file_descriptor: c_int) -> io::Result<NonNull<SharedBank>> {
             ),
         ));
     }
-
-    // SAFETY: the descriptor is open and `fstat` established that it has exactly the
-    // expected page-rounded backing length, which is at least `SharedBank` before this
-    // fixed-prefix mapping can be dereferenced. POSIX returns either `MAP_FAILED` or a
-    // page-aligned valid mapping.
-    let address = unsafe {
-        mmap(
-            ptr::null_mut(),
-            size_of::<SharedBank>(),
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED,
-            file_descriptor,
-            0,
-        )
-    };
-    if address == MAP_FAILED {
-        return Err(io::Error::last_os_error());
-    }
-    let Some(bank) = NonNull::new(address.cast()) else {
-        // SAFETY: `mmap` returned a non-failed mapping with the exact length above. This
-        // crate cannot represent a null mapping with `NonNull`, so release it before failing.
-        unsafe { munmap(address, size_of::<SharedBank>()) };
-        return Err(io::Error::other("mmap returned null"));
-    };
-    Ok(bank)
+    // The object has exactly the expected page-rounded length, which is at least `SharedBank`.
+    Ok(sys::map(object, size_of::<SharedBank>())?.cast())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MappedBankLifecycle, MappedRackBanks, MonotonicClock, O_CREAT, O_EXCL, O_RDWR,
-        RackRecoverySignal, RackRecoveryState, SHARED_MEMORY_MODE, SharedMemoryRegion, close,
-        ftruncate, generated_name, request_wake_supported, shm_unlink,
-        superposition_shm_open_create,
+        MappedBankLifecycle, MappedRackBanks, MonotonicClock, RackRecoverySignal,
+        RackRecoveryState, SharedMemoryRegion, generated_name, request_wake_supported, sys,
     };
     use sp_shared_memory::{BlockRequest, BlockTicket, SlotState};
     use std::io::{BufRead, Write};
@@ -1293,33 +1185,15 @@ mod tests {
     #[test]
     fn opening_an_undersized_object_returns_invalid_data_before_mapping() {
         let name = generated_name(std::process::id(), 17, 23).unwrap();
-        // SAFETY: the generated name is NUL terminated, all flags are POSIX constants, and
-        // the descriptor is closed and unlinked below regardless of the assertion result.
-        let file_descriptor = unsafe {
-            superposition_shm_open_create(
-                name.as_ptr(),
-                O_RDWR | O_CREAT | O_EXCL,
-                SHARED_MEMORY_MODE,
-            )
-        };
-        assert!(
-            file_descriptor >= 0,
-            "create undersized shared-memory object"
-        );
-
-        // SAFETY: the open descriptor belongs to this test and the positive length makes
-        // the object deliberately smaller than the `SharedBank` mapping length.
-        assert_eq!(unsafe { ftruncate(file_descriptor, 1) }, 0);
+        let object = sys::create_exclusive(&name).expect("create undersized shared-memory object");
+        // A positive length makes the object deliberately smaller than the bank mapping.
+        sys::set_len(&object, 1).unwrap();
         let Err(error) = SharedMemoryRegion::open(name.to_str().unwrap()) else {
             panic!("undersized shared-memory object must be rejected");
         };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-
-        // SAFETY: this test owns the descriptor and O_EXCL-created name exactly once.
-        unsafe {
-            close(file_descriptor);
-            shm_unlink(name.as_ptr());
-        }
+        drop(object);
+        sys::unlink(&name);
     }
 
     #[test]
