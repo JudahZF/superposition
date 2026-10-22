@@ -16,6 +16,7 @@ members = [
     "crates/sp-session",
     "crates/sp-midi",
     "crates/sp-ui",
+    "crates/sp-window-stream",
     "tools/xtask",
 ]
 default-members = ["apps/superposition"]
