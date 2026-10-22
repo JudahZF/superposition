@@ -45,6 +45,8 @@ fn runtime() -> ProductRuntime {
         helpers: HelperBinaries {
             scanner: PathBuf::from("/missing/scanner"),
             worker: PathBuf::from("/missing/worker"),
+            #[cfg(target_os = "linux")]
+            streamer: None,
         },
         processes: ProcessSupervisor::new(),
         workers: BTreeMap::new(),
@@ -56,6 +58,8 @@ fn runtime() -> ProductRuntime {
         next_maintenance_task_id: 1,
         cancelled_banks: Vec::new(),
         retiring_workers: Vec::new(),
+        #[cfg(target_os = "linux")]
+        editor_display: None,
     }
 }
 

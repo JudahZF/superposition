@@ -28,6 +28,7 @@ sp-audio-io-macos = { path = "../../crates/sp-audio-io-macos" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sp-audio-io-linux = { path = "../../crates/sp-audio-io-linux" }
+sp-window-stream = { path = "../../crates/sp-window-stream" }
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dev-dependencies]
 midir = "0.10.1"

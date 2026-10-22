@@ -9,6 +9,8 @@ mod previews;
 mod scenes;
 mod setup;
 mod show;
+#[cfg(target_os = "linux")]
+mod streamed;
 mod style;
 
 pub use style::install_style;
@@ -249,6 +251,9 @@ pub struct LiveRackApp {
     midi_learn_target: Option<MidiMappingTarget>,
     #[cfg(audio_backend)]
     telemetry: Option<std::sync::Arc<ProductTelemetry>>,
+    /// Linux: plug-in editors and Windows programs from the engine's private display.
+    #[cfg(target_os = "linux")]
+    streamed: Option<streamed::StreamedWindows>,
     /// Snapshot fixtures draw racks as if their workers were loaded.
     #[cfg(test)]
     test_workers_running: bool,
@@ -299,6 +304,12 @@ impl LiveRackApp {
         let catalog_plugins = product
             .as_ref()
             .map_or_else(|_| Vec::new(), ProductRuntime::catalog_plugins);
+        #[cfg(target_os = "linux")]
+        let streamed = product
+            .as_ref()
+            .ok()
+            .and_then(ProductRuntime::window_stream_socket)
+            .map(streamed::StreamedWindows::new);
         let status_line = if controller.document().model.racks.is_empty() {
             "No session yet".to_owned()
         } else {
@@ -375,6 +386,8 @@ impl LiveRackApp {
             midi_learn_target: None,
             #[cfg(audio_backend)]
             telemetry: None,
+            #[cfg(target_os = "linux")]
+            streamed,
             #[cfg(test)]
             test_workers_running: false,
         }
@@ -2359,6 +2372,27 @@ impl LiveRackApp {
         true
     }
 
+    /// Linux: draws streamed windows and closes editors the user closed there.
+    #[cfg(target_os = "linux")]
+    fn show_streamed_windows(&mut self, ctx: &egui::Context) {
+        let running = self.online();
+        let Some(streamed) = self.streamed.as_mut() else {
+            return;
+        };
+        let events = streamed.show(ctx);
+        for event in events {
+            match event {
+                streamed::StreamedWindowEvent::CloseEditor { rack, slot } => {
+                    if let Err(error) = self.product_mut().and_then(|product| {
+                        product.set_native_editor_open(rack, slot, false, running)
+                    }) {
+                        self.show_fault(error);
+                    }
+                }
+            }
+        }
+    }
+
     /// Closes one open native editor window. Returns false when none is open.
     fn close_open_editor(&mut self) -> bool {
         let racks = self.controller.document().model.racks.len();
@@ -2634,6 +2668,8 @@ impl LiveRackApp {
             self.update_meters();
         }
         self.poll_previews(ctx);
+        #[cfg(target_os = "linux")]
+        self.show_streamed_windows(ctx);
         self.autosave_if_due(Instant::now());
         ctx.request_repaint_after(
             self.next_autosave_at

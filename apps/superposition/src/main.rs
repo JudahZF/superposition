@@ -3,6 +3,8 @@
 //! All plug-in discovery and hosting is driven from this process, but all third-party code stays
 //! in the scanner or one retained worker process per rack.
 
+#[cfg(target_os = "linux")]
+mod editor_display;
 #[cfg(audio_backend)]
 mod engine;
 mod headless;
@@ -149,6 +151,9 @@ pub(crate) struct ProductRuntime {
     cancelled_banks: Vec<CancelledBanks>,
     /// Workers removed by a live layout change, kept until the callback stops reading them.
     retiring_workers: Vec<RetainedWorker>,
+    /// Linux: the private display that editors draw on, and its window streamer.
+    #[cfg(target_os = "linux")]
+    editor_display: Option<editor_display::EditorDisplay>,
 }
 
 /// How one rack position is produced by a live layout change.
@@ -284,6 +289,9 @@ impl ParameterFeedbackCursor {
 struct HelperBinaries {
     scanner: PathBuf,
     worker: PathBuf,
+    /// Linux: streams the private editor display. Optional: audio runs without it.
+    #[cfg(target_os = "linux")]
+    streamer: Option<PathBuf>,
 }
 
 struct RetainedWorker {
@@ -468,14 +476,29 @@ impl ProductRuntime {
                 .map_err(|error| format!("cannot open plug-in quarantine: {error}"))?;
         let helpers = HelperBinaries::resolve()?;
         let (maintenance_events_tx, maintenance_events_rx) = mpsc::channel();
+        #[allow(unused_mut, reason = "Linux attaches the private editor display")]
+        let mut processes = ProcessSupervisor::new();
+        #[allow(unused_mut, reason = "Linux reports a missing editor display")]
+        let mut diagnostics = Vec::new();
+        #[cfg(target_os = "linux")]
+        let editor_display = if let Some(streamer) = &helpers.streamer {
+            editor_display::runtime_dir()
+                .and_then(|directory| editor_display::EditorDisplay::start(streamer, &directory))
+                .inspect(|display| processes.set_display(Some(display.environment())))
+                .map_err(|error| diagnostics.push(format!("plug-in editors unavailable: {error}")))
+                .ok()
+        } else {
+            diagnostics.push("plug-in editors unavailable: sp-window-streamer is missing".into());
+            None
+        };
         Ok(Self {
             scanner: Scanner::with_default_timeout(&helpers.scanner, catalog)
                 .with_quarantine(quarantine),
             helpers,
-            processes: ProcessSupervisor::new(),
+            processes,
             workers: BTreeMap::new(),
             editor_requests: BTreeSet::new(),
-            diagnostics: Vec::new(),
+            diagnostics,
             pending_parameter_updates: BTreeMap::new(),
             maintenance_events_tx,
             maintenance_events_rx,
@@ -483,7 +506,37 @@ impl ProductRuntime {
             cancelled_banks: Vec::new(),
             retiring_workers: Vec::new(),
             app_support,
+            #[cfg(target_os = "linux")]
+            editor_display,
         })
+    }
+
+    /// Linux: the socket of the window streamer that shows plug-in editors.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn window_stream_socket(&self) -> Option<PathBuf> {
+        self.editor_display
+            .as_ref()
+            .map(|display| display.socket().to_path_buf())
+    }
+
+    /// Linux: restarts the editor display if it died and points new workers at it.
+    #[cfg(target_os = "linux")]
+    fn poll_editor_display(&mut self) {
+        let Some(display) = self.editor_display.as_mut() else {
+            return;
+        };
+        match display.ensure_running() {
+            Ok(false) => {}
+            Ok(true) => {
+                self.processes.set_display(Some(display.environment()));
+                self.note("the editor display restarted; reopen plug-in editors".to_owned());
+            }
+            Err(error) => {
+                self.editor_display = None;
+                self.processes.set_display(None);
+                self.note(format!("plug-in editors unavailable: {error}"));
+            }
+        }
     }
 
     pub(crate) fn scan_standard_locations(&mut self, full_rescan: bool) -> Result<usize, String> {
@@ -669,6 +722,8 @@ impl ProductRuntime {
     }
 
     fn poll_inner(&mut self, stopped_owns: Option<&StoppedRackOwnership<'_>>) {
+        #[cfg(target_os = "linux")]
+        self.poll_editor_display();
         if let Some(owns) = stopped_owns {
             self.service_unattached_recoveries(owns);
         }
@@ -3234,7 +3289,12 @@ impl HelperBinaries {
                 return Err(format!("required helper is missing: {}", helper.display()));
             }
         }
-        Ok(Self { scanner, worker })
+        Ok(Self {
+            #[cfg(target_os = "linux")]
+            streamer: Some(directory.join("sp-window-streamer")).filter(|path| path.is_file()),
+            scanner,
+            worker,
+        })
     }
 }
 

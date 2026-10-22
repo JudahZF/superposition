@@ -1,0 +1,530 @@
+//! Linux: the engine's private X server shown inside the app.
+//!
+//! Plug-in editors, Windows installers, and licence managers draw on the engine-owned Xvfb.
+//! `sp-window-streamer` sends their pixels as lossless tiles; this module keeps one texture per
+//! window, draws each top-level window as an egui window (popups float over their parent), and
+//! sends pointer, wheel, key, and text input back. Because the windows are egui content, a remote
+//! client sees and drives them like the rest of the UI.
+
+use std::{
+    collections::HashMap,
+    io,
+    os::unix::net::UnixStream,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use egui::{Context, Event, Key, Modifiers, PointerButton, Sense, TextureHandle, TextureOptions};
+use sp_window_stream::{
+    ClientMessage, InputEvent, PROTOCOL_VERSION, PointerButton as StreamButton, Role,
+    ScrollAccumulator, ServerMessage, WindowId, WindowInfo, WindowKind, WindowStreamClient,
+    WireMessage, keysym_for_char,
+};
+
+/// Wheel input per notch, in egui points.
+const POINTS_PER_NOTCH: f32 = 40.0;
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A request the app must handle itself.
+pub(crate) enum StreamedWindowEvent {
+    /// The user closed a plug-in editor; close it through its worker.
+    CloseEditor { rack: usize, slot: usize },
+}
+
+struct Connection {
+    writer: UnixStream,
+    state: Arc<Mutex<WindowStreamClient>>,
+    alive: Arc<AtomicBool>,
+}
+
+impl Connection {
+    fn open(socket: &PathBuf, ctx: &Context) -> io::Result<Self> {
+        let mut stream = UnixStream::connect(socket)?;
+        ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            role: Role::Controller,
+            name: "Superposition".into(),
+        }
+        .write_to(&mut stream)
+        .map_err(io::Error::other)?;
+        let state = Arc::new(Mutex::new(WindowStreamClient::new()?));
+        let alive = Arc::new(AtomicBool::new(true));
+        let mut reader = stream.try_clone()?;
+        let reader_state = Arc::clone(&state);
+        let reader_alive = Arc::clone(&alive);
+        let ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("sp-window-stream".into())
+            .spawn(move || {
+                let mut buffer = Vec::new();
+                while let Ok(message) = ServerMessage::read_from(&mut reader, &mut buffer) {
+                    let applied = reader_state
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .apply(&message);
+                    if applied.is_err() {
+                        break;
+                    }
+                    ctx.request_repaint();
+                }
+                reader_alive.store(false, Ordering::Release);
+                ctx.request_repaint();
+            })?;
+        Ok(Self {
+            writer: stream,
+            state,
+            alive,
+        })
+    }
+
+    fn send(&mut self, event: InputEvent) {
+        if ClientMessage::Input(event)
+            .write_to(&mut self.writer)
+            .is_err()
+        {
+            self.alive.store(false, Ordering::Release);
+        }
+    }
+}
+
+struct Shown {
+    info: WindowInfo,
+    size: [usize; 2],
+}
+
+/// The streamed windows of the engine's private display.
+pub(crate) struct StreamedWindows {
+    socket: PathBuf,
+    connection: Option<Connection>,
+    retry_at: Instant,
+    textures: HashMap<WindowId, TextureHandle>,
+    scroll: HashMap<WindowId, ScrollAccumulator>,
+    /// The window under a held pointer button, which keeps receiving the drag.
+    pointer_capture: Option<WindowId>,
+    /// The window that receives keys: the last one clicked.
+    keyboard: Option<WindowId>,
+    modifiers: Modifiers,
+}
+
+impl StreamedWindows {
+    /// Streams from the streamer listening at `socket`.
+    pub(crate) fn new(socket: PathBuf) -> Self {
+        Self {
+            socket,
+            connection: None,
+            retry_at: Instant::now(),
+            textures: HashMap::new(),
+            scroll: HashMap::new(),
+            pointer_capture: None,
+            keyboard: None,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    /// Draws every streamed window and forwards input. Returns editor close requests.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one pass: sync textures, draw windows, then popups over their parents"
+    )]
+    pub(crate) fn show(&mut self, ctx: &Context) -> Vec<StreamedWindowEvent> {
+        if self
+            .connection
+            .as_ref()
+            .is_some_and(|connection| !connection.alive.load(Ordering::Acquire))
+        {
+            // The streamer restarted (for example with the display); its window IDs are gone.
+            self.connection = None;
+            self.textures.clear();
+        }
+        if self.connection.is_none() && Instant::now() >= self.retry_at {
+            self.retry_at = Instant::now() + RECONNECT_INTERVAL;
+            self.connection = Connection::open(&self.socket, ctx).ok();
+        }
+        let Some(connection) = self.connection.as_mut() else {
+            return Vec::new();
+        };
+        let windows = {
+            let mut state = connection
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let ids: Vec<_> = state.windows().map(|window| window.info().id).collect();
+            let mut shown = Vec::with_capacity(ids.len());
+            for id in ids {
+                let Some(window) = state.window_mut(id) else {
+                    continue;
+                };
+                let size = window.size();
+                if size[0] == 0 || size[1] == 0 {
+                    continue;
+                }
+                upload(ctx, &mut self.textures, id, window);
+                shown.push(Shown {
+                    info: window.info().clone(),
+                    size,
+                });
+            }
+            shown
+        };
+        self.textures
+            .retain(|id, _| windows.iter().any(|window| window.info.id == *id));
+        self.scroll
+            .retain(|id, _| windows.iter().any(|window| window.info.id == *id));
+
+        let pixels_per_point = ctx.pixels_per_point();
+        let mut events = Vec::new();
+        let mut image_rects: HashMap<WindowId, egui::Rect> = HashMap::new();
+        for window in windows
+            .iter()
+            .filter(|window| window.info.kind == WindowKind::Normal)
+        {
+            let Some(texture) = self.textures.get(&window.info.id) else {
+                continue;
+            };
+            let mut open = true;
+            let title = if window.info.title.is_empty() {
+                "Window".to_owned()
+            } else {
+                window.info.title.clone()
+            };
+            let shown = egui::Window::new(title)
+                .id(egui::Id::new(("streamed-window", window.info.id)))
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    let size = points(window.size, pixels_per_point);
+                    ui.add(egui::Image::new((texture.id(), size)).sense(Sense::click_and_drag()))
+                });
+            if let Some(inner) = shown.and_then(|shown| shown.inner) {
+                image_rects.insert(window.info.id, inner.rect);
+            }
+            if !open {
+                match (window.info.rack, window.info.slot) {
+                    (Some(rack), Some(slot)) => events.push(StreamedWindowEvent::CloseEditor {
+                        rack: rack as usize,
+                        slot: slot as usize,
+                    }),
+                    _ => connection.send(InputEvent::Close {
+                        window: window.info.id,
+                    }),
+                }
+            }
+        }
+        // Popups (menus, drop-downs) keep their position relative to their parent window.
+        for window in windows
+            .iter()
+            .filter(|window| window.info.kind == WindowKind::Popup)
+        {
+            let parent = window
+                .info
+                .transient_for
+                .and_then(|parent| windows.iter().find(|shown| shown.info.id == parent));
+            let (Some(parent), Some(texture)) = (parent, self.textures.get(&window.info.id)) else {
+                continue;
+            };
+            let Some(parent_rect) = image_rects.get(&parent.info.id) else {
+                continue;
+            };
+            let offset = egui::vec2(
+                f32::from(window.info.x - parent.info.x),
+                f32::from(window.info.y - parent.info.y),
+            ) / pixels_per_point;
+            let size = points(window.size, pixels_per_point);
+            let shown = egui::Area::new(egui::Id::new(("streamed-popup", window.info.id)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(parent_rect.min + offset)
+                .show(ctx, |ui| {
+                    ui.add(egui::Image::new((texture.id(), size)).sense(Sense::click_and_drag()))
+                });
+            image_rects.insert(window.info.id, shown.inner.rect);
+        }
+        self.forward_input(ctx, &image_rects, pixels_per_point);
+        events
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one dispatch over egui's input events"
+    )]
+    fn forward_input(
+        &mut self,
+        ctx: &Context,
+        image_rects: &HashMap<WindowId, egui::Rect>,
+        pixels_per_point: f32,
+    ) {
+        let Some(connection) = self.connection.as_mut() else {
+            return;
+        };
+        // Popups draw last, so test them first.
+        let target_at = |position: egui::Pos2| {
+            let layer = ctx.layer_id_at(position);
+            image_rects
+                .iter()
+                .filter(|(_, rect)| rect.contains(position))
+                .map(|(id, rect)| (*id, *rect))
+                .max_by_key(|(id, _)| {
+                    layer.is_some_and(|layer| {
+                        layer.id == egui::Id::new(("streamed-popup", *id))
+                            || layer.id == egui::Id::new(("streamed-window", *id))
+                    })
+                })
+        };
+        let local = |rect: egui::Rect, position: egui::Pos2| {
+            let offset = (position - rect.min) * pixels_per_point;
+            (clamp_i16(offset.x), clamp_i16(offset.y))
+        };
+        let events = ctx.input(|input| input.events.clone());
+        for event in events {
+            match event {
+                Event::PointerMoved(position) => {
+                    let target = self
+                        .pointer_capture
+                        .and_then(|id| image_rects.get(&id).map(|rect| (id, *rect)))
+                        .or_else(|| target_at(position));
+                    if let Some((window, rect)) = target {
+                        let (x, y) = local(rect, position);
+                        connection.send(InputEvent::PointerMove { window, x, y });
+                    }
+                }
+                Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    ..
+                } => {
+                    let target = if pressed {
+                        target_at(pos)
+                    } else {
+                        self.pointer_capture
+                            .and_then(|id| image_rects.get(&id).map(|rect| (id, *rect)))
+                    };
+                    let Some((window, rect)) = target else {
+                        continue;
+                    };
+                    if pressed {
+                        self.pointer_capture = Some(window);
+                        if self.keyboard != Some(window) {
+                            self.keyboard = Some(window);
+                            connection.send(InputEvent::Focus { window });
+                        }
+                    } else {
+                        self.pointer_capture = None;
+                    }
+                    let (x, y) = local(rect, pos);
+                    connection.send(InputEvent::PointerButton {
+                        window,
+                        x,
+                        y,
+                        button: stream_button(button),
+                        pressed,
+                    });
+                }
+                Event::MouseWheel { delta, unit, .. } => {
+                    let Some(position) = ctx.input(|input| input.pointer.hover_pos()) else {
+                        continue;
+                    };
+                    let Some((window, rect)) = target_at(position) else {
+                        continue;
+                    };
+                    let scale = match unit {
+                        egui::MouseWheelUnit::Line => POINTS_PER_NOTCH,
+                        egui::MouseWheelUnit::Page => POINTS_PER_NOTCH * 10.0,
+                        egui::MouseWheelUnit::Point => 1.0,
+                    };
+                    // egui reports wheel-up as positive y; X scrolls down for positive notches.
+                    let notches = self
+                        .scroll
+                        .entry(window)
+                        .or_insert_with(|| ScrollAccumulator::new(POINTS_PER_NOTCH))
+                        .push(-delta.x * scale, -delta.y * scale);
+                    if let Some((dx, dy)) = notches {
+                        let (x, y) = local(rect, position);
+                        connection.send(InputEvent::Scroll {
+                            window,
+                            x,
+                            y,
+                            dx,
+                            dy,
+                        });
+                    }
+                }
+                Event::Key {
+                    key,
+                    pressed,
+                    modifiers,
+                    ..
+                } => {
+                    let Some(window) = self.keyboard.filter(|id| image_rects.contains_key(id))
+                    else {
+                        continue;
+                    };
+                    sync_modifiers(connection, window, &mut self.modifiers, modifiers);
+                    // Printable keys arrive as text unless a shortcut modifier is held.
+                    let shortcut = modifiers.ctrl || modifiers.alt || modifiers.command;
+                    if let Some(keysym) = keysym(key, shortcut) {
+                        connection.send(InputEvent::Key {
+                            window,
+                            keysym,
+                            pressed,
+                        });
+                    }
+                }
+                Event::Text(text) => {
+                    let Some(window) = self.keyboard.filter(|id| image_rects.contains_key(id))
+                    else {
+                        continue;
+                    };
+                    if !text.is_empty() {
+                        connection.send(InputEvent::Text { window, text });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn upload(
+    ctx: &Context,
+    textures: &mut HashMap<WindowId, TextureHandle>,
+    id: WindowId,
+    window: &mut sp_window_stream::StreamedWindow,
+) {
+    let [width, height] = window.size();
+    let dirty = window.take_dirty();
+    let resized = textures
+        .get(&id)
+        .is_some_and(|texture| texture.size() != [width, height]);
+    if resized || !textures.contains_key(&id) {
+        let image = egui::ColorImage::from_rgba_unmultiplied([width, height], window.rgba());
+        textures.insert(
+            id,
+            ctx.load_texture(format!("streamed-{id:?}"), image, TextureOptions::NEAREST),
+        );
+        return;
+    }
+    let texture = textures.get_mut(&id).expect("checked above");
+    for rect in dirty {
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [usize::from(rect.width), usize::from(rect.height)],
+            &window.copy_rect(rect),
+        );
+        texture.set_partial(
+            [usize::from(rect.x), usize::from(rect.y)],
+            image,
+            TextureOptions::NEAREST,
+        );
+    }
+}
+
+/// A window's pixel size in egui points. X window sizes fit `u16`.
+fn points([width, height]: [usize; 2], pixels_per_point: f32) -> egui::Vec2 {
+    let pixels = |value: usize| f32::from(u16::try_from(value).unwrap_or(u16::MAX));
+    egui::vec2(pixels(width), pixels(height)) / pixels_per_point
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "clamped to the i16 range before the cast"
+)]
+fn clamp_i16(value: f32) -> i16 {
+    // Saturating: drags may leave the window by more than i16 allows only in theory.
+    value
+        .round()
+        .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
+}
+
+fn stream_button(button: PointerButton) -> StreamButton {
+    match button {
+        PointerButton::Primary => StreamButton::Left,
+        PointerButton::Secondary => StreamButton::Right,
+        PointerButton::Middle => StreamButton::Middle,
+        PointerButton::Extra1 => StreamButton::Back,
+        PointerButton::Extra2 => StreamButton::Forward,
+    }
+}
+
+/// Presses or releases modifier keys so the window sees the same state as egui.
+fn sync_modifiers(
+    connection: &mut Connection,
+    window: WindowId,
+    current: &mut Modifiers,
+    wanted: Modifiers,
+) {
+    for (was, is, keysym) in [
+        (current.shift, wanted.shift, 0xffe1),
+        (current.ctrl, wanted.ctrl, 0xffe3),
+        (current.alt, wanted.alt, 0xffe9),
+    ] {
+        if was != is {
+            connection.send(InputEvent::Key {
+                window,
+                keysym,
+                pressed: is,
+            });
+        }
+    }
+    *current = wanted;
+}
+
+/// The X keysym for a key egui reports. Printable keys map only for shortcuts; otherwise their
+/// text arrives as `Event::Text`.
+fn keysym(key: Key, shortcut: bool) -> Option<u32> {
+    let named = match key {
+        Key::Enter => 0xff0d,
+        Key::Escape => 0xff1b,
+        Key::Tab => 0xff09,
+        Key::Backspace => 0xff08,
+        Key::Delete => 0xffff,
+        Key::Insert => 0xff63,
+        Key::Home => 0xff50,
+        Key::End => 0xff57,
+        Key::PageUp => 0xff55,
+        Key::PageDown => 0xff56,
+        Key::ArrowLeft => 0xff51,
+        Key::ArrowUp => 0xff52,
+        Key::ArrowRight => 0xff53,
+        Key::ArrowDown => 0xff54,
+        Key::F1 => 0xffbe,
+        Key::F2 => 0xffbf,
+        Key::F3 => 0xffc0,
+        Key::F4 => 0xffc1,
+        Key::F5 => 0xffc2,
+        Key::F6 => 0xffc3,
+        Key::F7 => 0xffc4,
+        Key::F8 => 0xffc5,
+        Key::F9 => 0xffc6,
+        Key::F10 => 0xffc7,
+        Key::F11 => 0xffc8,
+        Key::F12 => 0xffc9,
+        _ if shortcut => {
+            let mut name = key.name().chars();
+            return match (name.next(), name.next()) {
+                (Some(character), None) => Some(keysym_for_char(character.to_ascii_lowercase())),
+                _ => None,
+            };
+        }
+        _ => return None,
+    };
+    Some(named)
+}
+
+#[cfg(test)]
+mod tests {
+    use egui::Key;
+
+    use super::keysym;
+
+    #[test]
+    fn printable_keys_map_only_as_shortcuts() {
+        assert_eq!(keysym(Key::A, false), None);
+        assert_eq!(keysym(Key::A, true), Some(u32::from('a')));
+        assert_eq!(keysym(Key::Enter, false), Some(0xff0d));
+        assert_eq!(keysym(Key::ArrowLeft, true), Some(0xff51));
+    }
+}
