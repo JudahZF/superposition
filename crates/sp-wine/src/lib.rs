@@ -245,6 +245,9 @@ impl WineEnvironment {
         self.apply_display(&mut wineboot);
         let status = wineboot
             .arg("--init")
+            // Without this, a new prefix asks on the display to install Wine Mono and Gecko
+            // and waits minutes for an answer. Users can run their installers instead.
+            .env("WINEDLLOVERRIDES", "mscoree,mshtml=")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
