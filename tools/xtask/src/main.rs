@@ -287,6 +287,9 @@ fn run_doctor(workspace_root: &Path) -> Result<(), String> {
         required_tooling_check(),
         required_paths_check(workspace_root),
     ];
+    if cfg!(target_os = "linux") {
+        implementation_checks.push(linux_tooling_check());
+    }
 
     match cargo_metadata(workspace_root) {
         Ok(graph) => implementation_checks.push(dependency_boundary_check(&graph)),
@@ -322,14 +325,17 @@ fn run_doctor(workspace_root: &Path) -> Result<(), String> {
 fn platform_check() -> CheckResult {
     let os = env::consts::OS;
     let architecture = env::consts::ARCH;
-    if os == "macos" && architecture == "aarch64" {
-        CheckResult::pass("platform", "macOS/aarch64 is supported")
-    } else {
-        CheckResult::fail(
+    match (os, architecture) {
+        ("macos", "aarch64") | ("linux", "x86_64") => {
+            CheckResult::pass("platform", format!("{os}/{architecture} is supported"))
+        }
+        _ => CheckResult::fail(
             "platform",
-            format!("detected {os}/{architecture}; only macOS/aarch64 is supported"),
-            "Use an Apple Silicon macOS host.",
-        )
+            format!(
+                "detected {os}/{architecture}; only macOS/aarch64 and Linux/x86_64 are supported"
+            ),
+            "Use an Apple Silicon macOS host or an x86_64 Linux host.",
+        ),
     }
 }
 
@@ -374,52 +380,115 @@ fn toolchain_check(workspace_root: &Path) -> CheckResult {
     }
 }
 
+/// Rust targets the workspace builds for: macOS everywhere (Linux type-checks it), and the
+/// Windows helpers that run under Wine on Linux.
+const REQUIRED_TARGETS: &[&str] = if cfg!(target_os = "linux") {
+    &["aarch64-apple-darwin", "x86_64-pc-windows-gnu"]
+} else {
+    &["aarch64-apple-darwin"]
+};
+
 fn required_tooling_check() -> CheckResult {
-    let mut missing = Vec::new();
-    for requirement in REQUIRED_VERIFICATION_TOOLS {
-        if !command_succeeds("cargo", requirement.arguments) {
-            missing.push(requirement.name);
+    let mut missing: Vec<String> = REQUIRED_VERIFICATION_TOOLS
+        .iter()
+        .filter(|requirement| !command_succeeds("cargo", requirement.arguments))
+        .map(|requirement| requirement.name.to_owned())
+        .collect();
+
+    // Reads the sysroot instead of asking rustup, so Nix toolchains pass too.
+    match rustc_sysroot_and_host() {
+        Some((sysroot, host)) => {
+            let rustlib = sysroot.join("lib/rustlib");
+            missing.extend(
+                REQUIRED_TARGETS
+                    .iter()
+                    .filter(|target| !rustlib.join(target).join("lib").is_dir())
+                    .map(|target| format!("{target} target")),
+            );
+            let profdata = rustlib.join(&host).join("bin/llvm-profdata");
+            if !profdata.is_file() {
+                missing.push("llvm-tools-preview component".to_owned());
+            }
         }
-    }
-
-    let target_installed = Command::new("rustup")
-        .args(["target", "list", "--installed"])
-        .output()
-        .is_ok_and(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .any(|target| target.trim() == "aarch64-apple-darwin")
-        });
-    if !target_installed {
-        missing.push("aarch64-apple-darwin target");
-    }
-
-    let llvm_tools_installed = Command::new("rustup")
-        .args(["component", "list", "--installed"])
-        .output()
-        .is_ok_and(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .any(is_llvm_tools_component)
-        });
-    if !llvm_tools_installed {
-        missing.push("llvm-tools-preview component");
+        None => missing.push("rustc sysroot".to_owned()),
     }
 
     if missing.is_empty() {
         CheckResult::pass(
             "required verification tooling",
-            "rustfmt, Clippy, llvm-tools-preview, nextest, cargo-deny, cargo-audit, cargo-llvm-cov, and the Apple Silicon target are installed",
+            format!(
+                "rustfmt, Clippy, llvm-tools-preview, nextest, cargo-deny, cargo-audit, cargo-llvm-cov, and the {} target(s) are installed",
+                REQUIRED_TARGETS.join(", ")
+            ),
         )
     } else {
         CheckResult::fail(
             "required verification tooling",
             format!("missing {}", missing.join(", ")),
-            "Install the missing Cargo tools (`cargo install <tool> --locked`) and run `rustup component add rustfmt clippy llvm-tools-preview`; ensure `aarch64-apple-darwin` is installed with rustup.",
+            "On Linux, use `nix develop`. Otherwise install the missing Cargo tools (`cargo install <tool> --locked`) and the toolchain's components and targets from rust-toolchain.toml with rustup.",
         )
     }
+}
+
+/// The toolchain's sysroot and host triple, from `rustc`.
+fn rustc_sysroot_and_host() -> Option<(PathBuf, String)> {
+    let sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let version = Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let host = String::from_utf8_lossy(&version.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))?
+        .to_owned();
+    let sysroot = PathBuf::from(String::from_utf8_lossy(&sysroot.stdout).trim());
+    Some((sysroot, host))
+}
+
+/// The programs a Linux checkout needs to build the Windows helpers and run Wine, editor, and
+/// JACK tests. Each may come from its `SUPERPOSITION_*` variable, as the dev shell sets them.
+fn linux_tooling_check() -> CheckResult {
+    let tools = [
+        ("Wine", "SUPERPOSITION_WINE", "wine"),
+        ("Xvfb", "SUPERPOSITION_XVFB", "Xvfb"),
+        (
+            "mingw C compiler",
+            "SUPERPOSITION_MINGW_CC",
+            "x86_64-w64-mingw32-gcc",
+        ),
+        ("jackd", "", "jackd"),
+    ];
+    let missing: Vec<&str> = tools
+        .iter()
+        .filter(|(_, variable, program)| {
+            let configured = env::var_os(variable).is_some_and(|path| Path::new(&path).is_file());
+            !configured && !on_path(program)
+        })
+        .map(|(name, ..)| *name)
+        .collect();
+    if missing.is_empty() {
+        CheckResult::pass(
+            "Linux tooling",
+            "Wine, Xvfb, mingw, and jackd are available",
+        )
+    } else {
+        CheckResult::fail(
+            "Linux tooling",
+            format!("missing {}", missing.join(", ")),
+            "Run inside `nix develop`, which pins all of them.",
+        )
+    }
+}
+
+fn on_path(program: &str) -> bool {
+    env::var_os("PATH").is_some_and(|path| {
+        env::split_paths(&path).any(|directory| directory.join(program).is_file())
+    })
 }
 
 struct ToolRequirement {
@@ -461,31 +530,24 @@ fn command_succeeds(program: &str, arguments: &[&str]) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-fn is_llvm_tools_component(component: &str) -> bool {
-    let component = component.trim();
-    component == "llvm-tools-preview"
-        || component == "llvm-tools"
-        || component.starts_with("llvm-tools-preview-")
-        || component.starts_with("llvm-tools-")
-}
-
 fn print_hardware_certification_status() {
     println!("\nHardware certification (not evaluated by doctor):");
     println!(
         "[PENDING] Attached-device verification: doctor does not inspect loopback, click, MIDI timing, or soak results."
     );
     println!(
-        "          Action: run `cargo xtask loopback`, `click-test`, `midi-timing`, and `soak` with captured evidence on the designated Apple Silicon host."
+        "          Action: run `cargo xtask loopback`, `click-test`, `midi-timing`, and `soak` with captured evidence on the designated host."
     );
 }
 
 fn print_qualification_tooling() {
     println!("\nQualification tooling:");
     println!(
-        "[REQUIRED] Static verification: cargo nextest, cargo-deny, cargo-audit, cargo-llvm-cov, rustfmt, Clippy, and the aarch64-apple-darwin target."
+        "[REQUIRED] Static verification: cargo nextest, cargo-deny, cargo-audit, cargo-llvm-cov, rustfmt, Clippy, and the {} target(s).",
+        REQUIRED_TARGETS.join(", ")
     );
     println!(
-        "[REQUIRED FOR HARDWARE CERTIFICATION] Dedicated Apple Silicon host and a fixed 48 kHz stereo output route (for example, BlackHole or a reconfigurable device)."
+        "[REQUIRED FOR HARDWARE CERTIFICATION] A dedicated Apple Silicon host with a fixed 48 kHz stereo output route (for example, BlackHole), or a Linux host with a chosen JACK audio interface (none chosen yet)."
     );
     let sdk = env::var_os("VST3_SDK_DIR").is_some_and(|path| Path::new(&path).is_dir());
     let cmake = command_succeeds("cmake", &["--version"]);
@@ -719,7 +781,7 @@ fn dependency_boundary_check(graph: &PackageGraph) -> CheckResult {
 mod tests {
     use super::{
         PackageGraph, REQUIRED_VERIFICATION_TOOLS, availability, dependency_boundary_check,
-        graph_from_metadata, is_llvm_tools_component, parse_toml_string,
+        graph_from_metadata, parse_toml_string,
     };
     use serde_json::json;
 
@@ -801,13 +863,6 @@ mod tests {
                 "cargo-llvm-cov",
             ]
         );
-    }
-
-    #[test]
-    fn recognizes_legacy_and_target_qualified_llvm_tool_components() {
-        assert!(is_llvm_tools_component("llvm-tools-preview"));
-        assert!(is_llvm_tools_component("llvm-tools-aarch64-apple-darwin"));
-        assert!(!is_llvm_tools_component("rustfmt-aarch64-apple-darwin"));
     }
 
     #[test]

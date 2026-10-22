@@ -124,7 +124,7 @@ On Linux, the dev shell can type-check the macOS code. zig supplies the C header
 nix develop -c env SUPERPOSITION_SKIP_NATIVE_SHIMS=1 cargo clippy --workspace --all-targets --target aarch64-apple-darwin
 ```
 
-CI (`.github/workflows/ci.yml`) runs doctor, formatting, Clippy, tests, coverage, `cargo-deny`, and `cargo-audit` on macOS. On Linux, it runs formatting, Clippy for Linux and macOS, the tests, the JACK test, and the Wine check. Live timing needs real audio hardware and does not run in CI.
+CI (`.github/workflows/ci.yml`) runs doctor, formatting, Clippy, tests, coverage, `cargo-deny`, and `cargo-audit` on macOS. On Linux, it runs doctor, formatting, the NixOS module check, Clippy for Linux and macOS, the tests, the JACK test, and the Wine check. Live timing needs real audio hardware and does not run in CI.
 
 ## Documentation
 

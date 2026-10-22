@@ -120,6 +120,11 @@
                     ++ lib.optionals linux [ "x86_64-pc-windows-gnu" ];
                 })
                 pkgs.pkg-config
+                # Verification tools `cargo xtask doctor` requires.
+                pkgs.cargo-nextest
+                pkgs.cargo-deny
+                pkgs.cargo-audit
+                pkgs.cargo-llvm-cov
               ]
               ++ lib.optionals linux (
                 [

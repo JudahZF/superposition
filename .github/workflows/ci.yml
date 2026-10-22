@@ -109,6 +109,9 @@ jobs:
       - name: Check formatting
         run: nix develop -c cargo fmt --all -- --check
 
+      - name: Run doctor
+        run: nix develop -c cargo xtask doctor
+
       - name: Check the NixOS module
         run: nix build .#checks.x86_64-linux.nixos-module
 
