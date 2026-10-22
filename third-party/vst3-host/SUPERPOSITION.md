@@ -52,6 +52,8 @@ Local changes:
 - Linux `ModuleEntry` receives the module's `dlopen` handle, as the SDK's
   `linuxmain.cpp` expects. Upstream called it with no argument; VSTGUI finds its
   resources from that handle.
+- `MainThreadEditorHandle::parameter_ids` lists controller parameter IDs on the
+  loading thread, so batched live reads can reject unknown IDs.
 - `MainThreadEditorHandle::service_run_loop` services the Linux `IRunLoop`
   timers and file descriptors an open editor registered, on the loading thread,
   while the worker's audio thread keeps the processor.

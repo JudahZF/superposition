@@ -563,6 +563,10 @@ impl EditorCore {
         self.with_fields(|fields| fields.get_parameter(id))?
     }
 
+    pub(crate) fn parameter_ids(&self) -> Result<Vec<u32>> {
+        self.with_fields(|fields| fields.parameter_ids())?
+    }
+
     pub(crate) fn take_editor_resize_request(&self) -> Option<(i32, i32)> {
         self.with_fields(|fields| fields.editor_resize.lock().ok().and_then(|mut s| s.take()))
             .ok()
@@ -2867,6 +2871,21 @@ impl EditorFields {
             .as_ref()
             .ok_or_else(|| Error::InterfaceError("No controller available".to_string()))?;
         Ok(unsafe { controller.getParamNormalized(id) })
+    }
+
+    fn parameter_ids(&self) -> Result<Vec<u32>> {
+        let controller = self
+            .controller
+            .as_ref()
+            .ok_or_else(|| Error::InterfaceError("No controller available".to_string()))?;
+        unsafe {
+            Ok((0..controller.getParameterCount())
+                .filter_map(|index| {
+                    let mut info: ParameterInfo = std::mem::zeroed();
+                    (controller.getParameterInfo(index, &mut info) == kResultOk).then_some(info.id)
+                })
+                .collect())
+        }
     }
 
     fn has_editor(&self) -> bool {

@@ -144,8 +144,15 @@ impl MainThreadEditorHandle {
     }
 
     /// Read one controller parameter on the loading thread while audio processing continues.
+    /// `getParamNormalized` has no error result, so an unknown ID reads as the plug-in's
+    /// fallback value; check it against [`Self::parameter_ids`].
     pub fn get_parameter(&self, id: u32) -> Result<f64> {
         self.editor()?.get_parameter(id)
+    }
+
+    /// The IDs of every controller parameter, read on the plugin's loading thread.
+    pub fn parameter_ids(&self) -> Result<Vec<u32>> {
+        self.editor()?.parameter_ids()
     }
 }
 

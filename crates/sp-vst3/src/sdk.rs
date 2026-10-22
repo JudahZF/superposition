@@ -4,7 +4,11 @@
 //! `--features sdk`; the main application and engine must never depend on this crate's `sdk`
 //! feature.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    cell::OnceCell,
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use vst3_host::audio::{
     AudioBuffers, BusArrangements, BusDirection, MediaType, SpeakerArrangement,
@@ -45,6 +49,8 @@ pub use vst3_host::plugin::MainThreadService;
 pub struct SdkEditorHandle {
     inner: vst3_host::plugin::MainThreadEditorHandle,
     name: String,
+    /// Controller parameter IDs, read on first use.
+    parameter_ids: OnceCell<BTreeSet<u32>>,
 }
 
 impl SdkEditorHandle {
@@ -137,8 +143,20 @@ impl SdkEditorHandle {
     /// Reads one normalized controller value while the processor keeps running.
     ///
     /// # Errors
-    /// Returns an error if the plug-in has unloaded or has no controller.
+    /// Returns an error if the plug-in has unloaded, has no controller, or has no parameter
+    /// with this ID.
     pub fn read_parameter(&self, parameter_id: u32) -> Result<f64, SdkError> {
+        let known = if let Some(known) = self.parameter_ids.get() {
+            known
+        } else {
+            let known = self.inner.parameter_ids()?.into_iter().collect();
+            self.parameter_ids.get_or_init(|| known)
+        };
+        if !known.contains(&parameter_id) {
+            return Err(SdkError::Host(format!(
+                "unknown VST3 parameter {parameter_id}"
+            )));
+        }
         Ok(self.inner.get_parameter(parameter_id)?)
     }
 }
@@ -1364,6 +1382,7 @@ impl HostSdkRackAdapter {
             .map(|inner| SdkEditorHandle {
                 inner,
                 name: plugin.info().name.clone(),
+                parameter_ids: OnceCell::new(),
             })
     }
 
