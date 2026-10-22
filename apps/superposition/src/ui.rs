@@ -227,6 +227,8 @@ pub struct LiveRackApp {
     #[cfg(audio_backend)]
     buffer_frames: u32,
     #[cfg(audio_backend)]
+    sample_rate_hz: u32,
+    #[cfg(audio_backend)]
     midi_ports: Vec<MidiPortInfo>,
     #[cfg(audio_backend)]
     selected_midi: Option<MidiPortId>,
@@ -274,6 +276,15 @@ impl LiveRackApp {
             .audio_settings
             .as_ref()
             .map_or(128, |settings| settings.buffer_frames);
+        #[cfg(audio_backend)]
+        let sample_rate_hz = controller
+            .document()
+            .model
+            .audio_settings
+            .as_ref()
+            .map_or(sp_audio_io::PRODUCT_SAMPLE_RATE_HZ, |settings| {
+                settings.sample_rate_hz
+            });
         #[cfg(audio_backend)]
         let selected_route = controller
             .document()
@@ -343,6 +354,8 @@ impl LiveRackApp {
             #[cfg(audio_backend)]
             buffer_frames,
             #[cfg(audio_backend)]
+            sample_rate_hz,
+            #[cfg(audio_backend)]
             midi_ports,
             #[cfg(audio_backend)]
             selected_midi,
@@ -411,6 +424,7 @@ impl LiveRackApp {
                 name: output.info.name.clone(),
             },
             buffer_frames: self.buffer_frames,
+            sample_rate_hz: self.sample_rate_hz,
         });
     }
 
@@ -897,8 +911,8 @@ impl LiveRackApp {
             self.show_fault("Choose an audio output device before starting".to_owned());
             return;
         };
-        route.format = AudioFormat::product_stereo(self.buffer_frames)
-            .expect("fixed product buffer choice is valid");
+        route.format = AudioFormat::product(self.sample_rate_hz, self.buffer_frames)
+            .expect("fixed product rate and buffer choices are valid");
         let Some(output_device) = self
             .audio_devices
             .iter()
@@ -2788,8 +2802,8 @@ fn saved_route(
     Some(AudioRouteConfig {
         input,
         output,
-        format: AudioFormat::product_stereo(settings.buffer_frames)
-            .expect("saved product buffer size"),
+        format: AudioFormat::product(settings.sample_rate_hz, settings.buffer_frames)
+            .expect("validated saved rate and buffer size"),
     })
 }
 

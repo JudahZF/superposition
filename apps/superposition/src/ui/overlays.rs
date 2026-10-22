@@ -452,7 +452,7 @@ impl LiveRackApp {
                     ui,
                     &format!(
                         "Rack sources arrive one buffer late, {} at {frames} samples. Physical inputs are sample aligned.",
-                        latency_label(frames)
+                        latency_label(frames, self.sample_rate_value())
                     ),
                     ColorToken::Dim,
                 );

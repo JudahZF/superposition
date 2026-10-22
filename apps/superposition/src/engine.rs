@@ -23,8 +23,16 @@ pub(crate) fn prepare_audio(
     let graph = PreparedGraph::compile(model)
         .map_err(|error| format!("Rack graph is not ready: {error}"))?;
     let banks = product.audio_bank_mappings()?;
+    let sample_rate_hz = model
+        .audio_settings
+        .as_ref()
+        .map_or(sp_audio_io::PRODUCT_SAMPLE_RATE_HZ, |settings| {
+            settings.sample_rate_hz
+        });
     let mut renderer = ProductRenderer::with_rack_banks(graph, banks)
-        .map_err(|error| format!("Rack dispatcher setup failed: {error}"))?;
+        .map_err(|error| format!("Rack dispatcher setup failed: {error}"))?
+        .with_sample_rate(sample_rate_hz)
+        .map_err(|error| error.to_string())?;
     for (index, rack) in model.racks.iter().enumerate() {
         let mixer = renderer.mixer_mut();
         mixer.set_dry_fallback_available(index, product.rack_dry_fallback_available(rack));

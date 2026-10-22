@@ -30,7 +30,6 @@ use crate::{
     OutputRenderer, PreparedRackLane, RenderDisposition,
 };
 
-const PRODUCT_SAMPLE_RATE: u32 = 48_000;
 const PRODUCT_CONTROL_CAPACITY: usize = 64;
 
 fn input_meter(samples: &[f32], frames: usize) -> RackMeterSnapshot {
@@ -973,6 +972,8 @@ pub struct ProductRenderer {
     rack_inputs: Box<[[f32; sp_engine::MAX_MIX_FRAMES * 2]; MAX_RACKS]>,
     /// Times each callback for [`ProductTelemetry::take_callback_load`].
     load_clock: Option<MonotonicClock>,
+    /// The session rate; endpoints start only at this rate.
+    sample_rate: u32,
 }
 
 impl ProductRenderer {
@@ -1010,6 +1011,7 @@ impl ProductRenderer {
             ui_output_meter: UiMeterAccumulator::new(),
             rack_inputs: per_rack([0.0; sp_engine::MAX_MIX_FRAMES * 2]),
             load_clock: MonotonicClock::new().ok(),
+            sample_rate: crate::PRODUCT_SAMPLE_RATE_HZ,
         }
     }
 
@@ -1062,7 +1064,31 @@ impl ProductRenderer {
             ui_output_meter: UiMeterAccumulator::new(),
             rack_inputs: per_rack([0.0; sp_engine::MAX_MIX_FRAMES * 2]),
             load_clock: MonotonicClock::new().ok(),
+            sample_rate: crate::PRODUCT_SAMPLE_RATE_HZ,
         })
+    }
+
+    /// Sets the session sample rate (48 or 96 kHz) used for scene ramps, MIDI timing, and
+    /// deadlines. Endpoints refuse to start this renderer at another rate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::AudioFormatError::UnsupportedProductSampleRate`] for other rates.
+    pub fn with_sample_rate(
+        mut self,
+        sample_rate_hz: u32,
+    ) -> Result<Self, crate::AudioFormatError> {
+        if !crate::PRODUCT_SAMPLE_RATES_HZ.contains(&sample_rate_hz) {
+            return Err(crate::AudioFormatError::UnsupportedProductSampleRate { sample_rate_hz });
+        }
+        self.sample_rate = sample_rate_hz;
+        Ok(self)
+    }
+
+    /// The session sample rate in hertz.
+    #[must_use]
+    pub const fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 
     /// Borrows the mixer for control-thread configuration before start.
@@ -1292,7 +1318,7 @@ impl ProductRenderer {
             &self.current_parameters,
             scene.transition_ms,
             self.sample_clock,
-            PRODUCT_SAMPLE_RATE,
+            self.sample_rate,
         );
         let starts = std::array::from_fn(|rack| {
             self.mixer
@@ -1302,7 +1328,7 @@ impl ProductRenderer {
         self.active_rack_scene = Some(ActiveRackScene {
             start_sample: self.sample_clock,
             transition_samples: u64::from(scene.transition_ms)
-                .saturating_mul(u64::from(PRODUCT_SAMPLE_RATE))
+                .saturating_mul(u64::from(self.sample_rate))
                 .div_ceil(1_000)
                 .max(1),
             starts,
@@ -1473,7 +1499,7 @@ impl ProductRenderer {
         let block_duration = u64::try_from(frames)
             .unwrap_or(u64::MAX)
             .saturating_mul(1_000_000)
-            / u64::from(PRODUCT_SAMPLE_RATE);
+            / u64::from(self.sample_rate);
         let block_start = block_end.saturating_sub(block_duration);
         let mut midi_count = 0;
         for index in 0..self.wire_midi.len().min(self.midi_events.as_slice().len()) {
@@ -1481,7 +1507,7 @@ impl ProductRenderer {
             let frame_offset = sample_offset_for_timestamp(
                 event.timestamp_micros,
                 block_start,
-                1_000_000.0 / f64::from(PRODUCT_SAMPLE_RATE),
+                1_000_000.0 / f64::from(self.sample_rate),
                 u32::try_from(frames).unwrap_or(u32::MAX),
             );
             if !self.handle_midi_event(event, frame_offset) {
@@ -1615,7 +1641,7 @@ impl ProductRenderer {
                     .unwrap_or(u64::MAX)
                     .saturating_mul(1_000_000_000)
                     .saturating_mul(3)
-                    / (u64::from(PRODUCT_SAMPLE_RATE) * 4),
+                    / (u64::from(self.sample_rate) * 4),
             );
             dispatcher.process_block_with_events(
                 input,
@@ -1708,7 +1734,7 @@ impl ProductRenderer {
                     .unwrap_or(u64::MAX)
                     .saturating_mul(1_000_000_000)
                     .saturating_mul(3)
-                    / (u64::from(PRODUCT_SAMPLE_RATE) * 4),
+                    / (u64::from(self.sample_rate) * 4),
             );
             dispatcher.process_block_with_rack_inputs(
                 &self.rack_inputs,
@@ -1761,7 +1787,7 @@ impl ProductRenderer {
             .saturating_mul(1_000_000);
         let permille = u64::try_from(elapsed.as_nanos())
             .unwrap_or(u64::MAX)
-            .saturating_mul(u64::from(PRODUCT_SAMPLE_RATE))
+            .saturating_mul(u64::from(self.sample_rate))
             / divisor;
         self.telemetry.callback_load.fetch_max(
             u32::try_from(permille.saturating_add(1)).unwrap_or(u32::MAX),

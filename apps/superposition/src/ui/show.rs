@@ -168,7 +168,7 @@ impl LiveRackApp {
         readout(
             ui,
             "Latency",
-            &latency_label(frames),
+            &latency_label(frames, self.sample_rate_value()),
             ColorToken::Text,
             f32::INFINITY,
         );
@@ -225,6 +225,13 @@ impl LiveRackApp {
         return self.buffer_frames;
         #[cfg(not(audio_backend))]
         128
+    }
+
+    pub(super) fn sample_rate_value(&self) -> u32 {
+        #[cfg(audio_backend)]
+        return self.sample_rate_hz;
+        #[cfg(not(audio_backend))]
+        sp_audio_io::PRODUCT_SAMPLE_RATE_HZ
     }
 
     pub(super) fn draw_fault_line(&mut self, ctx: &egui::Context) {
@@ -1196,6 +1203,9 @@ pub(super) fn elapsed_label(elapsed: std::time::Duration) -> String {
 }
 
 /// Buffer latency at 48 kHz, as `1.3 ms`.
-pub(super) fn latency_label(frames: u32) -> String {
-    format!("{:.1} ms", f64::from(frames) / 48.0)
+pub(super) fn latency_label(frames: u32, sample_rate_hz: u32) -> String {
+    format!(
+        "{:.1} ms",
+        f64::from(frames) * 1_000.0 / f64::from(sample_rate_hz)
+    )
 }

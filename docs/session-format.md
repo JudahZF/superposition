@@ -21,7 +21,9 @@ My Set.superposition/
 `session.json` is a `SessionDocument`: document schema version plus the host-owned `sp_model::Session` (topology, rack gain/mute/bypass, ordered plug-in identities/fingerprints and bypass states, normalized parameters, scenes, MIDI mappings, audio device settings, per-rack channel routes, and state references). `manifest.json` has the package schema version, a generated revision ID, optional writer metadata, and one plugin-state declaration per instance. `metadata.json` records the instance ID, captured fingerprint, byte counts, state-capture schema, last known activation result, and an optional `preview` declaration (`bytes`, `captured_at_unix_ms`) for `preview.png`. Component and controller VST3 streams are separate opaque byte files. Rack controls, `audio_settings`, and `rack_routes` use serde defaults, so version-1 packages written before those fields existed remain readable without a schema bump.
 
 `audio_settings` saves optional input and required output device IDs and names,
-plus the preferred 32-, 64-, 128-, or 256-frame block size. On load, the app
+plus the preferred 32-, 64-, 128-, or 256-frame block size and the session sample
+rate (`sample_rate_hz`: 48000 or 96000; absent in older sessions, which load at
+48 kHz). On load, the app
 matches ID and name, or a unique matching name; an unavailable or ambiguous
 device must be selected again. `rack_routes` assigns each rack an optional mono
 or stereo input and a mono or stereo output. Channel indices are zero-based in

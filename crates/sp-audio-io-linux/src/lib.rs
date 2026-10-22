@@ -30,7 +30,7 @@ use sp_audio_io::{
     AudioDeviceCapabilities, AudioDeviceId, AudioDeviceInfo, AudioEndpoint, AudioEndpointEvent,
     AudioFormat, AudioFormatError, AudioRouteConfig, BlockFrames, CallbackTelemetry,
     InterleavedStereoF32, MultiChannelDuplexF32, MultiChannelDuplexRenderer, OutputRenderer,
-    PRODUCT_SAMPLE_RATE_HZ, ProductRenderer, RenderDisposition, StoppedRecoveryAccess,
+    PRODUCT_SAMPLE_RATES_HZ, ProductRenderer, RenderDisposition, StoppedRecoveryAccess,
 };
 use sp_engine::{PreparedGraph, RealtimeRackMixer};
 
@@ -311,9 +311,18 @@ impl LinuxAudioEndpoint {
                 frames: format.max_frames_per_callback,
             },
         )?;
-        let renderer = self.pending_renderer.take().ok_or(
+        let pending = self.pending_renderer.as_ref().ok_or(
             "audio renderer could not be safely recovered; rebuild the endpoint before starting",
         )?;
+        if pending.sample_rate() != format.sample_rate_hz {
+            return Err(format!(
+                "the session runs at {} Hz, but the route requests {} Hz",
+                pending.sample_rate(),
+                format.sample_rate_hz
+            )
+            .into());
+        }
+        let renderer = self.pending_renderer.take().expect("checked above");
         let returned = RendererReturn::default();
         let telemetry = Arc::new(TelemetryCell::default());
         let callback = ProductCallback::new(
@@ -408,8 +417,10 @@ fn device(id: &AudioDeviceId) -> Result<LinuxAudioDevice, BoxError> {
 
 fn validate_product_format(format: AudioFormat) -> Result<AudioFormat, BoxError> {
     let format = format.validate()?;
-    if format.sample_rate_hz != PRODUCT_SAMPLE_RATE_HZ {
-        return Err(format!("product audio requires {PRODUCT_SAMPLE_RATE_HZ} Hz").into());
+    if !PRODUCT_SAMPLE_RATES_HZ.contains(&format.sample_rate_hz) {
+        return Err(Box::new(AudioFormatError::UnsupportedProductSampleRate {
+            sample_rate_hz: format.sample_rate_hz,
+        }));
     }
     if format.channel_count == 0 || format.channel_count > MAX_PRODUCT_CHANNELS.min(MAX_CHANNELS) {
         return Err(format!(

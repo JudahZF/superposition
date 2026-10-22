@@ -24,8 +24,10 @@ pub use rack_dispatcher::{
 
 use std::fmt;
 
-/// Product sample rate required by the alpha audio path.
+/// Default product sample rate.
 pub const PRODUCT_SAMPLE_RATE_HZ: u32 = 48_000;
+/// Product sample rates a session may run at.
+pub const PRODUCT_SAMPLE_RATES_HZ: [u32; 2] = [48_000, 96_000];
 /// Product channel count (stereo main bus).
 pub const PRODUCT_CHANNEL_COUNT: u16 = 2;
 
@@ -114,17 +116,29 @@ pub struct AudioFormat {
 }
 
 impl AudioFormat {
-    /// Returns the fixed 48 kHz stereo product format for `frames` (32, 64, 128, or 256).
+    /// Returns the 48 kHz stereo product format for `frames` (32, 64, 128, or 256).
     ///
     /// # Errors
     ///
     /// Returns [`AudioFormatError::UnsupportedProductFrames`] for other frame counts.
     pub fn product_stereo(frames: u32) -> Result<Self, AudioFormatError> {
+        Self::product(PRODUCT_SAMPLE_RATE_HZ, frames)
+    }
+
+    /// Returns the stereo product format at 48 or 96 kHz for `frames` (32, 64, 128, or 256).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioFormatError`] for an unsupported rate or frame count.
+    pub fn product(sample_rate_hz: u32, frames: u32) -> Result<Self, AudioFormatError> {
+        if !PRODUCT_SAMPLE_RATES_HZ.contains(&sample_rate_hz) {
+            return Err(AudioFormatError::UnsupportedProductSampleRate { sample_rate_hz });
+        }
         if !matches!(frames, 32 | 64 | 128 | 256) {
             return Err(AudioFormatError::UnsupportedProductFrames { frames });
         }
         Ok(Self {
-            sample_rate_hz: PRODUCT_SAMPLE_RATE_HZ,
+            sample_rate_hz,
             channel_count: PRODUCT_CHANNEL_COUNT,
             max_frames_per_callback: frames,
         })
@@ -151,7 +165,7 @@ impl AudioFormat {
     /// Returns whether this format matches the alpha product contract.
     #[must_use]
     pub const fn is_product_format(self) -> bool {
-        self.sample_rate_hz == PRODUCT_SAMPLE_RATE_HZ
+        matches!(self.sample_rate_hz, 48_000 | 96_000)
             && self.channel_count == PRODUCT_CHANNEL_COUNT
             && matches!(self.max_frames_per_callback, 32 | 64 | 128 | 256)
     }
@@ -171,6 +185,11 @@ pub enum AudioFormatError {
         /// Requested frames.
         frames: u32,
     },
+    /// Product mode only runs at 48 or 96 kHz.
+    UnsupportedProductSampleRate {
+        /// Requested rate in hertz.
+        sample_rate_hz: u32,
+    },
 }
 
 impl fmt::Display for AudioFormatError {
@@ -184,6 +203,10 @@ impl fmt::Display for AudioFormatError {
             Self::UnsupportedProductFrames { frames } => write!(
                 formatter,
                 "product audio requires 32, 64, 128, or 256 frames, got {frames}"
+            ),
+            Self::UnsupportedProductSampleRate { sample_rate_hz } => write!(
+                formatter,
+                "product audio runs at 48000 or 96000 Hz, got {sample_rate_hz}"
             ),
         }
     }
@@ -277,6 +300,17 @@ mod tests {
         assert_eq!(
             AudioFormat::product_stereo(16),
             Err(AudioFormatError::UnsupportedProductFrames { frames: 16 })
+        );
+        assert!(
+            AudioFormat::product(96_000, 32)
+                .unwrap()
+                .is_product_format()
+        );
+        assert_eq!(
+            AudioFormat::product(44_100, 64),
+            Err(AudioFormatError::UnsupportedProductSampleRate {
+                sample_rate_hz: 44_100
+            })
         );
     }
 }

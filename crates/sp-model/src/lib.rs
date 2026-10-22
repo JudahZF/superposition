@@ -355,6 +355,16 @@ pub struct AudioDeviceSettings {
     pub output: AudioDeviceSelection,
     /// Requested callback block size.
     pub buffer_frames: u32,
+    /// Session sample rate: 48 or 96 kHz. Sessions saved before this field existed use 48 kHz.
+    #[serde(default = "default_sample_rate_hz")]
+    pub sample_rate_hz: u32,
+}
+
+/// Sample rates a session may run at, in hertz.
+pub const SUPPORTED_SAMPLE_RATES_HZ: [u32; 2] = [48_000, 96_000];
+
+const fn default_sample_rate_hz() -> u32 {
+    48_000
 }
 
 impl AudioDeviceSettings {
@@ -366,6 +376,11 @@ impl AudioDeviceSettings {
         if !matches!(self.buffer_frames, 32 | 64 | 128 | 256) {
             return Err(ValidationError::InvalidAudioBufferFrames {
                 frames: self.buffer_frames,
+            });
+        }
+        if !SUPPORTED_SAMPLE_RATES_HZ.contains(&self.sample_rate_hz) {
+            return Err(ValidationError::InvalidAudioSampleRate {
+                hertz: self.sample_rate_hz,
             });
         }
         Ok(())
@@ -1260,6 +1275,12 @@ pub enum ValidationError {
         /// Requested block size.
         frames: u32,
     },
+    /// Audio settings request a sample rate other than 48 or 96 kHz.
+    #[error("audio sample rate must be 48000 or 96000 Hz, got {hertz}")]
+    InvalidAudioSampleRate {
+        /// Requested sample rate.
+        hertz: u32,
+    },
     /// A physical route names a rack that is not present in the session.
     #[error("physical route references unknown rack {rack_id:?}")]
     UnknownRackRoute {
@@ -1563,10 +1584,22 @@ mod physical_route_tests {
                 name: "Studio Output".into(),
             },
             buffer_frames: 64,
+            sample_rate_hz: 96_000,
         });
         session.validate().unwrap();
         let encoded = serde_json::to_string(&session).unwrap();
         assert_eq!(serde_json::from_str::<Session>(&encoded).unwrap(), session);
+        // Sessions saved before the rate existed load at 48 kHz.
+        let legacy = encoded.replace(",\"sample_rate_hz\":96000", "");
+        assert_ne!(legacy, encoded);
+        let legacy = serde_json::from_str::<Session>(&legacy).unwrap();
+        assert_eq!(legacy.audio_settings.unwrap().sample_rate_hz, 48_000);
+        session.audio_settings.as_mut().unwrap().sample_rate_hz = 44_100;
+        assert_eq!(
+            session.validate(),
+            Err(ValidationError::InvalidAudioSampleRate { hertz: 44_100 })
+        );
+        session.audio_settings.as_mut().unwrap().sample_rate_hz = 48_000;
         session.audio_settings.as_mut().unwrap().buffer_frames = 16;
         assert_eq!(
             session.validate(),

@@ -10,6 +10,7 @@ use crate::{
     ActiveMultiChannelDuplex, ActiveOutput, CoreAudioError, OutputConfig, enumerate_devices,
 };
 
+/// The AUHAL streams run at 48 kHz only.
 const PRODUCT_SAMPLE_RATE: u32 = 48_000;
 
 /// macOS product audio endpoint: 48 kHz, 1–64 physical output channels.
@@ -226,7 +227,8 @@ impl AudioEndpoint for MacOsAudioEndpoint {
         let format = format
             .validate()
             .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
-        if !format.is_product_format() {
+        // The AUHAL streams run at 48 kHz only; 96 kHz sessions are Linux/Tunnel first.
+        if !format.is_product_format() || format.sample_rate_hz != PRODUCT_SAMPLE_RATE {
             return Err(Box::new(AudioFormatError::UnsupportedProductFrames {
                 frames: format.max_frames_per_callback,
             }));

@@ -20,6 +20,7 @@ const TABS: [(SetupTab, &str); 4] = [
     (SetupTab::Diagnostics, "Diagnostics"),
 ];
 const BUFFER_CHOICES: [u32; 4] = [32, 64, 128, 256];
+const SAMPLE_RATE_CHOICES: [u32; 2] = [48_000, 96_000];
 
 /// Table column widths in 16 px lines.
 const NARROW: f32 = 3.0;
@@ -93,6 +94,7 @@ impl LiveRackApp {
         }
         let previous_route = self.selected_route.clone();
         let previous_buffer = self.buffer_frames;
+        let previous_rate = self.sample_rate_hz;
         section(ui, "Output device");
         let outputs: Vec<_> = self
             .audio_devices
@@ -128,8 +130,8 @@ impl LiveRackApp {
                 self.selected_route = Some(AudioRouteConfig {
                     input,
                     output: id,
-                    format: AudioFormat::product_stereo(self.buffer_frames)
-                        .expect("product buffer size"),
+                    format: AudioFormat::product(self.sample_rate_hz, self.buffer_frames)
+                        .expect("product rate and buffer size"),
                 });
             }
         }
@@ -184,7 +186,25 @@ impl LiveRackApp {
                 ColorToken::Warn,
             );
         }
-        section(ui, "Buffer at 48 kHz");
+        section(ui, "Sample rate");
+        for rate in SAMPLE_RATE_CHOICES {
+            if choice_row(
+                ui,
+                Mark::Radio,
+                self.sample_rate_hz == rate,
+                &format!("{} kHz", rate / 1_000),
+                "",
+                !locked,
+            )
+            .clicked()
+            {
+                self.sample_rate_hz = rate;
+            }
+        }
+        section(
+            ui,
+            &format!("Buffer at {} kHz", self.sample_rate_hz / 1_000),
+        );
         let buffers = self
             .selected_route
             .as_ref()
@@ -200,7 +220,7 @@ impl LiveRackApp {
                 Mark::Radio,
                 self.buffer_frames == frames,
                 &format!("{frames} samples"),
-                &latency_label(frames),
+                &latency_label(frames, self.sample_rate_hz),
                 enabled,
             )
             .clicked()
@@ -211,7 +231,7 @@ impl LiveRackApp {
         if self.selected_route.is_some() && buffers.is_empty() {
             note(
                 ui,
-                "These devices share no 48 kHz buffer size.",
+                "These devices share no product buffer size.",
                 ColorToken::Warn,
             );
         }
@@ -228,7 +248,10 @@ impl LiveRackApp {
         if action(ui, "Refresh devices", None, !locked).clicked() {
             self.refresh_audio_devices();
         }
-        if self.selected_route != previous_route || self.buffer_frames != previous_buffer {
+        if self.selected_route != previous_route
+            || self.buffer_frames != previous_buffer
+            || self.sample_rate_hz != previous_rate
+        {
             self.persist_audio_settings();
         }
     }
@@ -688,7 +711,13 @@ impl LiveRackApp {
         let frames = self.buffer_frames_value();
         let load = self.callback_load().map_or_else(
             || "--".to_owned(),
-            |load| format!("{:.0} % of {}", load * 100.0, latency_label(frames)),
+            |load| {
+                format!(
+                    "{:.0} % of {}",
+                    load * 100.0,
+                    latency_label(frames, self.sample_rate_value())
+                )
+            },
         );
         let misses = self
             .deadline_misses()

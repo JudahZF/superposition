@@ -571,6 +571,7 @@ fn saved_route_finds_a_returned_device_by_name() {
             name: "Stage Interface".to_owned(),
         },
         buffer_frames: 128,
+        sample_rate_hz: 48_000,
     };
 
     assert!(
