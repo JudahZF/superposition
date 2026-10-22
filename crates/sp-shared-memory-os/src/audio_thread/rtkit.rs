@@ -16,7 +16,13 @@ use zbus::{blocking::Connection, proxy::CacheProperties};
     gen_async = false
 )]
 trait RealtimeKit1 {
-    fn make_thread_realtime(&self, thread: u64, priority: u32) -> zbus::Result<()>;
+    #[zbus(name = "MakeThreadRealtimeWithPID")]
+    fn make_thread_realtime_with_pid(
+        &self,
+        process: u64,
+        thread: u64,
+        priority: u32,
+    ) -> zbus::Result<()>;
 
     #[zbus(property)]
     fn max_realtime_priority(&self) -> zbus::Result<i32>;
@@ -25,9 +31,17 @@ trait RealtimeKit1 {
     fn rttime_usec_max(&self) -> zbus::Result<i64>;
 }
 
-/// Asks rtkit to make the calling thread real-time, at `priority` or rtkit's maximum.
-pub(super) fn make_current_thread_realtime(
+/// The calling thread's kernel thread ID. One system call, so an audio thread may record it.
+#[must_use]
+pub fn current_thread_id() -> u64 {
+    // SAFETY: `gettid` has no preconditions.
+    u64::try_from(unsafe { libc::gettid() }).unwrap_or(0)
+}
+
+/// Asks rtkit to make `thread` of this process real-time, at `priority` or rtkit's maximum.
+pub(super) fn make_thread_realtime(
     connection: &Connection,
+    thread: u64,
     priority: i32,
 ) -> io::Result<()> {
     let rtkit = RealtimeKit1Proxy::builder(connection)
@@ -36,11 +50,36 @@ pub(super) fn make_current_thread_realtime(
         .map_err(io::Error::other)?;
     limit_rttime(rtkit.rttime_usec_max().map_err(io::Error::other)?)?;
     let priority = priority.min(rtkit.max_realtime_priority().map_err(io::Error::other)?);
-    // SAFETY: `gettid` has no preconditions.
-    let thread = u64::try_from(unsafe { libc::gettid() }).map_err(io::Error::other)?;
     rtkit
-        .make_thread_realtime(thread, u32::try_from(priority).map_err(io::Error::other)?)
+        .make_thread_realtime_with_pid(
+            u64::from(std::process::id()),
+            thread,
+            u32::try_from(priority).map_err(io::Error::other)?,
+        )
         .map_err(io::Error::other)
+}
+
+/// Makes another thread of this process real-time through rtkit, unless it already is: for
+/// threads a library creates, such as a JACK callback thread. It waits for D-Bus, so call it off
+/// the audio path. Returns whether it changed the thread.
+///
+/// # Errors
+/// Returns an error when the thread does not exist, or rtkit is unreachable or refuses.
+pub fn promote_thread(thread: u64, priority: i32) -> io::Result<bool> {
+    let tid = libc::pid_t::try_from(thread).map_err(io::Error::other)?;
+    // SAFETY: `sched_getscheduler` only reads the scheduling policy of `tid`.
+    let policy = unsafe { libc::sched_getscheduler(tid) };
+    if policy < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if matches!(
+        policy & !libc::SCHED_RESET_ON_FORK,
+        libc::SCHED_FIFO | libc::SCHED_RR
+    ) {
+        return Ok(false);
+    }
+    let connection = Connection::system().map_err(io::Error::other)?;
+    make_thread_realtime(&connection, thread, priority).map(|()| true)
 }
 
 /// The highest priority rtkit grants, which also shows that rtkit answers on the system bus.
@@ -89,10 +128,10 @@ mod tests {
 
     use zbus::{Guid, blocking::connection::Builder};
 
-    use super::make_current_thread_realtime;
+    use super::{current_thread_id, make_thread_realtime};
 
-    /// The calls rtkit received, as (thread, priority).
-    type Calls = Arc<Mutex<Vec<(u64, u32)>>>;
+    /// The calls rtkit received, as (process, thread, priority).
+    type Calls = Arc<Mutex<Vec<(u64, u64, u32)>>>;
 
     struct FakeRtkit {
         calls: Calls,
@@ -102,11 +141,13 @@ mod tests {
 
     #[zbus::interface(name = "org.freedesktop.RealtimeKit1")]
     impl FakeRtkit {
-        fn make_thread_realtime(&self, thread: u64, priority: u32) {
+        // rtkit's own spelling, so a wrong name in the proxy fails this test.
+        #[zbus(name = "MakeThreadRealtimeWithPID")]
+        fn make_thread_realtime_with_pid(&self, process: u64, thread: u64, priority: u32) {
             self.calls
                 .lock()
                 .expect("calls lock")
-                .push((thread, priority));
+                .push((process, thread, priority));
         }
 
         #[zbus(property)]
@@ -123,7 +164,7 @@ mod tests {
     /// Checks the request against rtkit's D-Bus interface over a peer-to-peer connection,
     /// because CI machines rarely run rtkit.
     #[test]
-    fn asks_rtkit_for_the_calling_thread_within_its_limits() {
+    fn asks_rtkit_for_a_thread_of_this_process_within_its_limits() {
         let (server_end, client_end) = UnixStream::pair().expect("socket pair");
         let calls = Calls::default();
         let fake = FakeRtkit {
@@ -149,11 +190,13 @@ mod tests {
             .expect("client connection");
         let _server = server.join().expect("fake rtkit thread");
 
-        make_current_thread_realtime(&client, 70).expect("rtkit request");
+        let thread = current_thread_id();
+        make_thread_realtime(&client, thread, 70).expect("rtkit request");
 
-        // SAFETY: `gettid` has no preconditions.
-        let thread = u64::try_from(unsafe { libc::gettid() }).expect("thread id");
-        assert_eq!(*calls.lock().expect("calls lock"), [(thread, 20)]);
+        assert_eq!(
+            *calls.lock().expect("calls lock"),
+            [(u64::from(std::process::id()), thread, 20)]
+        );
         let mut limit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,

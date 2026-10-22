@@ -29,9 +29,24 @@ pub(crate) struct TelemetryCell {
     invalid_buffers: AtomicU64,
     invalid_channels: AtomicU64,
     histogram: [AtomicU64; 4],
+    /// The callback thread's kernel ID, 0 until its first block, for `promote_callback`.
+    callback_thread: AtomicU64,
 }
 
 impl TelemetryCell {
+    /// Records the calling thread as the callback thread, once.
+    pub(crate) fn record_callback_thread(&self) {
+        if self.callback_thread.load(Ordering::Relaxed) == 0 {
+            self.callback_thread
+                .store(sp_shared_memory_os::current_thread_id(), Ordering::Release);
+        }
+    }
+
+    /// The callback thread's kernel ID, once it has run.
+    pub(crate) fn callback_thread(&self) -> Option<u64> {
+        Some(self.callback_thread.load(Ordering::Acquire)).filter(|&thread| thread != 0)
+    }
+
     pub(crate) fn record(&self, outcome: BlockOutcome, frames: BlockFrames) {
         let sequence = self.sequence.load(Ordering::Relaxed);
         self.sequence

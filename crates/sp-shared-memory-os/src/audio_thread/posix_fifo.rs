@@ -140,7 +140,8 @@ pub fn realtime_priority_limit() -> u64 {
     }
 }
 
-fn priority() -> i32 {
+/// The real-time priority Superposition's processing threads use (`SUPERPOSITION_RT_PRIORITY`).
+pub fn priority() -> i32 {
     std::env::var("SUPERPOSITION_RT_PRIORITY")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -174,7 +175,7 @@ fn fifo_permitted() -> bool {
 #[cfg(target_os = "linux")]
 fn request_from_rtkit(priority: i32) -> io::Result<()> {
     let connection = zbus::blocking::Connection::system().map_err(io::Error::other)?;
-    super::rtkit::make_current_thread_realtime(&connection, priority)
+    super::rtkit::make_thread_realtime(&connection, super::rtkit::current_thread_id(), priority)
 }
 
 #[cfg(target_os = "linux")]

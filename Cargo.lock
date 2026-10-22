@@ -3654,6 +3654,7 @@ dependencies = [
  "quanta-audio-io",
  "sp-audio-io",
  "sp-engine",
+ "sp-shared-memory-os",
 ]
 
 [[package]]

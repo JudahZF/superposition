@@ -20,6 +20,7 @@ mod telemetry;
 use std::{
     error::Error,
     sync::{Arc, Mutex, PoisonError},
+    time::{Duration, Instant},
 };
 
 use quanta_audio_io::{
@@ -90,6 +91,37 @@ pub fn enumerate_devices() -> Result<Vec<LinuxAudioDevice>, quanta_audio_io::Err
 
 /// Where a stopped stream's callback hands the renderer back.
 type RendererReturn = Arc<Mutex<Option<Box<ProductRenderer>>>>;
+
+/// Makes the JACK callback thread real-time through rtkit once it has run, on a short-lived
+/// thread, because the rack dispatcher runs in it. A JACK server or client library that already
+/// made it real-time (`jackd -R`, PipeWire's `module-rt`) leaves nothing to do; one that did not
+/// (as PipeWire's JACK library can fail to without telling) gets rtkit's `SCHED_RR`.
+fn promote_callback(telemetry: Arc<TelemetryCell>) {
+    let spawned = std::thread::Builder::new()
+        .name("sp-jack-rt".into())
+        .spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let thread = loop {
+                match telemetry.callback_thread() {
+                    Some(thread) => break thread,
+                    None if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    None => return,
+                }
+            };
+            if let Err(error) =
+                sp_shared_memory_os::promote_thread(thread, sp_shared_memory_os::realtime_priority())
+            {
+                eprintln!(
+                    "superposition: the JACK callback thread runs without real-time priority: {error}"
+                );
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("superposition: could not start the JACK priority helper: {error}");
+    }
+}
 
 /// The JACK callback: interleaves, renders, and de-interleaves one product block.
 struct ProductCallback {
@@ -186,6 +218,7 @@ impl ProductCallback {
 
 impl Callback for ProductCallback {
     fn process(&mut self, mut block: AudioBlock<'_>) {
+        self.telemetry.record_callback_thread();
         let outcome = self.render(&mut block);
         if outcome != BlockOutcome::Rendered {
             for channel in 0..block.output_channels() {
@@ -363,6 +396,7 @@ impl LinuxAudioEndpoint {
                 return Err(error);
             }
         };
+        promote_callback(Arc::clone(&telemetry));
         let counters = stream.counters();
         self.stream = Some(ActiveStream {
             stream,

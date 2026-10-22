@@ -20,10 +20,12 @@ mod rtkit;
 pub use macos::AudioThreadPolicy;
 #[cfg(any(target_os = "linux", windows))]
 pub use posix_fifo::AudioThreadPolicy;
+#[cfg(any(target_os = "linux", windows))]
+pub use posix_fifo::priority as realtime_priority;
 #[cfg(target_os = "linux")]
 pub use posix_fifo::realtime_priority_limit;
 #[cfg(target_os = "linux")]
-pub use rtkit::max_priority as rtkit_max_priority;
+pub use rtkit::{current_thread_id, max_priority as rtkit_max_priority, promote_thread};
 
 /// The scheduling the processing thread actually received.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
