@@ -58,16 +58,20 @@ supports that representation.
 
 `preview.png` is a 320×200 PNG of the instance's native editor as it last looked:
 the editor's content area scaled to cover and centre-cropped, without the title
-bar. The worker takes it on its `AppKit` thread, never the audio thread: about
-0.5 s after the editor opens, then at most every 2 s while the plug-in reports
-changed parameter values (editor edits or its own output), and once as the
-editor closes (red button, close request, slot unload, or shutdown). Parameter
+bar. The worker takes it on its `AppKit` or X11 editor thread, never the audio
+thread: about 0.5 s after the editor opens, then at most every 2 s while the
+plug-in reports changed parameter values (editor edits or its own output), and
+once as the editor closes (red button, close request, slot unload, or shutdown). Parameter
 changes made by the host (scenes, MIDI) do not trigger a picture by themselves.
 The worker uses the window server's image of its own window
 (`CGWindowListCreateImage`, looked up at run time), which includes Metal and
 OpenGL layers. On macOS 27 this needs no screen-recording permission and shows
 no prompt: the window server only preflights the check. A drawn view cache is
 the fallback if that call is unavailable, but it misses layer-backed content.
+On Linux the worker reads its window from the private X server with
+`GetImage`, which includes the plug-in's embedded window, and scales it by
+area averaging. A `WM_DELETE_WINDOW` request closes the editor as the red
+button does.
 
 An explicit save stores the newest picture per instance, declared in that
 instance's `metadata.json` and committed with the manifest like the state

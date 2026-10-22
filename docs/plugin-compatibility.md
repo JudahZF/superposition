@@ -4,7 +4,7 @@
 
 The initial plug-in format is VST3, behind `sp-vst3` and executed only in scanner/worker helpers. The adapter translates declared audio buses, bounded event/MIDI data, parameter changes, processing calls, and state transfer into host-owned types. The engine and session layer do not depend on VST3 SDK types or lifetime rules.
 
-The disposable scanner validates bundle layout and Mach-O architecture before optional SDK enumeration. The parent computes a SHA-256 fingerprint over canonical path, entry metadata, and bundle file contents; unchanged results are reused from an atomically replaced JSON cache. Retained worker helpers rebuild and process fixed serial multi-slot racks, while editor lifecycle is isolated in worker-owned AppKit windows. Passing the alpha path does not certify all VST3 plug-ins.
+The disposable scanner validates bundle layout and the executable's architecture (Mach-O on macOS, ELF in `Contents/<arch>-linux` on Linux) before optional SDK enumeration. The parent computes a SHA-256 fingerprint over canonical path, entry metadata, and bundle file contents; unchanged results are reused from an atomically replaced JSON cache. Retained worker helpers rebuild and process fixed serial multi-slot racks, while editor lifecycle is isolated in worker-owned AppKit or X11 windows. Passing the alpha path does not certify all VST3 plug-ins.
 
 Scanner reports use a private temporary file, bounded to 4 MiB, so plug-in log
 output cannot corrupt the report or hold its output pipe open. Catalog version 3
