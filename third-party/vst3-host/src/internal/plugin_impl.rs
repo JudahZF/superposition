@@ -570,7 +570,7 @@ impl EditorCore {
     }
 
     #[cfg(target_os = "linux")]
-    fn service_run_loop(&self) {
+    pub(crate) fn service_run_loop(&self) {
         let _ = self.with_fields(|fields| fields.service_run_loop());
     }
 
