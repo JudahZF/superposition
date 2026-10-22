@@ -1,5 +1,6 @@
-# System settings for running Superposition on NixOS: real-time limits, the ntsync driver for
-# Wine, the pinned Wine build, and Xvfb for the engine's private editor display.
+# System settings for running Superposition on NixOS: real-time limits, a low-latency kernel
+# command line, the ntsync driver for Wine, the pinned Wine build, and Xvfb for the engine's
+# private editor display.
 #
 # Users who run Superposition must be in the `audio` group.
 { wineFor }:
@@ -17,6 +18,16 @@ in
       type = lib.types.nullOr lib.types.package;
       default = null;
       description = "Superposition build to install. Null installs only the runtime tools.";
+    };
+
+    lowLatencyKernel = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Boot with full kernel preemption and threaded interrupts (`preempt=full threadirqs`).
+        On a stock desktop kernel, a real-time worker can still wait more than 1 ms to run, which
+        misses blocks below 128 frames.
+      '';
     };
 
     realtimePriority = lib.mkOption {
@@ -43,6 +54,10 @@ in
     security.rtkit.enable = true;
     # Faster Windows synchronisation in Wine builds that support it.
     boot.kernelModules = [ "ntsync" ];
+    boot.kernelParams = lib.optionals cfg.lowLatencyKernel [
+      "preempt=full"
+      "threadirqs"
+    ];
 
     environment.systemPackages = [
       wine

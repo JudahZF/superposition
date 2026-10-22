@@ -55,6 +55,7 @@
           inherit (host) config;
           ok =
             lib.elem "ntsync" config.boot.kernelModules
+            && lib.elem "threadirqs" config.boot.kernelParams
             && lib.any (
               limit: limit.domain == "@audio" && limit.item == "rtprio" && limit.value == "95"
             ) config.security.pam.loginLimits
