@@ -19,8 +19,9 @@
 //! # Session
 //!
 //! 1. The client sends [`ClientMessage::Hello`] with [`PROTOCOL_VERSION`] and a [`Role`].
-//! 2. The streamer replies with `Welcome`, `WindowList`, `ControlStatus`, then a keyframe per
-//!    window, and from then on `WindowOpened`/`WindowChanged`/`WindowClosed` and `Frame`s.
+//! 2. The streamer replies with `Welcome`, `WindowList`, one `ControlStatus` (`Granted` or
+//!    `Denied` for a controller hello, else `Current`), then a keyframe per window, and from then
+//!    on `WindowOpened`/`WindowChanged`/`WindowClosed` and `Frame`s.
 //! 3. One client holds input control. A controller hello takes free control; a later one gets
 //!    `Denied` until it sends `RequestControl { takeover: true }`, which notifies everyone.
 //!    Viewers only receive. A client that falls behind skips frames and gets a keyframe later.

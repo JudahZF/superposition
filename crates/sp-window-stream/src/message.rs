@@ -310,6 +310,8 @@ pub enum ClientMessage {
 /// Why [`ServerMessage::ControlStatus`] was sent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlReason {
+    /// Only to a new client after `Welcome`: the state when it joined.
+    Current,
     /// The holder asked and nobody held control.
     Granted,
     /// The holder took control from the previous holder.
@@ -747,6 +749,7 @@ impl Body for ServerMessage {
                 w.u8(tag::CONTROL_STATUS);
                 w.opt_u32(holder.map(|id| id.0));
                 w.u8(match reason {
+                    ControlReason::Current => 0,
                     ControlReason::Granted => 1,
                     ControlReason::TakenOver => 2,
                     ControlReason::Released => 3,
@@ -790,6 +793,7 @@ impl Body for ServerMessage {
             tag::CONTROL_STATUS => {
                 let holder = r.opt_u32()?.map(ClientId);
                 let reason = match r.u8()? {
+                    0 => ControlReason::Current,
                     1 => ControlReason::Granted,
                     2 => ControlReason::TakenOver,
                     3 => ControlReason::Released,
