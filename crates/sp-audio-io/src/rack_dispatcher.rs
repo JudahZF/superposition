@@ -235,6 +235,9 @@ struct LiveRequest {
 
 struct RackDispatchState {
     rack_index: usize,
+    /// A pipelined rack is dispatched after this block's observations and its result is mixed
+    /// one block later, giving a worker under Wine a whole block of slack.
+    pipelined: bool,
     banks: MappedRackBanks,
     recovery: Option<Arc<RackRecoverySignal>>,
     gate: RackGate,
@@ -253,6 +256,7 @@ impl RackDispatchState {
     ) -> Self {
         Self {
             rack_index,
+            pipelined: false,
             banks,
             recovery,
             gate: RackGate::new(),
@@ -297,6 +301,14 @@ impl PreparedRackLane {
         ))))
     }
 
+    /// Marks this lane as pipelined: its output is the previous block's input, one block late.
+    /// Racks whose worker crosses a slower boundary (Windows plug-ins under Wine) use this.
+    #[must_use]
+    pub fn with_pipelined(mut self, pipelined: bool) -> Self {
+        self.0.pipelined = pipelined;
+        self
+    }
+
     /// The worker recovery signal that identifies this lane's worker.
     #[must_use]
     pub fn recovery(&self) -> Option<&Arc<RackRecoverySignal>> {
@@ -327,6 +339,20 @@ pub struct RackSharedMemoryDispatcher {
     )]
     racks: Vec<Box<RackDispatchState>>,
     block_index: u64,
+    /// Frames in the most recent valid block; pipelined racks delay their dry path by this.
+    block_frames: usize,
+}
+
+/// Which racks one dispatch pass publishes.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DispatchPass {
+    /// Racks whose result is mixed in this block.
+    SameBlock,
+    /// Racks whose result is mixed in the next block.
+    Pipelined,
+    /// Every open rack (tests that drive one pass by hand).
+    #[cfg(test)]
+    All,
 }
 
 impl RackSharedMemoryDispatcher {
@@ -467,6 +493,7 @@ impl RackSharedMemoryDispatcher {
             clock,
             racks,
             block_index: 0,
+            block_frames: 0,
         })
     }
 
@@ -524,6 +551,16 @@ impl RackSharedMemoryDispatcher {
             service_recovery(rack, self.block_index);
         }
         attached
+    }
+
+    /// Marks one rack pipelined (see [`PreparedRackLane::with_pipelined`]) before the callback
+    /// starts. Returns `false` for an unknown rack.
+    pub fn set_pipelined(&mut self, rack_index: usize, pipelined: bool) -> bool {
+        self.racks
+            .iter_mut()
+            .find(|rack| rack.rack_index == rack_index)
+            .map(|rack| rack.pipelined = pipelined)
+            .is_some()
     }
 
     /// Returns a lock-free telemetry snapshot for one rack.
@@ -728,8 +765,27 @@ impl RackSharedMemoryDispatcher {
             .clock
             .now_ticks()
             .saturating_add(self.clock.duration_to_ticks(deadline));
-        self.dispatch_open_inputs(inputs, sidechains, midi, automation, frames);
+        self.block_frames = frames;
+        // Same-block racks publish first. One observation pass then collects them and the
+        // pipelined racks' previous requests, which had a whole block more. Pipelined racks
+        // publish last, once their previous result is in.
+        self.dispatch_open_inputs(
+            DispatchPass::SameBlock,
+            inputs,
+            sidechains,
+            midi,
+            automation,
+            frames,
+        );
         self.observe_until(deadline_tick);
+        self.dispatch_open_inputs(
+            DispatchPass::Pipelined,
+            inputs,
+            sidechains,
+            midi,
+            automation,
+            frames,
+        );
         self.record_closed_gates();
         self.block_index = self.block_index.wrapping_add(1);
     }
@@ -756,9 +812,12 @@ impl RackSharedMemoryDispatcher {
                 .header
                 .worker_latency_samples
                 .load(Ordering::Acquire);
+            let pipeline = if rack.pipelined { self.block_frames } else { 0 };
             mixer.set_dry_delay_frames(
                 rack.rack_index,
-                usize::try_from(latency).unwrap_or(usize::MAX),
+                usize::try_from(latency)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(pipeline),
             );
         }
     }
@@ -825,11 +884,19 @@ impl RackSharedMemoryDispatcher {
         automation: &[RackAutomationEvents; MAX_RACKS],
         frames: usize,
     ) {
-        self.dispatch_open_inputs(RackInputs::Shared(input), None, midi, automation, frames);
+        self.dispatch_open_inputs(
+            DispatchPass::All,
+            RackInputs::Shared(input),
+            None,
+            midi,
+            automation,
+            frames,
+        );
     }
 
     fn dispatch_open_inputs(
         &mut self,
+        pass: DispatchPass,
         inputs: RackInputs<'_>,
         sidechains: Option<&SidechainSources<'_>>,
         midi: &[MidiEvent],
@@ -837,6 +904,15 @@ impl RackSharedMemoryDispatcher {
         frames: usize,
     ) {
         for rack in &mut self.racks {
+            let selected = match pass {
+                DispatchPass::SameBlock => !rack.pipelined,
+                DispatchPass::Pipelined => rack.pipelined,
+                #[cfg(test)]
+                DispatchPass::All => true,
+            };
+            if !selected {
+                continue;
+            }
             if rack.recovery.as_ref().is_some_and(|recovery| {
                 matches!(
                     recovery.state(),
@@ -1599,6 +1675,69 @@ mod tests {
             .store(99, Ordering::Release);
         dispatcher.apply_to_mixer(&mut mixer);
         assert_eq!(mixer.rack_settings(0).unwrap().latency_frames, 37);
+    }
+
+    #[test]
+    fn pipelined_rack_mixes_the_previous_blocks_result_and_delays_its_dry_path() {
+        let Some(mut dispatcher) = dispatcher(1) else {
+            return;
+        };
+        assert!(dispatcher.set_pipelined(0, true));
+        dispatcher.process_block(&[0.25, -0.25, 0.5, -0.5], &[], 2, Duration::ZERO);
+        // The first block only publishes; there is no result to mix yet and no miss.
+        assert!(matches!(dispatcher.sources()[0], RackAudioSource::None));
+        assert_eq!(dispatcher.telemetry(0).unwrap().deadline_misses, 0);
+        complete(&mut dispatcher, 0, [1.0, -1.0, 0.5, -0.5]);
+
+        let second = [0.75, -0.75, 0.125, -0.125];
+        dispatcher.process_block(&second, &[], 2, Duration::ZERO);
+        let RackAudioSource::Wet(wet) = dispatcher.sources()[0] else {
+            panic!("the previous block's completion must be mixed");
+        };
+        assert_eq!(&wet[..4], &[1.0, -1.0, 0.5, -0.5]);
+        // The block's own request is published after observation.
+        let live = dispatcher.racks[0].live.expect("next request");
+        let slot = dispatcher.racks[0]
+            .banks
+            .bank(live.bank_index)
+            .unwrap()
+            .bank()
+            .slot(live.slot_index)
+            .unwrap();
+        assert_eq!(&slot.input_audio[0][..2], &[0.75, 0.125]);
+        let telemetry = dispatcher.telemetry(0).unwrap();
+        assert_eq!((telemetry.completed, telemetry.deadline_misses), (1, 0));
+
+        dispatcher.racks[0]
+            .banks
+            .active_bank()
+            .bank()
+            .header
+            .worker_latency_samples
+            .store(37, Ordering::Release);
+        let mut mixer = sp_engine::RealtimeRackMixer::new(sp_engine::PreparedGraph::empty());
+        dispatcher.apply_to_mixer(&mut mixer);
+        assert_eq!(mixer.rack_settings(0).unwrap().latency_frames, 37 + 2);
+    }
+
+    #[test]
+    fn pipelined_rack_without_a_result_after_a_block_misses_its_deadline() {
+        let Some(mut dispatcher) = dispatcher(2) else {
+            return;
+        };
+        assert!(dispatcher.set_pipelined(1, true));
+        let input = [0.0; 4];
+        dispatcher.process_block(&input, &[], 2, Duration::ZERO);
+        // Rack 0 (same block) missed at once; rack 1 had its first request published.
+        assert_eq!(dispatcher.telemetry(0).unwrap().deadline_misses, 1);
+        assert_eq!(dispatcher.telemetry(1).unwrap().deadline_misses, 0);
+        dispatcher.process_block(&input, &[], 2, Duration::ZERO);
+        let telemetry = dispatcher.telemetry(1).unwrap();
+        assert_eq!(telemetry.deadline_misses, 1);
+        assert!(
+            dispatcher.racks[1].live.is_none(),
+            "the missed request is abandoned"
+        );
     }
 
     #[test]
