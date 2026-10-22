@@ -25,6 +25,36 @@ ValhallaSupermassive, and UADx 1176. Capture comparison through the BlackHole lo
 matched the source at one buffer of delay (256 samples at 64 frames, 128 at 32).
 That is the virtual loop's delay, not a physical round-trip latency.
 
+## Linux software rig (22 October 2026)
+
+No Linux audio hardware has been tested yet, so these are software results only. Setup:
+
+- x86_64 NixOS, 12 cores, no real-time priority (`RLIMIT_RTPRIO` 0, no rtkit).
+- A private `jackd --no-realtime` dummy server at 48 kHz.
+- One rack with Dragonfly Plate Reverb (Linux VST3).
+- Release build, `superposition --headless … --duration-seconds 30`.
+
+| Block | Machine load | Blocks | Deadline misses |
+| ---: | --- | ---: | ---: |
+| 256 | idle (0.4) | 5 625 | 0 |
+| 128 | idle (0.3) | 11 250 | 0 |
+| 64 | light (1.3) | 22 474 | 6 |
+| 32 | busy (6.0) | 37 622 | 211 |
+| 256 | busy (≈5, parallel builds) | 5 619 | 2 |
+| 256 | overloaded (≈25) | — | repeated misses; the rack gave up after 3 recoveries |
+
+Every miss was a worker that had been woken but not scheduled before the deadline (`unclaimed`),
+or a wake syscall delayed by several milliseconds. Neither is a protocol fault. A single hard miss
+replaces the worker, so on an overloaded system without real-time priority, misses cascade. Below
+128 frames, Linux needs real-time scheduling (see the README).
+
+The same rig ran the desktop UI through `--serve`/`--connect` on Xvfb:
+- device selection, the plug-in scan, adding a rack and plug-in, and starting audio all worked;
+- X programs on the private display appeared as windows in the app and took clicks.
+
+`cargo xtask wine-check` measured futex round trips through `sp_wine_bridge` with a Windows
+client under Wine 11.18: p50 5 µs; p99 1.1 ms while the machine was busy compiling.
+
 ## Known limits
 
 - Eight racks at 128 frames failed some earlier runs under load. The failed blocks
