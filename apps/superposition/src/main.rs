@@ -2608,13 +2608,12 @@ impl ProductRuntime {
         Ok(())
     }
 
-    /// Opens callback-owned mappings for every retained same-block (native) rack worker before
-    /// audio starts. The worker and callback have separate mappings of the same POSIX objects.
-    /// Pipelined (Windows) racks join through [`Self::pipelined_rack_lanes`].
+    /// Opens callback-owned mappings for every retained rack worker before audio starts. The
+    /// worker and callback have separate mappings of the same POSIX objects. Windows racks are
+    /// then marked pipelined ([`Self::rack_is_pipelined`]).
     pub(crate) fn audio_bank_mappings(&self) -> Result<Vec<AudioBankMapping>, String> {
         self.workers
             .iter()
-            .filter(|(_, worker)| worker.platform == PluginPlatform::Native)
             .map(|(&rack_index, worker)| {
                 if worker.recovery.state() != RackRecoveryState::Idle
                     || worker.maintenance.as_ref().is_some_and(|maintenance| maintenance.failed)
@@ -2640,34 +2639,6 @@ impl ProductRuntime {
                     worker.active_bank_index,
                     Arc::clone(&worker.recovery),
                 ))
-            })
-            .collect()
-    }
-
-    /// Pipelined dispatch lanes for the Windows rack workers, by rack position. The renderer's
-    /// initial banks cannot be pipelined, so audio start adds these with a topology change
-    /// that the first callback applies; each fades in once it delivers three valid blocks.
-    pub(crate) fn pipelined_rack_lanes(
-        &self,
-    ) -> Result<Vec<(usize, sp_audio_io::PreparedRackLane)>, String> {
-        self.workers
-            .iter()
-            .filter(|(_, worker)| worker.platform == PluginPlatform::Windows)
-            .map(|(&rack_index, worker)| {
-                let regions = [
-                    SharedMemoryRegion::open(worker.banks[0].name())
-                        .map_err(|error| format!("cannot map rack bank for audio: {error}"))?,
-                    SharedMemoryRegion::open(worker.banks[1].name())
-                        .map_err(|error| format!("cannot map rack bank for audio: {error}"))?,
-                ];
-                let lane = sp_audio_io::PreparedRackLane::new(
-                    regions,
-                    worker.active_bank_index,
-                    Arc::clone(&worker.recovery),
-                )
-                .map_err(|error| format!("rack {} cannot join audio: {error}", rack_index + 1))?
-                .with_pipelined(true);
-                Ok((rack_index, lane))
             })
             .collect()
     }

@@ -99,9 +99,8 @@ fn run() {
         .expect("launch the Windows worker through Wine");
     assert!(product.worker_running(0));
     assert!(product.rack_is_pipelined(0));
-    assert!(product.audio_bank_mappings().unwrap().is_empty());
-    assert_eq!(product.pipelined_rack_lanes().unwrap().len(), 1);
-    // Audio start queues the Windows rack as a pipelined lane.
+    assert_eq!(product.audio_bank_mappings().unwrap().len(), 1);
+    // Audio start maps the Windows rack and marks it pipelined.
     let prepared = engine::prepare_audio(&mut product, &model).expect("prepare audio");
     drop(prepared);
 

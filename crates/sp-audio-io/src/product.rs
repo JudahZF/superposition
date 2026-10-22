@@ -1122,6 +1122,14 @@ impl ProductRenderer {
         self
     }
 
+    /// Marks a rack pipelined before audio starts: its worker's result is mixed one block late
+    /// (see [`crate::PreparedRackLane::with_pipelined`]). Returns `false` for an unknown rack.
+    pub fn set_rack_pipelined(&mut self, rack_index: usize, pipelined: bool) -> bool {
+        self.dispatcher
+            .as_mut()
+            .is_some_and(|dispatcher| dispatcher.set_pipelined(rack_index, pipelined))
+    }
+
     /// Validates the mixer's physical routes against a device's channel counts.
     ///
     /// # Errors
