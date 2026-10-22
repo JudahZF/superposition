@@ -151,6 +151,8 @@ pub(crate) struct ProductRuntime {
     cancelled_banks: Vec<CancelledBanks>,
     /// Workers removed by a live layout change, kept until the callback stops reading them.
     retiring_workers: Vec<RetainedWorker>,
+    /// The session rate new workers start at. Each worker runs at one rate for its lifetime.
+    sample_rate_hz: u32,
     /// Linux: the private display that editors draw on, and its window streamer.
     #[cfg(target_os = "linux")]
     editor_display: Option<editor_display::EditorDisplay>,
@@ -505,6 +507,7 @@ impl ProductRuntime {
             next_maintenance_task_id: 1,
             cancelled_banks: Vec::new(),
             retiring_workers: Vec::new(),
+            sample_rate_hz: sp_audio_io::PRODUCT_SAMPLE_RATE_HZ,
             app_support,
             #[cfg(target_os = "linux")]
             editor_display,
@@ -896,21 +899,21 @@ impl ProductRuntime {
                             .map_err(|error| error.to_string())
                             .and_then(|()| {
                                 self.processes
-                                    .launch(&launch.launch)
+                                    .launch_with_pipes(&launch.launch)
                                     .map_err(|error| error.to_string())
                             })
                     } else {
                         Err("stale or cancelled rack maintenance launch".to_owned())
                     };
                     match result {
-                        Ok(pid) => {
+                        Ok((pid, pipes)) => {
                             if let Some(maintenance) = self
                                 .workers
                                 .get_mut(&rack_index)
                                 .and_then(|worker| worker.maintenance.as_mut())
                             {
                                 maintenance.new_pid = Some(pid);
-                                if reply.send(Ok(pid)).is_err() {
+                                if reply.send(Ok((pid, pipes))).is_err() {
                                     let _ = self.processes.request_stop(pid);
                                 }
                             } else {
@@ -1721,24 +1724,18 @@ impl ProductRuntime {
                 })?;
         }
         let target = control_target(rack_index, bank_index, generation)?;
-        // The bank's exclusive nonce also isolates sockets between host processes.
-        let socket = self
-            .app_support
-            .join(format!("{}.sock", bank.name().trim_start_matches('/')));
-        let _ = fs::remove_file(&socket);
         let launch = WorkerControlLaunch {
-            launch: HelperLaunch {
-                kind: HelperKind::PluginWorker,
-                executable: self.helpers.worker.clone(),
-                arguments: worker_arguments(
+            launch: HelperLaunch::native(
+                HelperKind::PluginWorker,
+                &self.helpers.worker,
+                worker_arguments(
                     bank.name(),
-                    &socket,
                     target,
+                    self.sample_rate_hz,
                     &first.bundle,
                     &first.class_id,
                 ),
-            },
-            control_socket: socket,
+            ),
             target,
             timeout: CONTROL_TIMEOUT,
         };
@@ -2669,23 +2666,18 @@ impl ProductRuntime {
                 .map_err(|error| format!("cannot reset replacement bank: {error}"))?;
             let bank_name = worker.banks[replacement_index].name();
             let target = control_target(worker.wire_index, replacement_index, generation)?;
-            let socket = self
-                .app_support
-                .join(format!("{}.sock", bank_name.trim_start_matches('/')));
-            let _ = fs::remove_file(&socket);
             let launch = WorkerControlLaunch {
-                launch: HelperLaunch {
-                    kind: HelperKind::PluginWorker,
-                    executable: self.helpers.worker.clone(),
-                    arguments: worker_arguments(
+                launch: HelperLaunch::native(
+                    HelperKind::PluginWorker,
+                    &self.helpers.worker,
+                    worker_arguments(
                         bank_name,
-                        &socket,
                         target,
+                        self.sample_rate_hz,
                         &first.bundle,
                         &first.class_id,
                     ),
-                },
-                control_socket: socket,
+                ),
                 target,
                 timeout: CONTROL_TIMEOUT,
             };
@@ -3328,8 +3320,8 @@ fn next_bank_generation(banks: &[SharedMemoryRegion; 2]) -> u64 {
 
 fn worker_arguments(
     bank: &str,
-    socket: &Path,
     target: ControlTarget,
+    sample_rate_hz: u32,
     bundle: &Path,
     class_id: &str,
 ) -> Vec<String> {
@@ -3347,8 +3339,8 @@ fn worker_arguments(
         target.bank().index().to_string(),
         "--bank-generation".to_owned(),
         target.bank().generation().to_string(),
-        "--control-socket".to_owned(),
-        socket.display().to_string(),
+        "--sample-rate".to_owned(),
+        sample_rate_hz.to_string(),
         "--bundle".to_owned(),
         bundle.display().to_string(),
         "--class-id".to_owned(),
