@@ -67,6 +67,30 @@ Linux, 48 kHz, 128 frames) give these results:
 These runs last seconds, not 30 minutes, and do not prove licensed plug-ins (iLok, FabFilter,
 Neural DSP) under Wine.
 
+A test that publishes a planned-restart request from the Windows plug-in in that mixed rack,
+under the product renderer, saw the rack reload live: all three segment workers were replaced,
+and the rack processed on.
+
+### Linux packages on Debian (22 October 2026)
+
+`cargo xtask bundle-linux` output ran in clean `debian:trixie` containers (glibc 2.41) with
+Debian's `jackd2` (dummy driver, 48 kHz, 128 frames), `xvfb`, and `dragonfly-reverb-vst3`. The
+tarball and the AppImage (with `--appimage-extract-and-run`, as containers have no FUSE) gave
+the same results:
+
+- `--doctor` reported the container's real state: no real-time priority, no `ntsync`, helpers,
+  Xvfb, and the bundled Wine present.
+- `--scan` cataloged Debian's Dragonfly bundles and the Windows Surge XT Effects bundle under
+  the bundled Wine.
+- A session saved on NixOS opened with Debian's own Dragonfly build (rebound by VST3 class ID)
+  and ran 20 s: 7 500 blocks, 0 deadline misses.
+- A session with a Windows Surge XT Effects rack ran 20 s under the bundled Wine: 7 499 blocks,
+  0 deadline misses.
+
+On `debian:bookworm` (glibc 2.36) both packages started, listed devices, and scanned, but
+Debian 12 ships no VST3 plug-ins, and Nix-built ones need a newer `libstdc++`. These are
+containers on the NixOS host's kernel, not a separate distribution in a VM.
+
 ## Known limits
 
 - Eight racks at 128 frames failed some earlier runs under load. The failed blocks
