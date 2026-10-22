@@ -6,11 +6,13 @@
 //! Linux host's bank; see the `sys` module.
 
 mod audio_thread;
+mod chain;
 mod sys;
 
 pub use audio_thread::{
     AudioThreadPolicy, SUPPORTED_BLOCK_FRAMES, SUPPORTED_SAMPLE_RATES, SchedulingMode,
 };
+pub use chain::{ChainLink, Forwarded};
 
 use std::{
     ffi::CString,
