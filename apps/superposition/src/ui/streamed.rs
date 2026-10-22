@@ -125,6 +125,11 @@ impl StreamedWindows {
         }
     }
 
+    /// Whether a streamed window has keyboard focus (the user last clicked inside one).
+    pub(crate) fn has_keyboard_focus(&self) -> bool {
+        self.keyboard.is_some()
+    }
+
     /// Draws every streamed window and forwards input. Returns editor close requests.
     #[allow(
         clippy::too_many_lines,
@@ -172,6 +177,12 @@ impl StreamedWindows {
         };
         self.textures
             .retain(|id, _| windows.iter().any(|window| window.info.id == *id));
+        if self
+            .keyboard
+            .is_some_and(|id| windows.iter().all(|window| window.info.id != id))
+        {
+            self.keyboard = None;
+        }
         self.scroll
             .retain(|id, _| windows.iter().any(|window| window.info.id == *id));
 
@@ -304,6 +315,10 @@ impl StreamedWindows {
                             .and_then(|id| image_rects.get(&id).map(|rect| (id, *rect)))
                     };
                     let Some((window, rect)) = target else {
+                        // A click in the app's own UI takes the keyboard back.
+                        if pressed {
+                            self.keyboard = None;
+                        }
                         continue;
                     };
                     if pressed {

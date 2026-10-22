@@ -2423,6 +2423,15 @@ impl LiveRackApp {
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
         use egui::{Key, Modifiers};
+        // Keys typed into a streamed editor or installer belong to it, not to app shortcuts.
+        #[cfg(target_os = "linux")]
+        if self
+            .streamed
+            .as_ref()
+            .is_some_and(streamed::StreamedWindows::has_keyboard_focus)
+        {
+            return;
+        }
         if self.rename.is_none()
             && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
         {
