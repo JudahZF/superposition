@@ -3,7 +3,12 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=csrc");
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+    println!("cargo:rerun-if-env-changed=SUPERPOSITION_SKIP_NATIVE_SHIMS");
+    // `SUPERPOSITION_SKIP_NATIVE_SHIMS=1 cargo check --target aarch64-apple-darwin` type-checks
+    // the macOS code from Linux, which has no macOS SDK. Such a build cannot link.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos")
+        || std::env::var_os("SUPERPOSITION_SKIP_NATIVE_SHIMS").is_some()
+    {
         return;
     }
     cc::Build::new()

@@ -78,17 +78,28 @@
                   pkgs.xorg-server # Xvfb, the engine-owned editor display
                   pkgs.xdotool
                   wine
-                  mingw.stdenv.cc # x86_64-w64-mingw32-gcc links the Windows worker
                 ]
                 ++ runtimeLibs
               );
 
+            # Prefixed mingw tools (x86_64-w64-mingw32-dlltool for windows-sys) without the
+            # cross wrapper's setup hooks.
+            shellHook = lib.optionalString linux ''
+              export PATH="${mingw.buildPackages.binutils-unwrapped}/bin:$PATH"
+            '';
+
             env = lib.optionalAttrs linux {
+              # Some hosts export `-L/usr/lib` here from /etc/profile; it would link against the
+              # system glibc instead of the shell's.
+              NIX_CFLAGS_LINK = "";
               LD_LIBRARY_PATH = lib.makeLibraryPath runtimeLibs;
               SUPERPOSITION_WINE = "${wine}/bin/wine";
               SUPERPOSITION_WINE_PREFIX_DIR = "${wine}";
+              # The mingw wrapper is referenced, not added to `packages`: its setup hook would
+              # replace the host linker flags and link Linux binaries against the wrong glibc.
+              SUPERPOSITION_MINGW_CC = "${mingw.stdenv.cc}/bin/x86_64-w64-mingw32-gcc";
               CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${mingw.stdenv.cc}/bin/x86_64-w64-mingw32-gcc";
-              CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-L native=${mingw.windows.pthreads}/lib";
+              CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-L native=${mingw.windows.pthreads}/lib -L native=${mingw.windows.mcfgthreads}/lib";
             };
           };
         }

@@ -3031,6 +3031,14 @@ dependencies = [
 [[package]]
 name = "sp-audio-io"
 version = "0.1.0"
+dependencies = [
+ "rtrb",
+ "sp-engine",
+ "sp-midi",
+ "sp-model",
+ "sp-shared-memory",
+ "sp-shared-memory-os",
+]
 
 [[package]]
 name = "sp-audio-io-macos"

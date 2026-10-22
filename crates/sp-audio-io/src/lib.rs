@@ -1,4 +1,26 @@
-//! Audio device boundary types used by the application and engine layers.
+//! Platform-neutral audio: device boundary types, real-time callback contracts, and the product
+//! renderer and rack dispatcher that every device backend drives.
+//!
+//! Backends (`sp-audio-io-macos` for AUHAL, `sp-audio-io-linux` for JACK) own device streams and
+//! implement [`AudioEndpoint`] around a [`ProductRenderer`].
+
+mod callback;
+mod product;
+mod rack_dispatcher;
+
+pub use callback::{
+    BlockFrames, CallbackTelemetry, InterleavedStereoF32, InterleavedStereoF32Error,
+    MultiChannelDuplexF32, MultiChannelDuplexRenderer, OutputRenderer, RenderDisposition,
+};
+pub use product::{
+    LaneWorker, PreparedProductScene, ProductControl, ProductControlReceiver,
+    ProductRackDiagnostics, ProductRenderer, ProductTelemetry, StoppedRecoveryAccess, TopologyLane,
+    current_product_parameters, prepare_product_scenes, product_midi_mappings,
+};
+pub use rack_dispatcher::{
+    LaneSource, PreparedRackLane, RackAutomationEvents, RackDispatchTelemetry,
+    RackSharedMemoryDispatcher,
+};
 
 use std::fmt;
 
