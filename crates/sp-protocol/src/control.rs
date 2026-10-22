@@ -1267,98 +1267,170 @@ fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-/// Reusable Unix-domain request/response stream wrappers. They neither launch helpers nor load plug-ins.
-#[cfg(unix)]
-pub mod unix {
+/// Request/response transport over two byte streams: a worker's stdin and stdout.
+///
+/// A dedicated thread reads whole frames, so a missed deadline never leaves half a frame in the
+/// stream, and the same code runs on macOS, Linux, and a Windows worker under Wine (whose pipes
+/// are the host's pipes). Nothing here launches helpers or loads plug-ins.
+pub mod pipe {
     use super::{
-        ControlProtocolError, ControlRequest, ControlRequestGate, ControlResponse, ControlTarget,
+        ControlProtocolError, ControlRequest, ControlResponse, MAX_CONTROL_FRAME_BYTES,
+        PREFIX_BYTES,
     };
-    use std::{io::Write, net::Shutdown, os::unix::net::UnixStream, path::Path, time::Duration};
+    use std::{
+        io::{self, Read, Write},
+        sync::mpsc::{self, Receiver, RecvTimeoutError},
+        thread,
+        time::Duration,
+    };
 
-    #[derive(Debug)]
-    pub struct UnixControlClient {
-        stream: UnixStream,
-        last_sent_id: Option<u64>,
-    }
-    impl UnixControlClient {
-        pub fn connect(path: impl AsRef<Path>) -> Result<Self, ControlProtocolError> {
-            Ok(Self::from_stream(UnixStream::connect(path)?))
-        }
-        #[must_use]
-        pub fn from_stream(stream: UnixStream) -> Self {
-            Self {
-                stream,
-                last_sent_id: None,
+    /// Reads one complete length-prefixed frame, prefix included. Returns `Ok(None)` when the
+    /// stream ends cleanly between frames.
+    ///
+    /// # Errors
+    /// Returns an error for a frame that ends early or declares more than
+    /// [`MAX_CONTROL_FRAME_BYTES`].
+    pub fn read_frame(reader: &mut impl Read) -> Result<Option<Vec<u8>>, ControlProtocolError> {
+        let mut prefix = [0_u8; PREFIX_BYTES];
+        let mut filled = 0;
+        while filled < PREFIX_BYTES {
+            match reader.read(&mut prefix[filled..]) {
+                Ok(0) if filled == 0 => return Ok(None),
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
             }
         }
-        pub fn set_timeout(&self, timeout: Duration) -> Result<(), ControlProtocolError> {
-            self.stream.set_read_timeout(Some(timeout))?;
-            self.stream.set_write_timeout(Some(timeout))?;
-            Ok(())
+        let length = usize::try_from(u32::from_le_bytes(prefix)).unwrap_or(usize::MAX);
+        if length > MAX_CONTROL_FRAME_BYTES {
+            return Err(ControlProtocolError::FrameTooLarge {
+                maximum: MAX_CONTROL_FRAME_BYTES,
+                received: length,
+            });
         }
-        pub fn close(&self) -> Result<(), ControlProtocolError> {
-            self.stream.shutdown(Shutdown::Both)?;
-            Ok(())
+        let mut frame = vec![0; PREFIX_BYTES + length];
+        frame[..PREFIX_BYTES].copy_from_slice(&prefix);
+        reader.read_exact(&mut frame[PREFIX_BYTES..])?;
+        Ok(Some(frame))
+    }
+
+    /// The result of waiting for the next frame.
+    #[derive(Debug)]
+    pub enum FrameWait {
+        /// One complete frame, prefix included.
+        Frame(Vec<u8>),
+        /// No frame arrived before the timeout.
+        TimedOut,
+        /// The stream ended or carried a malformed frame; no further frame will arrive.
+        Closed,
+    }
+
+    /// Frames read from a stream by a dedicated thread, which ends with the stream.
+    #[derive(Debug)]
+    pub struct FrameReceiver {
+        frames: Receiver<Vec<u8>>,
+    }
+
+    impl FrameReceiver {
+        /// Starts the reader thread.
+        ///
+        /// # Errors
+        /// Returns an error when the thread cannot start.
+        pub fn spawn(mut reader: impl Read + Send + 'static) -> io::Result<Self> {
+            let (sender, frames) = mpsc::sync_channel(1);
+            thread::Builder::new()
+                .name("sp-control-frames".to_owned())
+                .spawn(move || {
+                    while let Ok(Some(frame)) = read_frame(&mut reader) {
+                        if sender.send(frame).is_err() {
+                            break;
+                        }
+                    }
+                })?;
+            Ok(Self { frames })
         }
-        pub fn send(&mut self, request: &ControlRequest) -> Result<(), ControlProtocolError> {
+
+        /// Waits up to `timeout` for the next frame.
+        #[must_use]
+        pub fn wait(&self, timeout: Duration) -> FrameWait {
+            match self.frames.recv_timeout(timeout) {
+                Ok(frame) => FrameWait::Frame(frame),
+                Err(RecvTimeoutError::Timeout) => FrameWait::TimedOut,
+                Err(RecvTimeoutError::Disconnected) => FrameWait::Closed,
+            }
+        }
+    }
+
+    /// The host's end of one worker's control pipes. Request IDs must increase.
+    pub struct PipeControlClient {
+        writer: Box<dyn Write + Send>,
+        frames: FrameReceiver,
+        last_sent_id: Option<u64>,
+    }
+
+    impl std::fmt::Debug for PipeControlClient {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("PipeControlClient")
+                .field("last_sent_id", &self.last_sent_id)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl PipeControlClient {
+        /// Sends requests to `writer` (the worker's stdin) and reads responses from `reader`
+        /// (its stdout).
+        ///
+        /// # Errors
+        /// Returns an error when the reader thread cannot start.
+        pub fn new(
+            writer: impl Write + Send + 'static,
+            reader: impl Read + Send + 'static,
+        ) -> io::Result<Self> {
+            Ok(Self {
+                writer: Box::new(writer),
+                frames: FrameReceiver::spawn(reader)?,
+                last_sent_id: None,
+            })
+        }
+
+        /// Sends `request` and waits up to `timeout` for its correlated response. After an
+        /// error the pipes may hold a late response, so the caller must stop using them.
+        ///
+        /// # Errors
+        /// Returns `TimedOut` or `UnexpectedEof` I/O errors, and framing or correlation errors.
+        pub fn round_trip(
+            &mut self,
+            request: &ControlRequest,
+            timeout: Duration,
+        ) -> Result<ControlResponse, ControlProtocolError> {
             let id = request.request_id().get();
-            if let Some(previous) = self.last_sent_id {
-                if id == previous {
+            match self.last_sent_id {
+                Some(previous) if id == previous => {
                     return Err(ControlProtocolError::DuplicateRequestId(id));
                 }
-                if id < previous {
+                Some(previous) if id < previous => {
                     return Err(ControlProtocolError::NonMonotonicRequestId {
                         previous,
                         received: id,
                     });
                 }
+                _ => {}
             }
-            request.write_to(&mut self.stream)?;
-            self.stream.flush()?;
+            request.write_to(&mut self.writer)?;
+            self.writer.flush()?;
             self.last_sent_id = Some(id);
-            Ok(())
-        }
-        pub fn receive(&mut self) -> Result<ControlResponse, ControlProtocolError> {
-            ControlResponse::read_from(&mut self.stream)
-        }
-        pub fn round_trip(
-            &mut self,
-            request: &ControlRequest,
-        ) -> Result<ControlResponse, ControlProtocolError> {
-            self.send(request)?;
-            let response = self.receive()?;
+            let frame = match self.frames.wait(timeout) {
+                FrameWait::Frame(frame) => frame,
+                FrameWait::TimedOut => return Err(io::Error::from(io::ErrorKind::TimedOut).into()),
+                FrameWait::Closed => {
+                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+                }
+            };
+            let response = ControlResponse::read_from(&mut frame.as_slice())?;
             response.validate_for(request)?;
             Ok(response)
-        }
-    }
-
-    #[derive(Debug)]
-    pub struct UnixControlServer {
-        stream: UnixStream,
-        gate: ControlRequestGate,
-    }
-    impl UnixControlServer {
-        #[must_use]
-        pub fn from_stream(stream: UnixStream, target: ControlTarget) -> Self {
-            Self {
-                stream,
-                gate: ControlRequestGate::new(target),
-            }
-        }
-        pub fn receive(&mut self) -> Result<ControlRequest, ControlProtocolError> {
-            self.gate.read_from(&mut self.stream)
-        }
-        pub fn respond(&mut self, response: &ControlResponse) -> Result<(), ControlProtocolError> {
-            response.write_to(&mut self.stream)?;
-            self.stream.flush()?;
-            Ok(())
-        }
-        #[must_use]
-        pub const fn gate(&self) -> &ControlRequestGate {
-            &self.gate
-        }
-        pub fn gate_mut(&mut self) -> &mut ControlRequestGate {
-            &mut self.gate
         }
     }
 }
@@ -1559,28 +1631,49 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn unix_domain_transport_delivers_an_admitted_request_response() {
-        use super::unix::{UnixControlClient, UnixControlServer};
-        use std::{os::unix::net::UnixStream, thread};
-        let request = request(ControlOperation::QueryHealth, 1);
-        let (client, server) = UnixStream::pair().expect("pair");
+    fn pipe_transport_delivers_an_admitted_request_response() {
+        use super::pipe::PipeControlClient;
+        use std::{thread, time::Duration};
+        let health = request(ControlOperation::QueryHealth, 1);
+        let (mut requests, worker_stdin) = io::pipe().expect("request pipe");
+        let (worker_stdout, mut responses) = io::pipe().expect("response pipe");
         let worker = thread::spawn(move || -> Result<(), ControlProtocolError> {
-            let mut server = UnixControlServer::from_stream(server, target());
-            let received = server.receive()?;
-            server.respond(&ControlResponse::success(
+            let received = ControlRequestGate::new(target()).read_from(&mut requests)?;
+            ControlResponse::success(
                 received.request_id(),
                 received.target(),
                 received.slot(),
                 b"healthy",
-            )?)
+            )?
+            .write_to(&mut responses)
         });
-        let response = UnixControlClient::from_stream(client)
-            .round_trip(&request)
+        let mut client = PipeControlClient::new(worker_stdin, worker_stdout).expect("client");
+        let response = client
+            .round_trip(&health, Duration::from_secs(5))
             .expect("round trip");
         assert_eq!(response.payload(), b"healthy");
         worker.join().expect("thread").expect("worker");
+        // The worker has gone: the next request fails at once instead of waiting.
+        assert!(matches!(
+            client.round_trip(
+                &request(ControlOperation::QueryHealth, 2),
+                Duration::from_secs(5)
+            ),
+            Err(ControlProtocolError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn frame_reader_rejects_a_truncated_or_oversized_frame() {
+        use super::pipe::read_frame;
+        assert!(read_frame(&mut &[][..]).expect("clean end").is_none());
+        assert!(read_frame(&mut &[4, 0, 0, 0, 1][..]).is_err());
+        let oversized = u32::try_from(MAX_CONTROL_FRAME_BYTES + 1).expect("bound");
+        assert!(matches!(
+            read_frame(&mut &oversized.to_le_bytes()[..]),
+            Err(ControlProtocolError::FrameTooLarge { .. })
+        ));
     }
 
     fn request_header(request: &ControlRequest) -> [u8; CONTROL_REQUEST_HEADER_BYTES] {
