@@ -3547,12 +3547,14 @@ dependencies = [
 name = "sp-plugin-worker"
 version = "0.1.0"
 dependencies = [
+ "png",
  "rtrb",
  "sp-protocol",
  "sp-shared-memory",
  "sp-shared-memory-os",
  "sp-supervisor",
  "sp-vst3",
+ "xcb",
 ]
 
 [[package]]
@@ -3608,6 +3610,7 @@ dependencies = [
 name = "sp-supervisor"
 version = "0.1.0"
 dependencies = [
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3629,8 +3632,10 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
+ "png",
  "sp-model",
  "vst3-host",
+ "xcb",
 ]
 
 [[package]]

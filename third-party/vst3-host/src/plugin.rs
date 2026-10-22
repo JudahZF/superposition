@@ -126,6 +126,17 @@ impl MainThreadEditorHandle {
         self.editor().ok()?.take_editor_resize_request()
     }
 
+    /// Fire the editor's due Linux `IRunLoop` timers and dispatch its ready file descriptors.
+    /// Call it often on the loading thread while the editor is open: VSTGUI and other non-JUCE
+    /// editors paint and take input only from these callbacks. It does nothing off that thread,
+    /// after the plugin is dropped, or when the editor registered nothing.
+    #[cfg(target_os = "linux")]
+    pub fn service_run_loop(&self) {
+        if let Ok(editor) = self.editor() {
+            editor.service_run_loop();
+        }
+    }
+
     /// Serialize the plug-in state on its loading thread while audio processing continues.
     /// VST3 defines `getState` as a UI-thread call that may run concurrently with `process`.
     pub fn save_state(&self) -> Result<Vec<u8>> {
@@ -133,8 +144,15 @@ impl MainThreadEditorHandle {
     }
 
     /// Read one controller parameter on the loading thread while audio processing continues.
+    /// `getParamNormalized` has no error result, so an unknown ID reads as the plug-in's
+    /// fallback value; check it against [`Self::parameter_ids`].
     pub fn get_parameter(&self, id: u32) -> Result<f64> {
         self.editor()?.get_parameter(id)
+    }
+
+    /// The IDs of every controller parameter, read on the plugin's loading thread.
+    pub fn parameter_ids(&self) -> Result<Vec<u32>> {
+        self.editor()?.parameter_ids()
     }
 }
 

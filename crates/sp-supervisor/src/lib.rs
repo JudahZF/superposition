@@ -1,11 +1,15 @@
 //! Process supervision for isolated helper binaries.
 
 mod catalog;
+#[cfg(target_os = "linux")]
+mod private_display;
 mod quarantine;
 mod scanner;
 mod worker_control;
 
 pub use catalog::{CATALOG_SCHEMA_VERSION, PluginCatalog};
+#[cfg(target_os = "linux")]
+pub use private_display::{DisplayEnvironment, PrivateDisplay};
 pub use quarantine::{
     PersistentQuarantine, PluginFailureKind, QuarantineRecord, QuarantineTable, QuarantinedPlugin,
 };
@@ -494,6 +498,9 @@ pub struct ProcessSupervisor {
     restart_policy: Option<RestartPolicy>,
     shutdown_line: Option<String>,
     shutdown_timeout: Duration,
+    /// Private X server for children on Linux. `None` gives children no display at all.
+    #[cfg(target_os = "linux")]
+    display: Option<DisplayEnvironment>,
 }
 
 impl ProcessSupervisor {
@@ -507,7 +514,35 @@ impl ProcessSupervisor {
             restart_policy: None,
             shutdown_line: None,
             shutdown_timeout: Duration::from_millis(100),
+            #[cfg(target_os = "linux")]
+            display: None,
         }
+    }
+
+    /// Points children launched from now on at a private display, or at none.
+    ///
+    /// Children never inherit the user's `DISPLAY`, `XAUTHORITY`, or `WAYLAND_DISPLAY`, so a
+    /// plug-in cannot open a window on the desktop. Pass [`PrivateDisplay::environment`] again
+    /// after the display restarts; running children keep the environment they started with.
+    #[cfg(target_os = "linux")]
+    pub fn set_display(&mut self, display: Option<DisplayEnvironment>) {
+        self.display = display;
+    }
+
+    /// Creates a command for `launch` with this supervisor's child environment.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            clippy::unused_self,
+            reason = "only Linux children get a private display"
+        )
+    )]
+    fn command(&self, launch: &HelperLaunch) -> Command {
+        let mut command = Command::new(&launch.executable);
+        command.args(&launch.arguments);
+        #[cfg(target_os = "linux")]
+        private_display::apply_display(&mut command, self.display.as_ref());
+        command
     }
 
     /// Enables replacement launches after unexpected exits.
@@ -681,8 +716,7 @@ impl ProcessSupervisor {
         launch: &HelperLaunch,
         timeout: Duration,
     ) -> std::io::Result<TimedHelperResult> {
-        let mut command = Command::new(&launch.executable);
-        command.args(&launch.arguments);
+        let mut command = self.command(launch);
         command.stdin(Stdio::null());
         command.stdout(Stdio::null());
         command.stderr(Stdio::null());
@@ -722,8 +756,7 @@ impl ProcessSupervisor {
         launch: &HelperLaunch,
         timeout: Duration,
     ) -> std::io::Result<CapturedHelperOutput> {
-        let mut command = Command::new(&launch.executable);
-        command.args(&launch.arguments);
+        let mut command = self.command(launch);
         command.stdin(Stdio::null());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
@@ -794,8 +827,7 @@ impl ProcessSupervisor {
     }
 
     fn launch_child(&mut self, launch: HelperLaunch, restarts: u32) -> std::io::Result<u64> {
-        let mut command = Command::new(&launch.executable);
-        command.args(&launch.arguments);
+        let mut command = self.command(&launch);
         command.stdin(if self.shutdown_line.is_some() {
             Stdio::piped()
         } else {

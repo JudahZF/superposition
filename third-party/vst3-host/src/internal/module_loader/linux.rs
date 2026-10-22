@@ -14,8 +14,9 @@ use vst3::Steinberg::IPluginFactory;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use libloading::{Library, Symbol};
 
-/// Function signature for ModuleEntry
-type ModuleEntryFunc = unsafe extern "C" fn() -> bool;
+/// Function signature for ModuleEntry. The SDK's `linuxmain.cpp` keeps the argument as the
+/// module handle; VSTGUI resolves the bundle's resource folder from it.
+type ModuleEntryFunc = unsafe extern "C" fn(*mut std::ffi::c_void) -> bool;
 
 /// Function signature for ModuleExit
 type ModuleExitFunc = unsafe extern "C" fn() -> bool;
@@ -71,6 +72,9 @@ impl LinuxModule {
                         Error::PluginLoadFailed(format!("Failed to load shared object: {}", e))
                     })
             })?;
+            // Keep the raw `dlopen` handle for ModuleEntry; the library still owns it.
+            let handle = libloading::os::unix::Library::from(library).into_raw();
+            let library = Library::from(libloading::os::unix::Library::from_raw(handle));
             log::debug!("Shared object loaded successfully");
 
             // Step 2: Get ModuleEntry function (REQUIRED)
@@ -96,7 +100,7 @@ impl LinuxModule {
 
             // Step 4: Call ModuleEntry (MUST be called before GetPluginFactory)
             log::debug!("Step 4: Calling ModuleEntry...");
-            let entry_result = module_entry();
+            let entry_result = module_entry(handle);
             if !entry_result {
                 return Err(Error::PluginLoadFailed(
                     "ModuleEntry function returned false".to_string(),

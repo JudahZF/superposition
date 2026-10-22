@@ -44,6 +44,19 @@ Local changes:
 - A Plugin Compatibility Class that fails to instantiate or declines
   `getCompatibilityJSON` counts as no compatibility entries, as in the SDK's
   moduleinfo tool. TICK 0.6.0 returns `kResultFalse` there.
+- Windows and Linux bundles resolve the binary in the `Contents/` architecture
+  folder that matches the running target (`x86_64-linux`, `x86_64-win`, and so
+  on), preferring the binary named after the bundle. Upstream took the first
+  folder that existed and checked ARM64 before x86_64, so a multi-architecture
+  bundle loaded the wrong binary or failed.
+- Linux `ModuleEntry` receives the module's `dlopen` handle, as the SDK's
+  `linuxmain.cpp` expects. Upstream called it with no argument; VSTGUI finds its
+  resources from that handle.
+- `MainThreadEditorHandle::parameter_ids` lists controller parameter IDs on the
+  loading thread, so batched live reads can reject unknown IDs.
+- `MainThreadEditorHandle::service_run_loop` services the Linux `IRunLoop`
+  timers and file descriptors an open editor registered, on the loading thread,
+  while the worker's audio thread keeps the processor.
 
 The installed Pro-Q 4 controller does not expose `IDataExchangeReceiver` in the
 offline check. A live editor check observed 412 off-thread connection messages
@@ -62,6 +75,9 @@ cargo test --manifest-path third-party/vst3-host/Cargo.toml \
   --no-default-features --lib connection_proxy_tests
 cargo test --manifest-path third-party/vst3-host/Cargo.toml \
   --no-default-features --lib main_thread_editor_tests
+# Windows and Linux only:
+cargo test --manifest-path third-party/vst3-host/Cargo.toml \
+  --no-default-features --lib architecture_folder_tests
 ```
 
 Replace this local patch with an upstream release when an equivalent safe

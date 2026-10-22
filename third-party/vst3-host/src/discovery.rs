@@ -1077,6 +1077,63 @@ pub fn discover_plugins_safe(paths: &[PathBuf], timeout: Duration) -> SafeDiscov
     report
 }
 
+/// `Contents/` architecture folders whose binaries this process can load, best first.
+///
+/// A multi-architecture bundle has one folder per architecture, so the folder must match the
+/// running target: the first folder that merely exists may hold code this process cannot load.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const NATIVE_ARCHITECTURE_FOLDERS: &[&str] = &["x86_64-linux"];
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const NATIVE_ARCHITECTURE_FOLDERS: &[&str] = &["aarch64-linux"];
+#[cfg(all(target_os = "linux", target_arch = "x86"))]
+const NATIVE_ARCHITECTURE_FOLDERS: &[&str] = &["i386-linux"];
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+const NATIVE_ARCHITECTURE_FOLDERS: &[&str] = &["x86_64-win"];
+// A native ARM64 process loads ARM64 and ARM64X code, but not ARM64EC.
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+const NATIVE_ARCHITECTURE_FOLDERS: &[&str] = &["arm64-win", "arm64x-win"];
+#[cfg(all(target_os = "windows", target_arch = "x86"))]
+const NATIVE_ARCHITECTURE_FOLDERS: &[&str] = &["x86-win"];
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86"))
+))]
+const NATIVE_ARCHITECTURE_FOLDERS: &[&str] = &[];
+
+/// Binary file extension inside a bundle's architecture folder.
+#[cfg(target_os = "linux")]
+const BINARY_EXTENSION: &str = "so";
+#[cfg(target_os = "windows")]
+const BINARY_EXTENSION: &str = "vst3";
+
+/// Finds the bundle binary in the first of `folders` that holds one. The binary named after the
+/// bundle comes first, as the VST3 layout requires; otherwise the first by name.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn binary_in_architecture_folders(bundle: &Path, folders: &[&str]) -> Option<PathBuf> {
+    let contents = bundle.join("Contents");
+    let named = bundle
+        .file_stem()
+        .map(|stem| Path::new(stem).with_extension(BINARY_EXTENSION));
+    folders.iter().find_map(|folder| {
+        let folder = contents.join(folder);
+        if let Some(named) = named.as_ref().map(|name| folder.join(name)) {
+            if named.is_file() {
+                return Some(named);
+            }
+        }
+        let mut binaries: Vec<PathBuf> = std::fs::read_dir(&folder)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension() == Some(std::ffi::OsStr::new(BINARY_EXTENSION)) && path.is_file()
+            })
+            .collect();
+        binaries.sort();
+        binaries.into_iter().next()
+    })
+}
+
 /// Platform-specific VST3 binary path resolution
 pub fn get_vst3_binary_path(bundle_path: &Path) -> Result<PathBuf> {
     // If it's already pointing to the binary, use it
@@ -1111,53 +1168,19 @@ pub fn get_vst3_binary_path(bundle_path: &Path) -> Result<PathBuf> {
         }
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        // Windows: .vst3 file or folder structure
-        if bundle_path.is_dir() {
-            // Look for the .vst3 in the per-arch Contents folder. VST3 uses `arm64-win`
-            // (and `arm64ec-win`) for ARM64 — not `aarch64-win`. Native arch first.
-            let contents = bundle_path.join("Contents");
-            let arm64_path = contents.join("arm64-win");
-            let arm64ec_path = contents.join("arm64ec-win");
-            let x64_path = contents.join("x86_64-win");
-            let x86_path = contents.join("x86-win");
-
-            for contents_path in &[arm64_path, arm64ec_path, x64_path, x86_path] {
-                if let Ok(entries) = std::fs::read_dir(contents_path) {
-                    for entry in entries.flatten() {
-                        let file_path = entry.path();
-                        if file_path.extension() == Some(std::ffi::OsStr::new("vst3")) {
-                            return Ok(file_path);
-                        }
-                    }
-                }
-            }
+    // Windows and Linux bundles keep one binary per architecture under `Contents/`.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    if bundle_path.is_dir() {
+        if let Some(binary) =
+            binary_in_architecture_folders(bundle_path, NATIVE_ARCHITECTURE_FOLDERS)
+        {
+            return Ok(binary);
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        // Linux: Similar to Windows
-        if bundle_path.is_dir() {
-            let contents_path = bundle_path.join("Contents");
-            let arch_paths = [
-                contents_path.join("aarch64-linux"),
-                contents_path.join("x86_64-linux"),
-                contents_path.join("i386-linux"),
-            ];
-
-            for arch_path in &arch_paths {
-                if let Ok(entries) = std::fs::read_dir(arch_path) {
-                    for entry in entries.flatten() {
-                        let file_path = entry.path();
-                        if file_path.extension() == Some(std::ffi::OsStr::new("so")) {
-                            return Ok(file_path);
-                        }
-                    }
-                }
-            }
-        }
+        return Err(crate::Error::PluginNotFound(format!(
+            "VST3 bundle {} has no binary for this host in Contents/{{{}}}",
+            bundle_path.display(),
+            NATIVE_ARCHITECTURE_FOLDERS.join(",")
+        )));
     }
 
     Err(crate::Error::PluginNotFound(format!(
@@ -1246,6 +1269,59 @@ mod scan_tests {
             bundles.len()
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
+mod architecture_folder_tests {
+    use super::*;
+
+    fn bundle_with(root: &Path, folders: &[&str], file: &str) -> PathBuf {
+        let bundle = root.join("Multi.vst3");
+        for folder in folders {
+            let folder = bundle.join("Contents").join(folder);
+            std::fs::create_dir_all(&folder).expect("mk architecture folder");
+            std::fs::write(folder.join(file), b"binary").expect("write binary");
+        }
+        bundle
+    }
+
+    fn temporary_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("vst3-arch-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    /// Foreign folders sort before and after the native one, so neither folder order nor
+    /// directory order can select them.
+    #[test]
+    fn multi_architecture_bundle_resolves_to_the_running_target() {
+        let root = temporary_root("multi");
+        let file = Path::new("Multi").with_extension(BINARY_EXTENSION);
+        let file = file.to_str().expect("UTF-8 name");
+        let mut folders = vec!["aarch64-linux", "arm64-win", "i386-linux", "zz-foreign"];
+        folders.extend_from_slice(NATIVE_ARCHITECTURE_FOLDERS);
+        let bundle = bundle_with(&root, &folders, file);
+
+        let binary = get_vst3_binary_path(&bundle).expect("native binary");
+
+        assert_eq!(
+            binary,
+            bundle
+                .join("Contents")
+                .join(NATIVE_ARCHITECTURE_FOLDERS[0])
+                .join(file)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bundle_without_a_native_folder_is_rejected() {
+        let root = temporary_root("foreign");
+        let bundle = bundle_with(&root, &["zz-foreign"], "Multi.bin");
+
+        assert!(get_vst3_binary_path(&bundle).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -74,6 +74,25 @@ so an attached view is removed before its controller is destroyed. The main
 application never receives a plug-in view or SDK pointer. Repeated live open/close
 checks passed on BlackHole for Pro-Q 4 and Archetype Nolly X; see [live validation](live-validation.md).
 
+On Linux the same requests, threads, and ownership apply to X11. Every editor
+renders on an engine-owned private X server, never the user's desktop.
+`sp-supervisor::PrivateDisplay` starts `Xvfb` (from `SUPERPOSITION_XVFB` or
+`PATH`) with `-displayfd`, no TCP listener, a 3840×2160 screen, and a private
+MIT cookie, and restarts it on the same display number if it exits.
+`ProcessSupervisor::set_display` gives helper children its `DISPLAY` and
+`XAUTHORITY`; children never inherit the desktop's `DISPLAY`, `XAUTHORITY`, or
+`WAYLAND_DISPLAY`. Before plug-ins load, the worker creates the ICCCM and EWMH
+atoms a window manager would; JUCE otherwise names a property with atom 0 on a
+bare server, and Xlib exits the process. The loading thread owns one top-level
+window per open editor and attaches the plug-in view as `X11EmbedWindowID`.
+Each pass services the editor's VST3 `IRunLoop` timers and file descriptors,
+which JUCE, VSTGUI, and DPF editors need in order to draw, then handles window
+events. `WM_DELETE_WINDOW` is the deferred close, as the red button is on macOS.
+Each window carries `WM_NAME` and `_NET_WM_NAME` (plug-in, rack, and slot),
+`_NET_WM_PID`, and `CARDINAL` `_SUPERPOSITION_RACK` and zero-based
+`_SUPERPOSITION_SLOT` properties, so the window streamer can map it to its
+slot. Preview pictures come from an X `GetImage` of the window.
+
 Native editor parameter callbacks publish latest values into the worker's
 fixed-ID atomic mirror. Its loading-thread service writes a per-slot
 shared-memory sidecar with epoch, revision, and overflow counters; a separate
@@ -104,6 +123,14 @@ fingerprint without clearing other failure records.
 ## Package direction and VST3 boundary
 
 `sp-model` defines durable domain types. `sp-protocol` defines versioned wire records. `sp-shared-memory` owns safe fixed-layout and slot primitives, while `sp-shared-memory-os` owns the platform mapping, clock, wake, and scheduling FFI (macOS, Linux, and Windows under Wine). `sp-engine` owns graph/gate/mixing foundations. `sp-audio-io` contains platform-neutral endpoint types, callback contracts, the product renderer, and the rack dispatcher; `sp-audio-io-macos` owns the direct AUHAL implementation and `sp-audio-io-linux` the JACK implementation. `sp-supervisor`, `sp-session`, `sp-midi`, and `sp-ui` remain outside the callback dependency path.
+
+Bundle discovery and scanning are platform-specific. macOS searches the
+system and user `Library/Audio/Plug-Ins/VST3` folders and reads the bundle's
+Mach-O header. Linux searches each absolute folder in `VST3_PATH`, then
+`~/.vst3`, `/usr/lib/vst3`, and `/usr/local/lib/vst3`, and reads the ELF header
+of the shared object in `Contents/<arch>-linux`. A bundle is supported when it
+holds code for the running architecture; `vst3-host` loads the binary from the
+architecture folder that matches the running target.
 
 `sp-vst3` is the sole VST3 adapter boundary. Its SDK feature is enabled by `sp-plugin-worker` and `sp-plugin-scanner` only. The main app and `sp-engine` must not transitively reach `sp-vst3`, `vst3`, or `vst3-host`; direct dependency edges remain limited to the helper/adapter chain. No app, engine, model, protocol, session, or UI type may expose VST3 SDK types. `cargo xtask doctor` verifies that dependency rule from Cargo metadata. The scanner and worker helper capabilities are partial foundations, not a general VST3 compatibility assertion.
 
