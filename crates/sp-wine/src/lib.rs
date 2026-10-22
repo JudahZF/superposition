@@ -226,6 +226,15 @@ impl WineEnvironment {
             action: "create the Wine prefix",
             source,
         })?;
+        // A server left by a process that crashed may be on an old display; end it first.
+        let _ = self
+            .launcher
+            .tool("wineserver")
+            .arg("-k")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         // `-p` keeps the server alive without clients; `-f` keeps it in the foreground, so this
         // value owns and reaps it. It starts first so wineboot does not start its own.
         let mut server = self.launcher.tool("wineserver");
