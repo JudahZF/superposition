@@ -2,6 +2,10 @@
 
 mod control_stdio;
 mod control_thread;
+#[cfg(all(feature = "sdk", any(target_os = "macos", test)))]
+mod editor_stream;
+#[cfg(all(feature = "sdk", any(target_os = "macos", test)))]
+mod remote_input;
 #[cfg(feature = "sdk")]
 mod segment_chain;
 #[cfg(feature = "sdk")]
@@ -724,11 +728,14 @@ struct EditorHost {
     /// Session rate for plug-ins this thread loads into the chain.
     sample_rate: u32,
     /// Rack index the window streamer reads from each editor window.
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     rack_index: u8,
     /// Keeps the event pump running until a closed window has left the screen.
     #[cfg(target_os = "macos")]
     pump_until: Option<Instant>,
+    /// Streams the editors to the app while remote clients watch.
+    #[cfg(target_os = "macos")]
+    stream: Option<editor_stream::EditorStream>,
 }
 
 /// An open editor window and when it is next pictured.
@@ -774,10 +781,10 @@ struct EditorPreview {
 #[cfg(feature = "sdk")]
 impl EditorHost {
     #[cfg_attr(
-        not(any(target_os = "linux", windows)),
+        not(any(target_os = "macos", target_os = "linux", windows)),
         expect(
             unused_variables,
-            reason = "only X11 and Win32 windows carry their rack index"
+            reason = "only platforms with editor windows label them with their rack"
         )
     )]
     fn new(rack_index: u8, sample_rate: u32) -> Self {
@@ -794,10 +801,18 @@ impl EditorHost {
             #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             last_preview_sequence: 0,
             sample_rate,
-            #[cfg(any(target_os = "linux", windows))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             rack_index,
             #[cfg(target_os = "macos")]
             pump_until: None,
+            #[cfg(target_os = "macos")]
+            stream: std::env::var_os(sp_window_stream::EDITOR_STREAM_ENV).and_then(|socket| {
+                editor_stream::EditorStream::spawn(socket.into())
+                    .map_err(|error| {
+                        eprintln!("sp-plugin-worker: editor stream unavailable: {error}");
+                    })
+                    .ok()
+            }),
         }
     }
 
@@ -1175,6 +1190,66 @@ impl EditorHost {
         detach_result
     }
 
+    /// Injects the app's input into the editors, then pictures them for the stream when due.
+    #[cfg(target_os = "macos")]
+    fn service_stream(&mut self) {
+        let Some(stream) = self.stream.as_mut() else {
+            return;
+        };
+        for (window, input) in stream.take_input() {
+            if let Some(open) = self
+                .windows
+                .values()
+                .find(|open| open.window.window_number() == Some(window.0))
+            {
+                open.window.inject(&input);
+            }
+        }
+        if !stream.capture_due(Instant::now()) {
+            return;
+        }
+        let captures = self
+            .windows
+            .iter()
+            .filter_map(|(&slot, open)| {
+                let id = open.window.window_number()?;
+                let mut bgrx = Vec::new();
+                let (width, height) = open
+                    .window
+                    .capture_bgrx(&mut bgrx)
+                    .map_err(|error| {
+                        eprintln!("sp-plugin-worker: could not stream editor: {error}");
+                    })
+                    .ok()?;
+                let plugin = self
+                    .editors
+                    .get(&slot)
+                    .map_or("Plug-in", |editor| editor.plugin_name());
+                Some(editor_stream::Capture {
+                    info: sp_window_stream::WindowInfo {
+                        id: sp_window_stream::WindowId(id),
+                        kind: sp_window_stream::WindowKind::Normal,
+                        title: format!(
+                            "{plugin} – Rack {}, Slot {}",
+                            u32::from(self.rack_index) + 1,
+                            slot + 1
+                        ),
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                        rack: Some(u32::from(self.rack_index)),
+                        slot: u32::try_from(slot).ok(),
+                        pid: Some(std::process::id()),
+                        transient_for: None,
+                    },
+                    bgrx,
+                })
+            })
+            .collect();
+        stream.publish(captures);
+    }
+
     /// Whether `AppKit` events need pumping: an editor is open or one closed recently.
     #[cfg(target_os = "macos")]
     fn needs_event_pump(&self) -> bool {
@@ -1499,6 +1574,8 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
                 }) {
                     editor_host.capture_preview(slot);
                 }
+                #[cfg(target_os = "macos")]
+                editor_host.service_stream();
                 if editor_host.needs_event_pump() {
                     #[cfg(target_os = "macos")]
                     sp_vst3::editor_window::pump_events(EDITOR_RUN_LOOP_INTERVAL);
