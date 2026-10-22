@@ -3759,6 +3759,7 @@ dependencies = [
  "sp-shared-memory-os",
  "sp-supervisor",
  "sp-ui",
+ "sp-window-stream",
 ]
 
 [[package]]
