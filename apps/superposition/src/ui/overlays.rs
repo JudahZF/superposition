@@ -638,7 +638,8 @@ impl LiveRackApp {
             .map(|plugin| PickerRow {
                 vendor: plugin.descriptor.identity.vendor.clone(),
                 name: plugin.descriptor.identity.name.clone(),
-                reason: None,
+                // Windows plug-ins run under Wine, and their rack is heard one buffer late.
+                reason: plugin.windows.then_some("Windows, +1 buffer"),
                 plugin: Some(plugin.clone()),
             })
             .collect();
