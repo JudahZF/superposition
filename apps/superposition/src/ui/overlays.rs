@@ -41,7 +41,7 @@ enum SlotCommand {
 struct PickerRow {
     vendor: String,
     name: String,
-    /// Why it cannot be added, if it cannot.
+    /// A note beside the name: why it cannot be added, or that it runs under Wine.
     reason: Option<&'static str>,
     plugin: Option<CatalogPlugin>,
 }
