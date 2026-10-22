@@ -6,11 +6,15 @@
 //! that segment's bank, waits for its completion within the rack's block budget, and only then
 //! completes its own request. The host sees one pipelined rack.
 //!
-//! A link that misses its deadline abandons the request and stays failed: its bank retains the
-//! abandoned slot until the host replaces the downstream worker and gives the upstream worker a
-//! fresh bank. Meanwhile the caller bypasses the downstream segment.
+//! A link that misses its deadline abandons the request and stays failed until the host
+//! replaces the downstream worker and gives the upstream worker a new link. Meanwhile the caller
+//! bypasses the downstream segment.
+//!
+//! A bank has one producer at a time: the host replaces or kills a segment's worker before it
+//! points another worker at that segment's bank. Slots a gone producer left behind (an abandoned
+//! request, an unread completion) are therefore reclaimed when the link finds no free slot.
 
-use std::{io, time::Duration};
+use std::{io, sync::atomic::Ordering, time::Duration};
 
 use sp_shared_memory::{BlockRequest, BlockSlot, BlockTicket, SlotState};
 
@@ -19,7 +23,9 @@ use crate::{MonotonicClock, SharedMemoryRegion};
 /// How long a link spins before it sleeps between checks; most segments finish within it.
 const SPIN: Duration = Duration::from_micros(200);
 /// The sleep between checks after the spin. Workers do not signal completions, so a waiting
-/// link polls; this bounds the added latency.
+/// link polls; this bounds the added latency. Under Wine a short sleep lasts a whole
+/// millisecond, so a Windows worker yields instead.
+#[cfg(not(windows))]
 const SLEEP_SLICE: Duration = Duration::from_micros(100);
 
 /// The result of forwarding one block.
@@ -59,40 +65,49 @@ impl ChainLink {
         self.failed
     }
 
+    /// The latency the downstream worker last published, which includes the segments after it.
+    #[must_use]
+    pub fn downstream_latency(&self) -> u32 {
+        self.region
+            .bank()
+            .header
+            .worker_latency_samples
+            .load(Ordering::Acquire)
+    }
+
     /// Requests one block downstream and waits until `deadline_tick` (on the shared clock).
     ///
-    /// `fill` writes the request payload (input audio, sidechains, events, MIDI) into the free
-    /// slot before it is published. Real-time safe: no allocation; it spins briefly, then sleeps
-    /// in short slices.
+    /// The request carries `published_tick` as its publication time, so a chain of segments can
+    /// share the rack request's time and derive one deadline from it. `fill` writes the request
+    /// payload (input audio, sidechains, events, MIDI) into the free slot and returns the
+    /// request that describes it. Real-time safe: no allocation; it spins briefly, then sleeps
+    /// in short slices (yields, under Wine).
     pub fn forward(
         &mut self,
-        request: BlockRequest,
+        published_tick: u64,
         deadline_tick: u64,
-        fill: impl FnOnce(&mut BlockSlot),
+        fill: impl FnOnce(&mut BlockSlot) -> BlockRequest,
     ) -> Forwarded {
         if self.failed {
             return Forwarded::Bypass;
         }
         self.release();
-        let Some(slot_index) = self
-            .region
-            .bank()
-            .slots
-            .iter()
-            .position(|slot| slot.metadata.state() == Ok(SlotState::Free))
-        else {
+        let Some(slot_index) = self.free_slot().or_else(|| {
+            self.reclaim_stale();
+            self.free_slot()
+        }) else {
             return self.fail();
         };
         let Some(slot) = self.region.bank_mut().slot_mut(slot_index) else {
             return self.fail();
         };
-        fill(slot);
+        let request = fill(slot);
         let now = self.clock.now_ticks();
-        let Ok(ticket) = self
-            .region
-            .bank_mut()
-            .request_block_at(slot_index, request, now.max(1))
-        else {
+        let Ok(ticket) = self.region.bank_mut().request_block_at(
+            slot_index,
+            request,
+            published_tick.min(now).max(1),
+        ) else {
             return self.fail();
         };
         self.live = Some((slot_index, ticket));
@@ -112,8 +127,14 @@ impl ChainLink {
             if now < spin_until {
                 std::hint::spin_loop();
             } else {
-                let left = self.clock.ticks_to_duration(deadline_tick - now);
-                std::thread::sleep(left.min(SLEEP_SLICE));
+                #[cfg(windows)]
+                std::thread::yield_now();
+                #[cfg(not(windows))]
+                std::thread::sleep(
+                    self.clock
+                        .ticks_to_duration(deadline_tick - now)
+                        .min(SLEEP_SLICE),
+                );
             }
         }
     }
@@ -131,6 +152,32 @@ impl ChainLink {
         }
     }
 
+    fn free_slot(&self) -> Option<usize> {
+        self.region
+            .bank()
+            .slots
+            .iter()
+            .position(|slot| slot.metadata.state() == Ok(SlotState::Free))
+    }
+
+    /// Frees slots an earlier producer left: abandoned requests no worker claimed, and
+    /// completions nobody read. A slot still being processed is left to its worker.
+    fn reclaim_stale(&self) {
+        for slot in &self.region.bank().slots {
+            match slot.metadata.state() {
+                Ok(SlotState::Abandoned) => {
+                    let _ = slot.reclaim_abandoned();
+                }
+                Ok(SlotState::Complete) => {
+                    if let Ok(Some(snapshot)) = slot.completion_snapshot() {
+                        let _ = slot.consume_completion(snapshot.ticket);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn fail(&mut self) -> Forwarded {
         if let Some((slot_index, ticket)) = self.live.take() {
             // Only an unclaimed request can be abandoned; a claimed one stays with its worker,
@@ -139,6 +186,13 @@ impl ChainLink {
         }
         self.failed = true;
         Forwarded::Bypass
+    }
+}
+
+impl Drop for ChainLink {
+    fn drop(&mut self) {
+        // The next producer on this bank then finds every slot free.
+        self.release();
     }
 }
 
@@ -209,9 +263,10 @@ mod tests {
         for block in 0..200_u8 {
             let deadline = clock.now_ticks() + clock.duration_to_ticks(Duration::from_secs(1));
             let value = f32::from(block);
-            let result = link.forward(request(64), deadline, |slot| {
+            let result = link.forward(clock.now_ticks(), deadline, |slot| {
                 slot.input_audio[0][..64].fill(value);
                 slot.input_audio[1][..64].fill(-value);
+                request(64)
             });
             assert_eq!(result, Forwarded::Completed);
             let output = link
@@ -232,7 +287,7 @@ mod tests {
         // No downstream worker: the request is never claimed.
         let deadline = clock.now_ticks() + clock.duration_to_ticks(Duration::from_millis(2));
         assert_eq!(
-            link.forward(request(64), deadline, |_| {}),
+            link.forward(clock.now_ticks(), deadline, |_| request(64)),
             Forwarded::Bypass
         );
         assert!(link.is_failed());
@@ -244,6 +299,39 @@ mod tests {
             "the missed request is abandoned, not left for a late worker"
         );
         let later = clock.now_ticks() + clock.duration_to_ticks(Duration::from_secs(1));
-        assert_eq!(link.forward(request(64), later, |_| {}), Forwarded::Bypass);
+        assert_eq!(
+            link.forward(clock.now_ticks(), later, |_| request(64)),
+            Forwarded::Bypass
+        );
+    }
+
+    /// A replaced upstream worker reuses the bank that its failed predecessors filled.
+    #[test]
+    fn a_new_link_reclaims_slots_that_earlier_producers_abandoned() {
+        let host = SharedMemoryRegion::create(9).unwrap();
+        let clock = MonotonicClock::new().unwrap();
+        for _ in 0..sp_shared_memory::BLOCK_SLOT_COUNT {
+            let mut failed = ChainLink::open(host.name()).unwrap();
+            let deadline = clock.now_ticks() + clock.duration_to_ticks(Duration::from_millis(1));
+            failed.forward(clock.now_ticks(), deadline, |_| request(64));
+        }
+        assert!(
+            host.bank()
+                .slots
+                .iter()
+                .all(|slot| slot.metadata.state() == Ok(SlotState::Abandoned))
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = spawn_doubler(host.name().to_owned(), Arc::clone(&stop));
+        let mut link = ChainLink::open(host.name()).unwrap();
+        let deadline = clock.now_ticks() + clock.duration_to_ticks(Duration::from_secs(1));
+        let result = link.forward(clock.now_ticks(), deadline, |slot| {
+            slot.input_audio[0][..64].fill(0.25);
+            request(64)
+        });
+        assert_eq!(result, Forwarded::Completed);
+        stop.store(true, Ordering::Release);
+        let _ = host.notify_request();
+        worker.join().unwrap();
     }
 }
