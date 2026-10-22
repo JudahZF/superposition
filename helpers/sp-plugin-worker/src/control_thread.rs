@@ -1,13 +1,13 @@
-//! Worker-side Unix-domain control transport and bounded processing-thread mailbox.
+//! Worker-side control transport and bounded processing-thread mailbox.
 //!
-//! The Unix socket is owned by a control thread. That thread never calls plug-ins or touches the
-//! shared-memory audio payload. It forwards only validated bounded [`ControlRequest`] values to
-//! the dedicated processing thread through fixed-capacity SPSC queues and writes the matching
-//! [`ControlResponse`].
+//! Requests arrive as frames on the worker's original stdin and responses leave on its original
+//! stdout (see [`crate::control_stdio`]). A control thread owns both. That thread never calls
+//! plug-ins or touches the shared-memory audio payload. It forwards only validated bounded
+//! [`ControlRequest`] values to the dedicated processing thread through fixed-capacity SPSC
+//! queues and writes the matching [`ControlResponse`].
 
 use std::{
-    io,
-    os::unix::net::{UnixListener, UnixStream},
+    io::{self, Read, Write},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -18,12 +18,14 @@ use std::{
 
 use rtrb::{Consumer, Producer, RingBuffer};
 use sp_protocol::control::{
-    ControlErrorCode, ControlErrorRecord, ControlOperation, ControlProtocolError, ControlRequest,
-    ControlRequestGate, ControlResponse, ControlResponseStatus, ControlTarget,
-    MAX_CONTROL_FRAME_BYTES, MAX_PENDING_CONTROL_REQUESTS,
+    ControlErrorCode, ControlErrorRecord, ControlOperation, ControlRequest, ControlRequestGate,
+    ControlResponse, ControlResponseStatus, ControlTarget, MAX_PENDING_CONTROL_REQUESTS,
+    pipe::{FrameReceiver, FrameWait},
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
+/// How long the control thread waits for a request before it checks for shutdown.
+const IDLE_INTERVAL: Duration = Duration::from_millis(10);
 const SLOW_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Processing-thread endpoint of the bounded worker control mailbox.
@@ -59,13 +61,13 @@ impl ProcessingControlEndpoint {
 }
 
 /// Control-thread endpoint of the bounded worker control mailbox.
-pub struct SocketControlEndpoint {
+pub struct PipeControlEndpoint {
     commands: Producer<ControlRequest>,
     replies: Consumer<ControlResponse>,
     request_wake: Option<sp_shared_memory_os::SharedMemoryRegion>,
 }
 
-impl SocketControlEndpoint {
+impl PipeControlEndpoint {
     /// Opens a separate mapping to wake the processing thread after publishing control work.
     ///
     /// # Errors
@@ -76,13 +78,13 @@ impl SocketControlEndpoint {
     }
 }
 
-/// Creates the two fixed SPSC channels connecting a Unix control thread and processing thread.
+/// Creates the two fixed SPSC channels connecting the control thread and processing thread.
 #[must_use]
-pub fn control_mailbox() -> (SocketControlEndpoint, ProcessingControlEndpoint) {
+pub fn control_mailbox() -> (PipeControlEndpoint, ProcessingControlEndpoint) {
     let (command_producer, command_consumer) = RingBuffer::new(MAX_PENDING_CONTROL_REQUESTS);
     let (reply_producer, reply_consumer) = RingBuffer::new(MAX_PENDING_CONTROL_REQUESTS);
     (
-        SocketControlEndpoint {
+        PipeControlEndpoint {
             commands: command_producer,
             replies: reply_consumer,
             request_wake: None,
@@ -94,31 +96,34 @@ pub fn control_mailbox() -> (SocketControlEndpoint, ProcessingControlEndpoint) {
     )
 }
 
-/// Handle for the worker's dedicated Unix-domain control thread.
+/// Handle for the worker's dedicated control thread.
 pub struct ControlThread {
     shutdown: Arc<AtomicBool>,
     join: Option<JoinHandle<io::Result<()>>>,
 }
 
 impl ControlThread {
-    /// Returns whether the control thread has retired after a fatal transport timeout.
+    /// Returns whether the control thread has retired: the host closed the channel, sent a
+    /// malformed frame, or a request missed its deadline.
     #[must_use]
     pub fn is_stopped(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
     }
 
-    /// Starts the supplied bound Unix listener on a separate control thread.
+    /// Starts the control thread on the worker's request and response streams.
     ///
-    /// The listener is configured nonblocking only so orderly shutdown can be observed; each
-    /// accepted stream still has a finite read/write timeout.
+    /// A separate reader thread collects whole request frames, so the control thread can stop
+    /// at any time without leaving part of a frame unread. There is one channel and no
+    /// reconnection: when it closes or is corrupted, the worker shuts down.
     ///
     /// # Errors
     ///
-    /// Returns an error when the listener cannot be configured for finite shutdown polling.
+    /// Returns an error for a zero timeout or when a thread cannot start.
     pub fn spawn(
-        listener: UnixListener,
+        requests: impl Read + Send + 'static,
+        responses: impl Write + Send + 'static,
         target: ControlTarget,
-        mailbox: SocketControlEndpoint,
+        mailbox: PipeControlEndpoint,
         timeout: Duration,
     ) -> io::Result<Self> {
         if timeout.is_zero() {
@@ -127,12 +132,23 @@ impl ControlThread {
                 "worker control timeout must be nonzero",
             ));
         }
-        listener.set_nonblocking(true)?;
+        let frames = FrameReceiver::spawn(requests)?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
         let join = thread::Builder::new()
             .name("sp-worker-control".to_owned())
-            .spawn(move || control_loop(listener, target, mailbox, timeout, thread_shutdown))?;
+            .spawn(move || {
+                let result = control_loop(
+                    &frames,
+                    responses,
+                    target,
+                    mailbox,
+                    timeout,
+                    &thread_shutdown,
+                );
+                thread_shutdown.store(true, Ordering::Release);
+                result
+            })?;
         Ok(Self {
             shutdown,
             join: Some(join),
@@ -143,7 +159,7 @@ impl ControlThread {
     ///
     /// # Errors
     ///
-    /// Returns an error if the control thread panicked or its listener/stream failed.
+    /// Returns an error if the control thread panicked or its streams failed.
     pub fn shutdown(mut self) -> io::Result<()> {
         self.shutdown.store(true, Ordering::Release);
         let Some(join) = self.join.take() else {
@@ -160,139 +176,41 @@ impl Drop for ControlThread {
     }
 }
 
-// `listener` and the shutdown handle are intentionally moved into the dedicated control thread.
-#[allow(clippy::needless_pass_by_value)]
 fn control_loop(
-    listener: UnixListener,
+    frames: &FrameReceiver,
+    mut responses: impl Write,
     target: ControlTarget,
-    mut mailbox: SocketControlEndpoint,
-    timeout: Duration,
-    shutdown: Arc<AtomicBool>,
-) -> io::Result<()> {
-    while !shutdown.load(Ordering::Acquire) {
-        match listener.accept() {
-            // A protocol violation or I/O failure closes only that connection: the listener
-            // must survive so a recovering application can reconnect to a healthy worker.
-            Ok((stream, _)) => {
-                let _ = serve_connection(stream, target, &mut mailbox, timeout, &shutdown);
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(POLL_INTERVAL),
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
-fn serve_connection(
-    mut stream: UnixStream,
-    target: ControlTarget,
-    mailbox: &mut SocketControlEndpoint,
+    mut mailbox: PipeControlEndpoint,
     timeout: Duration,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
-    // On macOS the accepted stream inherits the listener's nonblocking flag. Framed reads must
-    // block: a nonblocking `read_exact` can consume a frame's length prefix, hit `EAGAIN`
-    // before the header arrives, and silently discard the consumed bytes, desynchronizing the
-    // stream for every later request.
-    stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
     let mut gate = ControlRequestGate::new(target);
     while !shutdown.load(Ordering::Acquire) {
-        // The frame is accumulated byte-exactly before parsing: an idle timeout between
-        // frames retries without losing bytes, while a stall after a frame has begun closes
-        // the connection, because a partially read frame can never be re-aligned.
-        let Some(frame) = read_complete_frame(&mut stream, shutdown)? else {
-            return Ok(());
+        let frame = match frames.wait(IDLE_INTERVAL) {
+            FrameWait::Frame(frame) => frame,
+            FrameWait::TimedOut => continue,
+            // The host closed the channel (it stopped or dropped this worker) or broke framing.
+            FrameWait::Closed => return Ok(()),
         };
-        let request = match gate.read_from(&mut frame.as_slice()) {
-            Ok(request) => request,
-            Err(ControlProtocolError::Io(_)) => return Ok(()),
-            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
-        };
-        let shutdown_after_reply = request.operation() == ControlOperation::Shutdown;
-        let response = forward_request(&request, mailbox, timeout, shutdown)?;
-        response
-            .write_to(&mut stream)
+        let request = gate
+            .read_from(&mut frame.as_slice())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let shutdown_after_reply = request.operation() == ControlOperation::Shutdown;
+        let response = forward_request(&request, &mut mailbox, timeout, shutdown)?;
+        response
+            .write_to(&mut responses)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        responses.flush()?;
         if shutdown_after_reply {
-            shutdown.store(true, Ordering::Release);
             return Ok(());
         }
     }
     Ok(())
-}
-
-/// Reads one complete length-prefixed control frame, including its prefix.
-///
-/// Returns `Ok(None)` when the connection should close quietly: the peer disconnected, stalled
-/// after starting a frame, or declared an impossible length. Idle timeouts while waiting for a
-/// new frame simply retry, pacing the loop for shutdown checks without discarding bytes — the
-/// failure mode that previously desynchronized the stream and surfaced as `UnexpectedEof` in
-/// the application.
-fn read_complete_frame(
-    stream: &mut UnixStream,
-    shutdown: &AtomicBool,
-) -> io::Result<Option<Vec<u8>>> {
-    use std::io::Read;
-    const PREFIX_BYTES: usize = 4;
-    let mut prefix = [0_u8; PREFIX_BYTES];
-    let mut have = 0_usize;
-    while have < PREFIX_BYTES {
-        if shutdown.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        match stream.read(&mut prefix[have..]) {
-            Ok(0) => return Ok(None),
-            Ok(read) => have += read,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) =>
-            {
-                if have > 0 {
-                    return Ok(None);
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    let Ok(length) = usize::try_from(u32::from_le_bytes(prefix)) else {
-        return Ok(None);
-    };
-    if length > MAX_CONTROL_FRAME_BYTES {
-        return Ok(None);
-    }
-    let mut frame = vec![0_u8; PREFIX_BYTES + length];
-    frame[..PREFIX_BYTES].copy_from_slice(&prefix);
-    let mut filled = PREFIX_BYTES;
-    while filled < frame.len() {
-        if shutdown.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        match stream.read(&mut frame[filled..]) {
-            Ok(0) => return Ok(None),
-            Ok(read) => filled += read,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) =>
-            {
-                return Ok(None);
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(Some(frame))
 }
 
 fn forward_request(
     request: &ControlRequest,
-    mailbox: &mut SocketControlEndpoint,
+    mailbox: &mut PipeControlEndpoint,
     timeout: Duration,
     shutdown: &AtomicBool,
 ) -> io::Result<ControlResponse> {
@@ -377,7 +295,7 @@ fn failure_response(
 /// Handles one validated request on the dedicated processing thread.
 ///
 /// Implementations own the helper-safe VST3 facade and fixed serial rack. They must not perform
-/// Unix socket I/O; [`ProcessingControlEndpoint`] carries all control-thread communication.
+/// control I/O; [`ProcessingControlEndpoint`] carries all control-thread communication.
 pub trait ProcessingControlHandler {
     /// Produces exactly one response for the received request.
     fn handle_control(&mut self, request: ControlRequest) -> ControlResponse;
@@ -399,10 +317,9 @@ mod tests {
 
     #[test]
     fn full_mailbox_returns_busy_without_losing_the_processing_endpoint() {
-        let (mut socket, mut processing) = control_mailbox();
+        let (mut pipe, mut processing) = control_mailbox();
         for request_id in 1..=u64::try_from(MAX_PENDING_CONTROL_REQUESTS).expect("capacity") {
-            socket
-                .commands
+            pipe.commands
                 .push(
                     ControlRequest::new(
                         ControlRequestId::new(request_id).expect("request ID"),
@@ -416,8 +333,7 @@ mod tests {
                 .expect("fixed queue accepts capacity entries");
         }
         assert!(
-            socket
-                .commands
+            pipe.commands
                 .push(
                     ControlRequest::new(
                         ControlRequestId::new(99).expect("request ID"),

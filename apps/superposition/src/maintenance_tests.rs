@@ -2,7 +2,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    os::unix::net::UnixListener,
     path::PathBuf,
     sync::{
         Arc,
@@ -14,7 +13,7 @@ use std::{
 };
 
 use sp_model::{EndpointId, GainDb, Rack, RackId, RackTopology, SourceId};
-use sp_protocol::control::{ControlOperation, ControlResponse, unix::UnixControlServer};
+use sp_protocol::control::{ControlRequestId, ControlResponse};
 use sp_shared_memory_os::{RackRecoverySignal, RackRecoveryState, SharedMemoryRegion};
 use sp_supervisor::{
     BundleFingerprint, HelperKind, HelperLaunch, PersistentQuarantine, PluginCatalog,
@@ -39,7 +38,6 @@ fn runtime() -> ProductRuntime {
         PersistentQuarantine::open(support.join("quarantine.json"), 3).expect("empty quarantine");
     let (maintenance_events_tx, maintenance_events_rx) = mpsc::channel();
     ProductRuntime {
-        app_support: support,
         scanner: Scanner::new("/missing/scanner", Duration::from_secs(1), catalog)
             .with_quarantine(quarantine),
         helpers: HelperBinaries {
@@ -47,6 +45,7 @@ fn runtime() -> ProductRuntime {
             worker: PathBuf::from("/missing/worker"),
             #[cfg(target_os = "linux")]
             streamer: None,
+            windows: None,
         },
         processes: ProcessSupervisor::new(),
         workers: BTreeMap::new(),
@@ -58,74 +57,75 @@ fn runtime() -> ProductRuntime {
         next_maintenance_task_id: 1,
         cancelled_banks: Vec::new(),
         retiring_workers: Vec::new(),
+        sample_rate_hz: 48_000,
+        wine: None,
+        windows_programs: Vec::new(),
         #[cfg(target_os = "linux")]
         editor_display: None,
     }
 }
 
-fn fake_session(process_id: u64) -> WorkerControlSession {
-    let directory = std::env::temp_dir().join(format!(
-        "sp-maintenance-socket-{}-{}",
+/// A session for `process_id` whose control pipes belong to a stand-in worker (`sh`) that
+/// answers the initial health request.
+fn fake_session(runtime: &mut ProductRuntime, process_id: u64) -> WorkerControlSession {
+    let target = super::control_target(0, 1, 12).expect("replacement target");
+    // The first request on fresh pipes has ID 1, so the health response is known in advance.
+    let mut health = Vec::new();
+    ControlResponse::success(ControlRequestId::new(1).unwrap(), target, None, &[])
+        .expect("health response")
+        .write_to(&mut health)
+        .expect("encode health response");
+    let response = std::env::temp_dir().join(format!(
+        "sp-maintenance-health-{}-{}",
         std::process::id(),
         NEXT_TEST_PATH.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::create_dir(&directory).expect("test socket directory");
-    let socket = directory.join("control.sock");
-    let target = super::control_target(0, 1, 12).expect("replacement target");
-    let listener = UnixListener::bind(&socket).expect("fake control listener");
-    let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("health connection");
-        let mut server = UnixControlServer::from_stream(stream, target);
-        let request = server.receive().expect("health request");
-        assert_eq!(request.operation(), ControlOperation::QueryHealth);
-        server
-            .respond(
-                &ControlResponse::success(
-                    request.request_id(),
-                    request.target(),
-                    request.slot(),
-                    &[],
-                )
-                .expect("health response"),
-            )
-            .expect("send health response");
-    });
-    let launch = WorkerControlLaunch {
-        launch: HelperLaunch {
-            kind: HelperKind::PluginWorker,
-            executable: PathBuf::from(
-                "/Applications/Superposition.app/Contents/Helpers/sp-plugin-worker",
-            ),
-            arguments: vec![
-                "--worker".to_owned(),
-                "--bank".to_owned(),
-                "/sp-test-bank".to_owned(),
-                "--worker-id".to_owned(),
-                "1".to_owned(),
-                "--rack-index".to_owned(),
-                "0".to_owned(),
-                "--rack-generation".to_owned(),
-                "12".to_owned(),
-                "--bank-index".to_owned(),
-                "1".to_owned(),
-                "--bank-generation".to_owned(),
-                "12".to_owned(),
-                "--control-socket".to_owned(),
-                socket.display().to_string(),
-                "--bundle".to_owned(),
-                "/tmp/Test.vst3".to_owned(),
-                "--class-id".to_owned(),
-                "test-class".to_owned(),
+    std::fs::write(&response, health).expect("write health response");
+    let (_, pipes) = runtime
+        .processes
+        .launch_with_pipes(&HelperLaunch::native(
+            HelperKind::PluginWorker,
+            "/bin/sh",
+            vec![
+                "-c".to_owned(),
+                format!("cat '{}'; cat >/dev/null", response.display()),
             ],
-        },
-        control_socket: socket,
+        ))
+        .expect("stand-in worker");
+    let launch = WorkerControlLaunch {
+        launch: HelperLaunch::native(
+            HelperKind::PluginWorker,
+            "/Applications/Superposition.app/Contents/Helpers/sp-plugin-worker",
+            [
+                "--worker",
+                "--bank",
+                "/sp-test-bank",
+                "--worker-id",
+                "1",
+                "--rack-index",
+                "0",
+                "--rack-generation",
+                "12",
+                "--bank-index",
+                "1",
+                "--bank-generation",
+                "12",
+                "--sample-rate",
+                "48000",
+                "--bundle",
+                "/tmp/Test.vst3",
+                "--class-id",
+                "test-class",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        ),
         target,
         timeout: Duration::from_secs(1),
     };
     let session =
-        WorkerControlSession::connect_launched(process_id, &launch).expect("fake worker session");
-    server.join().expect("fake server exits");
-    std::fs::remove_dir_all(directory).expect("remove test socket directory");
+        WorkerControlSession::attach(process_id, pipes, &launch).expect("fake worker session");
+    let _ = std::fs::remove_file(response);
     session
 }
 
@@ -135,6 +135,8 @@ fn quiescent_worker(task_id: u64) -> RetainedWorker {
     assert!(recovery.mark_quiescent());
     RetainedWorker {
         wire_index: 0,
+        platform: sp_supervisor::PluginPlatform::Native,
+        sample_rate_hz: 48_000,
         fingerprint: BundleFingerprint {
             algorithm: "sha256".to_owned(),
             digest: "test".to_owned(),
@@ -236,12 +238,11 @@ fn cancelled_spawn_event_is_rejected_before_launch_validation() {
             generation: 12,
             recovery,
             launch: WorkerControlLaunch {
-                launch: HelperLaunch {
-                    kind: HelperKind::PluginScanner,
-                    executable: PathBuf::from("/definitely/not/a/worker"),
-                    arguments: Vec::new(),
-                },
-                control_socket: PathBuf::from("/missing/worker.sock"),
+                launch: HelperLaunch::native(
+                    HelperKind::PluginScanner,
+                    "/definitely/not/a/worker",
+                    Vec::new(),
+                ),
                 target: super::control_target(0, 1, 12).expect("target"),
                 timeout: Duration::from_secs(1),
             },
@@ -270,11 +271,7 @@ fn cancelled_spawn_event_is_rejected_before_launch_validation() {
 fn unload_after_spawn_retains_banks_until_both_children_are_reaped() {
     let mut runtime = runtime();
     runtime.workers.insert(0, quiescent_worker(9));
-    let child = HelperLaunch {
-        kind: HelperKind::PluginWorker,
-        executable: PathBuf::from("/bin/sleep"),
-        arguments: vec!["5".to_owned()],
-    };
+    let child = HelperLaunch::native(HelperKind::PluginWorker, "/bin/sleep", vec!["5".to_owned()]);
     let old_pid = runtime.processes.launch(&child).expect("old child");
     let new_pid = runtime
         .processes
@@ -309,14 +306,10 @@ fn unload_after_spawn_retains_banks_until_both_children_are_reaped() {
 fn reaped_replacement_cannot_be_installed_even_when_ready() {
     let mut runtime = runtime();
     runtime.workers.insert(0, quiescent_worker(9));
-    let child = HelperLaunch {
-        kind: HelperKind::PluginWorker,
-        executable: PathBuf::from("/bin/sleep"),
-        arguments: vec!["5".to_owned()],
-    };
+    let child = HelperLaunch::native(HelperKind::PluginWorker, "/bin/sleep", vec!["5".to_owned()]);
     let old_pid = runtime.processes.launch(&child).expect("old child");
     let new_pid = runtime.processes.launch(&child).expect("replacement child");
-    let session = fake_session(new_pid);
+    let session = fake_session(&mut runtime, new_pid);
     runtime
         .processes
         .request_stop(old_pid)
@@ -340,6 +333,7 @@ fn reaped_replacement_cannot_be_installed_even_when_ready() {
     maintenance.new_pid = Some(new_pid);
     maintenance.ready = Some(maintenance::Ready {
         launched: LaunchedWorker {
+            platform: worker.platform,
             fingerprint: worker.fingerprint.clone(),
             session,
             parameters: Vec::new(),

@@ -17,7 +17,7 @@ use sp_session::{
     CapturedPluginState, PluginActivationMetadata, PluginActivationState, PluginStateMetadata,
 };
 use sp_shared_memory_os::RackRecoverySignal;
-use sp_supervisor::{WorkerControlLaunch, WorkerControlSession};
+use sp_supervisor::{WorkerControlLaunch, WorkerControlSession, WorkerPipes};
 
 use crate::{
     LaunchedWorker, ResolvedSlot, configure_worker_session, request_ok, slot_identity,
@@ -50,7 +50,7 @@ pub(super) enum Event {
         generation: u64,
         recovery: Arc<RackRecoverySignal>,
         launch: WorkerControlLaunch,
-        reply: Sender<Result<u64, String>>,
+        reply: Sender<Result<(u64, WorkerPipes), String>>,
     },
     Finished {
         rack_index: usize,
@@ -127,11 +127,11 @@ fn run_inner(
             reply,
         })
         .map_err(|_| "app stopped during worker launch".to_owned())?;
-    let process_id = receiver
+    let (process_id, pipes) = receiver
         .recv()
         .map_err(|_| "app stopped during worker launch".to_owned())??;
     cancelled(&input.cancel)?;
-    let session = WorkerControlSession::connect_launched(process_id, &input.launch)
+    let session = WorkerControlSession::attach(process_id, pipes, &input.launch)
         .map_err(|error| format!("replacement worker connection failed: {error}"))?;
     let mut launched = configure_worker_session(session, &rack, &input.candidates, &states, None)?;
     // The worker publishes lifecycle flags between control requests. This request fences the

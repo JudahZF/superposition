@@ -11,11 +11,12 @@
 //!   `x86_64-unix/sp_wine_bridge.so` (see `cargo xtask wine-bridge`), passed as `WINEDLLPATH`.
 //! - Display: the engine's private X server, so plug-in windows never reach the desktop.
 //!
-//! The environment keeps one `wineserver` alive for its lifetime, so worker starts do not pay
-//! for a cold Wine start.
+//! [`WineLauncher`] only describes how to start a Windows program; the process supervisor uses
+//! it for workers and scanners and adds the display itself. [`WineEnvironment`] owns the prefix
+//! and keeps one `wineserver` alive, so worker starts do not pay for a cold Wine start.
 
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     io,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -27,13 +28,100 @@ pub const BRIDGE_DLL: &str = "sp_wine_bridge.dll";
 /// Where the shared prefix keeps Windows VST3 bundles.
 pub const VST3_DIR_IN_PREFIX: &str = "drive_c/Program Files/Common Files/VST3";
 
-/// A Wine installation, prefix, and bridge shared by every Windows process.
-#[derive(Debug)]
-pub struct WineEnvironment {
+/// Extra Windows VST3 folders, as absolute Unix paths separated like `PATH`.
+pub const EXTRA_VST3_PATH_VARIABLE: &str = "SUPERPOSITION_WINDOWS_VST3_PATH";
+
+/// How to start a Windows program with the pinned Wine, the shared prefix, and the bridge.
+///
+/// Cheap to clone and compare; it starts nothing itself and leaves `DISPLAY` to the caller.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WineLauncher {
     wine: PathBuf,
     prefix: PathBuf,
     bridge_dir: PathBuf,
-    display: Option<OsString>,
+}
+
+impl WineLauncher {
+    /// A launcher for `wine` with `prefix` and the bridge layout in `bridge_dir`.
+    #[must_use]
+    pub const fn new(wine: PathBuf, prefix: PathBuf, bridge_dir: PathBuf) -> Self {
+        Self {
+            wine,
+            prefix,
+            bridge_dir,
+        }
+    }
+
+    /// A command that runs `program` (a Unix path to a Windows `.exe`; Wine maps it through `Z:`)
+    /// under Wine. It sets the prefix, bridge path, and quiet logging, and drops
+    /// `WAYLAND_DISPLAY` so Wine's Wayland driver cannot bypass the private X server.
+    #[must_use]
+    pub fn command(&self, program: impl AsRef<OsStr>) -> Command {
+        let mut command = Command::new(&self.wine);
+        command.arg(program);
+        self.apply_environment(&mut command);
+        command
+    }
+
+    /// The shared prefix.
+    #[must_use]
+    pub fn prefix(&self) -> &Path {
+        &self.prefix
+    }
+
+    /// The prefix folder that Windows VST3 installers write to.
+    #[must_use]
+    pub fn vst3_dir(&self) -> PathBuf {
+        self.prefix.join(VST3_DIR_IN_PREFIX)
+    }
+
+    /// Every folder scanned for Windows VST3 bundles: the prefix folder, then each absolute
+    /// folder in [`EXTRA_VST3_PATH_VARIABLE`].
+    #[must_use]
+    pub fn vst3_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = vec![self.vst3_dir()];
+        if let Some(extra) = std::env::var_os(EXTRA_VST3_PATH_VARIABLE) {
+            dirs.extend(std::env::split_paths(&extra).filter(|path| path.is_absolute()));
+        }
+        dirs
+    }
+
+    /// A Wine tool such as `wineboot` or `wineserver`, which live beside the pinned `wine`.
+    fn tool(&self, tool: &str) -> Command {
+        let tool = self
+            .wine
+            .parent()
+            .map(|dir| dir.join(tool))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| PathBuf::from(tool));
+        let mut command = Command::new(tool);
+        self.apply_environment(&mut command);
+        command
+    }
+
+    fn apply_environment(&self, command: &mut Command) {
+        command
+            .env("WINEPREFIX", &self.prefix)
+            .env("WINEDLLPATH", &self.bridge_dir)
+            .env("WINEDEBUG", "-all")
+            .env_remove("WAYLAND_DISPLAY");
+    }
+}
+
+/// The X display Windows windows open on.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WineDisplay {
+    /// `DISPLAY`, such as `:7`.
+    pub display: OsString,
+    /// `XAUTHORITY` file with the display's cookie.
+    pub authority: PathBuf,
+}
+
+/// The shared prefix and its persistent `wineserver`.
+#[derive(Debug)]
+pub struct WineEnvironment {
+    launcher: WineLauncher,
+    display: Option<WineDisplay>,
     server: Option<Child>,
 }
 
@@ -83,47 +171,92 @@ impl WineEnvironment {
         let prefix = std::env::var_os("SUPERPOSITION_WINE_PREFIX")
             .map_or_else(|| app_support.join("wine"), PathBuf::from);
         Ok(Self {
-            wine,
-            prefix,
-            bridge_dir,
+            launcher: WineLauncher::new(wine, prefix, bridge_dir),
             display: None,
             server: None,
         })
     }
 
-    /// Sends every later Windows window to `display` (the engine's private X server).
+    /// How workers and scanners start under this environment.
     #[must_use]
-    pub fn with_display(mut self, display: impl Into<OsString>) -> Self {
-        self.display = Some(display.into());
-        self
+    pub const fn launcher(&self) -> &WineLauncher {
+        &self.launcher
     }
 
     /// The shared prefix.
     #[must_use]
     pub fn prefix(&self) -> &Path {
-        &self.prefix
+        self.launcher.prefix()
     }
 
-    /// The prefix directory that Windows VST3 installers write to.
+    /// The prefix folder that Windows VST3 installers write to.
     #[must_use]
     pub fn vst3_dir(&self) -> PathBuf {
-        self.prefix.join(VST3_DIR_IN_PREFIX)
+        self.launcher.vst3_dir()
+    }
+
+    /// Whether [`Self::prepare`] has a live `wineserver`.
+    pub fn is_prepared(&mut self) -> bool {
+        self.server
+            .as_mut()
+            .is_some_and(|server| server.try_wait().ok().flatten().is_none())
+    }
+
+    /// Sends later Windows windows to `display`, or to none. Wine's desktop process keeps the
+    /// display it started with, so a change stops the prefix's processes and server; the next
+    /// [`Self::prepare`] starts them on the new display.
+    pub fn set_display(&mut self, display: Option<WineDisplay>) {
+        if self.display != display {
+            self.stop_server();
+            self.display = display;
+        }
     }
 
     /// Creates or updates the prefix, then keeps one `wineserver` running.
     ///
-    /// The first call can take tens of seconds. Call it off the UI and audio threads.
+    /// The first call can take tens of seconds. Call it off the audio thread.
     ///
     /// # Errors
     /// Returns an error when `wineboot` or `wineserver` fails.
     pub fn prepare(&mut self) -> Result<(), WineError> {
-        std::fs::create_dir_all(&self.prefix).map_err(|source| WineError::Io {
+        if self.is_prepared() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(self.prefix()).map_err(|source| WineError::Io {
             action: "create the Wine prefix",
             source,
         })?;
-        let status = self
-            .command_for("wineboot")
+        // A server left by a process that crashed may be on an old display; end it first.
+        let _ = self
+            .launcher
+            .tool("wineserver")
+            .arg("-k")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        // `-p` keeps the server alive without clients; `-f` keeps it in the foreground, so this
+        // value owns and reaps it. It starts first so wineboot does not start its own.
+        let mut server = self.launcher.tool("wineserver");
+        self.apply_display(&mut server);
+        let server = server
+            .args(["-f", "-p"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|source| WineError::Io {
+                action: "start wineserver",
+                source,
+            })?;
+        self.server = Some(server);
+        let mut wineboot = self.launcher.tool("wineboot");
+        self.apply_display(&mut wineboot);
+        let status = wineboot
             .arg("--init")
+            // Without this, a new prefix asks on the display to install Wine Mono and Gecko
+            // and waits minutes for an answer. Users can run their installers instead.
+            .env("WINEDLLOVERRIDES", "mscoree,mshtml=")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -133,53 +266,40 @@ impl WineEnvironment {
                 source,
             })?;
         if !status.success() {
+            self.stop_server();
             return Err(WineError::PrefixFailed(status));
         }
         std::fs::create_dir_all(self.vst3_dir()).map_err(|source| WineError::Io {
             action: "create the prefix VST3 directory",
             source,
-        })?;
-        if self
-            .server
-            .as_mut()
-            .is_none_or(|server| server.try_wait().ok().flatten().is_some())
-        {
-            // `-p` keeps the server alive without clients; `-f` keeps it in the foreground,
-            // so this value owns and reaps it.
-            let server = self
-                .command_for("wineserver")
-                .args(["-f", "-p"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|source| WineError::Io {
-                    action: "start wineserver",
-                    source,
-                })?;
-            self.server = Some(server);
-        }
-        Ok(())
-    }
-
-    /// A command that runs `program` (a Windows `.exe`, or a Unix path Wine maps through `Z:`)
-    /// under Wine with the shared prefix, bridge, and display.
-    #[must_use]
-    pub fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
-        let mut command = Command::new(&self.wine);
-        command.arg(program);
-        self.apply_environment(&mut command);
-        command
+        })
     }
 
     /// Starts an installer or licence manager in the shared prefix. Its windows appear on the
-    /// engine's display, where the window streamer shows them.
+    /// engine's display, where the window streamer shows them. Call [`Self::prepare`] first.
     ///
     /// # Errors
     /// Returns an error when Wine cannot start the program.
     pub fn run_program(&self, program: &Path) -> Result<Child, WineError> {
-        self.command(program)
+        // msiexec installs a Windows Installer package; Wine runs every other program itself.
+        let is_msi = program
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("msi"));
+        let mut command = if is_msi {
+            let mut command = self.launcher.command("msiexec");
+            command.arg("/i").arg(program);
+            command
+        } else {
+            self.launcher.command(program)
+        };
+        self.apply_display(&mut command);
+        if let Some(directory) = program.parent() {
+            command.current_dir(directory);
+        }
+        command
             .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|source| WineError::Io {
                 action: "start the Windows program",
@@ -193,41 +313,29 @@ impl WineEnvironment {
         format!("Z:{}", path.display()).replace('/', "\\")
     }
 
-    fn command_for(&self, tool: &str) -> Command {
-        // wineboot and wineserver live beside the pinned wine binary.
-        let tool = self
-            .wine
-            .parent()
-            .map(|dir| dir.join(tool))
-            .filter(|path| path.is_file())
-            .unwrap_or_else(|| PathBuf::from(tool));
-        let mut command = Command::new(tool);
-        self.apply_environment(&mut command);
-        command
+    fn apply_display(&self, command: &mut Command) {
+        match &self.display {
+            Some(display) => command
+                .env("DISPLAY", &display.display)
+                .env("XAUTHORITY", &display.authority),
+            None => command.env_remove("DISPLAY").env_remove("XAUTHORITY"),
+        };
     }
 
-    fn apply_environment(&self, command: &mut Command) {
-        command
-            .env("WINEPREFIX", &self.prefix)
-            .env("WINEDLLPATH", &self.bridge_dir)
-            .env("WINEDEBUG", "-all")
-            // Wine's Wayland driver would bypass the private X server.
-            .env_remove("WAYLAND_DISPLAY");
-        match &self.display {
-            Some(display) => command.env("DISPLAY", display),
-            None => command.env_remove("DISPLAY"),
-        };
+    /// Ends the prefix's processes and its server.
+    fn stop_server(&mut self) {
+        if let Some(mut server) = self.server.take() {
+            // `wineserver -k` ends the prefix's processes cleanly before the server exits.
+            let _ = self.launcher.tool("wineserver").arg("-k").status();
+            let _ = server.kill();
+            let _ = server.wait();
+        }
     }
 }
 
 impl Drop for WineEnvironment {
     fn drop(&mut self) {
-        if let Some(mut server) = self.server.take() {
-            // `wineserver -k` ends the prefix's processes cleanly before the server exits.
-            let _ = self.command_for("wineserver").arg("-k").status();
-            let _ = server.kill();
-            let _ = server.wait();
-        }
+        self.stop_server();
     }
 }
 

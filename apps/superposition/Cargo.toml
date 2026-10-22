@@ -24,6 +24,7 @@ sp-ui = { path = "../../crates/sp-ui" }
 serde.workspace = true
 serde_json.workspace = true
 signal-hook = "0.3.18"
+sp-wine = { path = "../../crates/sp-wine" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Reads the system reduced-motion preference; already in the graph through winit.

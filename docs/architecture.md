@@ -2,7 +2,7 @@
 
 ## Purpose, status, and boundary
 
-Superposition is a macOS audio host that treats plug-ins as untrusted, latency-sensitive native code. The host process owns session orchestration, device integration, scheduling, UI coordination, persistence, and recovery policy; helpers own the code paths that load VST3 bundles.
+Superposition is a macOS and Linux audio host (on Linux, also for Windows VST3 plug-ins under Wine) that treats plug-ins as untrusted, latency-sensitive native code. The host process owns session orchestration, device integration, scheduling, UI coordination, persistence, and recovery policy; helpers own the code paths that load VST3 bundles.
 
 This repository is an alpha, not a certified product. It has fixed shared-memory protocol/layout types, helper-only VST3 scanning, retained serial-rack workers, and a duplex product mixer/endpoint composition. The desktop app can select independent input/output devices and per-rack mono/stereo channels, dispatch audio and bounded MIDI to indexed rack workers, mix validated completions, edit normalized parameters, persist component/controller state, open or focus worker-owned native-editor windows, and replace a failed rack worker on its alternate stable bank. Long-running hardware timing evidence remains incomplete.
 
@@ -44,7 +44,11 @@ The data plane uses `#[repr(C)]`, fixed-layout `SharedBank` mappings. A bank con
 
 A Windows plug-in worker runs under Wine against a Linux host. It is the same worker built for `x86_64-pc-windows-gnu`; it opens the host's bank through Wine's `Z:` drive (`Z:\dev\shm\<name>`), which Wine backs with a shared mapping of the same pages. Wine traps raw Linux syscalls from PE code, so the futex wait/wake, the `CLOCK_MONOTONIC` clock, and `SCHED_FIFO` come from `sp_wine_bridge`: a builtin PE DLL with a unixlib (`crates/sp-shared-memory-os/wine`, built by `cargo xtask wine-bridge`). Wine pairs the two halves only when it finds the DLL through `WINEDLLPATH` in its `x86_64-windows`/`x86_64-unix` layout. `cargo xtask wine-check` runs the Windows client under Wine against a Linux bank and times the round trips. The bank layout has only fixed-width fields, so both builds validate the same header.
 
-A rack whose worker crosses that slower boundary is pipelined: the dispatcher publishes its request after the block's observation pass and mixes the result one block later, under the same deadline and fallback rules, and delays the rack's dry path by one block so fallback and bypass stay aligned. Other racks keep the same-block deadline.
+`cargo xtask windows-helpers` puts `sp-plugin-worker.exe` and `sp-plugin-scanner.exe` in `<helpers>/windows/` and the bridge in `<helpers>/wine-bridge/`, beside the native helpers. With them and Wine present, `ProductRuntime` keeps one `sp_wine::WineEnvironment`: the shared prefix (`<app support>/wine`, or `SUPERPOSITION_WINE_PREFIX`), the private display, and one persistent `wineserver`. The prefix is prepared on first use (scan, worker launch, or installer); a stale server from a crashed host is ended first, and Wine Mono and Gecko are not installed automatically. A display restart restarts the server, so Windows workers recover on the new display. Every Wine process gets `WINEPREFIX`, `WINEDLLPATH` (the bridge), `WINEDEBUG=-all`, and the private `DISPLAY` and `XAUTHORITY`, never `WAYLAND_DISPLAY`. A Windows rack's worker starts as `wine <helpers>/windows/sp-plugin-worker.exe --worker … --sample-rate <rate> --bundle Z:\…\Plugin.vst3`; bank names are unchanged, and every bundle path the worker sees goes through `Z:`. Wine keeps the process the supervisor started, so its PID, stdio, and kill work as for a native worker. With a warm server, the worker answers its first health request in about 0.1 s.
+
+A rack hosts plug-ins of one platform: mixing Linux and Windows plug-ins in one rack is rejected until mixed racks (one worker per segment) land. A rack whose worker crosses the Wine boundary is pipelined: the dispatcher publishes its request after the block's observation pass and mixes the result one block later, under the same deadline and fallback rules, and delays the rack's dry path by one block so fallback and bypass stay aligned. Other racks keep the same-block deadline. A live layout change adds a Windows rack's lane with `with_pipelined(true)`. A renderer's initial banks cannot be pipelined, so audio start queues the Windows racks as pipelined lanes in a first layout change; each plays dry until its worker delivers three valid blocks, then fades in. Setup's Diagnostics lists these racks with the extra block of latency.
+
+Workers set plug-ins up for one sample rate, passed as `--sample-rate` (48000 or 96000), which also sizes the processing thread's scheduling policy. Audio start restarts any rack worker that runs at another rate, with its captured state.
 
 On Linux the processing thread requests `SCHED_FIFO` (priority `SUPERPOSITION_RT_PRIORITY`, default 70). Without `RLIMIT_RTPRIO` it keeps ordinary scheduling and warns once; `SUPERPOSITION_REQUIRE_REALTIME=1` makes that an error. It receives no control IPC and does not launch, log, allocate, or sleep from the callback path.
 
@@ -61,6 +65,8 @@ whose signal it still owns. This keeps the app from advancing that handshake
 through a second path.
 
 The separate control plane is reserved for discovery, helper lifecycle, parameters, state transfer, diagnostics, and UI requests. It may use ordinary IPC and persistence, but it cannot be a dependency of callback progress.
+
+Each worker's control channel is its stdin and stdout: length-prefixed `sp-protocol` frames, requests in and responses out, one request at a time. The same pipes work on macOS, on Linux, and for a Windows worker under Wine, whose standard handles are the host's pipes (Wine's `AF_UNIX` support to a Linux peer is not relied on). Before any plug-in loads, the worker moves the inherited streams to private descriptors and points its standard output at standard error, and on Windows also moves loaded C runtimes' descriptor 1, so plug-in output cannot corrupt a frame. Reader threads on both ends collect whole frames, so a missed deadline never leaves half a frame in a pipe; after an error the host stops using that worker's pipes. The first health response follows the worker's first plug-in load and may take up to the long control deadline. When the host closes the channel, the worker shuts down; there is no reconnection.
 
 Native Open, Close, Focus, and Resize requests go to the worker's initial AppKit
 thread through editor handles that do not own DSP. The processing thread keeps
@@ -103,6 +109,21 @@ Each window carries `WM_NAME` and `_NET_WM_NAME` (plug-in, rack, and slot),
 `_SUPERPOSITION_SLOT` properties, so the window streamer can map it to its
 slot. Preview pictures come from an X `GetImage` of the window.
 
+The Windows worker owns a top-level Win32 window per open editor and attaches
+the plug-in view as `kPlatformTypeHWND`. Wine maps the window to an X11 window
+on the private display, titled like the Linux one, with `_NET_WM_PID` set to the
+worker's PID. PE code cannot call Xlib, so the worker finds that X11 window
+through Wine's `__wine_x11_whole_window` property and labels it with
+`_SUPERPOSITION_RACK` and `_SUPERPOSITION_SLOT` through `sp_wine_bridge`, whose
+unixlib uses the `libX11` that Wine's X11 driver already loaded. The streamer
+and app therefore treat Windows and Linux editor windows alike. Windows editors
+run on window messages, so the loading thread dispatches its message queue on
+every pass, with or without an open editor; it also starts OLE before plug-ins
+load. Preview pictures are a GDI copy of the window's client area, which
+includes the plug-in's child window. Setup's "Run Windows program…" starts an
+installer or licence manager (`.exe`, or `.msi` through `msiexec`) in the shared
+prefix; its windows appear through the streamer like editors.
+
 The app sees that display only through `sp-window-streamer`, which the runtime starts on it with
 a socket in `$XDG_RUNTIME_DIR/superposition-<pid>/`. The streamer tracks every top-level and
 popup window, captures changed regions (Composite, DAMAGE, MIT-SHM), and sends them as
@@ -112,21 +133,6 @@ each popup over its parent, and forwards pointer, wheel, keys, and text, which t
 with XTEST. Closing an editor's egui window closes the editor through its worker; closing any
 other window (an installer, a licence manager) sends `WM_DELETE_WINDOW`. If Xvfb or the streamer
 dies, the runtime restarts it and the UI reconnects.
-
-## Remote operation
-
-`superposition --serve` runs the engine and the normal UI against a headless `egui::Context`;
-`superposition --connect HOST` opens a window that shows it (`sp-remote`). The client sends each
-frame's `egui::RawInput`; the engine runs a UI frame for that input, tessellates it, and sends the
-meshes and texture changes, which the client paints. The client therefore shows exactly the
-engine's UI, and streamed plug-in editors arrive as textures in it. The transport is QUIC with
-TLS 1.3 and self-signed identities. An unknown client pairs once with the six-digit code the
-engine prints: SPAKE2 over the connection, confirmed by HMACs over both certificate
-fingerprints, after which each side pins the other. One client controls; other clients watch
-until they take control. A client that joins late first receives every live texture in full.
-The engine renders only for input or a requested repaint, so an idle engine and client use
-almost no CPU. On macOS the served UI works the same, but native editors stay on the Mac's own
-display.
 
 Native editor parameter callbacks publish latest values into the worker's
 fixed-ID atomic mirror. Its loading-thread service writes a per-slot
@@ -155,6 +161,21 @@ before worker launch with its name in the load error, including when it is a
 later rack slot. The Setup page lists quarantined plug-ins and allows a retry for one
 fingerprint without clearing other failure records.
 
+## Remote operation
+
+`superposition --serve` runs the engine and the normal UI against a headless `egui::Context`;
+`superposition --connect HOST` opens a window that shows it (`sp-remote`). The client sends each
+frame's `egui::RawInput`; the engine runs a UI frame for that input, tessellates it, and sends the
+meshes and texture changes, which the client paints. The client therefore shows exactly the
+engine's UI, and streamed plug-in editors arrive as textures in it. The transport is QUIC with
+TLS 1.3 and self-signed identities. An unknown client pairs once with the six-digit code the
+engine prints: SPAKE2 over the connection, confirmed by HMACs over both certificate
+fingerprints, after which each side pins the other. One client controls; other clients watch
+until they take control. A client that joins late first receives every live texture in full.
+The engine renders only for input or a requested repaint, so an idle engine and client use
+almost no CPU. On macOS the served UI works the same, but native editors stay on the Mac's own
+display.
+
 ## Package direction and VST3 boundary
 
 `sp-model` defines durable domain types. `sp-protocol` defines versioned wire records. `sp-shared-memory` owns safe fixed-layout and slot primitives, while `sp-shared-memory-os` owns the platform mapping, clock, wake, and scheduling FFI (macOS, Linux, and Windows under Wine). `sp-engine` owns graph/gate/mixing foundations. `sp-audio-io` contains platform-neutral endpoint types, callback contracts, the product renderer, and the rack dispatcher; `sp-audio-io-macos` owns the direct AUHAL implementation and `sp-audio-io-linux` the JACK implementation. `sp-supervisor`, `sp-session`, `sp-midi`, and `sp-ui` remain outside the callback dependency path.
@@ -166,6 +187,15 @@ Mach-O header. Linux searches each absolute folder in `VST3_PATH`, then
 of the shared object in `Contents/<arch>-linux`. A bundle is supported when it
 holds code for the running architecture; `vst3-host` loads the binary from the
 architecture folder that matches the running target.
+
+On Linux with Wine, the scanner also searches the prefix's
+`drive_c/Program Files/Common Files/VST3` and each absolute folder in
+`SUPERPOSITION_WINDOWS_VST3_PATH`, for bundle folders and single-file `.vst3`
+DLLs. The Windows scanner runs each one under Wine with `Z:` paths, the private
+display, and a 30-second deadline, and reads the PE header of the DLL in
+`Contents/<arch>-win`. Timeouts and crashes count toward quarantine exactly as
+for native scans. The catalog records each plug-in's platform (`native` or
+`windows`; catalogs written before this field read as native).
 
 `sp-vst3` is the sole VST3 adapter boundary. Its SDK feature is enabled by `sp-plugin-worker` and `sp-plugin-scanner` only. The main app and `sp-engine` must not transitively reach `sp-vst3`, `vst3`, or `vst3-host`; direct dependency edges remain limited to the helper/adapter chain. No app, engine, model, protocol, session, or UI type may expose VST3 SDK types. `cargo xtask doctor` verifies that dependency rule from Cargo metadata. The scanner and worker helper capabilities are partial foundations, not a general VST3 compatibility assertion.
 

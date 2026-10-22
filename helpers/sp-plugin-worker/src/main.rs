@@ -1,5 +1,6 @@
 //! Isolated plug-in-host helper entry point.
 
+mod control_stdio;
 mod control_thread;
 #[cfg(feature = "sdk")]
 mod state_transfer;
@@ -7,8 +8,6 @@ mod worker_runtime;
 
 use std::{
     cmp, io,
-    os::unix::{fs::FileTypeExt, net::UnixListener},
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -67,12 +66,16 @@ use sp_vst3::{
     sdk::HostSdkRackAdapter,
 };
 
+#[cfg(all(feature = "sdk", any(target_os = "linux", windows)))]
+use sp_vst3::EditorWindowIdentity;
 #[cfg(all(feature = "sdk", target_os = "macos"))]
 use sp_vst3::editor_window::MacOsEditorWindow as EditorWindow;
 #[cfg(feature = "sdk")]
 use sp_vst3::sdk::SdkPlugin;
+#[cfg(all(feature = "sdk", windows))]
+use sp_vst3::win32_editor_window::Win32EditorWindow as EditorWindow;
 #[cfg(all(feature = "sdk", target_os = "linux"))]
-use sp_vst3::x11_editor_window::{EditorWindowIdentity, X11EditorWindow as EditorWindow};
+use sp_vst3::x11_editor_window::X11EditorWindow as EditorWindow;
 
 const WORKER_ID_OPTION: &str = "--worker-id";
 const BUNDLE_OPTION: &str = "--bundle";
@@ -93,7 +96,8 @@ struct StandaloneWorkerConfiguration {
 }
 
 /// Production worker configuration. Unlike standalone mode, this is entered only by the
-/// explicit `--worker` selector and always has a concrete VST3 class and control endpoint.
+/// explicit `--worker` selector and always has a concrete VST3 class. Its control channel is
+/// its stdin and stdout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProductionWorkerConfiguration {
     bank_name: String,
@@ -102,9 +106,13 @@ struct ProductionWorkerConfiguration {
     rack_generation: u64,
     bank_index: u8,
     bank_generation: u64,
-    control_socket: PathBuf,
+    /// The session rate. Plug-ins are set up for it, and a different rate needs a new worker.
+    sample_rate: u32,
     selection: Vst3ClassSelection,
 }
+
+/// Session sample rates, in hertz.
+const SAMPLE_RATES: [u32; 2] = [48_000, 96_000];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum WorkerStartup {
@@ -156,7 +164,7 @@ fn main() {
     };
     let Some(startup) = startup else {
         println!(
-            "usage: sp-plugin-worker --worker --bank <shared-memory-bank> --worker-id <id> --rack-index <0..7> --rack-generation <generation> --bank-index <0..1> --bank-generation <generation> --control-socket <absolute-path> --bundle <path> --class-id <id>"
+            "usage: sp-plugin-worker --worker --bank <shared-memory-bank> --worker-id <id> --rack-index <0..7> --rack-generation <generation> --bank-index <0..1> --bank-generation <generation> --sample-rate <48000|96000> --bundle <path> --class-id <id>\n(control requests on stdin, responses on stdout)"
         );
         return;
     };
@@ -246,7 +254,7 @@ fn parse_production_worker_arguments(
     let mut rack_generation = None;
     let mut bank_index = None;
     let mut bank_generation = None;
-    let mut control_socket = None;
+    let mut sample_rate = None;
     let mut bundle = None;
     let mut class_id = None;
     for pair in arguments.chunks_exact(2) {
@@ -301,15 +309,17 @@ fn parse_production_worker_arguments(
                 }
                 bank_generation = Some(parse_nonzero_generation(value, "bank generation")?);
             }
-            "--control-socket" => {
-                if control_socket.is_some() {
+            "--sample-rate" => {
+                if sample_rate.is_some() {
                     return Err(duplicate(option));
                 }
-                let path = PathBuf::from(value);
-                if !path.is_absolute() {
-                    return Err("worker control socket must be an absolute path".to_owned());
-                }
-                control_socket = Some(path);
+                sample_rate = Some(
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|rate| SAMPLE_RATES.contains(rate))
+                        .ok_or("sample rate must be 48000 or 96000")?,
+                );
             }
             BUNDLE_OPTION => {
                 if bundle.replace(Vst3BundlePath::new(value.clone())).is_some() || value.is_empty()
@@ -333,7 +343,7 @@ fn parse_production_worker_arguments(
         rack_generation: rack_generation.ok_or("production worker requires --rack-generation")?,
         bank_index: bank_index.ok_or("production worker requires --bank-index")?,
         bank_generation: bank_generation.ok_or("production worker requires --bank-generation")?,
-        control_socket: control_socket.ok_or("production worker requires --control-socket")?,
+        sample_rate: sample_rate.ok_or("production worker requires --sample-rate")?,
         selection: Vst3ClassSelection::new(
             bundle,
             class_id.ok_or("production worker requires --class-id")?,
@@ -629,10 +639,16 @@ const EDITOR_RUN_LOOP_INTERVAL: Duration = Duration::from_millis(2);
 #[cfg(all(feature = "sdk", target_os = "macos"))]
 const EDITOR_CLOSE_PUMP: Duration = Duration::from_millis(500);
 /// An editor is pictured this long after it opens or a parameter changes, once it has painted.
-#[cfg(all(feature = "sdk", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "sdk",
+    any(target_os = "macos", target_os = "linux", windows)
+))]
 const EDITOR_PREVIEW_SETTLE: Duration = Duration::from_millis(500);
 /// While parameters keep changing, an open editor is pictured at most this often.
-#[cfg(all(feature = "sdk", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "sdk",
+    any(target_os = "macos", target_os = "linux", windows)
+))]
 const EDITOR_PREVIEW_INTERVAL: Duration = Duration::from_secs(2);
 /// A loading thread without a loop pass for this long is held by plug-in code, such as a modal
 /// dialog or menu. Picture polls are refused then instead of waiting past the host's deadline.
@@ -693,16 +709,18 @@ struct EditorHost {
     feedback_loss_counts: BTreeMap<usize, u64>,
     container_loss_counts: BTreeMap<usize, u64>,
     editors: BTreeMap<usize, sp_vst3::sdk::SdkEditorHandle>,
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     windows: BTreeMap<usize, OpenEditor>,
     /// Newest editor picture per slot. It outlives the window, so the host can still fetch the
     /// picture taken as the editor closed.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     previews: BTreeMap<usize, EditorPreview>,
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     last_preview_sequence: u64,
+    /// Session rate for plug-ins this thread loads into the chain.
+    sample_rate: u32,
     /// Rack index the window streamer reads from each editor window.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     rack_index: u8,
     /// Keeps the event pump running until a closed window has left the screen.
     #[cfg(target_os = "macos")]
@@ -710,7 +728,10 @@ struct EditorHost {
 }
 
 /// An open editor window and when it is next pictured.
-#[cfg(all(feature = "sdk", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "sdk",
+    any(target_os = "macos", target_os = "linux", windows)
+))]
 struct OpenEditor {
     window: EditorWindow,
     /// When to picture the editor next; `None` until a parameter changes.
@@ -718,7 +739,10 @@ struct OpenEditor {
     pictured_at: Option<Instant>,
 }
 
-#[cfg(all(feature = "sdk", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "sdk",
+    any(target_os = "macos", target_os = "linux", windows)
+))]
 impl OpenEditor {
     /// Schedules a picture once the editor has repainted, and no sooner than
     /// [`EDITOR_PREVIEW_INTERVAL`] after the last one.
@@ -733,7 +757,10 @@ impl OpenEditor {
 }
 
 /// A PNG picture of a slot's editor, numbered in capture order across the worker.
-#[cfg(all(feature = "sdk", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "sdk",
+    any(target_os = "macos", target_os = "linux", windows)
+))]
 struct EditorPreview {
     sequence: u64,
     captured_at_unix_ms: u64,
@@ -743,23 +770,27 @@ struct EditorPreview {
 #[cfg(feature = "sdk")]
 impl EditorHost {
     #[cfg_attr(
-        not(target_os = "linux"),
-        expect(unused_variables, reason = "only X11 windows carry their rack index")
+        not(any(target_os = "linux", windows)),
+        expect(
+            unused_variables,
+            reason = "only X11 and Win32 windows carry their rack index"
+        )
     )]
-    fn new(rack_index: u8) -> Self {
+    fn new(rack_index: u8, sample_rate: u32) -> Self {
         Self {
             state_transfers: StateTransfers::starting_at(LIVE_CAPTURE_TRANSFER_BASE),
             services: BTreeMap::new(),
             feedback_loss_counts: BTreeMap::new(),
             container_loss_counts: BTreeMap::new(),
             editors: BTreeMap::new(),
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             windows: BTreeMap::new(),
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             previews: BTreeMap::new(),
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             last_preview_sequence: 0,
-            #[cfg(target_os = "linux")]
+            sample_rate,
+            #[cfg(any(target_os = "linux", windows))]
             rack_index,
             #[cfg(target_os = "macos")]
             pump_until: None,
@@ -792,7 +823,7 @@ impl EditorHost {
             let result = self.handle_live_read(request);
             return ProductionRuntime::response(request, result);
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             return ProductionRuntime::unsupported(
                 request,
@@ -800,7 +831,7 @@ impl EditorHost {
             );
         }
 
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         {
             let result = match request.operation() {
                 ControlOperation::OpenNativeEditor => ProductionRuntime::slot_index(request)
@@ -860,7 +891,7 @@ impl EditorHost {
 
     /// Opens `slot`'s editor in a new worker-owned window at the requested position, or
     /// focuses the window that is already open.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn open_editor(&mut self, slot: usize, payload: &[u8]) -> Result<Vec<u8>, String> {
         if let Some(open) = self.windows.get(&slot) {
             open.window.focus();
@@ -876,7 +907,7 @@ impl EditorHost {
             .ok_or("native editor slot is not loaded")?;
         #[cfg(target_os = "macos")]
         let window = EditorWindow::new("Superposition Plug-in Editor")?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         let window = EditorWindow::new(&EditorWindowIdentity {
             title: &format!(
                 "{} – Rack {}, Slot {}",
@@ -920,7 +951,7 @@ impl EditorHost {
                 let configuration = WirePluginSlotConfiguration::decode(request.payload())
                     .map_err(|error| error.to_string())?;
                 let slot = ProductionRuntime::request_configuration_slot(request, &configuration)?;
-                let mut facade = ProductionRuntime::load_facade(&configuration)?;
+                let mut facade = ProductionRuntime::load_facade(&configuration, self.sample_rate)?;
                 facade.set_active(true).map_err(|error| error.to_string())?;
                 self.forget_slot(slot);
                 if let Some(service) = facade.adapter.main_thread_service() {
@@ -937,7 +968,7 @@ impl EditorHost {
             }
             ControlOperation::UnloadSlot => {
                 let slot = ProductionRuntime::slot_index(request)?;
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                #[cfg(any(target_os = "macos", target_os = "linux", windows))]
                 if self.windows.contains_key(&slot) {
                     self.close_editor(slot)?;
                 }
@@ -953,7 +984,7 @@ impl EditorHost {
                 permute_slot_keys(&mut self.editors, &from);
                 permute_slot_keys(&mut self.feedback_loss_counts, &from);
                 permute_slot_keys(&mut self.container_loss_counts, &from);
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                #[cfg(any(target_os = "macos", target_os = "linux", windows))]
                 {
                     permute_slot_keys(&mut self.windows, &from);
                     permute_slot_keys(&mut self.previews, &from);
@@ -974,7 +1005,7 @@ impl EditorHost {
         self.editors.remove(&slot);
         self.feedback_loss_counts.remove(&slot);
         self.container_loss_counts.remove(&slot);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         self.previews.remove(&slot);
     }
 
@@ -1050,7 +1081,7 @@ impl EditorHost {
     /// Describes `slot`'s newest picture and stages its PNG as a live-capture transfer when the
     /// host's known sequence differs. It answers from stored pictures and never pictures the
     /// editor itself.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn describe_preview(&mut self, slot: usize, payload: &[u8]) -> Result<Vec<u8>, String> {
         let known = EditorPreviewRequest::decode(payload)
             .map_err(|error| error.to_string())?
@@ -1088,7 +1119,7 @@ impl EditorHost {
     }
 
     /// Pictures `slot`'s open editor and keeps the picture as the slot's newest preview.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn capture_preview(&mut self, slot: usize) {
         let Some(open) = self.windows.get_mut(&slot) else {
             return;
@@ -1117,7 +1148,7 @@ impl EditorHost {
     }
 
     /// Pictures the editor one last time, then detaches its view and closes its window.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn close_editor(&mut self, slot: usize) -> Result<(), String> {
         self.log_service_stats("editor-close");
         self.capture_preview(slot);
@@ -1146,8 +1177,9 @@ impl EditorHost {
         !self.windows.is_empty() || self.pump_until.is_some_and(|until| Instant::now() < until)
     }
 
-    /// Whether editors need servicing: X11 closes a window at once, so only open ones do.
-    #[cfg(target_os = "linux")]
+    /// Whether editors need servicing: X11 and Win32 close a window at once, so only open ones
+    /// do.
+    #[cfg(any(target_os = "linux", windows))]
     fn needs_event_pump(&self) -> bool {
         !self.windows.is_empty()
     }
@@ -1163,6 +1195,15 @@ impl EditorHost {
             }
             open.window.pump_events();
         }
+        thread::sleep(EDITOR_RUN_LOOP_INTERVAL);
+    }
+
+    /// Dispatches the loading thread's window messages, which drive editors, then waits up to
+    /// [`EDITOR_RUN_LOOP_INTERVAL`].
+    #[cfg(windows)]
+    fn pump_events(&self) {
+        let _ = self;
+        sp_vst3::win32_editor_window::pump_messages();
         thread::sleep(EDITOR_RUN_LOOP_INTERVAL);
     }
 
@@ -1199,9 +1240,16 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
     #[cfg(feature = "sdk")]
     {
         if !sp_shared_memory_os::request_wake_supported() {
-            return Err("live plug-in workers require macOS 14.4 or later".to_owned());
+            return Err(if cfg!(windows) {
+                "a Windows worker runs only under Wine with sp_wine_bridge on WINEDLLPATH"
+            } else {
+                "live plug-in workers require macOS 14.4 or later"
+            }
+            .to_owned());
         }
-        let listener = bind_control_listener(&configuration.control_socket)?;
+        // Before any plug-in loads, so plug-in output never reaches the control channel.
+        let (requests, responses) = control_stdio::take()
+            .map_err(|error| format!("could not take the control channel: {error}"))?;
         let target = ControlTarget::new(
             RackIdentity::new(configuration.rack_index, configuration.rack_generation)
                 .map_err(|error| error.to_string())?,
@@ -1226,8 +1274,12 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
         {
             eprintln!("sp-plugin-worker: {error}");
         }
+        #[cfg(windows)]
+        if let Err(error) = sp_vst3::win32_editor_window::prepare_thread() {
+            eprintln!("sp-plugin-worker: {error}");
+        }
         // The initial plug-in has no sidechain. A rebuild that asks for one reloads it.
-        let facade = Vst3Facade::load(&configuration.selection, false)?;
+        let facade = Vst3Facade::load(&configuration.selection, false, configuration.sample_rate)?;
         let initial_plugin = WirePluginSlotConfiguration {
             slot: 0,
             input_channels: facade.layout.input_channels,
@@ -1244,20 +1296,20 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
         };
         let mut runtime = Box::new(ProductionRuntime::new(
             configuration.worker_id,
+            configuration.sample_rate,
             facade,
             initial_plugin,
         )?);
         heartbeat.publish_now(&region.bank().header)?;
-        let (mut socket_endpoint, processing_endpoint) = control_mailbox();
-        socket_endpoint
+        let (mut pipe_endpoint, processing_endpoint) = control_mailbox();
+        pipe_endpoint
             .set_request_wake(&configuration.bank_name)
             .map_err(|error| error.to_string())?;
         let control_thread =
-            ControlThread::spawn(listener, target, socket_endpoint, CONTROL_TIMEOUT)
+            ControlThread::spawn(requests, responses, target, pipe_endpoint, CONTROL_TIMEOUT)
                 .map_err(|error| error.to_string())?;
-        // Product workers use the authenticated control shutdown request. Unlike the standalone
-        // worker, EOF on inherited stdin must not terminate a rack immediately when the
-        // supervisor deliberately launches it with null stdin.
+        // Product workers stop on the authenticated control shutdown request, or when the host
+        // closes the control channel.
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         runtime.shutdown_requested = Arc::clone(&shutdown_requested);
         let loading_pass = Arc::clone(&runtime.loading_pass);
@@ -1268,7 +1320,7 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
         let (editor_response_tx, editor_response_rx) = sync_channel(1);
         // Plug-ins removed from the chain return here for teardown on the loading thread.
         let (retired_tx, retired_rx) = sync_channel::<Vst3Facade>(MAX_PLUGINS_PER_RACK);
-        let mut editor_host = EditorHost::new(configuration.rack_index);
+        let mut editor_host = EditorHost::new(configuration.rack_index, configuration.sample_rate);
         editor_host.register_services(&runtime.rack);
         // This second mapping belongs to the loading/main thread. The processing thread keeps
         // its own mapping, and neither audio blocks nor control RPCs carry editor feedback.
@@ -1280,12 +1332,14 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
             .reset_slot(0)
             .ok_or("could not initialize first parameter feedback slot")?;
         publish_worker_telemetry(region.bank(), &mut runtime);
+        let sample_rate = configuration.sample_rate;
         let processing = thread::Builder::new()
             .name("sp-worker-processing".to_owned())
             .spawn(move || {
                 let mut runtime = Some(runtime);
                 let result = run_production_processing_thread(
                     region,
+                    sample_rate,
                     clock,
                     heartbeat,
                     &mut runtime,
@@ -1304,6 +1358,9 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
 
         while !shutdown_requested.load(Ordering::Acquire) && !control_thread.is_stopped() {
             loading_pass.store(clock.now_ticks(), Ordering::Release);
+            // Windows plug-ins post messages to the loading thread even without an editor.
+            #[cfg(windows)]
+            sp_vst3::win32_editor_window::pump_messages();
             if let Ok(request) = editor_request_rx.try_recv() {
                 let reply = if is_chain_edit(request.operation()) {
                     match editor_host.prepare_chain_edit(&request, &feedback_region.bank().feedback)
@@ -1335,9 +1392,9 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
             }
             #[cfg(not(target_os = "macos"))]
             let _ = removed;
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             let pumping = editor_host.needs_event_pump();
-            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
             let pumping = false;
             let next_request = if pumping {
                 match main_request_rx.try_recv() {
@@ -1365,7 +1422,7 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
                     }
                     editor_host.feedback_loss_counts.clear();
                     editor_host.container_loss_counts.clear();
-                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
                     editor_host.previews.clear();
                 }
                 editor_host.register_services(&task.runtime.rack);
@@ -1382,7 +1439,7 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
             for (&slot, service) in &editor_host.services {
                 let _ = service.pump_foreground();
                 let values = service.take_parameter_values(128);
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                #[cfg(any(target_os = "macos", target_os = "linux", windows))]
                 if !values.is_empty()
                     && let Some(open) = editor_host.windows.get_mut(&slot)
                 {
@@ -1407,7 +1464,7 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
                     .feedback
                     .report_overflow(slot, feedback_delta.saturating_add(container_delta));
             }
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             {
                 let close_requests: Vec<usize> = editor_host
                     .windows
@@ -1441,7 +1498,7 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
                 if editor_host.needs_event_pump() {
                     #[cfg(target_os = "macos")]
                     sp_vst3::editor_window::pump_events(EDITOR_RUN_LOOP_INTERVAL);
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", windows))]
                     editor_host.pump_events();
                 }
             }
@@ -1455,7 +1512,7 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
         let (processing_result, runtime) = processing
             .join()
             .map_err(|_| "worker processing thread panicked".to_owned())?;
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         for slot in editor_host.windows.keys().copied().collect::<Vec<_>>() {
             if let Err(error) = editor_host.close_editor(slot) {
                 eprintln!("sp-plugin-worker: could not detach editor on shutdown: {error}");
@@ -1463,7 +1520,6 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
         }
         // VST3 controller teardown belongs on its loading thread, after native views detach.
         drop(runtime);
-        let _ = std::fs::remove_file(&configuration.control_socket);
         control_result?;
         processing_result
     }
@@ -1483,6 +1539,7 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
 )]
 fn run_production_processing_thread(
     mut region: SharedMemoryRegion,
+    sample_rate: u32,
     clock: MonotonicClock,
     mut heartbeat: HeartbeatPublisher,
     runtime: &mut Option<Box<ProductionRuntime>>,
@@ -1552,13 +1609,14 @@ fn run_production_processing_thread(
                 &mut heartbeat,
                 &mut runtime.rack,
                 &mut audio_policy,
+                sample_rate,
             )? {
                 RequestProgress::Idle => {}
                 RequestProgress::Retry => observed_request = true,
                 RequestProgress::Processed(frames) => {
                     observed_request = true;
                     let idle_ticks = clock.duration_to_ticks(Duration::from_nanos(
-                        u64::from(frames) * 2_000_000_000 / 48_000,
+                        u64::from(frames) * 2_000_000_000 / u64::from(sample_rate),
                     ));
                     last_audio = Some((clock.now_ticks().saturating_add(idle_ticks), frames));
                 }
@@ -1594,7 +1652,7 @@ fn run_production_processing_thread(
             && clock.now_ticks() < idle_deadline
         {
             audio_policy
-                .enter(frames, 48_000)
+                .enter(frames, sample_rate)
                 .map_err(|error| error.to_string())?;
         }
         if !observed_request {
@@ -1807,20 +1865,6 @@ const fn is_main_thread_operation(operation: ControlOperation) -> bool {
     )
 }
 
-fn bind_control_listener(path: &std::path::Path) -> Result<UnixListener, String> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => {
-            std::fs::remove_file(path)
-                .map_err(|error| format!("could not replace stale control socket: {error}"))?;
-        }
-        Ok(_) => return Err("worker control path exists and is not a socket".to_owned()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("could not inspect control socket path: {error}")),
-    }
-    UnixListener::bind(path)
-        .map_err(|error| format!("could not bind worker control socket: {error}"))
-}
-
 #[cfg(feature = "sdk")]
 enum RequestProgress {
     Idle,
@@ -1841,6 +1885,7 @@ fn process_production_request(
     heartbeat: &mut HeartbeatPublisher,
     rack: &mut RackProcessor<Vst3Facade>,
     audio_policy: &mut sp_shared_memory_os::AudioThreadPolicy,
+    sample_rate: u32,
 ) -> Result<RequestProgress, String> {
     let Some(observed_ticket) = requested_ticket(slot)? else {
         return Ok(RequestProgress::Idle);
@@ -1859,7 +1904,7 @@ fn process_production_request(
         };
     let frames = slot.metadata.frame_count;
     audio_policy
-        .enter(frames, 48_000)
+        .enter(frames, sample_rate)
         .map_err(|error| error.to_string())?;
     rack.process_block(slot)
         .map_err(|error| format!("could not process VST3 rack: {error}"))?;
@@ -1901,10 +1946,15 @@ struct Vst3Facade {
 
 #[cfg(feature = "sdk")]
 impl Vst3Facade {
-    /// Loads the plug-in with its default main buses and, when `sidechain` is set, its first
-    /// auxiliary input negotiated to stereo and active.
-    fn load(selection: &Vst3ClassSelection, sidechain: bool) -> Result<Self, String> {
-        let format = ProcessingFormat::new(48_000.0, 256).map_err(|error| error.to_string())?;
+    /// Loads the plug-in for `sample_rate` with its default main buses and, when `sidechain` is
+    /// set, its first auxiliary input negotiated to stereo and active.
+    fn load(
+        selection: &Vst3ClassSelection,
+        sidechain: bool,
+        sample_rate: u32,
+    ) -> Result<Self, String> {
+        let format = ProcessingFormat::new(f64::from(sample_rate), 256)
+            .map_err(|error| error.to_string())?;
         let mut adapter = HostSdkRackAdapter::new();
         adapter.set_editor_gesture_feedback(false);
         adapter
@@ -2184,6 +2234,7 @@ fn translate_midi_event(event: sp_shared_memory::MidiEvent) -> Option<MidiMessag
 #[cfg(feature = "sdk")]
 struct ProductionRuntime {
     worker_id: u32,
+    sample_rate: u32,
     rack: RackProcessor<Vst3Facade>,
     loaded: [Option<WirePluginSlotConfiguration>; 8],
     rack_committed: bool,
@@ -2200,6 +2251,7 @@ struct ProductionRuntime {
 impl ProductionRuntime {
     fn new(
         worker_id: u32,
+        sample_rate: u32,
         facade: Vst3Facade,
         configuration: WirePluginSlotConfiguration,
     ) -> Result<Self, String> {
@@ -2224,6 +2276,7 @@ impl ProductionRuntime {
         loaded[slot] = Some(configuration);
         Ok(Self {
             worker_id,
+            sample_rate,
             rack,
             loaded,
             rack_committed: false,
@@ -2268,7 +2321,10 @@ impl ProductionRuntime {
         Ok(request_slot)
     }
 
-    fn load_facade(configuration: &WirePluginSlotConfiguration) -> Result<Vst3Facade, String> {
+    fn load_facade(
+        configuration: &WirePluginSlotConfiguration,
+        sample_rate: u32,
+    ) -> Result<Vst3Facade, String> {
         let class_id = configuration
             .class_id
             .as_deref()
@@ -2277,6 +2333,7 @@ impl ProductionRuntime {
         Vst3Facade::load(
             &Vst3ClassSelection::new(Vst3BundlePath::new(&configuration.bundle_path), class_id),
             configuration.sidechain_active,
+            sample_rate,
         )
     }
 
@@ -2405,7 +2462,7 @@ impl ProductionRuntime {
             let Some(configuration) = requested[slot].take() else {
                 continue;
             };
-            let facade = Self::load_facade(&configuration)?;
+            let facade = Self::load_facade(&configuration, self.sample_rate)?;
             let plugin_topology = facade.topology;
             let sidechain = facade.layout.sidechain_input;
             self.rack
@@ -2446,12 +2503,12 @@ impl ProductionRuntime {
             host.state_transfers.clear();
         }
 
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             return self.handle_control(request);
         }
 
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         {
             if matches!(
                 request.operation(),
@@ -2808,8 +2865,8 @@ mod tests {
             "1",
             "--bank-generation",
             "17",
-            "--control-socket",
-            "/tmp/superposition-worker.sock",
+            "--sample-rate",
+            "96000",
             BUNDLE_OPTION,
             "Example.vst3",
             "--class-id",
@@ -2826,6 +2883,11 @@ mod tests {
         assert_eq!(configuration.bank_index, 1);
         assert_eq!(configuration.bank_generation, 17);
         assert_eq!(configuration.worker_id, 7);
+        assert_eq!(configuration.sample_rate, 96_000);
+
+        let mut unsupported_rate = arguments;
+        unsupported_rate[14] = "44100";
+        assert!(parse_worker_startup(unsupported_rate).is_err());
 
         assert!(
             parse_worker_startup([
@@ -2840,8 +2902,8 @@ mod tests {
                 "11",
                 "--bank-generation",
                 "17",
-                "--control-socket",
-                "/tmp/superposition-worker.sock",
+                "--sample-rate",
+                "48000",
                 BUNDLE_OPTION,
                 "Example.vst3",
                 "--class-id",

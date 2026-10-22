@@ -7,6 +7,16 @@
 //!
 //! `wine-check` runs the Windows build of `sp-shared-memory-os` under Wine against a bank this
 //! Linux process creates, and measures futex round trips through the bridge.
+//!
+//! `windows-helpers` puts the Windows plug-in helpers and the bridge beside the native helpers,
+//! where the app looks for them:
+//!
+//! ```text
+//! <helpers>/windows/sp-plugin-worker.exe
+//! <helpers>/windows/sp-plugin-scanner.exe
+//! <helpers>/wine-bridge/x86_64-windows/sp_wine_bridge.dll
+//! <helpers>/wine-bridge/x86_64-unix/sp_wine_bridge.so
+//! ```
 
 use std::{
     path::{Path, PathBuf},
@@ -98,6 +108,64 @@ pub(crate) fn run_bridge(workspace_root: &Path, arguments: &[String]) -> Result<
         return Err("wine-bridge does not accept arguments".to_owned());
     }
     build_bridge(workspace_root).map(|_| ())
+}
+
+/// Builds the Windows helpers and lays them out under `--out` (default `target/debug`, or
+/// `target/release` with `--release`).
+pub(crate) fn run_windows_helpers(
+    workspace_root: &Path,
+    arguments: &[String],
+) -> Result<(), String> {
+    let mut release = false;
+    let mut out = None;
+    let mut arguments = arguments.iter();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--release" => release = true,
+            "--out" => {
+                out = Some(PathBuf::from(
+                    arguments.next().ok_or("--out requires a directory")?,
+                ));
+            }
+            other => return Err(format!("unknown windows-helpers argument `{other}`")),
+        }
+    }
+    let profile = if release { "release" } else { "debug" };
+    let out = out.unwrap_or_else(|| workspace_root.join("target").join(profile));
+    let bridge = build_bridge(workspace_root)?;
+    run(
+        Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned()))
+            .current_dir(workspace_root)
+            .args(["build", "--target", "x86_64-pc-windows-gnu"])
+            .args(release.then_some("--release"))
+            .args(["-p", "sp-plugin-worker", "-p", "sp-plugin-scanner"]),
+    )?;
+    let built = workspace_root
+        .join("target/x86_64-pc-windows-gnu")
+        .join(profile);
+    let copy = |from: &Path, to: &Path| {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+        }
+        std::fs::copy(from, to)
+            .map(drop)
+            .map_err(|error| format!("could not copy {}: {error}", from.display()))
+    };
+    for helper in ["sp-plugin-worker.exe", "sp-plugin-scanner.exe"] {
+        copy(&built.join(helper), &out.join("windows").join(helper))?;
+    }
+    for library in [
+        "x86_64-windows/sp_wine_bridge.dll",
+        "x86_64-unix/sp_wine_bridge.so",
+    ] {
+        copy(
+            &bridge.join(library),
+            &out.join("wine-bridge").join(library),
+        )?;
+    }
+    println!("Windows helpers in {}", out.display());
+    Ok(())
 }
 
 struct Worker(Child);

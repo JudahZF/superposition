@@ -9,9 +9,9 @@ use std::{cell::Cell, marker::PhantomData, rc::Rc};
 
 use xcb::{Xid, x};
 
-// Editor preview pictures are exactly 320×200 pixels.
-const PREVIEW_WIDTH: usize = 320;
-const PREVIEW_HEIGHT: usize = 200;
+pub use crate::editor_common::EditorWindowIdentity;
+use crate::editor_common::{PREVIEW_HEIGHT, PREVIEW_WIDTH, Pixels, encode_png};
+
 /// Size of a window before its editor reports one.
 const INITIAL_SIZE: u16 = 64;
 /// ICCCM and EWMH atoms a window manager creates. The private display has no window manager,
@@ -58,17 +58,6 @@ const WINDOW_MANAGER_ATOMS: [&str; 39] = [
     "_XEMBED",
     "_XEMBED_INFO",
 ];
-
-/// Which rack slot an editor window belongs to, and what the window is called.
-#[derive(Clone, Copy, Debug)]
-pub struct EditorWindowIdentity<'a> {
-    /// Window title, for `WM_NAME` and `_NET_WM_NAME`.
-    pub title: &'a str,
-    /// Rack index, for the `_SUPERPOSITION_RACK` `CARDINAL` property.
-    pub rack: u32,
-    /// Zero-based slot index in the rack, for the `_SUPERPOSITION_SLOT` `CARDINAL` property.
-    pub slot: u32,
-}
 
 /// Creates the atoms a window manager would on the display in `DISPLAY`. Call it before any
 /// plug-in loads; the private server runs with `-noreset`, so the atoms outlive this
@@ -319,7 +308,7 @@ impl X11EditorWindow {
                 "editor window pixels use an unsupported {bits_per_pixel}-bit format"
             ));
         }
-        let pixels = Pixels::from_zpixmap(
+        let pixels = pixels_from_zpixmap(
             image.data(),
             usize::from(width),
             usize::from(height),
@@ -437,167 +426,42 @@ fn intern_atoms<const N: usize>(
     Ok(atoms)
 }
 
-/// Packed 8-bit RGB pixels, row by row.
-#[derive(Debug, PartialEq)]
-struct Pixels {
+/// Reads a 32-bit `ZPixmap` image of depth 24 or 32. Each pixel is `0xXXRRGGBB` in the
+/// server's byte order, and rows have no padding.
+fn pixels_from_zpixmap(
+    data: &[u8],
     width: usize,
     height: usize,
-    rgb: Vec<u8>,
-}
-
-impl Pixels {
-    /// Reads a 32-bit `ZPixmap` image of depth 24 or 32. Each pixel is `0xXXRRGGBB` in the
-    /// server's byte order, and rows have no padding.
-    fn from_zpixmap(
-        data: &[u8],
-        width: usize,
-        height: usize,
-        little_endian: bool,
-    ) -> Result<Self, String> {
-        let pixels = width * height;
-        let data = data
-            .get(..pixels * 4)
-            .ok_or("editor window image is truncated")?;
-        let mut rgb = Vec::with_capacity(pixels * 3);
-        for pixel in data.chunks_exact(4) {
-            let [blue, green, red] = if little_endian {
-                [pixel[0], pixel[1], pixel[2]]
-            } else {
-                [pixel[3], pixel[2], pixel[1]]
-            };
-            rgb.extend([red, green, blue]);
-        }
-        Ok(Self { width, height, rgb })
-    }
-
-    /// Scales the image to cover `width`×`height`, centred, cropping the overflow. Each output
-    /// pixel averages the source pixels it covers, so large editors do not alias.
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "image dimensions are far below f64's exact integer range; source indices are \
-                  clamped to the image"
-    )]
-    fn cover(&self, width: usize, height: usize) -> Self {
-        let scale = (width as f64 / self.width as f64).max(height as f64 / self.height as f64);
-        // Source pixels per output pixel, and the centred source rectangle that stays visible.
-        let step = 1.0 / scale;
-        let left = (self.width as f64 - width as f64 * step) / 2.0;
-        let top = (self.height as f64 - height as f64 * step) / 2.0;
-        let span = |start: f64, limit: usize| {
-            let first = (start.max(0.0) as usize).min(limit - 1);
-            let end = ((start + step).ceil() as usize).clamp(first + 1, limit);
-            first..end
+    little_endian: bool,
+) -> Result<Pixels, String> {
+    let pixels = width * height;
+    let data = data
+        .get(..pixels * 4)
+        .ok_or("editor window image is truncated")?;
+    let mut rgb = Vec::with_capacity(pixels * 3);
+    for pixel in data.chunks_exact(4) {
+        let [blue, green, red] = if little_endian {
+            [pixel[0], pixel[1], pixel[2]]
+        } else {
+            [pixel[3], pixel[2], pixel[1]]
         };
-        let mut rgb = Vec::with_capacity(width * height * 3);
-        for row in 0..height {
-            let rows = span(top + row as f64 * step, self.height);
-            for column in 0..width {
-                let columns = span(left + column as f64 * step, self.width);
-                let mut sum = [0_usize; 3];
-                for source_row in rows.clone() {
-                    let line = &self.rgb[source_row * self.width * 3..][..self.width * 3];
-                    for pixel in line[columns.start * 3..columns.end * 3].chunks_exact(3) {
-                        for (total, &value) in sum.iter_mut().zip(pixel) {
-                            *total += usize::from(value);
-                        }
-                    }
-                }
-                let count = rows.len() * columns.len();
-                rgb.extend(sum.map(|total| u8::try_from(total / count).unwrap_or(u8::MAX)));
-            }
-        }
-        Self { width, height, rgb }
+        rgb.extend([red, green, blue]);
     }
-}
-
-fn encode_png(pixels: &Pixels) -> Result<Vec<u8>, String> {
-    let failed = |error: png::EncodingError| format!("could not encode editor picture: {error}");
-    let mut png = Vec::new();
-    let mut encoder = png::Encoder::new(
-        &mut png,
-        u32::try_from(pixels.width).map_err(|_| "editor picture is too wide")?,
-        u32::try_from(pixels.height).map_err(|_| "editor picture is too tall")?,
-    );
-    encoder.set_color(png::ColorType::Rgb);
-    encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header().map_err(failed)?;
-    writer.write_image_data(&pixels.rgb).map_err(failed)?;
-    writer.finish().map_err(failed)?;
-    Ok(png)
+    Ok(Pixels { width, height, rgb })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Pixels, encode_png};
-
-    const RED: [u8; 3] = [255, 0, 0];
-    const BLUE: [u8; 3] = [0, 0, 255];
-
-    fn image(width: usize, height: usize, color: impl Fn(usize, usize) -> [u8; 3]) -> Pixels {
-        let rgb = (0..height)
-            .flat_map(|row| (0..width).map(move |column| (row, column)))
-            .flat_map(|(row, column)| color(column, row))
-            .collect();
-        Pixels { width, height, rgb }
-    }
-
-    fn pixel(pixels: &Pixels, column: usize, row: usize) -> [u8; 3] {
-        let start = (row * pixels.width + column) * 3;
-        pixels.rgb[start..start + 3].try_into().expect("RGB pixel")
-    }
+    use super::pixels_from_zpixmap;
 
     #[test]
     fn zpixmap_pixels_decode_in_either_byte_order() {
         let little = [0x30, 0x20, 0x10, 0xff];
         let big = [0xff, 0x10, 0x20, 0x30];
         for (data, little_endian) in [(little, true), (big, false)] {
-            let pixels = Pixels::from_zpixmap(&data, 1, 1, little_endian).expect("one pixel");
+            let pixels = pixels_from_zpixmap(&data, 1, 1, little_endian).expect("one pixel");
             assert_eq!(pixels.rgb, [0x10, 0x20, 0x30]);
         }
-        assert!(Pixels::from_zpixmap(&little[..3], 1, 1, true).is_err());
-    }
-
-    /// A downscaled editor keeps its layout: each half of the picture keeps its colour.
-    #[test]
-    fn cover_downscales_with_area_averaging() {
-        let source = image(640, 400, |column, _| if column < 320 { RED } else { BLUE });
-        let picture = source.cover(320, 200);
-        assert_eq!((picture.width, picture.height), (320, 200));
-        assert_eq!(pixel(&picture, 0, 0), RED);
-        assert_eq!(pixel(&picture, 159, 199), RED);
-        assert_eq!(pixel(&picture, 160, 0), BLUE);
-        assert_eq!(pixel(&picture, 319, 199), BLUE);
-    }
-
-    /// A tall editor fills the picture's width and shows its vertical centre, like the macOS
-    /// picture.
-    #[test]
-    fn cover_centre_crops_the_overflowing_axis() {
-        let source = image(
-            100,
-            400,
-            |_, row| if (100..300).contains(&row) { RED } else { BLUE },
-        );
-        let picture = source.cover(320, 200);
-        assert!(picture.rgb.chunks_exact(3).all(|rgb| rgb == RED));
-    }
-
-    #[test]
-    fn small_editors_scale_up_to_the_picture() {
-        let source = image(32, 20, |column, _| if column < 16 { RED } else { BLUE });
-        let picture = source.cover(320, 200);
-        assert_eq!(pixel(&picture, 150, 100), RED);
-        assert_eq!(pixel(&picture, 170, 100), BLUE);
-    }
-
-    #[test]
-    fn pictures_encode_as_320_by_200_rgb_png() {
-        let png = encode_png(&image(320, 200, |_, _| RED)).expect("PNG");
-        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
-        assert_eq!(&png[12..16], b"IHDR");
-        assert_eq!(png[16..20], 320_u32.to_be_bytes());
-        assert_eq!(png[20..24], 200_u32.to_be_bytes());
+        assert!(pixels_from_zpixmap(&little[..3], 1, 1, true).is_err());
     }
 }

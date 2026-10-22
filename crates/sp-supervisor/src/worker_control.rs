@@ -1,21 +1,21 @@
-//! Versioned Unix-domain control client for isolated plug-in workers.
+//! Versioned control client for isolated plug-in workers.
 //!
-//! The client stays outside every real-time path. It launches only the deployed worker helper,
-//! sets finite socket deadlines, and uses the protocol's request gate identities so a response
-//! cannot be accepted for a different rack, dual-bank generation, or request ID.
+//! A worker's stdin and stdout are its control channel, on every platform and under Wine. The
+//! client stays outside every real-time path. It launches only the deployed worker helper, sets
+//! finite deadlines, and uses the protocol's request gate identities so a response cannot be
+//! accepted for a different rack, dual-bank generation, or request ID.
 
 use std::{
-    fmt, io,
-    os::unix::net::UnixStream,
-    path::{Path, PathBuf},
+    fmt,
+    io::{self, Read, Write},
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use sp_protocol::control::{
     ControlOperation, ControlProtocolError, ControlRequest, ControlRequestId, ControlResponse,
-    ControlResponseStatus, ControlTarget, SlotIdentity, unix::UnixControlClient,
+    ControlResponseStatus, ControlTarget, SlotIdentity, pipe::PipeControlClient,
 };
 use sp_protocol::payload::{
     ControlPayloadCodec, EditorPreviewDescriptor, EditorPreviewRequest, MAX_STATE_STREAM_BYTES,
@@ -23,10 +23,11 @@ use sp_protocol::payload::{
     StateTransferDescriptor, StateTransferId, StateTransferLengths,
 };
 
-use crate::{HelperKind, HelperLaunch, ProcessSupervisor};
+use crate::{HelperKind, HelperLaunch, ProcessSupervisor, WorkerPipes};
 
-const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 const LONG_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Sample rates a worker accepts, in hertz.
+const WORKER_SAMPLE_RATES: [u32; 2] = [48_000, 96_000];
 
 fn operation_timeout(operation: ControlOperation, timeout: Duration) -> Duration {
     if matches!(
@@ -47,11 +48,11 @@ fn operation_timeout(operation: ControlOperation, timeout: Duration) -> Duration
 /// Errors returned by a versioned worker-control request or launch lifecycle operation.
 #[derive(Debug)]
 pub enum WorkerControlError {
-    /// The underlying Unix socket or process operation failed.
+    /// The underlying pipe or process operation failed.
     Io(io::Error),
     /// The bounded control protocol rejected framing, target identity, or payload validation.
     Protocol(ControlProtocolError),
-    /// A socket connection or request response exceeded its finite control deadline.
+    /// A request response exceeded its finite control deadline.
     TimedOut,
     /// A launch selected a role other than the dedicated worker helper.
     NotPluginWorker,
@@ -159,15 +160,15 @@ pub struct EditorPreviewPoll {
     pub png: Option<Vec<u8>>,
 }
 
-/// Bounded, version-aware client for one connected rack worker.
+type PendingRequest = Receiver<(
+    PipeControlClient,
+    Result<ControlResponse, WorkerControlError>,
+)>;
+
+/// Bounded, version-aware client for one rack worker's control pipes.
 pub struct WorkerControlClient {
-    stream: Option<UnixControlClient>,
-    pending: Option<
-        Receiver<(
-            UnixControlClient,
-            Result<ControlResponse, WorkerControlError>,
-        )>,
-    >,
+    pipe: Option<PipeControlClient>,
+    pending: Option<PendingRequest>,
     target: ControlTarget,
     timeout: Duration,
     next_request_id: u64,
@@ -175,24 +176,35 @@ pub struct WorkerControlClient {
 }
 
 impl WorkerControlClient {
-    /// Connects to a worker's Unix-domain control endpoint with an explicit rack/bank target.
+    /// Talks to a launched worker through its control pipes with an explicit rack/bank target.
     ///
     /// # Errors
     ///
-    /// Returns an error for an unavailable endpoint or invalid timeout configuration.
-    pub fn connect(
-        socket_path: impl AsRef<Path>,
+    /// Returns an error for a zero timeout or when the response reader cannot start.
+    pub fn new(
+        pipes: WorkerPipes,
+        target: ControlTarget,
+        timeout: Duration,
+    ) -> Result<Self, WorkerControlError> {
+        Self::from_streams(pipes.stdin, pipes.stdout, target, timeout)
+    }
+
+    /// Like [`Self::new`] over any request writer and response reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero timeout or when the response reader cannot start.
+    pub fn from_streams(
+        requests: impl Write + Send + 'static,
+        responses: impl Read + Send + 'static,
         target: ControlTarget,
         timeout: Duration,
     ) -> Result<Self, WorkerControlError> {
         if timeout.is_zero() {
             return Err(WorkerControlError::TimedOut);
         }
-        let stream = UnixStream::connect(socket_path)?;
-        stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(timeout))?;
         Ok(Self {
-            stream: Some(UnixControlClient::from_stream(stream)),
+            pipe: Some(PipeControlClient::new(requests, responses)?),
             pending: None,
             target,
             timeout,
@@ -207,7 +219,7 @@ impl WorkerControlClient {
         self.target
     }
 
-    /// Returns the finite timeout applied to every socket read and write.
+    /// Returns the finite timeout applied to every ordinary request.
     #[must_use]
     pub const fn timeout(&self) -> Duration {
         self.timeout
@@ -215,7 +227,7 @@ impl WorkerControlClient {
 
     /// Sends one bounded operation and validates the exact correlated rack/bank response.
     ///
-    /// `payload` is operation-specific and bounded by `sp-protocol` before it reaches the socket.
+    /// `payload` is operation-specific and bounded by `sp-protocol` before it reaches the pipe.
     /// The returned response may carry a worker-side error status; such a response is a valid
     /// transport result for the supervisor's recovery policy.
     ///
@@ -227,6 +239,21 @@ impl WorkerControlClient {
         operation: ControlOperation,
         slot: Option<SlotIdentity>,
         payload: &[u8],
+    ) -> Result<ControlResponse, WorkerControlError> {
+        self.request_within(
+            operation,
+            slot,
+            payload,
+            operation_timeout(operation, self.timeout),
+        )
+    }
+
+    fn request_within(
+        &mut self,
+        operation: ControlOperation,
+        slot: Option<SlotIdentity>,
+        payload: &[u8],
+        timeout: Duration,
     ) -> Result<ControlResponse, WorkerControlError> {
         if self.pending.is_some() {
             return Err(WorkerControlError::Busy);
@@ -241,18 +268,15 @@ impl WorkerControlClient {
             slot,
             payload,
         )?;
-        let stream = self
-            .stream
+        let pipe = self
+            .pipe
             .as_mut()
             .ok_or(WorkerControlError::ConnectionClosed)?;
-        stream.set_timeout(operation_timeout(operation, self.timeout))?;
-        let result = stream
-            .round_trip(&request)
+        let result = pipe
+            .round_trip(&request, timeout)
             .map_err(WorkerControlError::from);
-        if result.is_err() {
-            self.closed = true;
-            let _ = stream.close();
-        }
+        // A late response may still arrive, so the pipes cannot carry another request.
+        self.closed = result.is_err();
         result
     }
 
@@ -283,8 +307,8 @@ impl WorkerControlClient {
             slot,
             payload,
         )?;
-        let stream = self
-            .stream
+        let mut pipe = self
+            .pipe
             .take()
             .ok_or(WorkerControlError::ConnectionClosed)?;
         let deadline = operation_timeout(operation, self.timeout);
@@ -292,15 +316,10 @@ impl WorkerControlClient {
         thread::Builder::new()
             .name("sp-worker-control-request".to_owned())
             .spawn(move || {
-                let mut stream = stream;
-                let result = stream
-                    .set_timeout(deadline)
-                    .and_then(|()| stream.round_trip(&request))
+                let result = pipe
+                    .round_trip(&request, deadline)
                     .map_err(WorkerControlError::from);
-                if result.is_err() {
-                    let _ = stream.close();
-                }
-                let _ = sender.send((stream, result));
+                let _ = sender.send((pipe, result));
             })
             .map_err(|error| {
                 self.closed = true;
@@ -323,10 +342,10 @@ impl WorkerControlClient {
     pub fn poll_request(&mut self) -> Option<Result<ControlResponse, WorkerControlError>> {
         let receiver = self.pending.as_ref()?;
         match receiver.try_recv() {
-            Ok((stream, result)) => {
+            Ok((pipe, result)) => {
                 self.pending = None;
                 self.closed = result.is_err();
-                self.stream = Some(stream);
+                self.pipe = Some(pipe);
                 Some(result)
             }
             Err(TryRecvError::Empty) => None,
@@ -558,11 +577,9 @@ impl WorkerControlClient {
 pub struct WorkerControlLaunch {
     /// The deployed helper launch command.
     pub launch: HelperLaunch,
-    /// Absolute Unix-domain socket path created by the worker.
-    pub control_socket: PathBuf,
     /// Exact rack/bank target sent on every control request.
     pub target: ControlTarget,
-    /// Finite connection and per-request timeout.
+    /// Finite per-request timeout.
     pub timeout: Duration,
 }
 
@@ -571,33 +588,22 @@ impl WorkerControlLaunch {
     ///
     /// # Errors
     ///
-    /// Returns an error for an untrusted helper role/path, relative endpoint, zero timeout, or
-    /// product arguments which fail to match the explicit rack/bank target.
+    /// Returns an error for an untrusted helper role/path, zero timeout, or product arguments
+    /// which fail to match the explicit rack/bank target.
     pub fn validate(&self) -> Result<(), WorkerControlError> {
         if self.launch.kind != HelperKind::PluginWorker {
             return Err(WorkerControlError::NotPluginWorker);
         }
         self.launch.validate_helper_only()?;
-        if !self.control_socket.is_absolute() {
-            return Err(WorkerControlError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "worker control socket must be an absolute path",
-            )));
-        }
         if self.timeout.is_zero() {
             return Err(WorkerControlError::TimedOut);
         }
-        validate_production_worker_arguments(
-            &self.launch.arguments,
-            &self.control_socket,
-            self.target,
-        )
+        validate_production_worker_arguments(&self.launch.arguments, self.target)
     }
 }
 
 fn validate_production_worker_arguments(
     arguments: &[String],
-    control_socket: &Path,
     target: ControlTarget,
 ) -> Result<(), WorkerControlError> {
     let Some((mode, options)) = arguments.split_first() else {
@@ -622,7 +628,7 @@ fn validate_production_worker_arguments(
     let mut rack_generation_seen = false;
     let mut bank_index_seen = false;
     let mut bank_generation_seen = false;
-    let mut socket_seen = false;
+    let mut sample_rate_seen = false;
     let mut bundle_seen = false;
     let mut class_id_seen = false;
     for pair in options.chunks_exact(2) {
@@ -660,12 +666,13 @@ fn validate_production_worker_arguments(
             {
                 bank_generation_seen = true;
             }
-            "--control-socket"
-                if !socket_seen
-                    && Path::new(value).is_absolute()
-                    && Path::new(value) == control_socket =>
+            "--sample-rate"
+                if !sample_rate_seen
+                    && value
+                        .parse::<u32>()
+                        .is_ok_and(|rate| WORKER_SAMPLE_RATES.contains(&rate)) =>
             {
-                socket_seen = true;
+                sample_rate_seen = true;
             }
             "--bundle" if !bundle_seen && !value.is_empty() => bundle_seen = true,
             "--class-id" if !class_id_seen && !value.is_empty() => class_id_seen = true,
@@ -682,14 +689,14 @@ fn validate_production_worker_arguments(
         && rack_generation_seen
         && bank_index_seen
         && bank_generation_seen
-        && socket_seen
+        && sample_rate_seen
         && bundle_seen
         && class_id_seen
     {
         Ok(())
     } else {
         Err(WorkerControlError::InvalidLaunchArguments(
-            "worker launch requires --bank, --worker-id, --rack-index, --rack-generation, --bank-index, --bank-generation, --control-socket, --bundle, and --class-id"
+            "worker launch requires --bank, --worker-id, --rack-index, --rack-generation, --bank-index, --bank-generation, --sample-rate, --bundle, and --class-id"
                 .to_owned(),
         ))
     }
@@ -703,20 +710,20 @@ pub struct WorkerControlSession {
 }
 
 impl WorkerControlSession {
-    /// Launches a verified worker helper, waits only until the bounded socket deadline, and sends
-    /// an initial health request through the exact rack/bank identity gate.
+    /// Launches a verified worker helper with its control pipes and sends an initial health
+    /// request through the exact rack/bank identity gate.
     ///
     /// # Errors
     ///
-    /// Returns an error after stopping the newly launched helper when its endpoint or initial
-    /// health request cannot be established inside the configured deadline.
+    /// Returns an error after stopping the newly launched helper when its initial health
+    /// request does not succeed inside the deadline.
     pub fn launch(
         supervisor: &mut ProcessSupervisor,
         configuration: &WorkerControlLaunch,
     ) -> Result<Self, WorkerControlError> {
         configuration.validate()?;
-        let process_id = supervisor.launch(&configuration.launch)?;
-        match Self::connect_launched(process_id, configuration) {
+        let (process_id, pipes) = supervisor.launch_with_pipes(&configuration.launch)?;
+        match Self::attach(process_id, pipes, configuration) {
             Ok(session) => Ok(session),
             Err(error) => {
                 let _ = supervisor.stop(process_id);
@@ -725,17 +732,20 @@ impl WorkerControlSession {
         }
     }
 
-    /// Connects to an already launched worker and validates its first health response.
+    /// Attaches to an already launched worker's control pipes and validates its first health
+    /// response. The worker answers once its first plug-in has loaded, so that response may
+    /// take up to the long control deadline (a Wine worker also starts Wine first).
     ///
     /// The caller retains ownership of the child in `ProcessSupervisor`. On failure, the caller
     /// must stop or reap that process; this method never mutates the process supervisor.
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid launch metadata, an unavailable endpoint, or a rejected
-    /// correlated health response before the finite connection deadline.
-    pub fn connect_launched(
+    /// Returns an error for invalid launch metadata or a missing or rejected correlated health
+    /// response.
+    pub fn attach(
         process_id: u64,
+        pipes: WorkerPipes,
         configuration: &WorkerControlLaunch,
     ) -> Result<Self, WorkerControlError> {
         configuration.validate()?;
@@ -744,32 +754,14 @@ impl WorkerControlSession {
                 "worker process ID must be nonzero".to_owned(),
             ));
         }
-        let deadline = Instant::now() + configuration.timeout;
-        let client = loop {
-            match WorkerControlClient::connect(
-                &configuration.control_socket,
-                configuration.target,
-                configuration.timeout,
-            ) {
-                Ok(client) => break client,
-                Err(WorkerControlError::Io(error))
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::NotFound
-                            | io::ErrorKind::ConnectionRefused
-                            | io::ErrorKind::WouldBlock
-                    ) && Instant::now() < deadline =>
-                {
-                    thread::sleep(CONNECT_RETRY_INTERVAL);
-                }
-                Err(error) => return Err(error),
-            }
-            if Instant::now() >= deadline {
-                return Err(WorkerControlError::TimedOut);
-            }
-        };
-        let mut client = client;
-        let initial_health = match client.request(ControlOperation::QueryHealth, None, &[]) {
+        let mut client =
+            WorkerControlClient::new(pipes, configuration.target, configuration.timeout)?;
+        let initial_health = match client.request_within(
+            ControlOperation::QueryHealth,
+            None,
+            &[],
+            LONG_CONTROL_TIMEOUT.max(configuration.timeout),
+        ) {
             Ok(response) if response.status() == ControlResponseStatus::Ok => response,
             Ok(response) => {
                 return Err(WorkerControlError::InitialHealthRejected(response.status()));
@@ -826,14 +818,14 @@ impl WorkerControlSession {
 #[cfg(test)]
 mod tests {
     use std::{
-        os::unix::net::{UnixListener, UnixStream},
+        io::{PipeReader, PipeWriter},
+        path::PathBuf,
         sync::mpsc,
         thread,
+        time::Instant,
     };
 
-    use sp_protocol::control::{
-        BankIdentity, ControlTarget, RackIdentity, unix::UnixControlServer,
-    };
+    use sp_protocol::control::{BankIdentity, ControlRequestGate, ControlTarget, RackIdentity};
 
     use super::*;
 
@@ -844,194 +836,198 @@ mod tests {
         )
     }
 
+    /// The worker's end of a pair of control pipes.
+    struct FakeWorker {
+        requests: PipeReader,
+        responses: PipeWriter,
+        gate: ControlRequestGate,
+    }
+
+    impl FakeWorker {
+        fn receive(&mut self) -> ControlRequest {
+            self.gate.read_from(&mut self.requests).expect("request")
+        }
+
+        fn respond(&mut self, response: &ControlResponse) {
+            response.write_to(&mut self.responses).expect("response");
+        }
+
+        fn succeed(&mut self, request: &ControlRequest, payload: &[u8]) {
+            self.respond(
+                &ControlResponse::success(
+                    request.request_id(),
+                    request.target(),
+                    request.slot(),
+                    payload,
+                )
+                .expect("response"),
+            );
+        }
+    }
+
+    /// A client and the fake worker on the other end of its pipes.
+    fn connected(timeout: Duration) -> (WorkerControlClient, FakeWorker) {
+        let (requests, request_writer) = io::pipe().expect("request pipe");
+        let (response_reader, responses) = io::pipe().expect("response pipe");
+        let client =
+            WorkerControlClient::from_streams(request_writer, response_reader, target(), timeout)
+                .expect("client");
+        let worker = FakeWorker {
+            requests,
+            responses,
+            gate: ControlRequestGate::new(target()),
+        };
+        (client, worker)
+    }
+
+    fn worker_arguments(target: ControlTarget) -> Vec<String> {
+        [
+            "--worker",
+            "--bank",
+            "/sp-worker-bank",
+            "--worker-id",
+            "17",
+            "--rack-index",
+            &target.rack().index().to_string(),
+            "--rack-generation",
+            &target.rack().generation().to_string(),
+            "--bank-index",
+            &target.bank().index().to_string(),
+            "--bank-generation",
+            &target.bank().generation().to_string(),
+            "--sample-rate",
+            "96000",
+            "--bundle",
+            "/Library/Audio/Plug-Ins/VST3/Example.vst3",
+            "--class-id",
+            "example-class",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    }
+
     #[test]
     fn client_rejects_response_for_a_stale_bank_generation() {
-        let directory = std::env::temp_dir().join(format!(
-            "superposition-worker-control-{}-{}",
-            std::process::id(),
-            1
-        ));
-        std::fs::create_dir_all(&directory).expect("temporary control directory");
-        let socket = directory.join("worker.sock");
-        let listener = UnixListener::bind(&socket).expect("control listener");
-        let (ready_tx, ready_rx) = mpsc::channel();
+        let (mut client, mut worker) = connected(Duration::from_secs(1));
         let server = thread::spawn(move || {
-            ready_tx.send(()).expect("server is ready");
-            let (stream, _) = listener.accept().expect("client connection");
-            let mut server = UnixControlServer::from_stream(stream, target());
-            let request = server.receive().expect("request frame");
+            let request = worker.receive();
             let stale_target = ControlTarget::new(
                 request.target().rack(),
                 BankIdentity::new(1, 18).expect("different bank generation"),
             );
-            let response = ControlResponse::success(
-                request.request_id(),
-                stale_target,
-                request.slot(),
-                b"stale",
-            )
-            .expect("response");
-            server.respond(&response).expect("response frame");
+            worker.respond(
+                &ControlResponse::success(
+                    request.request_id(),
+                    stale_target,
+                    request.slot(),
+                    b"stale",
+                )
+                .expect("response"),
+            );
         });
-        ready_rx.recv().expect("listener started");
-
-        let mut client = WorkerControlClient::connect(&socket, target(), Duration::from_secs(1))
-            .expect("client connects");
         assert!(matches!(
             client.request(ControlOperation::QueryHealth, None, &[]),
             Err(WorkerControlError::Protocol(
                 ControlProtocolError::CorrelationMismatch
             ))
         ));
-
         server.join().expect("server joins");
-        std::fs::remove_dir_all(directory).expect("temporary directory cleanup");
     }
 
+    /// The first health response follows the worker's first plug-in load, which can outlast the
+    /// ordinary request deadline.
+    #[cfg(unix)]
     #[test]
-    fn connect_launched_waits_for_delayed_socket_without_owning_child() {
-        let directory = PathBuf::from("/tmp").join(format!("sp-connect-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).expect("temporary control directory");
-        let socket = directory.join("worker.sock");
+    fn attach_waits_past_the_ordinary_deadline_for_the_first_health_response() {
         let target = target();
-        let configuration = WorkerControlLaunch {
-            launch: HelperLaunch {
-                kind: HelperKind::PluginWorker,
-                executable: PathBuf::from(
-                    "/Applications/Superposition.app/Contents/Helpers/sp-plugin-worker",
-                ),
-                arguments: vec![
-                    "--worker".to_owned(),
-                    "--bank".to_owned(),
-                    "/sp-test-bank".to_owned(),
-                    "--worker-id".to_owned(),
-                    "1".to_owned(),
-                    "--rack-index".to_owned(),
-                    target.rack().index().to_string(),
-                    "--rack-generation".to_owned(),
-                    target.rack().generation().to_string(),
-                    "--bank-index".to_owned(),
-                    target.bank().index().to_string(),
-                    "--bank-generation".to_owned(),
-                    target.bank().generation().to_string(),
-                    "--control-socket".to_owned(),
-                    socket.display().to_string(),
-                    "--bundle".to_owned(),
-                    "/tmp/Test.vst3".to_owned(),
-                    "--class-id".to_owned(),
-                    "test-class".to_owned(),
-                ],
-            },
-            control_socket: socket.clone(),
+        // The first request on fresh pipes has ID 1, so its response is known in advance.
+        let health = ControlRequest::new(
+            ControlRequestId::new(1).unwrap(),
             target,
-            timeout: Duration::from_secs(1),
+            ControlOperation::QueryHealth,
+            None,
+            &[],
+        )
+        .unwrap();
+        let response = std::env::temp_dir().join(format!("sp-attach-{}", std::process::id()));
+        let mut bytes = Vec::new();
+        ControlResponse::success(health.request_id(), target, None, &[])
+            .unwrap()
+            .write_to(&mut bytes)
+            .unwrap();
+        std::fs::write(&response, bytes).unwrap();
+        let mut processes = ProcessSupervisor::new();
+        let (process_id, pipes) = processes
+            .launch_with_pipes(&HelperLaunch::native(
+                HelperKind::PluginWorker,
+                "/bin/sh",
+                vec![
+                    "-c".to_owned(),
+                    format!("sleep 0.3; cat '{}'; cat >/dev/null", response.display()),
+                ],
+            ))
+            .expect("fake worker");
+        let configuration = WorkerControlLaunch {
+            launch: HelperLaunch::native(
+                HelperKind::PluginWorker,
+                "/Applications/Superposition.app/Contents/Helpers/sp-plugin-worker",
+                worker_arguments(target),
+            ),
+            target,
+            timeout: Duration::from_millis(50),
         };
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let server = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(30));
-            let listener = UnixListener::bind(&socket).expect("bind delayed socket");
-            ready_tx.send(()).expect("signal bound socket");
-            let (stream, _) = listener.accept().expect("accept connection");
-            let mut server = UnixControlServer::from_stream(stream, target);
-            let request = server.receive().expect("health request");
-            assert_eq!(request.operation(), ControlOperation::QueryHealth);
-            server
-                .respond(
-                    &ControlResponse::success(
-                        request.request_id(),
-                        request.target(),
-                        request.slot(),
-                        &[],
-                    )
-                    .unwrap(),
-                )
-                .unwrap();
-        });
-        let session = WorkerControlSession::connect_launched(42, &configuration)
-            .expect("connect already launched worker");
-        assert_eq!(session.process_id(), 42);
+        let session = WorkerControlSession::attach(process_id, pipes, &configuration)
+            .expect("slow first health response");
         assert_eq!(session.initial_health().status(), ControlResponseStatus::Ok);
-        ready_rx.recv().unwrap();
-        server.join().unwrap();
-        std::fs::remove_dir_all(directory).expect("remove temporary control directory");
+        // Dropping the session closes the worker's stdin, which ends it.
+        drop(session);
+        processes.stop(process_id).unwrap();
+        std::fs::remove_file(response).unwrap();
     }
 
     #[test]
     fn worker_launch_validation_requires_consistent_explicit_product_target() {
         let target = target();
         let configuration = WorkerControlLaunch {
-            launch: HelperLaunch {
-                kind: HelperKind::PluginWorker,
-                executable: PathBuf::from(
-                    "/Applications/Superposition.app/Contents/Helpers/sp-plugin-worker",
-                ),
-                arguments: vec![
-                    "--worker".to_owned(),
-                    "--bank".to_owned(),
-                    "/sp-worker-bank".to_owned(),
-                    "--worker-id".to_owned(),
-                    "17".to_owned(),
-                    "--rack-index".to_owned(),
-                    "2".to_owned(),
-                    "--rack-generation".to_owned(),
-                    "11".to_owned(),
-                    "--bank-index".to_owned(),
-                    "1".to_owned(),
-                    "--bank-generation".to_owned(),
-                    "17".to_owned(),
-                    "--control-socket".to_owned(),
-                    "/tmp/superposition-worker.sock".to_owned(),
-                    "--bundle".to_owned(),
-                    "/Library/Audio/Plug-Ins/VST3/Example.vst3".to_owned(),
-                    "--class-id".to_owned(),
-                    "example-class".to_owned(),
-                ],
-            },
-            control_socket: PathBuf::from("/tmp/superposition-worker.sock"),
+            launch: HelperLaunch::native(
+                HelperKind::PluginWorker,
+                "/Applications/Superposition.app/Contents/Helpers/sp-plugin-worker",
+                worker_arguments(target),
+            ),
             target,
             timeout: Duration::from_secs(1),
         };
         assert!(configuration.validate().is_ok());
 
-        let mut inconsistent = configuration;
+        let mut inconsistent = configuration.clone();
         inconsistent.launch.arguments[12] = "18".to_owned();
         assert!(matches!(
             inconsistent.validate(),
             Err(WorkerControlError::InvalidLaunchArguments(_))
         ));
+
+        let mut unsupported_rate = configuration.clone();
+        unsupported_rate.launch.arguments[14] = "44100".to_owned();
+        assert!(matches!(
+            unsupported_rate.validate(),
+            Err(WorkerControlError::InvalidLaunchArguments(_))
+        ));
+
+        // Under Wine the same arguments follow the Windows build of the worker.
+        let mut windows = configuration;
+        windows.launch.executable = PathBuf::from("/opt/sp/helpers/windows/sp-plugin-worker.exe");
+        assert!(windows.validate().is_err());
     }
 
     #[test]
     fn request_ids_are_monotonic_on_one_client_connection() {
-        let (client_stream, server_stream) = UnixStream::pair().expect("Unix pair");
+        let (mut client, mut worker) = connected(Duration::from_secs(1));
         let server = thread::spawn(move || {
-            let mut server = UnixControlServer::from_stream(server_stream, target());
             for _ in 0..2 {
-                let request = server.receive().expect("request");
-                let response = ControlResponse::success(
-                    request.request_id(),
-                    request.target(),
-                    request.slot(),
-                    &[],
-                )
-                .expect("response");
-                server.respond(&response).expect("reply");
+                let request = worker.receive();
+                worker.succeed(&request, &[]);
             }
         });
-        client_stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("timeout");
-        client_stream
-            .set_write_timeout(Some(Duration::from_secs(1)))
-            .expect("timeout");
-        let mut client = WorkerControlClient {
-            stream: Some(UnixControlClient::from_stream(client_stream)),
-            pending: None,
-            target: target(),
-            timeout: Duration::from_secs(1),
-            next_request_id: 1,
-            closed: false,
-        };
         assert!(
             client
                 .request(ControlOperation::QueryHealth, None, &[])
@@ -1046,49 +1042,40 @@ mod tests {
     }
 
     #[test]
-    fn background_request_does_not_block_and_preserves_socket_order() {
-        let (client_stream, server_stream) = UnixStream::pair().expect("Unix pair");
+    fn a_timed_out_request_closes_the_pipes() {
+        let (mut client, mut worker) = connected(Duration::from_millis(50));
+        let server = thread::spawn(move || {
+            let request = worker.receive();
+            thread::sleep(Duration::from_millis(200));
+            // The late response must never be taken for the next request's.
+            worker.succeed(&request, b"late");
+        });
+        assert!(matches!(
+            client.request(ControlOperation::QueryHealth, None, &[]),
+            Err(WorkerControlError::TimedOut)
+        ));
+        assert!(matches!(
+            client.request(ControlOperation::QueryHealth, None, &[]),
+            Err(WorkerControlError::ConnectionClosed)
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn background_request_does_not_block_and_preserves_order() {
+        let (mut client, mut worker) = connected(Duration::from_secs(3));
         let (received_tx, received_rx) = mpsc::channel();
         let (reply_tx, reply_rx) = mpsc::channel();
         let server = thread::spawn(move || {
-            let mut server = UnixControlServer::from_stream(server_stream, target());
-            let first = server.receive().expect("first request");
+            let first = worker.receive();
             received_tx.send(first.operation()).expect("signal request");
             reply_rx.recv().expect("release first reply");
-            server
-                .respond(
-                    &ControlResponse::success(
-                        first.request_id(),
-                        first.target(),
-                        first.slot(),
-                        b"editor opened",
-                    )
-                    .unwrap(),
-                )
-                .unwrap();
-            let second = server.receive().expect("second request");
+            worker.succeed(&first, b"editor opened");
+            let second = worker.receive();
             assert_eq!(second.operation(), ControlOperation::QueryHealth);
             assert!(second.request_id() > first.request_id());
-            server
-                .respond(
-                    &ControlResponse::success(
-                        second.request_id(),
-                        second.target(),
-                        second.slot(),
-                        b"healthy",
-                    )
-                    .unwrap(),
-                )
-                .unwrap();
+            worker.succeed(&second, b"healthy");
         });
-        let mut client = WorkerControlClient {
-            stream: Some(UnixControlClient::from_stream(client_stream)),
-            pending: None,
-            target: target(),
-            timeout: Duration::from_secs(3),
-            next_request_id: 1,
-            closed: false,
-        };
         let slot = SlotIdentity::new(1).unwrap();
         client
             .begin_request(ControlOperation::OpenNativeEditor, Some(slot), &[])
@@ -1135,13 +1122,7 @@ mod tests {
             StateTransferLengths,
         };
 
-        let (client_stream, server_stream) = UnixStream::pair().expect("Unix pair");
-        client_stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        client_stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+        let (mut client, mut server) = connected(Duration::from_secs(2));
         let slot = SlotIdentity::new(5).unwrap();
         let original = StateRestore {
             component: vec![0xA5; MAX_STATE_TRANSFER_CHUNK_BYTES * 8 + 1],
@@ -1149,14 +1130,13 @@ mod tests {
         };
         let expected = original.clone();
         let server = thread::spawn(move || {
-            let mut server = UnixControlServer::from_stream(server_stream, target());
             let mut restored = StateRestore {
                 component: vec![0; expected.component.len()],
                 controller: vec![0; expected.controller.len()],
             };
             let mut capture_released = false;
             loop {
-                let request = server.receive().expect("request");
+                let request = server.receive();
                 let response = match request.operation() {
                     ControlOperation::BeginStateCapture => StateTransferDescriptor {
                         id: 1,
@@ -1212,7 +1192,7 @@ mod tests {
                             &[],
                         )
                         .unwrap();
-                        server.respond(&response).unwrap();
+                        server.respond(&response);
                         break;
                     }
                     operation => panic!("unexpected {operation:?}"),
@@ -1224,17 +1204,9 @@ mod tests {
                     &response,
                 )
                 .unwrap();
-                server.respond(&response).unwrap();
+                server.respond(&response);
             }
         });
-        let mut client = WorkerControlClient {
-            stream: Some(UnixControlClient::from_stream(client_stream)),
-            pending: None,
-            target: target(),
-            timeout: Duration::from_secs(2),
-            next_request_id: 1,
-            closed: false,
-        };
         assert_eq!(client.capture_state(slot).unwrap(), original);
         client.restore_state(slot, &original).unwrap();
         server.join().unwrap();

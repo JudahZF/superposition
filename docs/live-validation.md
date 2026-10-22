@@ -93,5 +93,4 @@ SUPERPOSITION_HELPERS_DIR="$PWD/target/release" \
 cargo test --release -p superposition live_save_check -- --ignored --nocapture
 ```
 
-The checks copy the session to `/tmp` and never modify the source. Worker sockets
-need short paths, so keep test directories under `/tmp`, not `$TMPDIR`.
+The checks copy the session to `/tmp` and never modify the source.

@@ -108,9 +108,64 @@ pub(crate) fn run_bundle(workspace_root: &Path, arguments: &[String]) -> Result<
         return Err("bundle-linux does not accept arguments".to_owned());
     }
     let work = workspace_root.join("target/bundle-linux");
+    build_in_container(workspace_root, &work)?;
+
+    let version = env!("CARGO_PKG_VERSION");
+    let name = format!("superposition-{version}-linux-x86_64");
+    let staging = work.join(&name);
+    let _ = std::fs::remove_dir_all(&staging);
+    let lib = staging.join("lib/superposition");
+    let helpers = lib.join("helpers");
+    let built = work.join("target/release");
+    copy(&built.join("superposition"), &lib.join("superposition"))?;
+    for helper in LINUX_HELPERS {
+        copy(&built.join(helper), &helpers.join(helper))?;
+    }
+    // The Windows helpers and the bridge's PE half are portable and build on the host; the
+    // unixlib is replaced by the container build so it needs only the older glibc.
+    crate::wine::run_windows_helpers(
+        workspace_root,
+        &[
+            "--release".to_owned(),
+            "--out".to_owned(),
+            helpers.display().to_string(),
+        ],
+    )?;
+    copy(
+        &work.join("target/sp_wine_bridge.so"),
+        &helpers.join("wine-bridge/x86_64-unix/sp_wine_bridge.so"),
+    )?;
+    copy(
+        &workspace_root.join("packaging/linux/superposition.sh"),
+        &staging.join("bin/superposition"),
+    )?;
+    copy(
+        &workspace_root.join("packaging/linux/README-linux.md"),
+        &staging.join("share/doc/superposition/README-linux.md"),
+    )?;
+    let wine = wine_archive(&work.join("cache"))?;
+    std::fs::create_dir_all(lib.join("wine")).map_err(|error| error.to_string())?;
+    run(Command::new("tar")
+        .arg("-xJf")
+        .arg(&wine)
+        .args(["--strip-components=1", "-C"])
+        .arg(lib.join("wine")))?;
+    let tarball = work.join(format!("{name}.tar.xz"));
+    run(Command::new("tar")
+        .args(["-cJf"])
+        .arg(&tarball)
+        .arg("-C")
+        .arg(&work)
+        .arg(&name))?;
+    println!("built {}", tarball.display());
+    Ok(())
+}
+
+/// Vendors the sources on the host, then builds the Linux binaries and the bridge unixlib in
+/// the Debian 12 container into `<work>/target`.
+fn build_in_container(workspace_root: &Path, work: &Path) -> Result<(), String> {
     let vendor = work.join("vendor");
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-
     // Vendor on the host, where git can reach the SSH dependencies.
     let vendored = Command::new(&cargo)
         .current_dir(workspace_root)
@@ -155,63 +210,5 @@ pub(crate) fn run_bundle(workspace_root: &Path, arguments: &[String]) -> Result<
         .arg(format!("{}:/src", workspace_root.display()))
         .args(["--workdir", "/src"])
         .args(["--env", "CARGO_TARGET_DIR=/src/target/bundle-linux/target"])
-        .args([IMAGE, "sh", "-c", &script]))?;
-
-    // The PE half of the bridge is portable; build it on the host with the pinned Wine headers.
-    let bridge = crate::wine::build_bridge(workspace_root)?;
-
-    let version = env!("CARGO_PKG_VERSION");
-    let name = format!("superposition-{version}-linux-x86_64");
-    let staging = work.join(&name);
-    let _ = std::fs::remove_dir_all(&staging);
-    let lib = staging.join("lib/superposition");
-    let built = work.join("target/release");
-    copy(&built.join("superposition"), &lib.join("superposition"))?;
-    for helper in LINUX_HELPERS {
-        copy(&built.join(helper), &lib.join("helpers").join(helper))?;
-    }
-    copy(
-        &bridge.join("x86_64-windows/sp_wine_bridge.dll"),
-        &lib.join("helpers/wine-bridge/x86_64-windows/sp_wine_bridge.dll"),
-    )?;
-    copy(
-        &work.join("target/sp_wine_bridge.so"),
-        &lib.join("helpers/wine-bridge/x86_64-unix/sp_wine_bridge.so"),
-    )?;
-    for windows_helper in ["sp-plugin-worker.exe", "sp-plugin-scanner.exe"] {
-        let path = workspace_root
-            .join("target/x86_64-pc-windows-gnu/release")
-            .join(windows_helper);
-        if path.is_file() {
-            copy(&path, &lib.join("helpers/windows").join(windows_helper))?;
-        } else {
-            eprintln!(
-                "note: {windows_helper} is not built; Windows plug-ins are unavailable in this bundle"
-            );
-        }
-    }
-    copy(
-        &workspace_root.join("packaging/linux/superposition.sh"),
-        &staging.join("bin/superposition"),
-    )?;
-    copy(
-        &workspace_root.join("packaging/linux/README-linux.md"),
-        &staging.join("share/doc/superposition/README-linux.md"),
-    )?;
-    let wine = wine_archive(&work.join("cache"))?;
-    std::fs::create_dir_all(lib.join("wine")).map_err(|error| error.to_string())?;
-    run(Command::new("tar")
-        .arg("-xJf")
-        .arg(&wine)
-        .args(["--strip-components=1", "-C"])
-        .arg(lib.join("wine")))?;
-    let tarball = work.join(format!("{name}.tar.xz"));
-    run(Command::new("tar")
-        .args(["-cJf"])
-        .arg(&tarball)
-        .arg("-C")
-        .arg(&work)
-        .arg(&name))?;
-    println!("built {}", tarball.display());
-    Ok(())
+        .args([IMAGE, "sh", "-c", &script]))
 }
