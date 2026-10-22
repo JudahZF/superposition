@@ -1,6 +1,6 @@
 # Superposition
 
-Superposition is a macOS-native live VST3 host. It runs each rack's plug-ins in a separate worker process, so a plug-in that crashes or misses its deadline affects only its own rack. The audio engine keeps bounded latency and keeps the other racks playing.
+Superposition is a live VST3 host for macOS and Linux. On Linux it can also run Windows VST3 plug-ins under Wine. It runs each rack's plug-ins in a separate worker process, so a plug-in that crashes or misses its deadline affects only its own rack. The audio engine keeps bounded latency and keeps the other racks playing.
 
 **Status: alpha.** It runs real plug-ins live on Apple Silicon, but it is not a certified release. Notarized bundles, approved brand assets, and long-run hardware testing are still incomplete. Worker isolation protects availability; it is not a security sandbox.
 
@@ -17,12 +17,22 @@ Superposition is a macOS-native live VST3 host. It runs each rack's plug-ins in 
 
 ## Build and run
 
-Requires an Apple Silicon Mac, macOS 14.4 or later, and the Rust toolchain in `rust-toolchain.toml` (rustup installs it automatically).
+macOS requires an Apple Silicon Mac, macOS 14.4 or later, and the Rust toolchain in `rust-toolchain.toml` (rustup installs it automatically).
 
 ```sh
 cargo build --workspace
 cargo run -p superposition
 ```
+
+Linux (x86_64) builds inside the Nix dev shell, which pins Rust, JACK, Xvfb, mingw, and the Wine build that Windows plug-ins use:
+
+```sh
+nix develop -c cargo build --workspace
+nix develop -c cargo run -p superposition
+nix develop -c cargo xtask wine-check   # Windows worker boundary under Wine
+```
+
+Audio runs through JACK (PipeWire's JACK library works). The server's rate and quantum must match the session, for example `pw-metadata -n settings 0 clock.force-quantum 128`. For real-time scheduling, grant `RLIMIT_RTPRIO` (for example through `security.pam.loginLimits` on NixOS).
 
 The app finds its helper executables beside its own executable. Packaged builds use the bundle's `Helpers` directory. `SUPERPOSITION_HELPERS_DIR` overrides both, and `SUPERPOSITION_APP_SUPPORT` selects a separate catalog and quarantine directory.
 
