@@ -38,6 +38,22 @@
           # sp-wine-bridge unixlib ABI both depend on it; change it deliberately.
           wine = pkgs.wineWow64Packages.staging;
           mingw = pkgs.pkgsCross.mingwW64;
+          # zig's bundled macOS libc headers let C build scripts (zstd-sys, ring) run for
+          # `--target aarch64-apple-darwin`, so Linux can type-check the macOS code.
+          zigCcMacos = pkgs.writeShellScript "zig-cc-aarch64-macos" ''
+            args=()
+            skip=0
+            for arg in "$@"; do
+              if [ "$skip" = 1 ]; then skip=0; continue; fi
+              case "$arg" in
+                -arch) skip=1 ;;
+                --target=* | -mmacosx-version-min=*) ;;
+                *) args+=("$arg") ;;
+              esac
+            done
+            exec ${pkgs.zig}/bin/zig cc -target aarch64-macos "''${args[@]}"
+          '';
+          zigAr = pkgs.writeShellScript "zig-ar" ''exec ${pkgs.zig}/bin/zig ar "$@"'';
           # Libraries that eframe, the X11 editor host and the streamer open at run time.
           runtimeLibs = with pkgs; [
             libxkbcommon
@@ -100,6 +116,8 @@
               SUPERPOSITION_MINGW_CC = "${mingw.stdenv.cc}/bin/x86_64-w64-mingw32-gcc";
               SUPERPOSITION_MINGW_LIB_DIRS = "${mingw.windows.pthreads}/lib:${mingw.windows.mcfgthreads}/lib";
               CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${mingw.stdenv.cc}/bin/x86_64-w64-mingw32-gcc";
+              CC_aarch64_apple_darwin = "${zigCcMacos}";
+              AR_aarch64_apple_darwin = "${zigAr}";
               CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-L native=${mingw.windows.pthreads}/lib -L native=${mingw.windows.mcfgthreads}/lib";
             };
           };

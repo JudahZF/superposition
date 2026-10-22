@@ -115,6 +115,10 @@ jobs:
       - name: Check the Windows worker target
         run: nix develop -c cargo check -p sp-shared-memory-os --target x86_64-pc-windows-gnu
 
+      - name: Type-check the macOS code
+        # Rust only: zig supplies the C headers, the Objective-C shims are skipped, nothing links.
+        run: nix develop -c env SUPERPOSITION_SKIP_NATIVE_SHIMS=1 cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
+
       - name: Run tests
         # Includes the Xvfb window-streamer test and the remote loopback test.
         run: nix develop -c cargo test --workspace

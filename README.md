@@ -108,7 +108,13 @@ To render the show screen to PNGs for visual review:
 SUPERPOSITION_UI_SNAPSHOT=<dir> cargo test -p superposition --bin superposition render_show_screen_snapshots -- --ignored
 ```
 
-CI (`.github/workflows/ci.yml`) runs doctor, formatting, Clippy, tests, coverage, `cargo-deny`, and `cargo-audit` on macOS. Live timing needs real Apple Silicon hardware and does not run in CI.
+On Linux, the dev shell can type-check the macOS code. zig supplies the C headers, and the Objective-C shims are skipped, so nothing links:
+
+```sh
+nix develop -c env SUPERPOSITION_SKIP_NATIVE_SHIMS=1 cargo clippy --workspace --all-targets --target aarch64-apple-darwin
+```
+
+CI (`.github/workflows/ci.yml`) runs doctor, formatting, Clippy, tests, coverage, `cargo-deny`, and `cargo-audit` on macOS. On Linux, it runs formatting, Clippy for Linux and macOS, the tests, the JACK test, and the Wine check. Live timing needs real audio hardware and does not run in CI.
 
 ## Documentation
 
