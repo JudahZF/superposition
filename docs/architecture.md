@@ -179,8 +179,50 @@ engine prints: SPAKE2 over the connection, confirmed by HMACs over both certific
 fingerprints, after which each side pins the other. One client controls; other clients watch
 until they take control. A client that joins late first receives every live texture in full.
 The engine renders only for input or a requested repaint, so an idle engine and client use
-almost no CPU. On macOS the served UI works the same, but native editors stay on the Mac's own
-display.
+almost no CPU.
+
+### macOS editor streaming
+
+On macOS, editors are native windows of their workers. The local app does not stream them. The
+served engine (`--serve`) also streams them to remote clients, with the same `sp-window-stream`
+protocol and the same UI code as on Linux:
+
+- **Transport.** The engine listens on `$TMPDIR/superposition-<pid>/editors.sock` (mode 0600)
+  and gives each worker the path in `SUPERPOSITION_EDITOR_STREAM`. The worker connects to it and
+  serves the session for its own windows (`WindowSource`). The app speaks first, as it does to
+  the Linux streamer. Each worker is one connection, and the UI sends input to the connection
+  that owns the window. The window ID is the `AppKit` window number, which is unique across
+  processes. The title, rack, and slot are the same as on Linux.
+- **When.** The UI greets the workers only while a remote client is connected. When the last
+  client leaves, the UI closes the connections; each worker stops its pictures, connects again,
+  and waits. A Mac with no remote client therefore pictures nothing.
+- **Capture.** While greeted, the worker's loading thread pictures each open editor at most 30
+  times a second, and only after the stream thread has written the previous pictures. The
+  content view draws itself into a bitmap inside the worker process
+  (`cacheDisplayInRect:toBitmapImageRep:`) at one pixel per point. This needs no Screen
+  Recording permission. The stream thread compares each picture with the last one and sends only
+  the 64×64 tiles that changed.
+- **Input.** The controller's input comes back on the same connection. The worker turns it into
+  `NSEvent`s (scroll events go through `CGEvent`) and gives them to its own window with
+  `-[NSWindow sendEvent:]`. This needs no Accessibility permission, and the Mac's pointer does
+  not move. X keysyms become Mac key codes and characters; `Super` is Command, and the UI sends
+  a Mac client's Command key as `Super`. Pressing a button counts double and triple clicks, and
+  moving with a held button is a drag.
+- **Local use.** The native windows stay open on the Mac's display and work as before.
+
+Known limits:
+
+- Views that draw with Metal or OpenGL layers (`CAMetalLayer`) can picture blank, because the
+  view cache does not include those layers.
+- Menus and other pop-up windows that a plug-in opens are not streamed. They show only on the
+  Mac's display.
+- The stream has one pixel per point, so on a Retina Mac it is half the native resolution.
+- The Back and Forward mouse buttons are refused. Windows report position 0, 0.
+- Code that reads hardware state instead of the event (for example
+  `+[NSEvent pressedMouseButtons]`), and hover effects from tracking areas, may not react to
+  injected events.
+- This path is type-checked for macOS from Linux, and its platform-neutral parts are tested on
+  Linux. It is not yet verified on a Mac.
 
 ## Package direction and VST3 boundary
 
