@@ -1,7 +1,7 @@
 //! Disposable VST3 bundle scanner.
 //!
-//! Bundle layout and Mach-O architecture inspection always happen before any factory code is
-//! eligible to load. The parent launches this helper once per bundle and applies its deadline;
+//! Bundle layout and Mach-O or ELF architecture inspection always happen before any factory
+//! code is eligible to load. The parent launches this helper once per bundle and applies its deadline;
 //! all machine-readable data is serialized as the SDK-free scan-metadata schema.
 
 use std::{env, fs, path::PathBuf, process};
@@ -120,13 +120,17 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<Args, &'static 
 
 fn report_for_info(info: Vst3BundleInfo, sdk_enumerate: bool) -> ScanReport {
     let architecture = architecture_from(info.architectures);
-    if !info.supported_on_apple_silicon {
+    if !info.native {
+        #[cfg(target_os = "macos")]
+        let detail = "bundle has no native Apple Silicon code".to_owned();
+        #[cfg(not(target_os = "macos"))]
+        let detail = format!("bundle has no native {} code", std::env::consts::ARCH);
         return report(
             info.path,
             metadata_with_detail(
                 architecture,
                 PluginScanOutcome::UnsupportedArchitecture,
-                "bundle has no native Apple Silicon code",
+                detail,
             ),
             false,
         );

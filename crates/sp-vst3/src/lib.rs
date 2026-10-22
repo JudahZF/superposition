@@ -1,7 +1,7 @@
 //! VST3 bundle inspection and helper-only SDK hosting for Superposition.
 //!
-//! The default API reads only bundle layout and Mach-O headers and never loads a
-//! plug-in. Enable `--features sdk` inside isolated helper binaries to unlock the
+//! The default API reads only bundle layout and Mach-O or ELF headers and never loads
+//! a plug-in. Enable `--features sdk` inside isolated helper binaries to unlock the
 //! [`sdk`] module, which wraps `vst3-host` without exposing SDK types to the main
 //! application or engine.
 
@@ -44,21 +44,27 @@ pub struct Vst3PluginDescriptor {
 /// CPU architecture advertised by a VST3 bundle executable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Vst3Architecture {
-    /// Native Apple Silicon code is present.
+    /// 64-bit ARM code (Apple Silicon or `aarch64-linux`) is present.
     Arm64,
     /// Intel 64-bit code is present.
     X86_64,
     /// Both Apple Silicon and Intel 64-bit code are present.
     Universal,
-    /// The executable is not a recognised Mach-O file or has another CPU type.
+    /// The executable is not a recognised Mach-O or ELF file or has another CPU type.
     Unknown,
 }
 
 impl Vst3Architecture {
-    /// Returns whether this architecture includes native Apple Silicon code.
+    /// Returns whether this architecture includes code the running host executes natively.
     #[must_use]
-    pub const fn supports_apple_silicon(self) -> bool {
-        matches!(self, Self::Arm64 | Self::Universal)
+    pub const fn is_native(self) -> bool {
+        if cfg!(target_arch = "aarch64") {
+            matches!(self, Self::Arm64 | Self::Universal)
+        } else if cfg!(target_arch = "x86_64") {
+            matches!(self, Self::X86_64 | Self::Universal)
+        } else {
+            false
+        }
     }
 
     /// Returns the stable machine-readable architecture name.
@@ -78,12 +84,12 @@ impl Vst3Architecture {
 pub struct Vst3BundleInfo {
     /// Original bundle path.
     pub path: PathBuf,
-    /// Architecture read from the executable's Mach-O header.
+    /// Architecture read from the executable's Mach-O or ELF header.
     pub architectures: Vst3Architecture,
-    /// Name of the executable found in `Contents/MacOS`.
+    /// Name of the executable found in `Contents/MacOS` or `Contents/<arch>-linux`.
     pub executable_name: String,
-    /// Whether the bundle includes native Apple Silicon code.
-    pub supported_on_apple_silicon: bool,
+    /// Whether the bundle includes code this host executes natively.
+    pub native: bool,
 }
 
 /// Reportable result of a scanning attempt.
@@ -91,7 +97,7 @@ pub struct Vst3BundleInfo {
 pub enum ScanOutcome {
     /// The bundle layout is valid and can be scanned on this architecture.
     Supported,
-    /// The bundle layout is valid but has no native Apple Silicon code.
+    /// The bundle layout is valid but has no code this host executes natively.
     UnsupportedArchitecture,
     /// The path does not have the expected VST3 bundle layout.
     InvalidBundle,
@@ -127,14 +133,25 @@ impl std::error::Error for Vst3BundleError {}
 ///
 /// # Errors
 ///
-/// Returns an error if the path is not a VST3 bundle, has no `Info.plist`, or
-/// has no regular executable file in `Contents/MacOS`.
+/// Returns an error if the path is not a VST3 bundle or has no executable in its platform
+/// layout: `Contents/Info.plist` and `Contents/MacOS` on macOS, or a shared object in a
+/// `Contents/<arch>-linux` folder on Linux.
 pub fn inspect_bundle_layout(path: impl AsRef<Path>) -> Result<Vst3BundleInfo, Vst3BundleError> {
     let path = path.as_ref();
     if path.extension().and_then(|extension| extension.to_str()) != Some("vst3") {
         return Err(Vst3BundleError::invalid("bundle path must end in .vst3"));
     }
+    let (executable_name, architectures) = probe_bundle_executable(path)?;
+    Ok(Vst3BundleInfo {
+        path: path.to_path_buf(),
+        architectures,
+        executable_name,
+        native: architectures.is_native(),
+    })
+}
 
+#[cfg(not(target_os = "linux"))]
+fn probe_bundle_executable(path: &Path) -> Result<(String, Vst3Architecture), Vst3BundleError> {
     let contents = path.join("Contents");
     let info_plist = contents.join("Info.plist");
     if !info_plist.is_file() {
@@ -167,14 +184,109 @@ pub fn inspect_bundle_layout(path: impl AsRef<Path>) -> Result<Vst3BundleInfo, V
             executable.path().display()
         ))
     })?;
-    let architectures = probe_macho_architecture(&bytes);
+    Ok((executable_name, probe_macho_architecture(&bytes)))
+}
 
-    Ok(Vst3BundleInfo {
-        path: path.to_path_buf(),
-        architectures,
-        executable_name,
-        supported_on_apple_silicon: architectures.supports_apple_silicon(),
-    })
+/// `Contents/` folder that holds code the running Linux host loads.
+#[cfg(target_os = "linux")]
+const NATIVE_LINUX_FOLDER: &str = if cfg!(target_arch = "aarch64") {
+    "aarch64-linux"
+} else if cfg!(target_arch = "x86") {
+    "i386-linux"
+} else {
+    "x86_64-linux"
+};
+
+/// Finds the shared object in a `Contents/<arch>-linux` folder and reads its ELF header. The
+/// native folder comes first, so a multi-architecture bundle reports the binary this host loads.
+#[cfg(target_os = "linux")]
+fn probe_bundle_executable(path: &Path) -> Result<(String, Vst3Architecture), Vst3BundleError> {
+    use std::io::Read as _;
+
+    let contents = path.join("Contents");
+    let entries = fs::read_dir(&contents).map_err(|error| {
+        Vst3BundleError::invalid(format!("cannot read {}: {error}", contents.display()))
+    })?;
+    let mut folders = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_name().to_string_lossy().ends_with("-linux") && entry.path().is_dir()
+        })
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    folders.sort_by_key(|name| (name.as_os_str() != NATIVE_LINUX_FOLDER, name.clone()));
+    let named = path
+        .file_stem()
+        .map(|stem| Path::new(stem).with_extension("so"));
+    let executable = folders
+        .iter()
+        .find_map(|folder| linux_shared_object(&contents.join(folder), named.as_deref()))
+        .ok_or_else(|| {
+            Vst3BundleError::invalid(format!(
+                "missing shared object in {}/*-linux",
+                contents.display()
+            ))
+        })?;
+    let mut header = Vec::with_capacity(64);
+    fs::File::open(&executable)
+        .and_then(|file| file.take(64).read_to_end(&mut header))
+        .map_err(|error| {
+            Vst3BundleError::invalid(format!("cannot read {}: {error}", executable.display()))
+        })?;
+    let executable_name = executable
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    Ok((executable_name, probe_elf_architecture(&header)))
+}
+
+/// The shared object named after the bundle, as the VST3 layout requires, or else the first
+/// `.so` by name.
+#[cfg(target_os = "linux")]
+fn linux_shared_object(folder: &Path, named: Option<&Path>) -> Option<PathBuf> {
+    if let Some(named) = named.map(|name| folder.join(name))
+        && named.is_file()
+    {
+        return Some(named);
+    }
+    let mut objects = fs::read_dir(folder)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().and_then(|extension| extension.to_str()) == Some("so")
+                && path.is_file()
+        })
+        .collect::<Vec<_>>();
+    objects.sort();
+    objects.into_iter().next()
+}
+
+/// Reads an ELF header and classifies its machine.
+///
+/// This function only examines the supplied bytes; it never executes or loads them.
+#[must_use]
+pub fn probe_elf_architecture(bytes: &[u8]) -> Vst3Architecture {
+    const X86_64: u16 = 62;
+    const AARCH64: u16 = 183;
+
+    let little_endian = match bytes.get(..6) {
+        Some([0x7f, b'E', b'L', b'F', 1 | 2, 1]) => true,
+        Some([0x7f, b'E', b'L', b'F', 1 | 2, 2]) => false,
+        _ => return Vst3Architecture::Unknown,
+    };
+    let Some(&[low, high]) = bytes.get(18..20) else {
+        return Vst3Architecture::Unknown;
+    };
+    let machine = if little_endian {
+        u16::from_le_bytes([low, high])
+    } else {
+        u16::from_be_bytes([low, high])
+    };
+    match machine {
+        X86_64 => Vst3Architecture::X86_64,
+        AARCH64 => Vst3Architecture::Arm64,
+        _ => Vst3Architecture::Unknown,
+    }
 }
 
 /// Reads a Mach-O or fat Mach-O header and classifies its CPU architecture.
@@ -306,7 +418,7 @@ pub mod native;
 #[cfg(test)]
 mod tests {
     use super::{
-        FakeVst3Inspector, Vst3Architecture, Vst3BundlePath, Vst3Inspector,
+        FakeVst3Inspector, Vst3Architecture, Vst3BundlePath, Vst3Inspector, probe_elf_architecture,
         probe_macho_architecture,
     };
 
@@ -365,6 +477,78 @@ mod tests {
             probe_macho_architecture(b"not a Mach-O"),
             Vst3Architecture::Unknown
         );
+    }
+
+    /// The first 20 bytes of an ELF header: identification, type, then machine.
+    fn elf_header(class: u8, little_endian: bool, machine: u16) -> Vec<u8> {
+        let mut header = vec![
+            0x7f,
+            b'E',
+            b'L',
+            b'F',
+            class,
+            if little_endian { 1 } else { 2 },
+        ];
+        header.resize(16, 0);
+        let (kind, machine) = if little_endian {
+            (3_u16.to_le_bytes(), machine.to_le_bytes())
+        } else {
+            (3_u16.to_be_bytes(), machine.to_be_bytes())
+        };
+        header.extend(kind);
+        header.extend(machine);
+        header
+    }
+
+    #[test]
+    fn probes_elf_machine_in_either_byte_order() {
+        assert_eq!(
+            probe_elf_architecture(&elf_header(2, true, 62)),
+            Vst3Architecture::X86_64
+        );
+        assert_eq!(
+            probe_elf_architecture(&elf_header(2, false, 183)),
+            Vst3Architecture::Arm64
+        );
+        assert_eq!(
+            probe_elf_architecture(&elf_header(1, true, 3)),
+            Vst3Architecture::Unknown,
+            "32-bit x86 is not a supported plug-in architecture"
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_or_non_elf_headers() {
+        let header = elf_header(2, true, 62);
+        assert_eq!(
+            probe_elf_architecture(&header[..19]),
+            Vst3Architecture::Unknown
+        );
+        assert_eq!(
+            probe_elf_architecture(b"not an ELF object at all"),
+            Vst3Architecture::Unknown
+        );
+    }
+
+    /// A bundle with code for another architecture sorted first reports the host's binary.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn linux_layout_prefers_the_native_architecture_folder() {
+        let root = std::env::temp_dir().join(format!("sp-vst3-layout-{}", std::process::id()));
+        let bundle = root.join("Multi.vst3");
+        for (folder, machine) in [("aarch64-linux", 183), ("x86_64-linux", 62)] {
+            let folder = bundle.join("Contents").join(folder);
+            std::fs::create_dir_all(&folder).expect("create architecture folder");
+            std::fs::write(folder.join("Multi.so"), elf_header(2, true, machine))
+                .expect("write shared object");
+        }
+
+        let info = super::inspect_bundle_layout(&bundle).expect("valid Linux bundle");
+
+        assert_eq!(info.architectures, Vst3Architecture::X86_64);
+        assert_eq!(info.executable_name, "Multi.so");
+        assert!(info.native);
+        std::fs::remove_dir_all(root).expect("remove test bundle");
     }
 
     #[test]
