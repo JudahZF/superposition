@@ -19,7 +19,11 @@ use sha2::{Digest, Sha256};
 const IMAGE: &str = "superposition-linux-build:bookworm";
 const WINE_URL: &str = "https://github.com/Kron4ek/Wine-Builds/releases/download/11.18/wine-11.18-staging-amd64-wow64.tar.xz";
 const WINE_SHA256: &str = "15f312effe798838d4877a37126509618b3f98759744b37aeda0c6f55875d99a";
-const LINUX_HELPERS: [&str; 3] = ["sp-plugin-worker", "sp-plugin-scanner", "sp-window-streamer"];
+const LINUX_HELPERS: [&str; 3] = [
+    "sp-plugin-worker",
+    "sp-plugin-scanner",
+    "sp-window-streamer",
+];
 
 fn run(command: &mut Command) -> Result<(), String> {
     let status = command
@@ -72,7 +76,13 @@ fn wine_archive(cache: &Path) -> Result<PathBuf, String> {
     if !archive.is_file() || sha256(&archive)? != WINE_SHA256 {
         std::fs::create_dir_all(cache).map_err(|error| error.to_string())?;
         run(Command::new("curl")
-            .args(["--fail", "--location", "--silent", "--show-error", "--output"])
+            .args([
+                "--fail",
+                "--location",
+                "--silent",
+                "--show-error",
+                "--output",
+            ])
             .arg(&archive)
             .arg(WINE_URL))?;
         let digest = sha256(&archive)?;
@@ -175,7 +185,9 @@ pub(crate) fn run_bundle(workspace_root: &Path, arguments: &[String]) -> Result<
         if path.is_file() {
             copy(&path, &lib.join("helpers/windows").join(windows_helper))?;
         } else {
-            eprintln!("note: {windows_helper} is not built; Windows plug-ins are unavailable in this bundle");
+            eprintln!(
+                "note: {windows_helper} is not built; Windows plug-ins are unavailable in this bundle"
+            );
         }
     }
     copy(
