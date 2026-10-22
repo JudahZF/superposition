@@ -68,28 +68,46 @@ fn remote_state(directory: &str) -> PathBuf {
     default_application_support().join(directory)
 }
 
-fn serve(arguments: &[String]) -> Result<(), String> {
-    let mut bind: Option<SocketAddr> = None;
-    let mut name = host_name();
-    let mut pair = false;
-    let mut arguments = arguments.iter();
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "--bind" => {
-                bind = Some(
-                    arguments
-                        .next()
-                        .ok_or("--bind needs an address")?
-                        .parse()
-                        .map_err(|error| format!("invalid --bind address: {error}"))?,
-                );
-            }
-            "--name" => name.clone_from(arguments.next().ok_or("--name needs a value")?),
-            "--pair" => pair = true,
-            other => return Err(format!("unknown --serve option `{other}`")),
-        }
-    }
+/// The `--serve` options.
+struct ServeOptions {
+    bind: Option<SocketAddr>,
+    name: String,
+    /// Show a pairing code even when clients are already paired.
+    pair: bool,
+}
 
+impl ServeOptions {
+    fn parse(arguments: &[String]) -> Result<Self, String> {
+        let mut options = Self {
+            bind: None,
+            name: host_name(),
+            pair: false,
+        };
+        let mut arguments = arguments.iter();
+        while let Some(argument) = arguments.next() {
+            match argument.as_str() {
+                "--bind" => {
+                    options.bind = Some(
+                        arguments
+                            .next()
+                            .ok_or("--bind needs an address")?
+                            .parse()
+                            .map_err(|error| format!("invalid --bind address: {error}"))?,
+                    );
+                }
+                "--name" => options
+                    .name
+                    .clone_from(arguments.next().ok_or("--name needs a value")?),
+                "--pair" => options.pair = true,
+                other => return Err(format!("unknown --serve option `{other}`")),
+            }
+        }
+        Ok(options)
+    }
+}
+
+fn serve(arguments: &[String]) -> Result<(), String> {
+    let ServeOptions { bind, name, pair } = ServeOptions::parse(arguments)?;
     let controller = SessionController::open(default_session_root())
         .map_err(|error| format!("cannot open the session: {error}"))?;
     let recovery_offered = controller.recovery_offered();
@@ -100,6 +118,17 @@ fn serve(arguments: &[String]) -> Result<(), String> {
         product.stream_editors();
     }
     let ctx = egui::Context::default();
+    // Streamed editor frames and other threads ask for a repaint; the loop below sleeps until
+    // input arrives or its next frame is due, so a request brings that frame forward.
+    let repaint_requested = Arc::new(AtomicBool::new(false));
+    ctx.set_request_repaint_callback({
+        let repaint_requested = Arc::clone(&repaint_requested);
+        move |request| {
+            if request.delay.is_zero() {
+                repaint_requested.store(true, Ordering::Release);
+            }
+        }
+    });
     ui::install_style(&ctx);
     let mut app = ui::LiveRackApp::new(controller, recovery_offered, runtime);
 
@@ -136,7 +165,11 @@ fn serve(arguments: &[String]) -> Result<(), String> {
     let mut screen = egui::Rect::from_min_size(egui::Pos2::ZERO, DEFAULT_SCREEN);
     let mut viewports = egui::ViewportIdMap::default();
     let mut next_frame = Instant::now();
+    let mut last_frame = Instant::now();
     while !stop.load(Ordering::Relaxed) {
+        if repaint_requested.swap(false, Ordering::Acquire) {
+            next_frame = next_frame.min(last_frame + ACTIVE_FRAME);
+        }
         let input = server.take_input();
         // Render only for input or when the UI asked to repaint (meters, timers, polling).
         if input.is_none() && Instant::now() < next_frame {
@@ -157,6 +190,7 @@ fn serve(arguments: &[String]) -> Result<(), String> {
         input.time = Some(started.elapsed().as_secs_f64());
         #[cfg(target_os = "macos")]
         app.set_remote_watched(!server.clients().is_empty());
+        last_frame = Instant::now();
         let output = ctx.run(input, |ctx| app.frame(ctx));
         server.publish(&ctx, &output);
         let repaint = output
