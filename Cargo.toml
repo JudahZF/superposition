@@ -4,6 +4,7 @@ members = [
     "apps/superposition",
     "helpers/sp-plugin-worker",
     "helpers/sp-plugin-scanner",
+    "helpers/sp-window-streamer",
     "crates/sp-model",
     "crates/sp-protocol",
     "crates/sp-shared-memory",
@@ -19,6 +20,7 @@ members = [
     "crates/sp-wine",
     "crates/sp-ui",
     "crates/sp-remote",
+    "crates/sp-window-stream",
     "tools/xtask",
 ]
 default-members = ["apps/superposition"]
