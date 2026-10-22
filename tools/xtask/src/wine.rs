@@ -112,7 +112,10 @@ pub(crate) fn run_bridge(workspace_root: &Path, arguments: &[String]) -> Result<
 
 /// Builds the Windows helpers and lays them out under `--out` (default `target/debug`, or
 /// `target/release` with `--release`).
-pub(crate) fn run_windows_helpers(workspace_root: &Path, arguments: &[String]) -> Result<(), String> {
+pub(crate) fn run_windows_helpers(
+    workspace_root: &Path,
+    arguments: &[String],
+) -> Result<(), String> {
     let mut release = false;
     let mut out = None;
     let mut arguments = arguments.iter();
@@ -156,7 +159,10 @@ pub(crate) fn run_windows_helpers(workspace_root: &Path, arguments: &[String]) -
         "x86_64-windows/sp_wine_bridge.dll",
         "x86_64-unix/sp_wine_bridge.so",
     ] {
-        copy(&bridge.join(library), &out.join("wine-bridge").join(library))?;
+        copy(
+            &bridge.join(library),
+            &out.join("wine-bridge").join(library),
+        )?;
     }
     println!("Windows helpers in {}", out.display());
     Ok(())

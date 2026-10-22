@@ -71,7 +71,11 @@ pub struct HelperLaunch {
 impl HelperLaunch {
     /// A helper that runs natively.
     #[must_use]
-    pub fn native(kind: HelperKind, executable: impl Into<PathBuf>, arguments: Vec<String>) -> Self {
+    pub fn native(
+        kind: HelperKind,
+        executable: impl Into<PathBuf>,
+        arguments: Vec<String>,
+    ) -> Self {
         Self {
             kind,
             executable: executable.into(),

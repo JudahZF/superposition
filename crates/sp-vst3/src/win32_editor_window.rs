@@ -15,8 +15,7 @@ use windows_sys::Win32::{
     Foundation::{GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM},
     Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
-        DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, ReleaseDC, SRCCOPY,
-        SelectObject,
+        DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, ReleaseDC, SRCCOPY, SelectObject,
     },
     System::{
         LibraryLoader::{GetModuleHandleW, GetProcAddress},
@@ -27,16 +26,16 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
             GWLP_USERDATA, GetClientRect, GetPropW, GetWindowLongPtrW, MSG, PM_REMOVE,
-            PeekMessageW,
-            RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-            SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-            WM_CLOSE, WNDCLASSEXW, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+            PeekMessageW, RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+            TranslateMessage, WM_CLOSE, WNDCLASSEXW, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED,
+            WS_SYSMENU,
         },
     },
 };
 
-use crate::editor_common::{PREVIEW_HEIGHT, PREVIEW_WIDTH, Pixels, encode_png};
 pub use crate::editor_common::EditorWindowIdentity;
+use crate::editor_common::{PREVIEW_HEIGHT, PREVIEW_WIDTH, Pixels, encode_png};
 
 /// Size of a window before its editor reports one.
 const INITIAL_SIZE: i32 = 64;
@@ -126,7 +125,9 @@ impl Win32EditorWindow {
             // SAFETY: reads this thread's last error.
             let error = unsafe { GetLastError() };
             if error != CLASS_EXISTS {
-                return Err(format!("could not register the editor window class: {error}"));
+                return Err(format!(
+                    "could not register the editor window class: {error}"
+                ));
             }
         }
         let title = wide(identity.title);
@@ -361,10 +362,7 @@ impl Capture {
             };
             let mut info: BITMAPINFO = std::mem::zeroed();
             info.bmiHeader = BITMAPINFOHEADER {
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    reason = "the header is 40 bytes"
-                )]
+                #[allow(clippy::cast_possible_truncation, reason = "the header is 40 bytes")]
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: width,
                 // Negative: rows run top to bottom.
@@ -382,8 +380,7 @@ impl Capture {
                 ptr::null_mut(),
                 0,
             );
-            if capture.memory_dc.is_null() || capture.bitmap.is_null() || capture.bits.is_null()
-            {
+            if capture.memory_dc.is_null() || capture.bitmap.is_null() || capture.bits.is_null() {
                 return Err("could not picture editor window: no bitmap".to_owned());
             }
             capture.previous = SelectObject(capture.memory_dc, capture.bitmap);

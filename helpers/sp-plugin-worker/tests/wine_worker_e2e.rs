@@ -106,8 +106,8 @@ fn windows_plugin_scans_processes_and_opens_its_editor_under_wine() {
 
     // One private display and one prefix, like the app's.
     let display = PrivateDisplay::start().expect("start Xvfb");
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("wine-e2e-{}", std::process::id()));
+    let root =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("wine-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("prefix root");
     let mut prefix = Prefix {
         root: root.clone(),
@@ -130,8 +130,12 @@ fn windows_plugin_scans_processes_and_opens_its_editor_under_wine() {
     let discovered = discover_windows_vst3_bundles(&launcher.vst3_dirs());
     assert_eq!(discovered.len(), 1, "the prefix holds the one test bundle");
     let catalog = PluginCatalog::open(root.join("catalog.json")).expect("catalog");
-    let mut scanner = Scanner::new(root.join("no-native-scanner"), Duration::from_secs(5), catalog)
-        .with_windows_scanner(&scanner_exe, launcher.clone());
+    let mut scanner = Scanner::new(
+        root.join("no-native-scanner"),
+        Duration::from_secs(5),
+        catalog,
+    )
+    .with_windows_scanner(&scanner_exe, launcher.clone());
     scanner.set_windows_display(Some(display.environment()));
     let started = Instant::now();
     let scan = scanner
@@ -146,7 +150,10 @@ fn windows_plugin_scans_processes_and_opens_its_editor_under_wine() {
         scan.metadata.detail
     );
     let class = scan.metadata.classes.first().expect("one audio class");
-    println!("cataloged {} by {}", class.identity.name, class.identity.vendor);
+    println!(
+        "cataloged {} by {}",
+        class.identity.name, class.identity.vendor
+    );
     let bundle_path = WineEnvironment::windows_path(&scan.bundle);
 
     // Launch: the app's own launch path, through Wine, with control pipes.
@@ -222,9 +229,11 @@ fn windows_plugin_scans_processes_and_opens_its_editor_under_wine() {
     assert!(dispatcher.set_pipelined(0, true));
     let timing = SharedMemoryRegion::open(bank.name()).expect("timing mapping");
     let clock = MonotonicClock::new().unwrap();
-    let period = Duration::from_secs_f64(FRAMES as f64 / f64::from(SAMPLE_RATE));
+    let period = Duration::from_nanos(
+        u64::try_from(FRAMES).unwrap() * 1_000_000_000 / u64::from(SAMPLE_RATE),
+    );
     let input: Vec<f32> = (0..FRAMES * 2)
-        .map(|sample| ((sample / 2) as f32 * 0.05).sin() * 0.5)
+        .map(|sample| (f32::from(u16::try_from(sample / 2).unwrap()) * 0.05).sin() * 0.5)
         .collect();
     let mut round_trips = Vec::with_capacity(BLOCKS);
     let mut processing = Vec::with_capacity(BLOCKS);

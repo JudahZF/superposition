@@ -160,7 +160,10 @@ pub struct EditorPreviewPoll {
     pub png: Option<Vec<u8>>,
 }
 
-type PendingRequest = Receiver<(PipeControlClient, Result<ControlResponse, WorkerControlError>)>;
+type PendingRequest = Receiver<(
+    PipeControlClient,
+    Result<ControlResponse, WorkerControlError>,
+)>;
 
 /// Bounded, version-aware client for one rack worker's control pipes.
 pub struct WorkerControlClient {

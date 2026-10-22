@@ -286,10 +286,7 @@ fn probe_bundle_executable(path: &Path) -> Result<(String, Vst3Architecture), Vs
             .iter()
             .find_map(|folder| bundle_binary(&contents.join(folder), named, "vst3"))
             .ok_or_else(|| {
-                Vst3BundleError::invalid(format!(
-                    "missing DLL in {}/*-win",
-                    contents.display()
-                ))
+                Vst3BundleError::invalid(format!("missing DLL in {}/*-win", contents.display()))
             })?
     };
     // The PE header offset sits in the DOS header; real DLLs place the header well inside this.
@@ -515,8 +512,7 @@ pub mod native;
 mod tests {
     use super::{
         FakeVst3Inspector, Vst3Architecture, Vst3BundlePath, Vst3Inspector, probe_elf_architecture,
-        probe_pe_architecture,
-        probe_macho_architecture,
+        probe_macho_architecture, probe_pe_architecture,
     };
 
     #[test]
@@ -639,7 +635,10 @@ mod tests {
         };
         assert_eq!(probe_pe_architecture(&pe(0x8664)), Vst3Architecture::X86_64);
         assert_eq!(probe_pe_architecture(&pe(0xaa64)), Vst3Architecture::Arm64);
-        assert_eq!(probe_pe_architecture(&pe(0x014c)), Vst3Architecture::Unknown);
+        assert_eq!(
+            probe_pe_architecture(&pe(0x014c)),
+            Vst3Architecture::Unknown
+        );
         assert_eq!(
             probe_pe_architecture(&pe(0x8664)[..0x44]),
             Vst3Architecture::Unknown

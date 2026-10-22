@@ -79,4 +79,3 @@ pub fn assert_editor_window_identity(display: &sp_supervisor::PrivateDisplay, wo
         "no top-level window carries the worker's PID, rack 0, slot 0, and its title"
     );
 }
-

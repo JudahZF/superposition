@@ -66,12 +66,12 @@ use sp_vst3::{
     sdk::HostSdkRackAdapter,
 };
 
+#[cfg(all(feature = "sdk", any(target_os = "linux", windows)))]
+use sp_vst3::EditorWindowIdentity;
 #[cfg(all(feature = "sdk", target_os = "macos"))]
 use sp_vst3::editor_window::MacOsEditorWindow as EditorWindow;
 #[cfg(feature = "sdk")]
 use sp_vst3::sdk::SdkPlugin;
-#[cfg(all(feature = "sdk", any(target_os = "linux", windows)))]
-use sp_vst3::EditorWindowIdentity;
 #[cfg(all(feature = "sdk", windows))]
 use sp_vst3::win32_editor_window::Win32EditorWindow as EditorWindow;
 #[cfg(all(feature = "sdk", target_os = "linux"))]
@@ -639,10 +639,16 @@ const EDITOR_RUN_LOOP_INTERVAL: Duration = Duration::from_millis(2);
 #[cfg(all(feature = "sdk", target_os = "macos"))]
 const EDITOR_CLOSE_PUMP: Duration = Duration::from_millis(500);
 /// An editor is pictured this long after it opens or a parameter changes, once it has painted.
-#[cfg(all(feature = "sdk", any(target_os = "macos", target_os = "linux", windows)))]
+#[cfg(all(
+    feature = "sdk",
+    any(target_os = "macos", target_os = "linux", windows)
+))]
 const EDITOR_PREVIEW_SETTLE: Duration = Duration::from_millis(500);
 /// While parameters keep changing, an open editor is pictured at most this often.
-#[cfg(all(feature = "sdk", any(target_os = "macos", target_os = "linux", windows)))]
+#[cfg(all(
+    feature = "sdk",
+    any(target_os = "macos", target_os = "linux", windows)
+))]
 const EDITOR_PREVIEW_INTERVAL: Duration = Duration::from_secs(2);
 /// A loading thread without a loop pass for this long is held by plug-in code, such as a modal
 /// dialog or menu. Picture polls are refused then instead of waiting past the host's deadline.
@@ -722,7 +728,10 @@ struct EditorHost {
 }
 
 /// An open editor window and when it is next pictured.
-#[cfg(all(feature = "sdk", any(target_os = "macos", target_os = "linux", windows)))]
+#[cfg(all(
+    feature = "sdk",
+    any(target_os = "macos", target_os = "linux", windows)
+))]
 struct OpenEditor {
     window: EditorWindow,
     /// When to picture the editor next; `None` until a parameter changes.
@@ -730,7 +739,10 @@ struct OpenEditor {
     pictured_at: Option<Instant>,
 }
 
-#[cfg(all(feature = "sdk", any(target_os = "macos", target_os = "linux", windows)))]
+#[cfg(all(
+    feature = "sdk",
+    any(target_os = "macos", target_os = "linux", windows)
+))]
 impl OpenEditor {
     /// Schedules a picture once the editor has repainted, and no sooner than
     /// [`EDITOR_PREVIEW_INTERVAL`] after the last one.
@@ -745,7 +757,10 @@ impl OpenEditor {
 }
 
 /// A PNG picture of a slot's editor, numbered in capture order across the worker.
-#[cfg(all(feature = "sdk", any(target_os = "macos", target_os = "linux", windows)))]
+#[cfg(all(
+    feature = "sdk",
+    any(target_os = "macos", target_os = "linux", windows)
+))]
 struct EditorPreview {
     sequence: u64,
     captured_at_unix_ms: u64,
@@ -756,7 +771,10 @@ struct EditorPreview {
 impl EditorHost {
     #[cfg_attr(
         not(any(target_os = "linux", windows)),
-        expect(unused_variables, reason = "only X11 and Win32 windows carry their rack index")
+        expect(
+            unused_variables,
+            reason = "only X11 and Win32 windows carry their rack index"
+        )
     )]
     fn new(rack_index: u8, sample_rate: u32) -> Self {
         Self {
@@ -1287,14 +1305,9 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
         pipe_endpoint
             .set_request_wake(&configuration.bank_name)
             .map_err(|error| error.to_string())?;
-        let control_thread = ControlThread::spawn(
-            requests,
-            responses,
-            target,
-            pipe_endpoint,
-            CONTROL_TIMEOUT,
-        )
-        .map_err(|error| error.to_string())?;
+        let control_thread =
+            ControlThread::spawn(requests, responses, target, pipe_endpoint, CONTROL_TIMEOUT)
+                .map_err(|error| error.to_string())?;
         // Product workers stop on the authenticated control shutdown request, or when the host
         // closes the control channel.
         let shutdown_requested = Arc::new(AtomicBool::new(false));

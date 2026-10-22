@@ -138,8 +138,14 @@ impl ControlThread {
         let join = thread::Builder::new()
             .name("sp-worker-control".to_owned())
             .spawn(move || {
-                let result =
-                    control_loop(&frames, responses, target, mailbox, timeout, &thread_shutdown);
+                let result = control_loop(
+                    &frames,
+                    responses,
+                    target,
+                    mailbox,
+                    timeout,
+                    &thread_shutdown,
+                );
                 thread_shutdown.store(true, Ordering::Release);
                 result
             })?;
@@ -313,8 +319,7 @@ mod tests {
     fn full_mailbox_returns_busy_without_losing_the_processing_endpoint() {
         let (mut pipe, mut processing) = control_mailbox();
         for request_id in 1..=u64::try_from(MAX_PENDING_CONTROL_REQUESTS).expect("capacity") {
-            pipe
-                .commands
+            pipe.commands
                 .push(
                     ControlRequest::new(
                         ControlRequestId::new(request_id).expect("request ID"),
@@ -328,8 +333,7 @@ mod tests {
                 .expect("fixed queue accepts capacity entries");
         }
         assert!(
-            pipe
-                .commands
+            pipe.commands
                 .push(
                     ControlRequest::new(
                         ControlRequestId::new(99).expect("request ID"),

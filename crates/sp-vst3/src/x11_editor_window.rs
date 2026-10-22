@@ -450,7 +450,6 @@ fn pixels_from_zpixmap(
     Ok(Pixels { width, height, rgb })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::pixels_from_zpixmap;
@@ -465,5 +464,4 @@ mod tests {
         }
         assert!(pixels_from_zpixmap(&little[..3], 1, 1, true).is_err());
     }
-
 }

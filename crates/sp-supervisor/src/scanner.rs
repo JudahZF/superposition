@@ -153,7 +153,11 @@ impl Scanner {
     /// Also scans Windows bundles in `wine`'s VST3 folders, with `executable` (the Windows build
     /// of the scanner) under Wine. The caller keeps the prefix prepared while it scans.
     #[must_use]
-    pub fn with_windows_scanner(mut self, executable: impl Into<PathBuf>, wine: WineLauncher) -> Self {
+    pub fn with_windows_scanner(
+        mut self,
+        executable: impl Into<PathBuf>,
+        wine: WineLauncher,
+    ) -> Self {
         self.windows = Some(WindowsScanner {
             executable: executable.into(),
             wine,
@@ -254,7 +258,11 @@ impl Scanner {
             .into_iter()
             .map(|bundle| (bundle, PluginPlatform::Native));
         native
-            .chain(windows.into_iter().map(|bundle| (bundle, PluginPlatform::Windows)))
+            .chain(
+                windows
+                    .into_iter()
+                    .map(|bundle| (bundle, PluginPlatform::Windows)),
+            )
             .map(|(bundle, platform)| self.scan_inner(&bundle, platform, false))
             .collect()
     }
@@ -965,7 +973,11 @@ mod tests {
         assert_eq!(scan.platform, PluginPlatform::Windows);
         assert_eq!(scan.outcome(), PluginScanOutcome::Crashed);
         assert!(
-            scan.metadata.detail.as_deref().unwrap_or_default().contains("code 3"),
+            scan.metadata
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("code 3"),
             "the scanner received a Z: path: {:?}",
             scan.metadata.detail
         );
