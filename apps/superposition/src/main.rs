@@ -2042,8 +2042,8 @@ impl ProductRuntime {
 
     /// Applies `edit` to the running worker of `rack_index`, whose model is now `rack`. Other
     /// slots keep processing throughout. Returns `false` when the edit needs a rebuilt worker
-    /// instead: the rack has no running worker, has a missing plug-in, became empty, or the
-    /// worker rejected the edit.
+    /// instead: the rack has no running worker, has a missing plug-in, became empty, is or
+    /// becomes a mixed rack, or the worker rejected the edit.
     ///
     /// # Errors
     /// Returns an error, changing nothing, while [`Self::publish_live_topology`] would refuse
