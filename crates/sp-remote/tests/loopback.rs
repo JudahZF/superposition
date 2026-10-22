@@ -180,6 +180,23 @@ fn pairing_frames_input_pins_and_takeover() {
     assert_eq!(engine.presses, 1, "a viewer's input is ignored");
     assert_eq!(engine.server.clients().len(), 2);
 
+    // A client that lost its pins must see the engine prove the code again, even though the
+    // engine still trusts it.
+    drop(tablet);
+    std::fs::remove_file(tablet_state.join("trusted.json")).unwrap();
+    let no_code = client(&tablet_state, &engine, Role::Viewer, None);
+    until(&mut engine, "lost pin needs a code", |_| {
+        closed(&no_code).is_some()
+    });
+    let code = engine.server.open_pairing(Duration::from_mins(1));
+    let tablet = client(&tablet_state, &engine, Role::Viewer, Some(code));
+    until(&mut engine, "re-paired", |_| connected(&tablet).is_some());
+    assert_eq!(
+        engine.server.pairing_code(),
+        None,
+        "the re-pairing used the code"
+    );
+
     for path in [engine_state, laptop_state, tablet_state] {
         std::fs::remove_dir_all(path).unwrap();
     }

@@ -314,6 +314,7 @@ async fn serve_client(incoming: quinn::Incoming, shared: Arc<Shared>) -> Result<
         version,
         name,
         role,
+        pair: requested_pairing,
     }) = read_control(&mut receive).await?
     else {
         return Err(RemoteError::Protocol("expected Hello"));
@@ -325,7 +326,9 @@ async fn serve_client(incoming: quinn::Incoming, shared: Arc<Shared>) -> Result<
         return Ok(());
     }
     let known = shared.state().trust.client(fingerprint).is_some();
-    if !known && !pair(&shared, &mut send, &mut receive, fingerprint, &name).await? {
+    if (!known || requested_pairing)
+        && !pair(&shared, &mut send, &mut receive, fingerprint, &name).await?
+    {
         return Ok(());
     }
 

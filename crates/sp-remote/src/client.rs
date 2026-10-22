@@ -196,12 +196,13 @@ async fn run(
     mut messages: mpsc::UnboundedReceiver<ClientMessage>,
 ) -> Result<String, RemoteError> {
     let address = config.server.to_string();
-    let pinned = trust.server(&address).map(|peer| peer.fingerprint);
-    let expected = if config.pairing_code.is_some() {
-        None
-    } else {
-        Some(pinned.ok_or(RemoteError::NotPaired)?)
-    };
+    // A known engine is always held to its pin. An unknown one must prove the pairing code:
+    // TLS then accepts any certificate, and SPAKE2 binds the one presented.
+    let expected = trust.server(&address).map(|peer| peer.fingerprint);
+    let pair = expected.is_none();
+    if pair && config.pairing_code.is_none() {
+        return Err(RemoteError::NotPaired);
+    }
     let bind: SocketAddr = if config.server.is_ipv4() {
         ([0, 0, 0, 0], 0).into()
     } else {
@@ -220,10 +221,14 @@ async fn run(
         version: PROTOCOL_VERSION,
         name: config.name,
         role: config.role,
+        pair,
     };
     write_control(&mut send, &hello).await?;
 
     let mut reply: Option<ServerMessage> = read_control(&mut receive).await?;
+    if pair && matches!(reply, Some(ServerMessage::Welcome { .. })) {
+        return Err(RemoteError::PairingSkipped);
+    }
     if matches!(reply, Some(ServerMessage::PairingRequired)) {
         let Some(code) = config.pairing_code.as_deref() else {
             return Err(RemoteError::NotPaired);

@@ -30,6 +30,9 @@ pub(crate) enum ClientMessage {
         version: u32,
         name: String,
         role: Role,
+        /// The client has no pin for this engine and requires it to prove the pairing code,
+        /// even if the engine already trusts the client.
+        pair: bool,
     },
     /// SPAKE2 side A, when the client has a pairing code.
     PairStart { spake: Vec<u8> },

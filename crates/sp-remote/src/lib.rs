@@ -66,6 +66,9 @@ pub enum RemoteError {
     /// The engine did not prove knowledge of the pairing code.
     #[error("pairing failed: the engine did not confirm the code")]
     PairingFailed,
+    /// An engine this client has no pin for accepted it without pairing.
+    #[error("the engine accepted this client without proving the pairing code; refused")]
+    PairingSkipped,
 }
 
 impl From<rustls::Error> for RemoteError {
