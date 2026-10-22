@@ -94,10 +94,11 @@
               NIX_CFLAGS_LINK = "";
               LD_LIBRARY_PATH = lib.makeLibraryPath runtimeLibs;
               SUPERPOSITION_WINE = "${wine}/bin/wine";
-              SUPERPOSITION_WINE_PREFIX_DIR = "${wine}";
+              SUPERPOSITION_WINE_ROOT = "${wine}";
               # The mingw wrapper is referenced, not added to `packages`: its setup hook would
               # replace the host linker flags and link Linux binaries against the wrong glibc.
               SUPERPOSITION_MINGW_CC = "${mingw.stdenv.cc}/bin/x86_64-w64-mingw32-gcc";
+              SUPERPOSITION_MINGW_LIB_DIRS = "${mingw.windows.pthreads}/lib:${mingw.windows.mcfgthreads}/lib";
               CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${mingw.stdenv.cc}/bin/x86_64-w64-mingw32-gcc";
               CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-L native=${mingw.windows.pthreads}/lib -L native=${mingw.windows.mcfgthreads}/lib";
             };
