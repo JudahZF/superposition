@@ -35,7 +35,10 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [dev-dependencies]
+sp-audio-io = { path = "../../crates/sp-audio-io" }
+sp-engine = { path = "../../crates/sp-engine" }
 sp-supervisor = { path = "../../crates/sp-supervisor" }
+sp-wine = { path = "../../crates/sp-wine" }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 png = "0.18.1"

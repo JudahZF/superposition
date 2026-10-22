@@ -36,6 +36,9 @@ use sp_protocol::{
     },
 };
 use sp_shared_memory_os::{MonotonicClock, SharedMemoryRegion};
+
+#[cfg(target_os = "linux")]
+mod common;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use sp_supervisor::EditorPreviewPoll;
 use sp_supervisor::{PluginCatalog, Scanner, WorkerControlClient};
@@ -807,7 +810,7 @@ fn native_editor_renders_on_the_private_display_while_audio_runs() {
             .expect("audio block while the editor is open");
         assert!(output.iter().all(|sample| sample.is_finite()));
     }
-    assert_editor_window_identity(&display, harness.child.id());
+    common::assert_editor_window_identity(&display, harness.child.id());
     resize_and_close_editor(&mut harness, slot, &opened);
     harness.shutdown().expect("clean shutdown");
 }
@@ -897,70 +900,6 @@ fn assert_painted(png: &[u8]) {
     assert!(
         pixels.chunks_exact(3).any(|pixel| pixel != first),
         "the editor picture is one flat colour; the plug-in did not draw"
-    );
-}
-
-/// Finds the worker's editor window on the private display and checks the properties the
-/// window streamer uses: the owning process, rack, and slot.
-#[cfg(target_os = "linux")]
-fn assert_editor_window_identity(display: &sp_supervisor::PrivateDisplay, worker: u32) {
-    use xcb::x;
-
-    let authority = std::fs::read(display.authority()).expect("read display authority");
-    let cookie = std::str::from_utf8(&authority[authority.len() - 16..]).expect("text cookie");
-    let (connection, screen) = xcb::Connection::connect_to_display_with_auth_info(
-        Some(&display.name()),
-        xcb::AuthInfo {
-            name: "MIT-MAGIC-COOKIE-1",
-            data: cookie,
-        },
-    )
-    .expect("connect to the private display");
-    let root = connection
-        .get_setup()
-        .roots()
-        .nth(usize::try_from(screen).expect("screen index"))
-        .expect("screen")
-        .root();
-    let atom = |name: &str| {
-        connection
-            .wait_for_reply(connection.send_request(&x::InternAtom {
-                only_if_exists: false,
-                name: name.as_bytes(),
-            }))
-            .expect("intern atom")
-            .atom()
-    };
-    let (pid, rack, slot) = (
-        atom("_NET_WM_PID"),
-        atom("_SUPERPOSITION_RACK"),
-        atom("_SUPERPOSITION_SLOT"),
-    );
-    let cardinal = |window, property| {
-        connection
-            .wait_for_reply(connection.send_request(&x::GetProperty {
-                delete: false,
-                window,
-                property,
-                r#type: x::ATOM_CARDINAL,
-                long_offset: 0,
-                long_length: 1,
-            }))
-            .expect("read window property")
-            .value::<u32>()
-            .first()
-            .copied()
-    };
-    let windows = connection
-        .wait_for_reply(connection.send_request(&x::QueryTree { window: root }))
-        .expect("list top-level windows");
-    assert!(
-        windows.children().iter().any(|&window| {
-            cardinal(window, pid) == Some(worker)
-                && cardinal(window, rack) == Some(0)
-                && cardinal(window, slot) == Some(0)
-        }),
-        "no top-level window carries the worker's PID, rack 0, and slot 0"
     );
 }
 
