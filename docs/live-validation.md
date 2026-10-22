@@ -71,7 +71,7 @@ A test that publishes a planned-restart request from the Windows plug-in in that
 under the product renderer, saw the rack reload live: all three segment workers were replaced,
 and the rack processed on.
 
-### Real-time rig: 30 minutes at 64 frames (22 October 2026)
+### Real-time rig: 30-minute runs (22 October 2026)
 
 Setup:
 - A private PipeWire 1.6 daemon (its own runtime directory, never the desktop's), 48 kHz.
@@ -80,14 +80,15 @@ Setup:
 - The session has a native Dragonfly rack and a Linux → Wine (Surge XT Effects) → Linux rack.
 - The kernel is the stock NixOS desktop kernel (`PREEMPT_DYNAMIC`, no `threadirqs`, no CPU
   isolation). `RLIMIT_RTPRIO` is 0, so real-time priority comes from rtkit, at `SCHED_RR` 20.
-- Release build: `superposition --headless … --frames 64 --duration-seconds 1800`.
+- Release build: `superposition --headless … --frames <N> --duration-seconds 1800`.
 
-| Run | Real-time threads | Rack 1 misses | Rack 2 misses | Recoveries | Longest wake |
-| --- | --- | ---: | ---: | --- | ---: |
-| 1 | workers only (JACK callback and Wine worker at ordinary priority); other sessions compiling, load about 6 | 14 | 2 | 3 worker replacements, 4 segment bypasses | 5.9 ms |
-| 2 | JACK callback, three native workers, Wine worker; load under 1 | 8 | 2 | 1 worker replacement, 5 segment bypasses | 0.10 ms |
+| Run | Block | Real-time threads | Rack 1 misses | Rack 2 misses | Recoveries | Longest wake |
+| --- | ---: | --- | ---: | ---: | --- | ---: |
+| 1 | 64 | workers only (JACK callback and Wine worker at ordinary priority); other sessions compiling, load about 6 | 14 | 2 | 3 worker replacements, 4 segment bypasses | 5.9 ms |
+| 2 | 64 | JACK callback, three native workers, Wine worker; load under 1 | 8 | 2 | 1 worker replacement, 5 segment bypasses | 0.10 ms |
+| 3 | 128 | as run 2 | 0 | 0 | none | 0.01 ms |
 
-Each rack completed about 1.35 million blocks per run. In run 2, every miss was `unclaimed`: the
+Each rack completed about 1.35 million blocks in runs 1 and 2, and 675 000 in run 3. In run 2, every miss was `unclaimed`: the
 worker was woken but not scheduled within the 1 ms deadline, even at real-time priority. That is
 the stock kernel's scheduling latency, not the protocol. The NixOS module now boots hosts with
 `preempt=full threadirqs`; that change has not been measured, because this machine was not
@@ -125,6 +126,9 @@ the same results:
   and ran 20 s: 7 500 blocks, 0 deadline misses.
 - A session with a Windows Surge XT Effects rack ran 20 s under the bundled Wine: 7 499 blocks,
   0 deadline misses.
+- The containers have no real-time priority and no system bus. Of 9 repeated 20 s runs of the
+  native session from the final tarball, 7 had 0 misses; 2 had a few misses early in the run,
+  each followed by worker replacements and several seconds of dry fallback.
 
 On `debian:bookworm` (glibc 2.36) both packages started, listed devices, and scanned, but
 Debian 12 ships no VST3 plug-ins, and Nix-built ones need a newer `libstdc++`. These are
