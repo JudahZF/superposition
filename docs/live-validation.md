@@ -71,6 +71,45 @@ A test that publishes a planned-restart request from the Windows plug-in in that
 under the product renderer, saw the rack reload live: all three segment workers were replaced,
 and the rack processed on.
 
+### Real-time rig: 30 minutes at 64 frames (22 October 2026)
+
+Setup:
+- A private PipeWire 1.6 daemon (its own runtime directory, never the desktop's), 48 kHz.
+- A null sink and a `pw-cat` sine source, both marked as physical ports.
+- The app joins through PipeWire's JACK library as `jack:default`.
+- The session has a native Dragonfly rack and a Linux → Wine (Surge XT Effects) → Linux rack.
+- The kernel is the stock NixOS desktop kernel (`PREEMPT_DYNAMIC`, no `threadirqs`, no CPU
+  isolation). `RLIMIT_RTPRIO` is 0, so real-time priority comes from rtkit, at `SCHED_RR` 20.
+- Release build: `superposition --headless … --frames 64 --duration-seconds 1800`.
+
+| Run | Real-time threads | Rack 1 misses | Rack 2 misses | Recoveries | Longest wake |
+| --- | --- | ---: | ---: | --- | ---: |
+| 1 | workers only (JACK callback and Wine worker at ordinary priority); other sessions compiling, load about 6 | 14 | 2 | 3 worker replacements, 4 segment bypasses | 5.9 ms |
+| 2 | JACK callback, three native workers, Wine worker; load under 1 | 8 | 2 | 1 worker replacement, 5 segment bypasses | 0.10 ms |
+
+Each rack completed about 1.35 million blocks per run. In run 2, every miss was `unclaimed`: the
+worker was woken but not scheduled within the 1 ms deadline, even at real-time priority. That is
+the stock kernel's scheduling latency, not the protocol. The NixOS module now boots hosts with
+`preempt=full threadirqs`; that change has not been measured, because this machine was not
+rebooted. Zero misses at 64 frames for 30 minutes is not shown on this machine.
+
+Run 1 found two real faults, both fixed before run 2:
+- The first rtkit fallback asked rtkit inside the first block. That D-Bus call missed the
+  deadline, and so did every replacement worker.
+- PipeWire's JACK library logged an rtkit grant for its callback thread that never reached rtkit.
+  The JACK endpoint now asks rtkit for that thread itself, and the host does the same for Wine
+  workers.
+
+At 96 kHz on the same rig, 60 s per block size:
+
+| Block | Deadline | Rack 1 misses | Rack 2 misses |
+| ---: | ---: | ---: | ---: |
+| 128 | 1.0 ms | 0 | 0 |
+| 64 | 0.5 ms | 3 | 0 |
+| 32 | 0.25 ms | 8 | 2 |
+
+On this kernel, the smallest safe block at 96 kHz is 128 frames.
+
 ### Linux packages on Debian (22 October 2026)
 
 `cargo xtask bundle-linux` output ran in clean `debian:trixie` containers (glibc 2.41) with
