@@ -29,9 +29,11 @@ use sp_session::SessionController;
 use crate::{ProductRuntime, default_application_support, default_session_root, ui};
 
 const PAIRING_LIFETIME: Duration = Duration::from_mins(10);
-/// Frame interval while a client is connected, and while idle (the engine keeps polling).
+/// The shortest frame interval, and the longest (the engine keeps polling workers and audio).
 const ACTIVE_FRAME: Duration = Duration::from_millis(16);
-const IDLE_FRAME: Duration = Duration::from_millis(100);
+const IDLE_FRAME: Duration = Duration::from_millis(250);
+/// How often an idle server checks for client input.
+const INPUT_POLL: Duration = Duration::from_millis(4);
 /// The served window size before a controller connects.
 const DEFAULT_SCREEN: egui::Vec2 = egui::vec2(1180.0, 720.0);
 
@@ -116,8 +118,15 @@ fn serve(arguments: &[String]) -> Result<(), String> {
     let started = Instant::now();
     let mut screen = egui::Rect::from_min_size(egui::Pos2::ZERO, DEFAULT_SCREEN);
     let mut viewports = egui::ViewportIdMap::default();
+    let mut next_frame = Instant::now();
     while !stop.load(Ordering::Relaxed) {
-        let mut input = server.take_input().unwrap_or_default();
+        let input = server.take_input();
+        // Render only for input or when the UI asked to repaint (meters, timers, polling).
+        if input.is_none() && Instant::now() < next_frame {
+            std::thread::sleep(INPUT_POLL);
+            continue;
+        }
+        let mut input = input.unwrap_or_default();
         // Between controller inputs, keep laying out for the controller's last window.
         match input.screen_rect {
             Some(rect) => screen = rect,
@@ -135,12 +144,7 @@ fn serve(arguments: &[String]) -> Result<(), String> {
             .viewport_output
             .get(&egui::ViewportId::ROOT)
             .map_or(IDLE_FRAME, |viewport| viewport.repaint_delay);
-        let idle = if server.clients().is_empty() {
-            IDLE_FRAME
-        } else {
-            ACTIVE_FRAME
-        };
-        std::thread::sleep(repaint.clamp(ACTIVE_FRAME, idle));
+        next_frame = Instant::now() + repaint.clamp(ACTIVE_FRAME, IDLE_FRAME);
     }
     eframe::App::on_exit(&mut app, None);
     Ok(())

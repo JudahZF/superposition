@@ -11,6 +11,8 @@ use crate::{RemoteClient, protocol::WireMesh};
 pub struct RemoteView {
     textures: HashMap<TextureId, TextureHandle>,
     meshes: Vec<WireMesh>,
+    /// The window size and scale last sent; input without events is sent only when they change.
+    sent_layout: Option<(Option<egui::Rect>, Option<f32>)>,
 }
 
 impl Default for RemoteView {
@@ -26,6 +28,7 @@ impl RemoteView {
         Self {
             textures: HashMap::new(),
             meshes: Vec::new(),
+            sent_layout: None,
         }
     }
 
@@ -35,7 +38,13 @@ impl RemoteView {
     /// The engine lays out for the window size and scale in this input, so both sides agree on
     /// coordinates.
     pub fn show(&mut self, ctx: &Context, client: &RemoteClient) {
-        client.send_input(ctx.input(|input| input.raw.clone()));
+        let input = ctx.input(|input| input.raw.clone());
+        let layout = (input.screen_rect, input.viewport().native_pixels_per_point);
+        // Idle frames send nothing, so an idle engine renders nothing.
+        if !input.events.is_empty() || self.sent_layout != Some(layout) {
+            self.sent_layout = Some(layout);
+            client.send_input(input);
+        }
         let (textures, frame) = client.take_received();
         for delta in textures {
             for (id, change) in delta.set {
