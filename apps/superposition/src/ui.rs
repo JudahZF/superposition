@@ -9,7 +9,7 @@ mod previews;
 mod scenes;
 mod setup;
 mod show;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod streamed;
 mod style;
 #[cfg(target_os = "linux")]
@@ -253,8 +253,9 @@ pub struct LiveRackApp {
     midi_learn_target: Option<MidiMappingTarget>,
     #[cfg(audio_backend)]
     telemetry: Option<std::sync::Arc<ProductTelemetry>>,
-    /// Linux: plug-in editors and Windows programs from the engine's private display.
-    #[cfg(target_os = "linux")]
+    /// Plug-in editors and Windows programs from the engine's private display (Linux), or the
+    /// workers' streamed editor windows while remote clients watch (macOS `--serve`).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     streamed: Option<streamed::StreamedWindows>,
     /// Linux: the Tunnel device settings being edited.
     #[cfg(target_os = "linux")]
@@ -314,7 +315,13 @@ impl LiveRackApp {
             .as_ref()
             .ok()
             .and_then(ProductRuntime::window_stream_socket)
-            .map(streamed::StreamedWindows::new);
+            .map(streamed::StreamedWindows::from_streamer);
+        #[cfg(target_os = "macos")]
+        let streamed = product
+            .as_ref()
+            .ok()
+            .and_then(ProductRuntime::editor_stream_listener)
+            .map(streamed::StreamedWindows::from_workers);
         let status_line = if controller.document().model.racks.is_empty() {
             "No session yet".to_owned()
         } else {
@@ -391,7 +398,7 @@ impl LiveRackApp {
             midi_learn_target: None,
             #[cfg(audio_backend)]
             telemetry: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             streamed,
             #[cfg(target_os = "linux")]
             tunnel_settings: tunnel::TunnelSettings::load(),
@@ -2379,8 +2386,8 @@ impl LiveRackApp {
         true
     }
 
-    /// Linux: draws streamed windows and closes editors the user closed there.
-    #[cfg(target_os = "linux")]
+    /// Draws streamed windows and closes editors the user closed there.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn show_streamed_windows(&mut self, ctx: &egui::Context) {
         let running = self.online();
         let Some(streamed) = self.streamed.as_mut() else {
@@ -2397,6 +2404,14 @@ impl LiveRackApp {
                     }
                 }
             }
+        }
+    }
+
+    /// macOS `--serve`: workers stream their editors only while a remote client watches.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_remote_watched(&mut self, watched: bool) {
+        if let Some(streamed) = self.streamed.as_mut() {
+            streamed.set_watched(watched);
         }
     }
 
@@ -2424,7 +2439,7 @@ impl LiveRackApp {
     fn handle_keys(&mut self, ctx: &egui::Context) {
         use egui::{Key, Modifiers};
         // Keys typed into a streamed editor or installer belong to it, not to app shortcuts.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if self
             .streamed
             .as_ref()
@@ -2685,7 +2700,7 @@ impl LiveRackApp {
             self.update_meters();
         }
         self.poll_previews(ctx);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.show_streamed_windows(ctx);
         self.autosave_if_due(Instant::now());
         ctx.request_repaint_after(

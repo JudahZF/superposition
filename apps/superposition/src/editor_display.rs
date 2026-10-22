@@ -1,22 +1,32 @@
-//! Linux: the engine-owned display that plug-in editors and Windows programs draw on.
+//! Where plug-in editors draw, and how the UI receives them as streamed windows.
 //!
-//! The engine starts a private Xvfb server and `sp-window-streamer` on it. Workers and Wine get the
-//! display through their environment; the UI reads the streamer's socket. Neither reaches the
-//! user's desktop.
+//! Linux: the engine starts a private Xvfb server and `sp-window-streamer` on it. Workers and Wine
+//! get the display through their environment; the UI reads the streamer's socket. Neither reaches
+//! the user's desktop.
+//!
+//! macOS: editors stay native windows of their workers. When the engine serves remote clients, it
+//! also listens on a socket that each worker connects to and streams its own editor windows over,
+//! with the same protocol. The UI accepts those connections.
 
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::{fs, os::unix::fs::PermissionsExt, os::unix::net::UnixListener};
+#[cfg(target_os = "linux")]
 use std::{
     io::{BufRead, BufReader},
-    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::mpsc,
     time::Duration,
 };
 
+#[cfg(target_os = "linux")]
 use sp_supervisor::{DisplayEnvironment, PrivateDisplay};
 
+#[cfg(target_os = "linux")]
 const STREAMER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The private display and its streamer.
+#[cfg(target_os = "linux")]
 pub(crate) struct EditorDisplay {
     display: PrivateDisplay,
     streamer_binary: PathBuf,
@@ -24,6 +34,7 @@ pub(crate) struct EditorDisplay {
     socket: PathBuf,
 }
 
+#[cfg(target_os = "linux")]
 impl EditorDisplay {
     /// Starts Xvfb, then the streamer listening at `<runtime_dir>/windows.sock`.
     pub(crate) fn start(streamer_binary: &Path, runtime_dir: &Path) -> Result<Self, String> {
@@ -66,6 +77,7 @@ impl EditorDisplay {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for EditorDisplay {
     fn drop(&mut self) {
         // Closing stdin stops the streamer; kill covers a hung one.
@@ -76,6 +88,7 @@ impl Drop for EditorDisplay {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn start_streamer(binary: &Path, display: &PrivateDisplay, socket: &Path) -> Result<Child, String> {
     let _ = std::fs::remove_file(socket);
     let mut streamer = Command::new(binary)
@@ -118,4 +131,55 @@ pub(crate) fn runtime_dir() -> Result<PathBuf, String> {
     )
     .map_err(|error| format!("cannot secure {}: {error}", directory.display()))?;
     Ok(directory)
+}
+
+/// macOS: the socket that workers stream their editor windows to, mode 0600 in [`runtime_dir`].
+#[cfg(target_os = "macos")]
+pub(crate) struct EditorStreamSocket {
+    path: PathBuf,
+    listener: UnixListener,
+}
+
+#[cfg(target_os = "macos")]
+impl EditorStreamSocket {
+    fn bind(runtime_dir: &Path) -> Result<Self, String> {
+        let path = runtime_dir.join("editors.sock");
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path)
+            .map_err(|error| format!("cannot listen on {}: {error}", path.display()))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("cannot secure {}: {error}", path.display()))?;
+        Ok(Self { path, listener })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for EditorStreamSocket {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl crate::ProductRuntime {
+    /// macOS: workers launched from now on stream their editor windows to the UI, which shows
+    /// them to remote clients. Only `--serve` calls this, so local use keeps native windows only.
+    pub(crate) fn stream_editors(&mut self) {
+        match runtime_dir().and_then(|directory| EditorStreamSocket::bind(&directory)) {
+            Ok(socket) => {
+                self.processes.set_editor_stream(Some(socket.path.clone()));
+                self.editor_stream = Some(socket);
+            }
+            Err(error) => self.note(format!(
+                "plug-in editors will not stream to remote clients: {error}"
+            )),
+        }
+    }
+
+    /// macOS: the editor-stream socket, for the UI to accept workers on.
+    pub(crate) fn editor_stream_listener(&self) -> Option<UnixListener> {
+        self.editor_stream
+            .as_ref()
+            .and_then(|socket| socket.listener.try_clone().ok())
+    }
 }

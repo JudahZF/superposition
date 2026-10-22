@@ -3,7 +3,7 @@
 //! All plug-in discovery and hosting is driven from this process, but all third-party code stays
 //! in the scanner or one retained worker process per rack.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod editor_display;
 #[cfg(audio_backend)]
 mod engine;
@@ -166,6 +166,9 @@ pub(crate) struct ProductRuntime {
     /// Linux: the private display that editors draw on, and its window streamer.
     #[cfg(target_os = "linux")]
     editor_display: Option<editor_display::EditorDisplay>,
+    /// macOS: the socket workers stream their editor windows to, while serving remote clients.
+    #[cfg(target_os = "macos")]
+    editor_stream: Option<editor_display::EditorStreamSocket>,
 }
 
 /// How one rack position is produced by a live layout change.
@@ -805,6 +808,8 @@ impl ProductRuntime {
             windows_programs: Vec::new(),
             #[cfg(target_os = "linux")]
             editor_display,
+            #[cfg(target_os = "macos")]
+            editor_stream: None,
         };
         #[cfg(target_os = "linux")]
         runtime.share_display_with_wine();
