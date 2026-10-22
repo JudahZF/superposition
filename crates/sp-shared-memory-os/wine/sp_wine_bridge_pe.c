@@ -40,3 +40,10 @@ __declspec(dllexport) int CDECL sp_wine_set_scheduler(int policy, int priority)
     WINE_UNIX_CALL(SP_WINE_SCHEDULER, &params);
     return params.result;
 }
+
+__declspec(dllexport) int CDECL sp_wine_x11_label(UINT64 window, UINT32 rack, UINT32 slot)
+{
+    struct sp_wine_x11_label_params params = { window, rack, slot, 0 };
+    WINE_UNIX_CALL(SP_WINE_X11_LABEL, &params);
+    return params.result;
+}

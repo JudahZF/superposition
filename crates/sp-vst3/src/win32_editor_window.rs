@@ -3,9 +3,11 @@
 //!
 //! The worker runs under Wine, which maps this top-level window to an X11 window on the private
 //! display in `DISPLAY`; the window streamer shows it there. Wine names the X11 window after the
-//! window title, which carries the plug-in, rack, and slot. The plug-in view is a child window
-//! (`kPlatformTypeHWND`). Windows editors run on window messages, so the loading thread calls
-//! [`pump_messages`] on every pass.
+//! window title (plug-in, rack, and slot) and sets `_NET_WM_PID`. The worker adds the
+//! `_SUPERPOSITION_RACK` and `_SUPERPOSITION_SLOT` properties that Linux editor windows carry,
+//! through `sp_wine_bridge` (PE code cannot call Xlib), so the streamer maps both kinds of window
+//! to their slot the same way. The plug-in view is a child window (`kPlatformTypeHWND`). Windows
+//! editors run on window messages, so the loading thread calls [`pump_messages`] on every pass.
 
 use std::{cell::Cell, ffi::c_void, marker::PhantomData, ptr, rc::Rc};
 
@@ -16,12 +18,16 @@ use windows_sys::Win32::{
         DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, ReleaseDC, SRCCOPY,
         SelectObject,
     },
-    System::{LibraryLoader::GetModuleHandleW, Ole::OleInitialize},
+    System::{
+        LibraryLoader::{GetModuleHandleW, GetProcAddress},
+        Ole::OleInitialize,
+    },
     UI::{
         Input::KeyboardAndMouse::SetFocus,
         WindowsAndMessaging::{
             AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-            GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, MSG, PM_REMOVE, PeekMessageW,
+            GWLP_USERDATA, GetClientRect, GetPropW, GetWindowLongPtrW, MSG, PM_REMOVE,
+            PeekMessageW,
             RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
             SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
             WM_CLOSE, WNDCLASSEXW, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
@@ -37,6 +43,8 @@ const INITIAL_SIZE: i32 = 64;
 const STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
 /// `ERROR_CLASS_ALREADY_EXISTS`: another window registered the class first.
 const CLASS_EXISTS: u32 = 1410;
+/// `sp_wine_bridge.dll`'s `int sp_wine_x11_label(uint64_t window, uint32_t rack, uint32_t slot)`.
+type X11Label = unsafe extern "C" fn(u64, u32, u32) -> i32;
 
 /// Sets up the loading thread for plug-in editors: a single-threaded COM apartment with OLE,
 /// which editors use for drag and drop and the clipboard. Call it before any plug-in loads.
@@ -69,6 +77,8 @@ pub fn pump_messages() {
 /// Top-level editor window that may only be created and operated on the worker loading thread.
 pub struct Win32EditorWindow {
     hwnd: HWND,
+    rack: u32,
+    slot: u32,
     /// Read by the window procedure through `GWLP_USERDATA` until the window is destroyed.
     state: Box<WindowState>,
     closed: Cell<bool>,
@@ -151,6 +161,8 @@ impl Win32EditorWindow {
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr::from_ref(&*state) as isize) };
         Ok(Self {
             hwnd,
+            rack: identity.rack,
+            slot: identity.slot,
             state,
             closed: Cell::new(false),
         })
@@ -201,6 +213,29 @@ impl Win32EditorWindow {
             ShowWindow(self.hwnd, SW_SHOW);
             SetForegroundWindow(self.hwnd);
             SetFocus(self.hwnd);
+        }
+        // Wine creates the X11 window by now; labelling it again is harmless.
+        self.label_x11_window();
+    }
+
+    /// Sets the rack and slot properties on Wine's X11 window for this window. Does nothing
+    /// outside Wine or without the bridge.
+    fn label_x11_window(&self) {
+        let property = wide("__wine_x11_whole_window");
+        let bridge = wide("sp_wine_bridge.dll");
+        // SAFETY: both names are NUL-terminated; the window is live. The bridge stays loaded:
+        // the worker's shared-memory backend loaded it first.
+        unsafe {
+            let window = GetPropW(self.hwnd, property.as_ptr()) as u64;
+            let module = GetModuleHandleW(bridge.as_ptr());
+            if window == 0 || module.is_null() {
+                return;
+            }
+            if let Some(label) = GetProcAddress(module, c"sp_wine_x11_label".as_ptr().cast()) {
+                let label =
+                    std::mem::transmute::<unsafe extern "system" fn() -> isize, X11Label>(label);
+                label(window, self.rack, self.slot);
+            }
         }
     }
 
