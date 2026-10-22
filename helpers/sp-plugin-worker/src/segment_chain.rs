@@ -26,6 +26,9 @@ use crate::worker_runtime::{BypassDelay, PlanarBlock, SLOT_FADE_FRAMES, WARMUP_B
 /// time to notice the completion, copy it, and complete its own request. An eighth of the block,
 /// and at least the polling slice of a waiting link plus some scheduling delay.
 const MIN_HOP_MARGIN: Duration = Duration::from_micros(250);
+/// Misses a new link forgives before the next segment is first heard: a worker's first blocks
+/// can be slow (first plug-in calls, first scheduling). Each forgiven miss plays the bypass.
+const MAX_WARMUP_MISSES: u8 = 32;
 
 /// The forwarding state of one segment's worker.
 pub struct SegmentChain {
@@ -48,6 +51,9 @@ pub struct SegmentChain {
     good_blocks: u8,
     audible: bool,
     fade_position: usize,
+    /// Misses forgiven since the last retarget; [`MAX_WARMUP_MISSES`] once the next segment
+    /// has been heard, so later misses count as failures.
+    warmup_misses: u8,
     failure_reported: bool,
 }
 
@@ -68,6 +74,7 @@ impl SegmentChain {
             good_blocks: 0,
             audible: false,
             fade_position: SLOT_FADE_FRAMES,
+            warmup_misses: 0,
             failure_reported: false,
         }
     }
@@ -86,6 +93,7 @@ impl SegmentChain {
         self.good_blocks = 0;
         self.audible = false;
         self.fade_position = SLOT_FADE_FRAMES;
+        self.warmup_misses = 0;
         self.failure_reported = false;
         Ok(())
     }
@@ -171,17 +179,32 @@ impl SegmentChain {
                 })
                 .is_some()
             && self.downstream.is_finite(channels, frames);
-        if forwarded == Forwarded::Bypass && !self.failure_reported {
-            header.chain_link_failures.fetch_add(1, Ordering::Release);
-            self.failure_reported = true;
+        if forwarded == Forwarded::Bypass {
+            if self.warmup_misses < MAX_WARMUP_MISSES {
+                self.warmup_misses += 1;
+                link.forgive();
+            } else if !self.failure_reported {
+                header.chain_link_failures.fetch_add(1, Ordering::Release);
+                self.failure_reported = true;
+            }
         }
+        self.play(slot, channels, frames, completed);
+    }
+
+    /// Writes the downstream result to the slot once it is heard, and until then (or when the
+    /// block was lost) this segment's output delayed by the latency after it.
+    fn play(&mut self, slot: &mut BlockSlot, channels: usize, frames: usize, completed: bool) {
         self.good_blocks = if completed {
             self.good_blocks.saturating_add(1).min(WARMUP_BLOCKS)
         } else {
             0
         };
         let heard = self.good_blocks >= WARMUP_BLOCKS;
-        let bypass_latency = skipped_latency + self.downstream_latency as usize;
+        if heard {
+            // Once heard, the next segment gets no more grace.
+            self.warmup_misses = MAX_WARMUP_MISSES;
+        }
+        let bypass_latency = self.skipped_latency as usize + self.downstream_latency as usize;
         self.history.read(&mut self.delayed, bypass_latency, frames);
         if heard != self.audible {
             self.audible = heard;
