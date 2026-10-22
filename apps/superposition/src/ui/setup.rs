@@ -199,6 +199,11 @@ impl LiveRackApp {
             .clicked()
             {
                 self.sample_rate_hz = rate;
+                // Racks loaded from now on start at this rate; loaded ones restart when audio
+                // starts.
+                if let Ok(product) = self.product.as_mut() {
+                    product.set_sample_rate(rate);
+                }
             }
         }
         section(
@@ -468,24 +473,28 @@ impl LiveRackApp {
             ],
             ColorToken::Hairline,
         );
-        let plugins: Vec<(String, String)> = self
+        let plugins: Vec<(String, String, bool)> = self
             .catalog_plugins
             .iter()
             .map(|plugin| {
                 (
                     plugin.descriptor.identity.name.clone(),
                     plugin.descriptor.identity.vendor.clone(),
+                    plugin.windows,
                 )
             })
             .collect();
-        for (name, vendor) in &plugins {
+        for (name, vendor, windows) in &plugins {
             table_row(
                 ui,
                 &widths,
                 &[
                     (name, ColorToken::Text),
                     (vendor, ColorToken::Text),
-                    ("OK", ColorToken::Dim),
+                    (
+                        if *windows { "OK, Windows (Wine)" } else { "OK" },
+                        ColorToken::Dim,
+                    ),
                     ("", ColorToken::Dim),
                 ],
                 ColorToken::HoverFill,
@@ -540,6 +549,51 @@ impl LiveRackApp {
             "Allow retry clears only that plug-in's failure history. Other quarantines stay unchanged.",
             ColorToken::Dim,
         );
+        if self
+            .product
+            .as_ref()
+            .is_ok_and(crate::ProductRuntime::windows_available)
+        {
+            self.draw_windows_programs(ui);
+        }
+    }
+
+    /// Runs Windows installers and licence managers in the shared Wine prefix. Their windows
+    /// appear in the editor area; a rescan then finds the plug-ins they installed.
+    fn draw_windows_programs(&mut self, ui: &mut Ui) {
+        section(ui, "Windows plug-ins");
+        note(
+            ui,
+            "Windows plug-ins run under Wine in one shared prefix, so each licence is activated once. Racks with Windows plug-ins are heard one buffer late.",
+            ColorToken::Dim,
+        );
+        ui.add_space(sp(Spacing::S8));
+        let id = ui.id().with("windows_program_path");
+        let mut path = ui.data_mut(|data| data.get_temp::<String>(id).unwrap_or_default());
+        let mut run = false;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = sp(Spacing::S20);
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut path)
+                    .hint_text("/path/to/Setup.exe or Package.msi")
+                    .desired_width(WIDE * line() * 1.5),
+            );
+            run = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            run |= action(ui, "Run Windows program…", None, !path.trim().is_empty()).clicked();
+        });
+        if run {
+            let program = std::path::PathBuf::from(path.trim());
+            match self
+                .product_mut()
+                .and_then(|product| product.run_windows_program(&program))
+            {
+                Ok(()) => self.set_status(
+                    "Windows program started; its windows appear in the editor area. Rescan plug-ins when it finishes.",
+                ),
+                Err(error) => self.set_status(&error),
+            }
+        }
+        ui.data_mut(|data| data.insert_temp(id, path));
     }
 
     #[allow(
@@ -680,6 +734,27 @@ impl LiveRackApp {
                     host_updates.join(", ")
                 ),
                 ColorToken::Warn,
+            );
+        }
+        let pipelined: Vec<String> = (0..racks.len().min(MAX_RACKS))
+            .filter(|&rack| {
+                self.product
+                    .as_ref()
+                    .is_ok_and(|product| product.rack_is_pipelined(rack))
+            })
+            .map(|rack| racks[rack].0.clone())
+            .collect();
+        if !pipelined.is_empty() {
+            let frames = self.buffer_frames_value();
+            ui.add_space(sp(Spacing::S8));
+            note(
+                ui,
+                &format!(
+                    "{} run Windows plug-ins under Wine and are heard one buffer late: +{frames} samples ({}).",
+                    pipelined.join(", "),
+                    latency_label(frames, self.sample_rate_value())
+                ),
+                ColorToken::Dim,
             );
         }
         let over_dry_limit: Vec<String> = (0..racks.len().min(MAX_RACKS))
