@@ -221,6 +221,11 @@ fn run(arguments: &[String]) -> Result<u8, XtaskError> {
             wine::run_check(&workspace_root(), &arguments[1..]).map_err(XtaskError::Standard)?;
             return Ok(0);
         }
+        "windows-helpers" => {
+            wine::run_windows_helpers(&workspace_root(), &arguments[1..])
+                .map_err(XtaskError::Standard)?;
+            return Ok(0);
+        }
         "help" | "--help" | "-h" => {
             println!("{}", usage());
             return Ok(0);
@@ -248,7 +253,8 @@ fn usage() -> String {
     format!(
         "Usage: cargo xtask <command>\n\nCommands:\n  doctor\n  \
          wine-bridge   build the sp_wine_bridge unixlib into target/wine-bridge\n  \
-         wine-check    run the Windows shared-memory client under Wine and time its wakes\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}",
+         wine-check    run the Windows shared-memory client under Wine and time its wakes\n  \
+         windows-helpers [--release] [--out DIR]\n                build the Windows plug-in helpers and bridge into DIR/windows and DIR/wine-bridge\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}",
         verification::usage_host_checker(),
         verification::usage_compatibility(),
         verification::usage_loopback(),
