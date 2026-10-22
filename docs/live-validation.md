@@ -55,6 +55,18 @@ The same rig ran the desktop UI through `--serve`/`--connect` on Xvfb:
 `cargo xtask wine-check` measured futex round trips through `sp_wine_bridge` with a Windows
 client under Wine 11.18: p50 5 µs; p99 1.1 ms while the machine was busy compiling.
 
+The ignored `wine_tests` in the app (debug build, Surge XT Effects for Windows, Dragonfly for
+Linux, 48 kHz, 128 frames) give these results:
+- A Windows rack ran pipelined in the Wine worker for 400 blocks with 0 deadline misses. The
+  rack round trip had a p50 of 45 µs and a p99.9 of 72 µs.
+- A mixed Linux → Wine → Linux rack completed 1 141 blocks with 0 deadline misses. The round
+  trip from host publish to the first segment's completion had a p50 of 111 µs and a p99 of
+  165 µs. When the test killed a segment's worker, only that segment played bypassed, with its
+  latency kept, and its worker was replaced in about 115 ms.
+
+These runs last seconds, not 30 minutes, and do not prove licensed plug-ins (iLok, FabFilter,
+Neural DSP) under Wine.
+
 ## Known limits
 
 - Eight racks at 128 frames failed some earlier runs under load. The failed blocks
