@@ -67,18 +67,20 @@ fn remote_state(directory: &str) -> PathBuf {
 }
 
 fn serve(arguments: &[String]) -> Result<(), String> {
-    let mut bind: SocketAddr = ([0_u16; 8], DEFAULT_PORT).into();
+    let mut bind: Option<SocketAddr> = None;
     let mut name = host_name();
     let mut pair = false;
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--bind" => {
-                bind = arguments
-                    .next()
-                    .ok_or("--bind needs an address")?
-                    .parse()
-                    .map_err(|error| format!("invalid --bind address: {error}"))?;
+                bind = Some(
+                    arguments
+                        .next()
+                        .ok_or("--bind needs an address")?
+                        .parse()
+                        .map_err(|error| format!("invalid --bind address: {error}"))?,
+                );
             }
             "--name" => name.clone_from(arguments.next().ok_or("--name needs a value")?),
             "--pair" => pair = true,
@@ -94,11 +96,19 @@ fn serve(arguments: &[String]) -> Result<(), String> {
     ui::install_style(&ctx);
     let mut app = ui::LiveRackApp::new(controller, recovery_offered, runtime);
 
-    let server = RemoteServer::start(ServerConfig {
-        bind,
-        state_dir: remote_state("remote"),
-        name,
-    })
+    let start = |bind| {
+        RemoteServer::start(ServerConfig {
+            bind,
+            state_dir: remote_state("remote"),
+            name: name.clone(),
+        })
+    };
+    // By default listen dual-stack, or on IPv4 alone where IPv6 is disabled.
+    let server = match bind {
+        Some(bind) => start(bind),
+        None => start(([0_u16; 8], DEFAULT_PORT).into())
+            .or_else(|_| start(([0, 0, 0, 0], DEFAULT_PORT).into())),
+    }
     .map_err(|error| format!("cannot start the remote server: {error}"))?;
     println!(
         "serving on {} (fingerprint {})",
