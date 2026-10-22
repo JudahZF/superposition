@@ -2,7 +2,8 @@
 //!
 //! macOS applies a Mach time constraint sized to the block period. Linux, and a Windows worker
 //! under Wine through `sp_wine_bridge`, apply `SCHED_FIFO`. When Linux denies real-time
-//! priority (no `RLIMIT_RTPRIO`), a native thread asks rtkit for `SCHED_RR`. If that fails too,
+//! priority (no `RLIMIT_RTPRIO`), a native thread asks rtkit for `SCHED_RR` when its policy is
+//! created, and keeps it until it exits. If that fails too,
 //! the thread keeps ordinary scheduling, reports [`SchedulingMode::Normal`], and warns once,
 //! unless `SUPERPOSITION_REQUIRE_REALTIME=1` makes the denial an error.
 

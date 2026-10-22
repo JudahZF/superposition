@@ -1,5 +1,7 @@
 //! `SCHED_FIFO` for the processing thread on Linux, or under Wine through `sp_wine_bridge`.
-//! On Linux, rtkit is the fallback when `RLIMIT_RTPRIO` denies it.
+//! On Linux, rtkit is the fallback when `RLIMIT_RTPRIO` denies it. rtkit answers over D-Bus,
+//! too slowly for a block, so the policy asks it once, when it is created before audio starts,
+//! and the thread keeps rtkit's `SCHED_RR` until it exits.
 
 use std::{io, marker::PhantomData, rc::Rc, sync::Once};
 
@@ -12,11 +14,23 @@ const EPERM: i32 = 1;
 /// Owns the current thread's real-time scheduling state.
 ///
 /// Construct, enter, and leave this on the same thread. It cannot be sent to another thread.
-/// `Drop` restores ordinary scheduling if `leave` was not called.
+/// `Drop` restores ordinary scheduling if `leave` was not called, unless rtkit granted it.
 pub struct AudioThreadPolicy {
     active: Option<(u32, u32)>,
     mode: SchedulingMode,
+    rtkit: Rtkit,
     _thread_bound: PhantomData<Rc<()>>,
+}
+
+/// What rtkit did for this thread.
+#[cfg_attr(windows, allow(dead_code, reason = "a Wine worker never asks rtkit"))]
+enum Rtkit {
+    /// Not asked: `SCHED_FIFO` is permitted, or this is a Wine worker, which cannot reach rtkit.
+    NotAsked,
+    /// The thread runs `SCHED_RR` for its lifetime. Lowering it would need rtkit again.
+    Granted,
+    /// rtkit refused or did not answer.
+    Refused(io::Error),
 }
 
 impl AudioThreadPolicy {
@@ -32,9 +46,18 @@ impl AudioThreadPolicy {
                 "sp_wine_bridge.dll is required for worker scheduling",
             ));
         }
+        #[cfg(windows)]
+        let rtkit = Rtkit::NotAsked;
+        #[cfg(target_os = "linux")]
+        let rtkit = if fifo_permitted() {
+            Rtkit::NotAsked
+        } else {
+            request_from_rtkit(priority()).map_or_else(Rtkit::Refused, |()| Rtkit::Granted)
+        };
         Ok(Self {
             active: None,
             mode: SchedulingMode::RealTime,
+            rtkit,
             _thread_bound: PhantomData,
         })
     }
@@ -52,17 +75,16 @@ impl AudioThreadPolicy {
         if self.active == Some((frames, sample_rate)) {
             return Ok(());
         }
-        if self.mode == SchedulingMode::RealTime {
+        if self.mode == SchedulingMode::RealTime && !matches!(self.rtkit, Rtkit::Granted) {
             match set_fifo(priority()) {
                 0 => {}
+                EPERM if realtime_required() => return Err(io::Error::from_raw_os_error(EPERM)),
                 EPERM => {
-                    if let Err(error) = request_from_rtkit(priority()) {
-                        if realtime_required() {
-                            return Err(io::Error::from_raw_os_error(EPERM));
-                        }
-                        self.mode = SchedulingMode::Normal;
-                        warn_normal_scheduling(&error);
-                    }
+                    self.mode = SchedulingMode::Normal;
+                    warn_normal_scheduling(match &self.rtkit {
+                        Rtkit::Refused(error) => Some(error),
+                        Rtkit::NotAsked | Rtkit::Granted => None,
+                    });
                 }
                 code => return Err(io::Error::from_raw_os_error(code)),
             }
@@ -77,12 +99,16 @@ impl AudioThreadPolicy {
         self.mode
     }
 
-    /// Restores ordinary scheduling after real-time processing.
+    /// Restores ordinary scheduling after real-time processing. A thread rtkit made real-time
+    /// stays real-time.
     ///
     /// # Errors
     /// Returns an operating-system error if the scheduler rejects the restoration.
     pub fn leave(&mut self) -> io::Result<()> {
-        if self.active.take().is_some() && self.mode == SchedulingMode::RealTime {
+        if self.active.take().is_some()
+            && self.mode == SchedulingMode::RealTime
+            && !matches!(self.rtkit, Rtkit::Granted)
+        {
             match set_other() {
                 0 => {}
                 code => return Err(io::Error::from_raw_os_error(code)),
@@ -126,28 +152,29 @@ fn realtime_required() -> bool {
     std::env::var_os("SUPERPOSITION_REQUIRE_REALTIME").is_some_and(|value| value == "1")
 }
 
-fn warn_normal_scheduling(rtkit_error: &io::Error) {
+fn warn_normal_scheduling(rtkit_error: Option<&io::Error>) {
     static WARNED: Once = Once::new();
     WARNED.call_once(|| {
+        let rtkit = rtkit_error.map_or_else(String::new, |error| format!("; rtkit: {error}"));
         eprintln!(
-            "superposition: real-time priority denied (raise RLIMIT_RTPRIO; rtkit: {rtkit_error}); \
+            "superposition: real-time priority denied (raise RLIMIT_RTPRIO{rtkit}); \
              the processing thread uses ordinary scheduling"
         );
     });
+}
+
+/// Whether the kernel lets this thread set `SCHED_FIFO` at the configured priority itself.
+#[cfg(target_os = "linux")]
+fn fifo_permitted() -> bool {
+    // SAFETY: `geteuid` has no preconditions.
+    let root = unsafe { libc::geteuid() } == 0;
+    root || realtime_priority_limit() >= u64::try_from(priority()).unwrap_or(u64::MAX)
 }
 
 #[cfg(target_os = "linux")]
 fn request_from_rtkit(priority: i32) -> io::Result<()> {
     let connection = zbus::blocking::Connection::system().map_err(io::Error::other)?;
     super::rtkit::make_current_thread_realtime(&connection, priority)
-}
-
-#[cfg(windows)]
-fn request_from_rtkit(_priority: i32) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "a Wine worker cannot reach rtkit",
-    ))
 }
 
 #[cfg(target_os = "linux")]
