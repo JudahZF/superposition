@@ -17,7 +17,7 @@ use vst3_host::discovery::get_detailed_plugin_info;
 use vst3_host::midi::{MidiChannel, MidiEvent};
 use vst3_host::plugin::ParameterEditKind;
 #[cfg(all(
-    any(target_os = "macos", target_os = "linux"),
+    any(target_os = "macos", target_os = "linux", windows),
     feature = "editor-window"
 ))]
 use vst3_host::plugin::WindowHandle;
@@ -38,6 +38,8 @@ use super::{Vst3BundlePath, Vst3PluginDescriptor};
 
 #[cfg(all(target_os = "macos", feature = "editor-window"))]
 pub use super::editor_window::EditorParentView;
+#[cfg(all(windows, feature = "editor-window"))]
+pub use super::win32_editor_window::EditorParentView;
 #[cfg(all(target_os = "linux", feature = "editor-window"))]
 pub use super::x11_editor_window::EditorParentView;
 
@@ -66,7 +68,7 @@ impl SdkEditorHandle {
     /// Returns an error if the editor is unavailable or rejects its parent or size.
     pub fn open_editor(&self, parent_view: &EditorParentView) -> Result<Vst3EditorSize, SdkError> {
         #[cfg(all(
-            any(target_os = "macos", target_os = "linux"),
+            any(target_os = "macos", target_os = "linux", windows),
             feature = "editor-window"
         ))]
         {
@@ -79,7 +81,7 @@ impl SdkEditorHandle {
             size
         }
         #[cfg(not(all(
-            any(target_os = "macos", target_os = "linux"),
+            any(target_os = "macos", target_os = "linux", windows),
             feature = "editor-window"
         )))]
         {
@@ -163,7 +165,7 @@ impl SdkEditorHandle {
 
 /// Placeholder editor parent on platforms or builds without native editor hosting.
 #[cfg(not(all(
-    any(target_os = "macos", target_os = "linux"),
+    any(target_os = "macos", target_os = "linux", windows),
     feature = "editor-window"
 )))]
 pub struct EditorParentView {
@@ -182,6 +184,14 @@ fn native_parent(parent_view: &EditorParentView) -> WindowHandle {
 #[cfg(all(target_os = "linux", feature = "editor-window"))]
 fn native_parent(parent_view: &EditorParentView) -> WindowHandle {
     WindowHandle::from_x11(parent_view.window_id())
+}
+
+/// The VST3 parent handle (`kPlatformTypeHWND`) for a worker-owned editor window.
+#[cfg(all(windows, feature = "editor-window"))]
+fn native_parent(parent_view: &EditorParentView) -> WindowHandle {
+    // SAFETY: the parent token stays on the loading thread with its live window, which the
+    // worker destroys only after the plug-in view detaches.
+    unsafe { WindowHandle::from_hwnd(parent_view.hwnd()) }
 }
 
 /// Matches [`sp_protocol::MAX_FRAMES`] without pulling that crate into the adapter.
@@ -767,7 +777,7 @@ impl SdkPlugin {
             ));
         }
         #[cfg(not(all(
-            any(target_os = "macos", target_os = "linux"),
+            any(target_os = "macos", target_os = "linux", windows),
             feature = "editor-window"
         )))]
         {
@@ -777,7 +787,7 @@ impl SdkPlugin {
             ))
         }
         #[cfg(all(
-            any(target_os = "macos", target_os = "linux"),
+            any(target_os = "macos", target_os = "linux", windows),
             feature = "editor-window"
         ))]
         {

@@ -1,6 +1,6 @@
 //! VST3 bundle inspection and helper-only SDK hosting for Superposition.
 //!
-//! The default API reads only bundle layout and Mach-O or ELF headers and never loads
+//! The default API reads only bundle layout and Mach-O, ELF, or PE headers and never loads
 //! a plug-in. Enable `--features sdk` inside isolated helper binaries to unlock the
 //! [`sdk`] module, which wraps `vst3-host` without exposing SDK types to the main
 //! application or engine.
@@ -11,10 +11,17 @@ use std::path::{Path, PathBuf};
 
 /// SDK-free fixed-capacity serial rack contracts and lifecycle orchestration.
 pub mod adapter;
+#[cfg(all(any(target_os = "linux", windows), feature = "editor-window"))]
+mod editor_common;
 #[cfg(all(target_os = "macos", feature = "editor-window"))]
 pub mod editor_window;
+#[cfg(all(windows, feature = "editor-window"))]
+pub mod win32_editor_window;
 #[cfg(all(target_os = "linux", feature = "editor-window"))]
 pub mod x11_editor_window;
+
+#[cfg(all(any(target_os = "linux", windows), feature = "editor-window"))]
+pub use editor_common::EditorWindowIdentity;
 
 /// Filesystem location of a VST3 bundle selected for helper-side inspection.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,7 +59,7 @@ pub enum Vst3Architecture {
     X86_64,
     /// Both Apple Silicon and Intel 64-bit code are present.
     Universal,
-    /// The executable is not a recognised Mach-O or ELF file or has another CPU type.
+    /// The executable is not a recognised Mach-O, ELF, or PE file or has another CPU type.
     Unknown,
 }
 
@@ -86,9 +93,10 @@ impl Vst3Architecture {
 pub struct Vst3BundleInfo {
     /// Original bundle path.
     pub path: PathBuf,
-    /// Architecture read from the executable's Mach-O or ELF header.
+    /// Architecture read from the executable's Mach-O, ELF, or PE header.
     pub architectures: Vst3Architecture,
-    /// Name of the executable found in `Contents/MacOS` or `Contents/<arch>-linux`.
+    /// Name of the executable found in `Contents/MacOS`, `Contents/<arch>-linux`, or
+    /// `Contents/<arch>-win`, or of a single-file Windows bundle.
     pub executable_name: String,
     /// Whether the bundle includes code this host executes natively.
     pub native: bool,
@@ -136,8 +144,9 @@ impl std::error::Error for Vst3BundleError {}
 /// # Errors
 ///
 /// Returns an error if the path is not a VST3 bundle or has no executable in its platform
-/// layout: `Contents/Info.plist` and `Contents/MacOS` on macOS, or a shared object in a
-/// `Contents/<arch>-linux` folder on Linux.
+/// layout: `Contents/Info.plist` and `Contents/MacOS` on macOS, a shared object in a
+/// `Contents/<arch>-linux` folder on Linux, or on Windows a DLL in a `Contents/<arch>-win`
+/// folder or the `.vst3` DLL itself.
 pub fn inspect_bundle_layout(path: impl AsRef<Path>) -> Result<Vst3BundleInfo, Vst3BundleError> {
     let path = path.as_ref();
     if path.extension().and_then(|extension| extension.to_str()) != Some("vst3") {
@@ -152,7 +161,7 @@ pub fn inspect_bundle_layout(path: impl AsRef<Path>) -> Result<Vst3BundleInfo, V
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn probe_bundle_executable(path: &Path) -> Result<(String, Vst3Architecture), Vst3BundleError> {
     let contents = path.join("Contents");
     let info_plist = contents.join("Info.plist");
@@ -222,7 +231,7 @@ fn probe_bundle_executable(path: &Path) -> Result<(String, Vst3Architecture), Vs
         .map(|stem| Path::new(stem).with_extension("so"));
     let executable = folders
         .iter()
-        .find_map(|folder| linux_shared_object(&contents.join(folder), named.as_deref()))
+        .find_map(|folder| bundle_binary(&contents.join(folder), named.as_deref(), "so"))
         .ok_or_else(|| {
             Vst3BundleError::invalid(format!(
                 "missing shared object in {}/*-linux",
@@ -241,10 +250,93 @@ fn probe_bundle_executable(path: &Path) -> Result<(String, Vst3Architecture), Vs
     Ok((executable_name, probe_elf_architecture(&header)))
 }
 
-/// The shared object named after the bundle, as the VST3 layout requires, or else the first
-/// `.so` by name.
-#[cfg(target_os = "linux")]
-fn linux_shared_object(folder: &Path, named: Option<&Path>) -> Option<PathBuf> {
+/// `Contents/` folder that holds code the running Windows host loads.
+#[cfg(windows)]
+const NATIVE_WINDOWS_FOLDER: &str = if cfg!(target_arch = "aarch64") {
+    "arm64-win"
+} else if cfg!(target_arch = "x86") {
+    "x86-win"
+} else {
+    "x86_64-win"
+};
+
+/// Finds the DLL in a `Contents/<arch>-win` folder, native folder first, or takes a single-file
+/// `.vst3` DLL as it is, then reads its PE header.
+#[cfg(windows)]
+fn probe_bundle_executable(path: &Path) -> Result<(String, Vst3Architecture), Vst3BundleError> {
+    use std::io::Read as _;
+
+    let executable = if path.is_file() {
+        path.to_path_buf()
+    } else {
+        let contents = path.join("Contents");
+        let entries = fs::read_dir(&contents).map_err(|error| {
+            Vst3BundleError::invalid(format!("cannot read {}: {error}", contents.display()))
+        })?;
+        let mut folders = entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_name().to_string_lossy().ends_with("-win") && entry.path().is_dir()
+            })
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>();
+        folders.sort_by_key(|name| (name.as_os_str() != NATIVE_WINDOWS_FOLDER, name.clone()));
+        let named = path.file_name().map(Path::new);
+        folders
+            .iter()
+            .find_map(|folder| bundle_binary(&contents.join(folder), named, "vst3"))
+            .ok_or_else(|| {
+                Vst3BundleError::invalid(format!(
+                    "missing DLL in {}/*-win",
+                    contents.display()
+                ))
+            })?
+    };
+    // The PE header offset sits in the DOS header; real DLLs place the header well inside this.
+    let mut header = Vec::with_capacity(4096);
+    fs::File::open(&executable)
+        .and_then(|file| file.take(4096).read_to_end(&mut header))
+        .map_err(|error| {
+            Vst3BundleError::invalid(format!("cannot read {}: {error}", executable.display()))
+        })?;
+    let executable_name = executable
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    Ok((executable_name, probe_pe_architecture(&header)))
+}
+
+/// Reads a PE (Windows DLL) header and classifies its machine.
+///
+/// This function only examines the supplied bytes; it never executes or loads them.
+#[must_use]
+pub fn probe_pe_architecture(bytes: &[u8]) -> Vst3Architecture {
+    const AMD64: u16 = 0x8664;
+    const ARM64: u16 = 0xaa64;
+
+    if bytes.get(..2) != Some(b"MZ") {
+        return Vst3Architecture::Unknown;
+    }
+    let Some(offset) = read_u32(bytes, 0x3c, true).and_then(|offset| usize::try_from(offset).ok())
+    else {
+        return Vst3Architecture::Unknown;
+    };
+    if bytes.get(offset..offset.saturating_add(4)) != Some(b"PE\0\0") {
+        return Vst3Architecture::Unknown;
+    }
+    match bytes
+        .get(offset + 4..offset + 6)
+        .map(|machine| u16::from_le_bytes([machine[0], machine[1]]))
+    {
+        Some(AMD64) => Vst3Architecture::X86_64,
+        Some(ARM64) => Vst3Architecture::Arm64,
+        _ => Vst3Architecture::Unknown,
+    }
+}
+
+/// The binary named after the bundle, as the VST3 layout requires, or else the first file with
+/// `extension` by name.
+#[cfg(any(target_os = "linux", windows))]
+fn bundle_binary(folder: &Path, named: Option<&Path>, extension: &str) -> Option<PathBuf> {
     if let Some(named) = named.map(|name| folder.join(name))
         && named.is_file()
     {
@@ -255,7 +347,9 @@ fn linux_shared_object(folder: &Path, named: Option<&Path>) -> Option<PathBuf> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
-            path.extension().and_then(|extension| extension.to_str()) == Some("so")
+            path.extension()
+                .and_then(|found| found.to_str())
+                .is_some_and(|found| found.eq_ignore_ascii_case(extension))
                 && path.is_file()
         })
         .collect::<Vec<_>>();
@@ -421,6 +515,7 @@ pub mod native;
 mod tests {
     use super::{
         FakeVst3Inspector, Vst3Architecture, Vst3BundlePath, Vst3Inspector, probe_elf_architecture,
+        probe_pe_architecture,
         probe_macho_architecture,
     };
 
@@ -528,6 +623,29 @@ mod tests {
         );
         assert_eq!(
             probe_elf_architecture(b"not an ELF object at all"),
+            Vst3Architecture::Unknown
+        );
+    }
+
+    #[test]
+    fn probes_pe_machine_and_rejects_other_files() {
+        let pe = |machine: u16| {
+            let mut header = vec![0; 0x48];
+            header[..2].copy_from_slice(b"MZ");
+            header[0x3c..0x40].copy_from_slice(&0x40_u32.to_le_bytes());
+            header[0x40..0x44].copy_from_slice(b"PE\0\0");
+            header[0x44..0x46].copy_from_slice(&machine.to_le_bytes());
+            header
+        };
+        assert_eq!(probe_pe_architecture(&pe(0x8664)), Vst3Architecture::X86_64);
+        assert_eq!(probe_pe_architecture(&pe(0xaa64)), Vst3Architecture::Arm64);
+        assert_eq!(probe_pe_architecture(&pe(0x014c)), Vst3Architecture::Unknown);
+        assert_eq!(
+            probe_pe_architecture(&pe(0x8664)[..0x44]),
+            Vst3Architecture::Unknown
+        );
+        assert_eq!(
+            probe_pe_architecture(&elf_header(2, true, 62)),
             Vst3Architecture::Unknown
         );
     }
