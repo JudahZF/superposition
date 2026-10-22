@@ -5,6 +5,8 @@
 //! - A mixed rack of [Linux, Windows, Linux] plug-ins: three segment workers chained inside the
 //!   pipelined lane's block. Killing the Windows worker bypasses only its segment, with the
 //!   rack's latency kept, and a new worker takes its place. It prints the chain's timing.
+//! - The same mixed rack under the product renderer: when a plug-in asks for a planned restart,
+//!   the rack reloads live with new workers for every segment while audio keeps running.
 //!
 //! Ignored: they need Wine, Xvfb, the native and Windows helpers, and a Windows bundle. The
 //! mixed rack needs Surge XT Effects as that bundle and a folder in `VST3_PATH` holding the Linux
@@ -31,7 +33,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sp_audio_io::RackSharedMemoryDispatcher;
+use sp_audio_io::{
+    BlockFrames, InterleavedStereoF32, OutputRenderer, ProductRenderer, RackSharedMemoryDispatcher,
+};
 use sp_model::{
     ChannelLayout, Endpoint, EndpointId, Rack, RackId, RackTopology, Session, Source, SourceId,
 };
@@ -524,5 +528,139 @@ fn mixed_rack() {
         delay
     ));
 
+    product.unload_all_racks();
+}
+
+#[test]
+#[ignore = "needs Wine, Xvfb, the helpers, Surge XT Effects, and Dragonfly; see the module docs"]
+fn mixed_rack_reloads_live_when_a_plugin_requests_a_restart() {
+    on_large_stack(mixed_rack_reload);
+}
+
+/// Every worker process of rack 0, first segment first.
+fn rack_worker_pids(product: &ProductRuntime) -> Vec<u64> {
+    let worker = &product.workers[&0];
+    worker
+        .session
+        .iter()
+        .chain(
+            worker
+                .segments
+                .iter()
+                .filter_map(|segment| segment.session.as_ref()),
+        )
+        .map(sp_supervisor::WorkerControlSession::process_id)
+        .collect()
+}
+
+/// Renders paced blocks as an audio callback would, until `stop`, and returns the renderer.
+fn run_callback(mut renderer: ProductRenderer, stop: &AtomicBool) -> ProductRenderer {
+    let period =
+        Duration::from_secs(1) * u32::try_from(FRAMES).expect("block frames") / SAMPLE_RATE;
+    let mut buffer = vec![0.0_f32; FRAMES * 2];
+    let mut next = Instant::now();
+    while !stop.load(Ordering::Acquire) {
+        let block = InterleavedStereoF32::new(&mut buffer, BlockFrames::Frames128)
+            .expect("one stereo block");
+        renderer.render(block);
+        next += period;
+        thread::sleep(next.saturating_duration_since(Instant::now()));
+    }
+    renderer
+}
+
+fn mixed_rack_reload() {
+    let (_data, mut product) = product_with_windows_bundle("app-mixed-reload");
+    let plugins = product.catalog_plugins();
+    let plate = plugins
+        .iter()
+        .find(|plugin| !plugin.windows && plugin.descriptor.identity.name.contains("Plate"))
+        .expect("VST3_PATH holds DragonflyPlateReverb.vst3");
+    let windows = plugins
+        .iter()
+        .find(|plugin| plugin.windows)
+        .expect("the Windows plug-in is cataloged as Windows");
+    let model = session_with_rack(&[plate, windows, plate]);
+    product
+        .load_rack(0, &model.racks[0], &[])
+        .expect("start the three segment workers");
+    let prepared = engine::prepare_audio(&mut product, &model).expect("prepare audio");
+    let telemetry = prepared.renderer.telemetry();
+    let mut control = prepared.control;
+    let stop = Arc::new(AtomicBool::new(false));
+    // The renderer is large in a debug build, so it renders on a stack like the test's own.
+    let callback = thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn({
+            let (renderer, stop) = (prepared.renderer, Arc::clone(&stop));
+            move || run_callback(renderer, &stop)
+        })
+        .expect("callback thread");
+    let completed = || {
+        telemetry
+            .rack_diagnostics(0)
+            .map_or(0, |rack| rack.completed)
+    };
+    let poll_until = |product: &mut ProductRuntime,
+                      control: &mut sp_audio_io::ProductControl,
+                      done: &dyn Fn(&ProductRuntime) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !done(product) {
+            product.poll();
+            product.finish_live_topology(control);
+            assert!(Instant::now() < deadline, "{:?}", product.diagnostics());
+            thread::sleep(Duration::from_millis(5));
+        }
+    };
+    poll_until(&mut product, &mut control, &|_| completed() > 200);
+    let before = rack_worker_pids(&product);
+    assert_eq!(before.len(), 3, "one worker per segment");
+
+    // The Windows plug-in, first in the second segment, asks for a planned restart through its
+    // segment's bank, as its worker publishes it.
+    {
+        let segment = &product.workers[&0].segments[0];
+        assert!(
+            segment.banks[segment.active_bank_index]
+                .bank()
+                .feedback
+                .publish_restart(0, 1),
+            "publish kReloadComponent"
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let reloads = loop {
+        product.poll();
+        let reloads = product.take_rack_reloads();
+        if !reloads.is_empty() {
+            break reloads;
+        }
+        assert!(Instant::now() < deadline, "{:?}", product.diagnostics());
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(reloads, [0]);
+    let reload_at = completed();
+    product
+        .reload_rack_live(&mut control, &model, 0)
+        .unwrap_or_else(|error| panic!("{error}: {:?}", product.diagnostics()));
+    poll_until(&mut product, &mut control, &|product| {
+        product.retiring_workers.is_empty() && rack_worker_pids(product).len() == 3
+    });
+    let after = rack_worker_pids(&product);
+    assert!(
+        after.iter().all(|pid| !before.contains(pid)),
+        "every segment runs in a new worker: {before:?} -> {after:?}"
+    );
+    assert!(
+        product.take_rack_reloads().is_empty(),
+        "the request was taken once"
+    );
+    poll_until(&mut product, &mut control, &|_| {
+        completed() > reload_at + 200
+    });
+    stop.store(true, Ordering::Release);
+    drop(callback.join().expect("callback thread"));
+    println!("{}", product.diagnostics().join("\n"));
+    println!("reloaded at block {reload_at}; workers {before:?} -> {after:?}");
     product.unload_all_racks();
 }

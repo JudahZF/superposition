@@ -165,6 +165,13 @@ pub(crate) struct ProductRuntime {
     wine: Option<WineEnvironment>,
     /// Installers and licence managers started from Setup, reaped as they exit.
     windows_programs: Vec<std::process::Child>,
+    /// Mixed racks whose plug-ins asked for a planned restart. One worker cannot restart a rack
+    /// split across segments, so the host reloads each of these racks live
+    /// ([`Self::reload_rack_live`]) with its plug-ins' live states.
+    rack_reloads: Vec<usize>,
+    /// Planned-restart budgets of mixed racks. A reload starts new workers, so the budget lives
+    /// here rather than in the worker.
+    mixed_restart_budgets: BTreeMap<sp_model::RackId, RestartBudget>,
     /// Linux: the private display that editors draw on, and its window streamer.
     #[cfg(target_os = "linux")]
     editor_display: Option<editor_display::EditorDisplay>,
@@ -407,6 +414,28 @@ struct SegmentPlan {
 /// Splits a rack's resolved slots into segments of one platform each. A missing plug-in joins
 /// the segment before it, or the first segment when it leads the rack. A rack of only missing
 /// plug-ins has no segments.
+/// The planned-restart flags any plug-in of a mixed rack published, through its segment's bank.
+/// Acknowledges them: the rack reload that follows replaces every worker.
+fn take_mixed_restart_request(worker: &mut RetainedWorker) -> u32 {
+    let mut flags = 0;
+    for slot_index in 0..worker.restart_cursors.len() {
+        if worker.loaded_slots.get(slot_index) != Some(&true) {
+            continue;
+        }
+        let Some(snapshot) = worker.slot_bank(slot_index).and_then(|(bank, local)| {
+            bank.bank()
+                .feedback
+                .restart_snapshot(local, &worker.restart_cursors[slot_index])
+        }) else {
+            continue;
+        };
+        let requested = snapshot.flags & PLANNED_RESTART_FLAGS;
+        worker.restart_cursors[slot_index].ack(&snapshot, requested);
+        flags |= requested;
+    }
+    flags
+}
+
 fn rack_segments(candidates: &[Option<ResolvedSlot>]) -> Vec<SegmentPlan> {
     let mut segments: Vec<SegmentPlan> = Vec::new();
     for (slot, candidate) in candidates.iter().enumerate() {
@@ -808,6 +837,8 @@ impl ProductRuntime {
             sample_rate_hz: sp_audio_io::PRODUCT_SAMPLE_RATE_HZ,
             wine,
             windows_programs: Vec::new(),
+            rack_reloads: Vec::new(),
+            mixed_restart_budgets: BTreeMap::new(),
             #[cfg(target_os = "linux")]
             editor_display,
             #[cfg(target_os = "macos")]
@@ -1211,6 +1242,7 @@ impl ProductRuntime {
             self.recover_worker(rack, kind);
         }
         self.poll_planned_restarts();
+        self.poll_mixed_restarts();
         self.poll_segments();
         if let Some(owns) = stopped_owns {
             self.service_unattached_recoveries(owns);
@@ -1568,11 +1600,54 @@ impl ProductRuntime {
         worker.rack = rack;
     }
 
+    /// Queues a live reload for each mixed rack whose plug-in asked for a planned restart.
+    fn poll_mixed_restarts(&mut self) {
+        let now = Instant::now();
+        let mut notices = Vec::new();
+        for (&rack_index, worker) in &mut self.workers {
+            if worker.segments.is_empty()
+                || worker.recovery_failed
+                || worker.recovery.state() != RackRecoveryState::Idle
+                || self.editor_requests.contains(&rack_index)
+                || self.rack_reloads.contains(&rack_index)
+            {
+                continue;
+            }
+            let flags = take_mixed_restart_request(worker);
+            if flags == 0 {
+                continue;
+            }
+            let allowed = self
+                .mixed_restart_budgets
+                .entry(worker.rack.id.clone())
+                .or_default()
+                .allows_restart(now);
+            if allowed {
+                self.rack_reloads.push(rack_index);
+            }
+            notices.push(if allowed {
+                format!(
+                    "rack {} plug-in requested lifecycle maintenance (flags 0x{flags:X}); reloading the mixed rack with its live states",
+                    rack_index + 1
+                )
+            } else {
+                format!(
+                    "rack {} planned restart repeated too often (flags 0x{flags:X}); the rack keeps its current workers until it is reloaded",
+                    rack_index + 1
+                )
+            });
+        }
+        for notice in notices {
+            self.note(notice);
+        }
+    }
+
     fn poll_planned_restarts(&mut self) {
         let now = Instant::now();
         let mut notices = Vec::new();
         for (&rack_index, worker) in &mut self.workers {
-            // Planned maintenance restarts one worker for a whole rack; mixed racks do not use it.
+            // Planned maintenance restarts one worker for a whole rack; a mixed rack is reloaded
+            // instead (`poll_mixed_restarts`).
             if worker.maintenance.is_some()
                 || !worker.segments.is_empty()
                 || worker
@@ -2291,6 +2366,50 @@ impl ProductRuntime {
     }
 
     /// Captures the worker's slots without interrupting their audio processing.
+    /// Mixed racks that asked for a planned restart since the last call; reload each with
+    /// [`Self::reload_rack_live`].
+    pub(crate) fn take_rack_reloads(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.rack_reloads)
+    }
+
+    /// Rebuilds one rack with its plug-ins' live states while the other racks play on.
+    #[cfg(audio_backend)]
+    pub(crate) fn reload_rack_live(
+        &mut self,
+        control: &mut sp_audio_io::ProductControl,
+        model: &sp_model::Session,
+        rack_index: usize,
+    ) -> Result<(), String> {
+        let rack = model
+            .racks
+            .get(rack_index)
+            .ok_or("the rack to reload is not in the session")?;
+        let live = self.capture_rack_states(rack_index)?;
+        let plan: Vec<RackPlan> = (0..model.racks.len())
+            .map(|position| {
+                if position == rack_index {
+                    RackPlan::Rebuild(Some(position))
+                } else {
+                    RackPlan::Keep(position)
+                }
+            })
+            .collect();
+        let mut saved_states = vec![Vec::new(); model.racks.len()];
+        saved_states[rack_index] = rack
+            .slots
+            .iter()
+            .map(|slot| {
+                live.iter()
+                    .find(|state| {
+                        state.instance_id == slot.id.0
+                            && state.metadata.fingerprint == slot.plugin.fingerprint.digest
+                    })
+                    .cloned()
+            })
+            .collect();
+        self.publish_live_topology(control, model, &plan, &saved_states)
+    }
+
     pub(crate) fn capture_rack_states(
         &mut self,
         rack_index: usize,

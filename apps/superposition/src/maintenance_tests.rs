@@ -60,6 +60,8 @@ fn runtime() -> ProductRuntime {
         sample_rate_hz: 48_000,
         wine: None,
         windows_programs: Vec::new(),
+        rack_reloads: Vec::new(),
+        mixed_restart_budgets: BTreeMap::new(),
         #[cfg(target_os = "linux")]
         editor_display: None,
         #[cfg(target_os = "macos")]

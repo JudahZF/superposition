@@ -407,6 +407,12 @@ fn host(options: &HostOptions) -> Result<(), String> {
         let mut device_error = None;
         'host: while start.elapsed() < duration {
             product.poll();
+            for rack in product.take_rack_reloads() {
+                if let Err(error) = product.reload_rack_live(&mut control, model, rack) {
+                    eprintln!("host: rack {} reload failed: {error}", rack + 1);
+                }
+            }
+            product.finish_live_topology(&mut control);
             let meter = renderer_telemetry.output_meter();
             for channel in 0..2 {
                 max_peak[channel] = max_peak[channel].max(meter.peak[channel]);

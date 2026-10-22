@@ -1406,6 +1406,30 @@ impl LiveRackApp {
         Ok(())
     }
 
+    /// Reloads mixed racks whose plug-ins asked for a planned restart, keeping their live states.
+    fn reload_requested_racks(&mut self) {
+        let Ok(product) = self.product.as_mut() else {
+            return;
+        };
+        let reloads = product.take_rack_reloads();
+        if reloads.is_empty() {
+            return;
+        }
+        let racks: Vec<RackId> = self
+            .controller
+            .document()
+            .model
+            .racks
+            .iter()
+            .map(|rack| rack.id.clone())
+            .collect();
+        let rebuilt: Vec<RackId> = reloads
+            .iter()
+            .filter_map(|&index| racks.get(index).cloned())
+            .collect();
+        self.apply_rack_edit(&racks, &rebuilt);
+    }
+
     /// Runs a topology change that needs stopped audio, then restarts audio if it was running,
     /// so a rack edit during a show causes a short gap instead of lasting silence.
     fn with_audio_paused(&mut self, change: impl FnOnce(&mut Self)) {
@@ -2680,6 +2704,7 @@ impl LiveRackApp {
                 ctx.request_repaint_after(Duration::from_millis(16));
             }
         }
+        self.reload_requested_racks();
         self.poll_parameter_mirror();
         self.poll_product_diagnostic();
         #[cfg(audio_backend)]
