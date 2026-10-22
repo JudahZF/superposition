@@ -3773,6 +3773,7 @@ dependencies = [
 name = "sp-plugin-worker"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "png",
  "rtrb 0.3.5",
  "sp-protocol",
@@ -3780,6 +3781,7 @@ dependencies = [
  "sp-shared-memory-os",
  "sp-supervisor",
  "sp-vst3",
+ "windows-sys 0.61.2",
  "xcb",
 ]
 
@@ -3842,6 +3844,7 @@ dependencies = [
  "sha2 0.11.0",
  "sp-model",
  "sp-protocol",
+ "sp-wine",
 ]
 
 [[package]]
@@ -3861,6 +3864,7 @@ dependencies = [
  "png",
  "sp-model",
  "vst3-host",
+ "windows-sys 0.61.2",
  "xcb",
 ]
 
