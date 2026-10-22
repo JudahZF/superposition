@@ -25,5 +25,9 @@ sp-vst3 = { path = "../../crates/sp-vst3" }
 [dev-dependencies]
 sp-supervisor = { path = "../../crates/sp-supervisor" }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+png = "0.18.1"
+xcb = "1.7"
+
 [lints]
 workspace = true

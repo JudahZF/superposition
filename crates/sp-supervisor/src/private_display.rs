@@ -32,6 +32,10 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long `Xvfb` may take to exit after `SIGTERM` before it is killed.
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const COOKIE_NAME: &[u8] = b"MIT-MAGIC-COOKIE-1";
+/// Cookie bytes. Alphanumerics keep about 95 bits of entropy in 16 bytes and let clients that
+/// take the cookie as text, such as xcb's `AuthInfo`, connect without an authority file.
+const COOKIE_ALPHABET: &[u8; 62] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 static NEXT_AUTHORITY_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 /// What a child process needs to reach a private display: `DISPLAY` and `XAUTHORITY`.
@@ -242,6 +246,7 @@ impl AuthorityDirectory {
         };
         let mut cookie = [0_u8; 16];
         File::open("/dev/urandom")?.read_exact(&mut cookie)?;
+        let cookie = cookie.map(|byte| COOKIE_ALPHABET[usize::from(byte) % COOKIE_ALPHABET.len()]);
         fs::OpenOptions::new()
             .write(true)
             .create_new(true)

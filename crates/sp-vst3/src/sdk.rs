@@ -12,7 +12,10 @@ use vst3_host::audio::{
 use vst3_host::discovery::get_detailed_plugin_info;
 use vst3_host::midi::{MidiChannel, MidiEvent};
 use vst3_host::plugin::ParameterEditKind;
-#[cfg(all(target_os = "macos", feature = "editor-window"))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux"),
+    feature = "editor-window"
+))]
 use vst3_host::plugin::WindowHandle;
 use vst3_host::{Vst3Host, simple};
 
@@ -31,6 +34,8 @@ use super::{Vst3BundlePath, Vst3PluginDescriptor};
 
 #[cfg(all(target_os = "macos", feature = "editor-window"))]
 pub use super::editor_window::EditorParentView;
+#[cfg(all(target_os = "linux", feature = "editor-window"))]
+pub use super::x11_editor_window::EditorParentView;
 
 /// Main-thread visualization service that does not own the audio processor.
 pub use vst3_host::plugin::MainThreadService;
@@ -39,18 +44,27 @@ pub use vst3_host::plugin::MainThreadService;
 /// A stale handle rejects calls after its plug-in is unloaded.
 pub struct SdkEditorHandle {
     inner: vst3_host::plugin::MainThreadEditorHandle,
+    name: String,
 }
 
 impl SdkEditorHandle {
+    /// The plug-in's display name.
+    #[must_use]
+    pub fn plugin_name(&self) -> &str {
+        &self.name
+    }
+
     /// Attaches an editor while the processor continues running.
     ///
     /// # Errors
     /// Returns an error if the editor is unavailable or rejects its parent or size.
     pub fn open_editor(&self, parent_view: &EditorParentView) -> Result<Vst3EditorSize, SdkError> {
-        #[cfg(all(target_os = "macos", feature = "editor-window"))]
+        #[cfg(all(
+            any(target_os = "macos", target_os = "linux"),
+            feature = "editor-window"
+        ))]
         {
-            // The parent token retains its NSView and cannot leave the main thread.
-            let parent = unsafe { WindowHandle::from_nsview(parent_view.as_ptr()) };
+            let parent = native_parent(parent_view);
             self.inner.open_editor(parent)?;
             let size = self.get_editor_size();
             if size.is_err() {
@@ -58,13 +72,24 @@ impl SdkEditorHandle {
             }
             size
         }
-        #[cfg(not(all(target_os = "macos", feature = "editor-window")))]
+        #[cfg(not(all(
+            any(target_os = "macos", target_os = "linux"),
+            feature = "editor-window"
+        )))]
         {
             let _ = parent_view;
             Err(SdkError::Host(
-                "native editors require macOS editor-window support".to_owned(),
+                "native editors require editor-window support".to_owned(),
             ))
         }
+    }
+
+    /// Fires the open editor's due Linux `IRunLoop` timers and dispatches its ready file
+    /// descriptors. JUCE, VSTGUI, and DPF editors paint and take input only from these
+    /// callbacks, so the loading thread calls this every pass while the editor is open.
+    #[cfg(target_os = "linux")]
+    pub fn service_run_loop(&self) {
+        self.inner.service_run_loop();
     }
 
     /// Detaches the editor before its native parent is closed.
@@ -118,10 +143,27 @@ impl SdkEditorHandle {
     }
 }
 
-/// Placeholder editor parent on platforms or builds without `AppKit` editor hosting.
-#[cfg(not(all(target_os = "macos", feature = "editor-window")))]
+/// Placeholder editor parent on platforms or builds without native editor hosting.
+#[cfg(not(all(
+    any(target_os = "macos", target_os = "linux"),
+    feature = "editor-window"
+)))]
 pub struct EditorParentView {
     _private: (),
+}
+
+/// The VST3 parent handle for a worker-owned editor window.
+#[cfg(all(target_os = "macos", feature = "editor-window"))]
+fn native_parent(parent_view: &EditorParentView) -> WindowHandle {
+    // SAFETY: the parent token retains its NSView and cannot leave the main thread, so the
+    // pointer stays valid while the editor is attached.
+    unsafe { WindowHandle::from_nsview(parent_view.as_ptr()) }
+}
+
+/// The VST3 parent handle for a worker-owned editor window.
+#[cfg(all(target_os = "linux", feature = "editor-window"))]
+fn native_parent(parent_view: &EditorParentView) -> WindowHandle {
+    WindowHandle::from_x11(parent_view.window_id())
 }
 
 /// Matches [`sp_protocol::MAX_FRAMES`] without pulling that crate into the adapter.
@@ -706,18 +748,22 @@ impl SdkPlugin {
                 "selected VST3 class has no native editor".to_owned(),
             ));
         }
-        #[cfg(not(all(target_os = "macos", feature = "editor-window")))]
+        #[cfg(not(all(
+            any(target_os = "macos", target_os = "linux"),
+            feature = "editor-window"
+        )))]
         {
             let _ = parent_view;
             Err(SdkError::Host(
-                "native VST3 editor hosting requires the macOS editor-window feature".to_owned(),
+                "native VST3 editor hosting requires the editor-window feature".to_owned(),
             ))
         }
-        #[cfg(all(target_os = "macos", feature = "editor-window"))]
+        #[cfg(all(
+            any(target_os = "macos", target_os = "linux"),
+            feature = "editor-window"
+        ))]
         {
-            // The token retains an NSView and cannot cross threads. Its pointer stays valid here.
-            let parent_window = unsafe { WindowHandle::from_nsview(parent_view.as_ptr()) };
-            self.plugin.open_editor(parent_window)?;
+            self.plugin.open_editor(native_parent(parent_view))?;
             let size = self
                 .plugin
                 .get_editor_size()
@@ -1312,11 +1358,13 @@ impl HostSdkRackAdapter {
     /// Registers editor access on the loading thread before handing DSP to its worker thread.
     #[must_use]
     pub fn main_thread_editor_handle(&self) -> Option<SdkEditorHandle> {
-        self.plugin
-            .as_ref()?
-            .plugin
+        let plugin = &self.plugin.as_ref()?.plugin;
+        plugin
             .main_thread_editor_handle()
-            .map(|inner| SdkEditorHandle { inner })
+            .map(|inner| SdkEditorHandle {
+                inner,
+                name: plugin.info().name.clone(),
+            })
     }
 
     /// Registers a main-thread visualization pump for the loaded plug-in.

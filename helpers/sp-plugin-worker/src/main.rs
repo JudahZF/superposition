@@ -67,8 +67,12 @@ use sp_vst3::{
     sdk::HostSdkRackAdapter,
 };
 
+#[cfg(all(feature = "sdk", target_os = "macos"))]
+use sp_vst3::editor_window::MacOsEditorWindow as EditorWindow;
 #[cfg(feature = "sdk")]
 use sp_vst3::sdk::SdkPlugin;
+#[cfg(all(feature = "sdk", target_os = "linux"))]
+use sp_vst3::x11_editor_window::{EditorWindowIdentity, X11EditorWindow as EditorWindow};
 
 const WORKER_ID_OPTION: &str = "--worker-id";
 const BUNDLE_OPTION: &str = "--bundle";
@@ -625,10 +629,10 @@ const EDITOR_RUN_LOOP_INTERVAL: Duration = Duration::from_millis(2);
 #[cfg(all(feature = "sdk", target_os = "macos"))]
 const EDITOR_CLOSE_PUMP: Duration = Duration::from_millis(500);
 /// An editor is pictured this long after it opens or a parameter changes, once it has painted.
-#[cfg(all(feature = "sdk", target_os = "macos"))]
+#[cfg(all(feature = "sdk", any(target_os = "macos", target_os = "linux")))]
 const EDITOR_PREVIEW_SETTLE: Duration = Duration::from_millis(500);
 /// While parameters keep changing, an open editor is pictured at most this often.
-#[cfg(all(feature = "sdk", target_os = "macos"))]
+#[cfg(all(feature = "sdk", any(target_os = "macos", target_os = "linux")))]
 const EDITOR_PREVIEW_INTERVAL: Duration = Duration::from_secs(2);
 /// A loading thread without a loop pass for this long is held by plug-in code, such as a modal
 /// dialog or menu. Picture polls are refused then instead of waiting past the host's deadline.
@@ -689,29 +693,32 @@ struct EditorHost {
     feedback_loss_counts: BTreeMap<usize, u64>,
     container_loss_counts: BTreeMap<usize, u64>,
     editors: BTreeMap<usize, sp_vst3::sdk::SdkEditorHandle>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     windows: BTreeMap<usize, OpenEditor>,
     /// Newest editor picture per slot. It outlives the window, so the host can still fetch the
     /// picture taken as the editor closed.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     previews: BTreeMap<usize, EditorPreview>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     last_preview_sequence: u64,
+    /// Rack index the window streamer reads from each editor window.
+    #[cfg(target_os = "linux")]
+    rack_index: u8,
     /// Keeps the event pump running until a closed window has left the screen.
     #[cfg(target_os = "macos")]
     pump_until: Option<Instant>,
 }
 
 /// An open editor window and when it is next pictured.
-#[cfg(all(feature = "sdk", target_os = "macos"))]
+#[cfg(all(feature = "sdk", any(target_os = "macos", target_os = "linux")))]
 struct OpenEditor {
-    window: sp_vst3::editor_window::MacOsEditorWindow,
+    window: EditorWindow,
     /// When to picture the editor next; `None` until a parameter changes.
     preview_due: Option<Instant>,
     pictured_at: Option<Instant>,
 }
 
-#[cfg(all(feature = "sdk", target_os = "macos"))]
+#[cfg(all(feature = "sdk", any(target_os = "macos", target_os = "linux")))]
 impl OpenEditor {
     /// Schedules a picture once the editor has repainted, and no sooner than
     /// [`EDITOR_PREVIEW_INTERVAL`] after the last one.
@@ -726,7 +733,7 @@ impl OpenEditor {
 }
 
 /// A PNG picture of a slot's editor, numbered in capture order across the worker.
-#[cfg(all(feature = "sdk", target_os = "macos"))]
+#[cfg(all(feature = "sdk", any(target_os = "macos", target_os = "linux")))]
 struct EditorPreview {
     sequence: u64,
     captured_at_unix_ms: u64,
@@ -734,28 +741,31 @@ struct EditorPreview {
 }
 
 #[cfg(feature = "sdk")]
-impl Default for EditorHost {
-    fn default() -> Self {
+impl EditorHost {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(unused_variables, reason = "only X11 windows carry their rack index")
+    )]
+    fn new(rack_index: u8) -> Self {
         Self {
             state_transfers: StateTransfers::starting_at(LIVE_CAPTURE_TRANSFER_BASE),
             services: BTreeMap::new(),
             feedback_loss_counts: BTreeMap::new(),
             container_loss_counts: BTreeMap::new(),
             editors: BTreeMap::new(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             windows: BTreeMap::new(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             previews: BTreeMap::new(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             last_preview_sequence: 0,
+            #[cfg(target_os = "linux")]
+            rack_index,
             #[cfg(target_os = "macos")]
             pump_until: None,
         }
     }
-}
 
-#[cfg(feature = "sdk")]
-impl EditorHost {
     fn register_services(&mut self, rack: &RackProcessor<Vst3Facade>) {
         self.services = rack
             .plugins()
@@ -782,50 +792,19 @@ impl EditorHost {
             let result = self.handle_live_read(request);
             return ProductionRuntime::response(request, result);
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            return ProductionRuntime::unsupported(request, "native editors require macOS");
+            return ProductionRuntime::unsupported(
+                request,
+                "native editors require macOS or Linux",
+            );
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             let result = match request.operation() {
                 ControlOperation::OpenNativeEditor => ProductionRuntime::slot_index(request)
-                    .and_then(|slot| {
-                        if let Some(open) = self.windows.get(&slot) {
-                            open.window.focus();
-                            return Ok(Vec::new());
-                        }
-                        let position = (!request.payload().is_empty())
-                            .then(|| EditorPosition::decode(request.payload()))
-                            .transpose()
-                            .map_err(|error| error.to_string())?;
-                        let editor = self
-                            .editors
-                            .get_mut(&slot)
-                            .ok_or("native editor slot is not loaded")?;
-                        let window = sp_vst3::editor_window::MacOsEditorWindow::new(
-                            "Superposition Plug-in Editor",
-                        )?;
-                        let parent_view = window.content_view()?;
-                        let size = editor
-                            .open_editor(&parent_view)
-                            .map_err(|error| error.to_string())?;
-                        window.resize(size.width, size.height);
-                        if let Some(position) = position {
-                            window.set_top_left(f64::from(position.left), f64::from(position.top));
-                        }
-                        window.focus();
-                        self.windows.insert(
-                            slot,
-                            OpenEditor {
-                                window,
-                                preview_due: Some(Instant::now() + EDITOR_PREVIEW_SETTLE),
-                                pictured_at: None,
-                            },
-                        );
-                        Ok(Vec::new())
-                    }),
+                    .and_then(|slot| self.open_editor(slot, request.payload())),
                 ControlOperation::CloseNativeEditor => ProductionRuntime::slot_index(request)
                     .and_then(|slot| {
                         let window = &self
@@ -879,6 +858,55 @@ impl EditorHost {
         }
     }
 
+    /// Opens `slot`'s editor in a new worker-owned window at the requested position, or
+    /// focuses the window that is already open.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn open_editor(&mut self, slot: usize, payload: &[u8]) -> Result<Vec<u8>, String> {
+        if let Some(open) = self.windows.get(&slot) {
+            open.window.focus();
+            return Ok(Vec::new());
+        }
+        let position = (!payload.is_empty())
+            .then(|| EditorPosition::decode(payload))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let editor = self
+            .editors
+            .get_mut(&slot)
+            .ok_or("native editor slot is not loaded")?;
+        #[cfg(target_os = "macos")]
+        let window = EditorWindow::new("Superposition Plug-in Editor")?;
+        #[cfg(target_os = "linux")]
+        let window = EditorWindow::new(&EditorWindowIdentity {
+            title: &format!(
+                "{} – Rack {}, Slot {}",
+                editor.plugin_name(),
+                u32::from(self.rack_index) + 1,
+                slot + 1
+            ),
+            rack: u32::from(self.rack_index),
+            slot: u32::try_from(slot).map_err(|_| "slot index is out of range")?,
+        })?;
+        let parent_view = window.content_view()?;
+        let size = editor
+            .open_editor(&parent_view)
+            .map_err(|error| error.to_string())?;
+        window.resize(size.width, size.height);
+        if let Some(position) = position {
+            window.set_top_left(f64::from(position.left), f64::from(position.top));
+        }
+        window.focus();
+        self.windows.insert(
+            slot,
+            OpenEditor {
+                window,
+                preview_due: Some(Instant::now() + EDITOR_PREVIEW_SETTLE),
+                pictured_at: None,
+            },
+        );
+        Ok(Vec::new())
+    }
+
     /// Loads, closes, or rekeys loading-thread resources for a chain edit. The processing thread
     /// has already checked the edit against the rack.
     fn prepare_chain_edit(
@@ -909,7 +937,7 @@ impl EditorHost {
             }
             ControlOperation::UnloadSlot => {
                 let slot = ProductionRuntime::slot_index(request)?;
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 if self.windows.contains_key(&slot) {
                     self.close_editor(slot)?;
                 }
@@ -925,7 +953,7 @@ impl EditorHost {
                 permute_slot_keys(&mut self.editors, &from);
                 permute_slot_keys(&mut self.feedback_loss_counts, &from);
                 permute_slot_keys(&mut self.container_loss_counts, &from);
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 {
                     permute_slot_keys(&mut self.windows, &from);
                     permute_slot_keys(&mut self.previews, &from);
@@ -946,7 +974,7 @@ impl EditorHost {
         self.editors.remove(&slot);
         self.feedback_loss_counts.remove(&slot);
         self.container_loss_counts.remove(&slot);
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         self.previews.remove(&slot);
     }
 
@@ -1022,7 +1050,7 @@ impl EditorHost {
     /// Describes `slot`'s newest picture and stages its PNG as a live-capture transfer when the
     /// host's known sequence differs. It answers from stored pictures and never pictures the
     /// editor itself.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn describe_preview(&mut self, slot: usize, payload: &[u8]) -> Result<Vec<u8>, String> {
         let known = EditorPreviewRequest::decode(payload)
             .map_err(|error| error.to_string())?
@@ -1060,7 +1088,7 @@ impl EditorHost {
     }
 
     /// Pictures `slot`'s open editor and keeps the picture as the slot's newest preview.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn capture_preview(&mut self, slot: usize) {
         let Some(open) = self.windows.get_mut(&slot) else {
             return;
@@ -1089,7 +1117,7 @@ impl EditorHost {
     }
 
     /// Pictures the editor one last time, then detaches its view and closes its window.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn close_editor(&mut self, slot: usize) -> Result<(), String> {
         self.log_service_stats("editor-close");
         self.capture_preview(slot);
@@ -1105,7 +1133,10 @@ impl EditorHost {
             .and_then(|editor| editor.close_editor().map_err(|error| error.to_string()));
         window.close();
         self.windows.remove(&slot);
-        self.pump_until = Some(Instant::now() + EDITOR_CLOSE_PUMP);
+        #[cfg(target_os = "macos")]
+        {
+            self.pump_until = Some(Instant::now() + EDITOR_CLOSE_PUMP);
+        }
         detach_result
     }
 
@@ -1113,6 +1144,26 @@ impl EditorHost {
     #[cfg(target_os = "macos")]
     fn needs_event_pump(&self) -> bool {
         !self.windows.is_empty() || self.pump_until.is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Whether editors need servicing: X11 closes a window at once, so only open ones do.
+    #[cfg(target_os = "linux")]
+    fn needs_event_pump(&self) -> bool {
+        !self.windows.is_empty()
+    }
+
+    /// Services each open editor's VST3 run loop and its window's events, then waits up to
+    /// [`EDITOR_RUN_LOOP_INTERVAL`]. JUCE, VSTGUI, and DPF editors run their own event loops
+    /// only from run-loop callbacks.
+    #[cfg(target_os = "linux")]
+    fn pump_events(&self) {
+        for (slot, open) in &self.windows {
+            if let Some(editor) = self.editors.get(slot) {
+                editor.service_run_loop();
+            }
+            open.window.pump_events();
+        }
+        thread::sleep(EDITOR_RUN_LOOP_INTERVAL);
     }
 
     fn log_service_stats(&self, reason: &str) {
@@ -1168,6 +1219,13 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
         }
         let clock = MonotonicClock::new().map_err(|error| error.to_string())?;
         let mut heartbeat = HeartbeatPublisher::new(clock);
+        // Without a display the worker still processes audio; only its editors are unavailable.
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("DISPLAY").is_some()
+            && let Err(error) = sp_vst3::x11_editor_window::prepare_display()
+        {
+            eprintln!("sp-plugin-worker: {error}");
+        }
         // The initial plug-in has no sidechain. A rebuild that asks for one reloads it.
         let facade = Vst3Facade::load(&configuration.selection, false)?;
         let initial_plugin = WirePluginSlotConfiguration {
@@ -1210,7 +1268,7 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
         let (editor_response_tx, editor_response_rx) = sync_channel(1);
         // Plug-ins removed from the chain return here for teardown on the loading thread.
         let (retired_tx, retired_rx) = sync_channel::<Vst3Facade>(MAX_PLUGINS_PER_RACK);
-        let mut editor_host = EditorHost::default();
+        let mut editor_host = EditorHost::new(configuration.rack_index);
         editor_host.register_services(&runtime.rack);
         // This second mapping belongs to the loading/main thread. The processing thread keeps
         // its own mapping, and neither audio blocks nor control RPCs carry editor feedback.
@@ -1275,9 +1333,11 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
             if removed {
                 editor_host.pump_until = Some(Instant::now() + EDITOR_CLOSE_PUMP);
             }
-            #[cfg(target_os = "macos")]
-            let pumping = editor_host.needs_event_pump();
             #[cfg(not(target_os = "macos"))]
+            let _ = removed;
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            let pumping = editor_host.needs_event_pump();
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             let pumping = false;
             let next_request = if pumping {
                 match main_request_rx.try_recv() {
@@ -1305,7 +1365,7 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
                     }
                     editor_host.feedback_loss_counts.clear();
                     editor_host.container_loss_counts.clear();
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     editor_host.previews.clear();
                 }
                 editor_host.register_services(&task.runtime.rack);
@@ -1322,7 +1382,7 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
             for (&slot, service) in &editor_host.services {
                 let _ = service.pump_foreground();
                 let values = service.take_parameter_values(128);
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 if !values.is_empty()
                     && let Some(open) = editor_host.windows.get_mut(&slot)
                 {
@@ -1347,7 +1407,7 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
                     .feedback
                     .report_overflow(slot, feedback_delta.saturating_add(container_delta));
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             {
                 let close_requests: Vec<usize> = editor_host
                     .windows
@@ -1379,7 +1439,10 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
                     editor_host.capture_preview(slot);
                 }
                 if editor_host.needs_event_pump() {
+                    #[cfg(target_os = "macos")]
                     sp_vst3::editor_window::pump_events(EDITOR_RUN_LOOP_INTERVAL);
+                    #[cfg(target_os = "linux")]
+                    editor_host.pump_events();
                 }
             }
         }
@@ -1392,7 +1455,7 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
         let (processing_result, runtime) = processing
             .join()
             .map_err(|_| "worker processing thread panicked".to_owned())?;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         for slot in editor_host.windows.keys().copied().collect::<Vec<_>>() {
             if let Err(error) = editor_host.close_editor(slot) {
                 eprintln!("sp-plugin-worker: could not detach editor on shutdown: {error}");
@@ -2383,12 +2446,12 @@ impl ProductionRuntime {
             host.state_transfers.clear();
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             return self.handle_control(request);
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             if matches!(
                 request.operation(),

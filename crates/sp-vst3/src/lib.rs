@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 pub mod adapter;
 #[cfg(all(target_os = "macos", feature = "editor-window"))]
 pub mod editor_window;
+#[cfg(all(target_os = "linux", feature = "editor-window"))]
+pub mod x11_editor_window;
 
 /// Filesystem location of a VST3 bundle selected for helper-side inspection.
 #[derive(Clone, Debug, Eq, PartialEq)]
