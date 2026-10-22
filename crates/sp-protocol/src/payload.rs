@@ -12,8 +12,8 @@
 //! metadata/read/gesture use [`ParameterId`], write uses [`ParameterWrite`]; restore uses
 //! [`StateRestore`]; latency/restart/health use their matching report records; editor open may
 //! carry an [`EditorPosition`], resize uses [`EditorGeometry`], and preview polls use
-//! [`EditorPreviewRequest`] and [`EditorPreviewDescriptor`]. Every decoder validates all lengths
-//! and ranges before allocating.
+//! [`EditorPreviewRequest`] and [`EditorPreviewDescriptor`]; `Rechain` uses [`ChainTarget`].
+//! Every decoder validates all lengths and ranges before allocating.
 
 use crate::control::{
     CONTROL_SLOT_COUNT, ControlProtocolError, MAX_CONTROL_STATE_BYTES, MAX_PLUGIN_REFERENCE_BYTES,
@@ -874,6 +874,62 @@ impl ControlPayloadCodec for HealthReport {
     }
 }
 
+/// Fixed bytes of a [`ChainTarget`] before the bank name.
+pub const CHAIN_TARGET_FIXED_BYTES: usize = 5;
+/// Longest bank name a [`ChainTarget`] carries.
+pub const MAX_BANK_NAME_BYTES: usize = 255;
+
+/// Where a mixed-rack segment's worker sends its output (`Rechain`).
+///
+/// Slots are numbered from the receiving worker's first slot. Its own plug-ins are the slots
+/// below `first_slot`, minus any skipped slots: the slots between its own and `first_slot`
+/// belong to segments whose workers are down, and their plug-ins are bypassed with
+/// `skipped_latency` samples of delay. The next segment's worker owns `first_slot` onwards and
+/// reads `bank`. With no `bank`, nothing follows and the worker only delays its output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChainTarget {
+    pub bank: Option<String>,
+    pub first_slot: u8,
+    pub skipped_latency: u32,
+}
+impl ControlPayloadCodec for ChainTarget {
+    fn encode(&self) -> Result<Vec<u8>, ControlProtocolError> {
+        let name = self.bank.as_deref().unwrap_or_default();
+        let out = [
+            &[self.first_slot][..],
+            &self.skipped_latency.to_le_bytes(),
+            name.as_bytes(),
+        ]
+        .concat();
+        Self::decode(&out).map(|_| out)
+    }
+    fn decode(bytes: &[u8]) -> Result<Self, ControlProtocolError> {
+        if bytes.len() < CHAIN_TARGET_FIXED_BYTES
+            || bytes.len() > CHAIN_TARGET_FIXED_BYTES + MAX_BANK_NAME_BYTES
+        {
+            return Err(ControlProtocolError::InvalidPayload);
+        }
+        let name = std::str::from_utf8(&bytes[CHAIN_TARGET_FIXED_BYTES..])
+            .map_err(|_| ControlProtocolError::InvalidPayload)?;
+        let bank = (!name.is_empty()).then(|| name.to_owned());
+        // A following segment needs at least one slot of its own; with none, every slot may
+        // already be this worker's or skipped.
+        let last_slot = if bank.is_some() {
+            CONTROL_SLOT_COUNT - 1
+        } else {
+            CONTROL_SLOT_COUNT
+        };
+        if name.contains('\0') || !(1..=last_slot).contains(&bytes[0]) {
+            return Err(ControlProtocolError::InvalidPayload);
+        }
+        Ok(Self {
+            bank,
+            first_slot: bytes[0],
+            skipped_latency: at32(bytes, 1),
+        })
+    }
+}
+
 fn validate_order(current: &[u8], order: &[u8]) -> Result<(), ControlProtocolError> {
     if current.len() != order.len() || current.is_empty() || current.len() > 8 {
         return Err(ControlProtocolError::InvalidPayload);
@@ -974,6 +1030,36 @@ mod tests {
         let mut malformed = encoded_values;
         malformed[9..17].copy_from_slice(&f64::INFINITY.to_le_bytes());
         assert!(ParameterValues::decode(&malformed).is_err());
+    }
+
+    /// A following segment needs a slot of its own; a chain with nothing after it may skip up
+    /// to the last slot.
+    #[test]
+    fn chain_targets_round_trip_and_reject_impossible_slots() {
+        let skip_to_next = ChainTarget {
+            bank: Some("/sp-1-2-3".to_owned()),
+            first_slot: 3,
+            skipped_latency: 64,
+        };
+        let only_delay = ChainTarget {
+            bank: None,
+            first_slot: 8,
+            skipped_latency: 64,
+        };
+        for target in [skip_to_next, only_delay] {
+            assert_eq!(
+                ChainTarget::decode(&target.encode().unwrap()).unwrap(),
+                target
+            );
+        }
+        for (bank, first_slot) in [(Some("/sp"), 0), (Some("/sp"), 8), (None, 9)] {
+            let target = ChainTarget {
+                bank: bank.map(str::to_owned),
+                first_slot,
+                skipped_latency: 0,
+            };
+            assert!(target.encode().is_err(), "{target:?}");
+        }
     }
 
     #[test]

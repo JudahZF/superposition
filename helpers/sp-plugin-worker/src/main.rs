@@ -3,6 +3,8 @@
 mod control_stdio;
 mod control_thread;
 #[cfg(feature = "sdk")]
+mod segment_chain;
+#[cfg(feature = "sdk")]
 mod state_transfer;
 mod worker_runtime;
 
@@ -24,11 +26,12 @@ use sp_protocol::{
         ControlResponse, ControlResponseStatus, ControlTarget, RackIdentity, SlotIdentity,
     },
     payload::{
-        Bypass, ControlPayloadCodec, EditorGeometry, EditorPosition, EditorPreviewDescriptor,
-        EditorPreviewRequest, HealthReport, ParameterId, ParameterIds, ParameterMetadata,
-        ParameterValues, ParameterWrite, PluginSlotConfiguration as WirePluginSlotConfiguration,
-        RackTopology, RestartReport, SlotOrder, StateChunkRequest, StateChunkWrite, StateRestore,
-        StateTransferDescriptor, StateTransferId, StateTransferLengths,
+        Bypass, ChainTarget, ControlPayloadCodec, EditorGeometry, EditorPosition,
+        EditorPreviewDescriptor, EditorPreviewRequest, HealthReport, ParameterId, ParameterIds,
+        ParameterMetadata, ParameterValues, ParameterWrite,
+        PluginSlotConfiguration as WirePluginSlotConfiguration, RackTopology, RestartReport,
+        SlotOrder, StateChunkRequest, StateChunkWrite, StateRestore, StateTransferDescriptor,
+        StateTransferId, StateTransferLengths,
     },
 };
 use sp_shared_memory::{
@@ -49,6 +52,7 @@ use crate::{
     control_thread::{
         ControlThread, ProcessingControlEndpoint, ProcessingControlHandler, control_mailbox,
     },
+    segment_chain::SegmentChain,
     state_transfer::StateTransfers,
     worker_runtime::{
         PlanarBlock, PluginFacade, PluginProcessRequest, PluginRuntimeError,
@@ -1608,6 +1612,7 @@ fn run_production_processing_thread(
                 clock,
                 &mut heartbeat,
                 &mut runtime.rack,
+                runtime.chain.as_deref_mut(),
                 &mut audio_policy,
                 sample_rate,
             )? {
@@ -1884,6 +1889,7 @@ fn process_production_request(
     clock: MonotonicClock,
     heartbeat: &mut HeartbeatPublisher,
     rack: &mut RackProcessor<Vst3Facade>,
+    chain: Option<&mut SegmentChain>,
     audio_policy: &mut sp_shared_memory_os::AudioThreadPolicy,
     sample_rate: u32,
 ) -> Result<RequestProgress, String> {
@@ -1908,6 +1914,9 @@ fn process_production_request(
         .map_err(|error| error.to_string())?;
     rack.process_block(slot)
         .map_err(|error| format!("could not process VST3 rack: {error}"))?;
+    if let Some(chain) = chain {
+        chain.process(slot, header, clock, sample_rate);
+    }
     slot.publish_completion_at(worker_id, ticket, clock.now_ticks())
         .map_err(|error| format!("could not publish completion: {error}"))?;
     heartbeat.publish_now(header)?;
@@ -1916,9 +1925,16 @@ fn process_production_request(
 
 #[cfg(feature = "sdk")]
 fn publish_worker_telemetry(bank: &SharedBank, runtime: &mut ProductionRuntime) {
+    let own = runtime.rack.latency_samples();
+    bank.header
+        .segment_latency_samples
+        .store(own, Ordering::Release);
+    // A mixed-rack segment's latency includes the segments it forwards to, so the host's dry
+    // path stays aligned with the whole chain.
+    let chained = runtime.chain.as_ref().map_or(0, |chain| chain.latency());
     bank.header
         .worker_latency_samples
-        .store(runtime.rack.latency_samples(), Ordering::Release);
+        .store(own.saturating_add(chained), Ordering::Release);
     for (slot, flags) in runtime
         .rack
         .take_slot_restart_flags()
@@ -2236,6 +2252,8 @@ struct ProductionRuntime {
     worker_id: u32,
     sample_rate: u32,
     rack: RackProcessor<Vst3Facade>,
+    /// Mixed racks: forwarding to the next segment's worker, set by `Rechain`.
+    chain: Option<Box<SegmentChain>>,
     loaded: [Option<WirePluginSlotConfiguration>; 8],
     rack_committed: bool,
     state_transfers: StateTransfers,
@@ -2278,6 +2296,7 @@ impl ProductionRuntime {
             worker_id,
             sample_rate,
             rack,
+            chain: None,
             loaded,
             rack_committed: false,
             state_transfers: StateTransfers::default(),
@@ -2489,6 +2508,19 @@ impl ProductionRuntime {
         }
         self.rack_committed = true;
         Ok(Vec::new())
+    }
+
+    /// Points this worker at the next segment of a mixed rack, between blocks. A target with no
+    /// bank and no skipped latency ends the chain.
+    fn rechain(&mut self, target: &ChainTarget) -> Result<(), String> {
+        if target.bank.is_none() && target.skipped_latency == 0 {
+            self.chain = None;
+            return Ok(());
+        }
+        self.chain
+            .get_or_insert_with(|| Box::new(SegmentChain::new()))
+            .retarget(target)
+            .map_err(|error| format!("could not open the next segment's bank: {error}"))
     }
 
     fn handle_main_thread_control(
@@ -2810,6 +2842,10 @@ impl ProcessingControlHandler for ProductionRuntime {
                 self.shutdown_requested.store(true, Ordering::Release);
                 Ok(Vec::new())
             }
+            ControlOperation::Rechain => ChainTarget::decode(request.payload())
+                .map_err(|error| error.to_string())
+                .and_then(|target| self.rechain(&target))
+                .map(|()| Vec::new()),
         };
         Self::response(&request, result)
     }
