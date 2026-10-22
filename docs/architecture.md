@@ -103,6 +103,31 @@ Each window carries `WM_NAME` and `_NET_WM_NAME` (plug-in, rack, and slot),
 `_SUPERPOSITION_SLOT` properties, so the window streamer can map it to its
 slot. Preview pictures come from an X `GetImage` of the window.
 
+The app sees that display only through `sp-window-streamer`, which the runtime starts on it with
+a socket in `$XDG_RUNTIME_DIR/superposition-<pid>/`. The streamer tracks every top-level and
+popup window, captures changed regions (Composite, DAMAGE, MIT-SHM), and sends them as
+zstd-compressed 64×64 tiles (`sp-window-stream` protocol: one controller, any number of
+viewers). The UI keeps one texture per window, draws each top-level window as an egui window and
+each popup over its parent, and forwards pointer, wheel, keys, and text, which the streamer injects
+with XTEST. Closing an editor's egui window closes the editor through its worker; closing any
+other window (an installer, a licence manager) sends `WM_DELETE_WINDOW`. If Xvfb or the streamer
+dies, the runtime restarts it and the UI reconnects.
+
+## Remote operation
+
+`superposition --serve` runs the engine and the normal UI against a headless `egui::Context`;
+`superposition --connect HOST` opens a window that shows it (`sp-remote`). The client sends each
+frame's `egui::RawInput`; the engine runs a UI frame for that input, tessellates it, and sends the
+meshes and texture changes, which the client paints. The client therefore shows exactly the
+engine's UI, and streamed plug-in editors arrive as textures in it. The transport is QUIC with
+TLS 1.3 and self-signed identities. An unknown client pairs once with the six-digit code the
+engine prints: SPAKE2 over the connection, confirmed by HMACs over both certificate
+fingerprints, after which each side pins the other. One client controls; other clients watch
+until they take control. A client that joins late first receives every live texture in full.
+The engine renders only for input or a requested repaint, so an idle engine and client use
+almost no CPU. On macOS the served UI works the same, but native editors stay on the Mac's own
+display.
+
 Native editor parameter callbacks publish latest values into the worker's
 fixed-ID atomic mirror. Its loading-thread service writes a per-slot
 shared-memory sidecar with epoch, revision, and overflow counters; a separate

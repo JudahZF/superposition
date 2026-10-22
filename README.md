@@ -78,6 +78,18 @@ target/debug/superposition --headless --session /path/to/Live.superposition \
 
 Headless mode needs an explicit device and a saved session with at least one loaded rack. Use names or IDs from `--list-devices`. `--input-device none` selects output-only processing, and `--midi-port <id-or-name>` opens one MIDI input. At the end it reports callbacks, rack completions, deadline misses, fallback, closed gates, and output levels. It fails on callback errors, deadline misses, protocol faults, or an unhealthy worker. Use `--release` builds for timing checks. See [live validation](docs/live-validation.md) for measured results.
 
+## Remote operation
+
+```sh
+superposition --serve [--bind ADDR] [--name NAME] [--pair]   # engine without a window
+superposition --connect HOST[:PORT] [--pair CODE] [--viewer] # show and drive it
+```
+
+The engine prints a six-digit pairing code on its first start (or with `--pair`); a client uses it
+once, then both sides remember each other. The client shows the engine's whole UI, including
+plug-in editors on Linux engines. One client controls at a time; others watch and may take
+control.
+
 ## Development
 
 ```sh
