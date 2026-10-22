@@ -16,6 +16,7 @@ members = [
     "crates/sp-supervisor",
     "crates/sp-session",
     "crates/sp-midi",
+    "crates/sp-wine",
     "crates/sp-ui",
     "tools/xtask",
 ]
