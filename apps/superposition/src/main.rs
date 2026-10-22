@@ -532,6 +532,7 @@ impl ProductRuntime {
         if let (Some(windows), Some(wine)) = (&helpers.windows, &wine) {
             scanner = scanner.with_windows_scanner(&windows.scanner, wine.launcher().clone());
         }
+        #[allow(unused_mut, reason = "Linux shares the editor display with Wine")]
         let mut runtime = Self {
             scanner,
             helpers,
