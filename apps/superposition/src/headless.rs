@@ -1,4 +1,5 @@
-//! Command-line host for a saved session and explicitly selected `CoreAudio` devices.
+//! Command-line host for a saved session and explicitly selected audio devices (`CoreAudio` on
+//! macOS, JACK on Linux).
 
 use std::path::PathBuf;
 
@@ -10,7 +11,8 @@ const USAGE: &str = "Usage:
   superposition --headless --session <package> --device <id-or-unique-name> --duration-seconds <N> [--frames 32|64|128|256] [--midi-port <id-or-unique-name>]
   superposition --headless --session <package> --input-device <id-or-unique-name|none> --output-device <id-or-unique-name> --duration-seconds <N> [--frames 32|64|128|256] [--midi-port <id-or-unique-name>]
 
-The device ID printed by --list-devices is a CoreAudio object ID (coreaudio:<number>).
+The device ID printed by --list-devices is a CoreAudio object ID (coreaudio:<number>) on macOS
+and a JACK server (jack:<name>) on Linux.
 Use --input-device none for an output-only route. Both device choices must be explicit.
 The MIDI port ID printed by --list-midi-ports selects one input; no MIDI input is opened by default.
 The live host requires a saved session with at least one loaded plug-in rack.
@@ -165,7 +167,7 @@ fn parse(arguments: &[String]) -> Result<Command, String> {
         (if input == "none" { None } else { Some(input) }, output)
     };
     if output_device == "none" {
-        return Err("--output-device must select a CoreAudio device".to_owned());
+        return Err("--output-device must select an audio device".to_owned());
     }
     let duration_seconds = duration_seconds
         .ok_or("--headless requires --duration-seconds <N>")?
@@ -221,9 +223,9 @@ fn scan() -> Result<(), String> {
 #[cfg(audio_backend)]
 fn list_devices() -> Result<(), String> {
     let devices = crate::platform_audio::enumerate_devices()
-        .map_err(|error| format!("CoreAudio device discovery failed: {error}"))?;
+        .map_err(|error| format!("audio device discovery failed: {error}"))?;
     if devices.is_empty() {
-        println!("No CoreAudio devices were found.");
+        println!("No audio devices were found.");
     }
     for device in devices {
         let frames = device
@@ -298,7 +300,7 @@ fn host(options: &HostOptions) -> Result<(), String> {
         return Err("saved session has no plug-in racks to host".to_owned());
     }
     let devices = crate::platform_audio::enumerate_devices()
-        .map_err(|error| format!("CoreAudio device discovery failed: {error}"))?;
+        .map_err(|error| format!("audio device discovery failed: {error}"))?;
     let output = select_device_for_direction(
         &devices,
         &options.output_device,
@@ -312,7 +314,13 @@ fn host(options: &HostOptions) -> Result<(), String> {
             select_device_for_direction(&devices, requested, options.frames, DeviceDirection::Input)
         })
         .transpose()?;
-    let mut format = AudioFormat::product_stereo(options.frames)
+    let sample_rate_hz = model
+        .audio_settings
+        .as_ref()
+        .map_or(sp_audio_io::PRODUCT_SAMPLE_RATE_HZ, |settings| {
+            settings.sample_rate_hz
+        });
+    let mut format = AudioFormat::product(sample_rate_hz, options.frames)
         .map_err(|error| format!("invalid audio format: {error}"))?;
     format.channel_count = output.capabilities.max_output_channels.min(64);
     let route = AudioRouteConfig {
@@ -381,9 +389,9 @@ fn host(options: &HostOptions) -> Result<(), String> {
         PlatformAudioEndpoint::with_renderer(renderer).allow_device_reconfiguration();
     endpoint
         .start_route(route)
-        .map_err(|error| format!("CoreAudio could not start: {error}"))?;
+        .map_err(|error| format!("audio could not start: {error}"))?;
     println!(
-        "host: session={} input_device={} output_device={} input_name={:?} output_name={:?} input_channels={} output_channels={} sample_rate=48000 frames={} loaded_racks={} duration_seconds={}",
+        "host: session={} input_device={} output_device={} input_name={:?} output_name={:?} input_channels={} output_channels={} sample_rate={sample_rate_hz} frames={} loaded_racks={} duration_seconds={}",
         options.session.display(),
         input.map_or("none", |device| device.info.id.as_str()),
         output.info.id,
@@ -483,7 +491,7 @@ fn host(options: &HostOptions) -> Result<(), String> {
         }
         let callback = endpoint
             .callback_telemetry()
-            .ok_or("CoreAudio stopped before final telemetry was available")?;
+            .ok_or("audio stopped before final telemetry was available")?;
         println!(
             "audio: callbacks={} rendered={} silenced={} invalid_frames={} invalid_buffers={} invalid_channels={} invalid_bytes={} frames_32={} frames_64={} frames_128={} frames_256={}",
             callback.callbacks,
@@ -612,7 +620,7 @@ fn host(options: &HostOptions) -> Result<(), String> {
             return Err(error);
         }
         if callback.callbacks == 0 || callback.rendered == 0 {
-            return Err("CoreAudio did not render any callbacks".to_owned());
+            return Err("the audio device rendered no callbacks".to_owned());
         }
         if callback.silenced > 0
             || callback.invalid_frames > 0
@@ -620,7 +628,7 @@ fn host(options: &HostOptions) -> Result<(), String> {
             || callback.invalid_channels > 0
             || callback.invalid_bytes > 0
         {
-            return Err("CoreAudio reported silent or invalid callbacks".to_owned());
+            return Err("the audio device reported silent or invalid callbacks".to_owned());
         }
         if !incomplete_racks.is_empty() {
             return Err(format!(
@@ -638,13 +646,13 @@ fn host(options: &HostOptions) -> Result<(), String> {
             ));
         }
         if !callback.is_coherent() {
-            return Err("CoreAudio callback telemetry is inconsistent".to_owned());
+            return Err("audio callback telemetry is inconsistent".to_owned());
         }
         Ok(())
     })();
     let stop_result = endpoint
         .stop()
-        .map_err(|error| format!("CoreAudio could not stop cleanly: {error}"));
+        .map_err(|error| format!("audio could not stop cleanly: {error}"));
     match (run_result, stop_result) {
         (Ok(()), Ok(())) => {
             println!("host: complete");
@@ -729,7 +737,7 @@ fn select_device_for_direction<'a>(
     }
     if !selected.supported_buffer_frames.contains(&frames) {
         return Err(format!(
-            "device {requested:?} does not support {frames}-frame audio at 48 kHz"
+            "device {requested:?} does not support {frames}-frame audio"
         ));
     }
     Ok(selected)

@@ -977,7 +977,7 @@ impl LiveRackApp {
             }
             Err(error) => {
                 self.system.set_state(SystemStatusState::Offline);
-                self.show_fault(format!("CoreAudio could not start: {error}"));
+                self.show_fault(format!("Audio could not start: {error}"));
             }
         }
     }
