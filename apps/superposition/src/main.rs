@@ -21,10 +21,11 @@ mod wine_tests;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    ops::Range,
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     time::{Duration, Instant},
@@ -37,7 +38,7 @@ use sp_protocol::{
         RackIdentity, SlotIdentity,
     },
     payload::{
-        Bypass, ControlPayloadCodec, EditorPosition, MAX_PARAMETER_BATCH_SIZE,
+        Bypass, ChainTarget, ControlPayloadCodec, EditorPosition, MAX_PARAMETER_BATCH_SIZE,
         ParameterId as WireParameterId, ParameterIds, ParameterValues, ParameterWrite,
         RackTopology as WireRackTopology, SlotOrder, StateRestore,
     },
@@ -315,11 +316,14 @@ struct WindowsHelpers {
     bridge: PathBuf,
 }
 
+/// A rack's worker. In a mixed rack it runs the first segment, the only one the host sends audio
+/// to, and `segments` holds the rest. Per-slot fields count every slot of the rack.
 struct RetainedWorker {
     /// Rack index in this worker's control and bank identity. It stays fixed when the rack
     /// moves to another position during a live layout change.
     wire_index: usize,
-    /// Native, or Windows under Wine. A Windows rack is pipelined: it is heard one block late.
+    /// Native, or Windows under Wine, for the first segment. A rack with a Windows plug-in is
+    /// pipelined: it is heard one block late.
     platform: PluginPlatform,
     /// The rate the worker was started at; a session at another rate needs a new worker.
     sample_rate_hz: u32,
@@ -350,6 +354,76 @@ struct RetainedWorker {
     /// Per-slot editor windows of the current worker process.
     editors: Vec<EditorWindowState>,
     next_preview_poll: Instant,
+    /// Mixed racks: the segments after the first, in chain order.
+    segments: Vec<ChainSegment>,
+    /// The chain target this worker last accepted.
+    chain: Option<SentChain>,
+    /// This worker's chain-link failure count already acted on.
+    link_failures: u32,
+    /// The worker of the in-flight editor request: 0 for this one, `n` for `segments[n - 1]`.
+    editor_worker: usize,
+}
+
+/// A mixed-rack segment after the first: its plug-ins and its own worker and bank pair. The host
+/// never sends it audio; the segment before forwards each block to its active bank.
+struct ChainSegment {
+    /// The rack slots this segment runs; its worker numbers them from 0.
+    slots: Range<usize>,
+    banks: [SharedMemoryRegion; 2],
+    active_bank_index: usize,
+    /// `None` while the segment is down: the chain skips it, bypassed with its latency.
+    session: Option<WorkerControlSession>,
+    heartbeat: HeartbeatWatch,
+    /// The segment's own plug-in latency, as last published by its worker.
+    own_latency: u32,
+    chain: Option<SentChain>,
+    link_failures: u32,
+    restart_budget: RestartBudget,
+    /// Too many failures: the segment stays down until the rack reloads.
+    failed: bool,
+    restarts: u32,
+}
+
+/// A chain target sent to a worker, with the worker it points at (as in
+/// [`RetainedWorker::editor_worker`]); `None` when only skipped segments follow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SentChain {
+    next: Option<usize>,
+    target: ChainTarget,
+}
+
+/// One contiguous run of same-platform slots in a rack, run by one worker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SegmentPlan {
+    platform: PluginPlatform,
+    slots: Range<usize>,
+}
+
+/// Splits a rack's resolved slots into segments of one platform each. A missing plug-in joins
+/// the segment before it, or the first segment when it leads the rack. A rack of only missing
+/// plug-ins has no segments.
+fn rack_segments(candidates: &[Option<ResolvedSlot>]) -> Vec<SegmentPlan> {
+    let mut segments: Vec<SegmentPlan> = Vec::new();
+    for (slot, candidate) in candidates.iter().enumerate() {
+        match (candidate, segments.last_mut()) {
+            (Some(candidate), Some(last)) if last.platform != candidate.platform => {
+                segments.push(SegmentPlan {
+                    platform: candidate.platform,
+                    slots: slot..slot + 1,
+                });
+            }
+            (_, Some(last)) => last.slots.end = slot + 1,
+            (Some(candidate), None) => segments.push(SegmentPlan {
+                platform: candidate.platform,
+                slots: slot..slot + 1,
+            }),
+            (None, None) => {}
+        }
+    }
+    if let Some(first) = segments.first_mut() {
+        first.slots.start = 0;
+    }
+    segments
 }
 
 impl RetainedWorker {
@@ -428,6 +502,185 @@ impl RetainedWorker {
             }
         }
         self.rack = rack.clone();
+        Ok(())
+    }
+
+    /// A rack with a Windows plug-in, which includes every mixed rack, is heard one block late.
+    fn pipelined(&self) -> bool {
+        self.platform == PluginPlatform::Windows || !self.segments.is_empty()
+    }
+
+    /// The slots of worker `index`: 0 for this one, `n` for `segments[n - 1]`.
+    fn worker_slots(&self, index: usize) -> Range<usize> {
+        match index.checked_sub(1) {
+            Some(segment) => self.segments[segment].slots.clone(),
+            None => {
+                0..self
+                    .segments
+                    .first()
+                    .map_or(self.rack.slots.len(), |next| next.slots.start)
+            }
+        }
+    }
+
+    /// The worker that runs rack slot `slot`, as in [`Self::worker_slots`].
+    fn worker_of(&self, slot: usize) -> usize {
+        self.segments
+            .iter()
+            .rposition(|segment| segment.slots.start <= slot)
+            .map_or(0, |segment| segment + 1)
+    }
+
+    fn worker_session(&mut self, index: usize) -> Option<&mut WorkerControlSession> {
+        match index.checked_sub(1) {
+            Some(segment) => self.segments[segment].session.as_mut(),
+            None => self.session.as_mut(),
+        }
+    }
+
+    /// The control session that runs rack slot `slot`, and the slot's number in that worker.
+    ///
+    /// # Errors
+    /// Returns an error while that worker is being replaced.
+    fn slot_session(&mut self, slot: usize) -> Result<(&mut WorkerControlSession, usize), String> {
+        let index = self.worker_of(slot);
+        let first = self.worker_slots(index).start;
+        let session = self
+            .worker_session(index)
+            .ok_or("this plug-in's worker is being replaced")?;
+        Ok((session, slot - first))
+    }
+
+    /// The bank that holds rack slot `slot`'s parameter feedback and restart requests, and the
+    /// slot's number there. `None` while that worker is down.
+    fn slot_bank(&self, slot: usize) -> Option<(&SharedMemoryRegion, usize)> {
+        match self.worker_of(slot).checked_sub(1) {
+            Some(index) => {
+                let segment = &self.segments[index];
+                segment.session.as_ref()?;
+                Some((
+                    &segment.banks[segment.active_bank_index],
+                    slot - segment.slots.start,
+                ))
+            }
+            None => Some((&self.banks[self.active_bank_index], slot)),
+        }
+    }
+
+    /// Takes over a launched worker's per-slot state for `slots` and returns its session.
+    fn adopt_slots(
+        &mut self,
+        slots: Range<usize>,
+        launched: LaunchedWorker,
+    ) -> WorkerControlSession {
+        self.parameter_feedback.splice(
+            slots.clone(),
+            launched
+                .parameters
+                .iter()
+                .map(|parameters| ParameterFeedbackCursor::new(parameters)),
+        );
+        self.restart_cursors.splice(
+            slots.clone(),
+            slots.clone().map(|_| RestartCursor::default()),
+        );
+        self.editors.splice(
+            slots.clone(),
+            slots.clone().map(|_| EditorWindowState::default()),
+        );
+        self.parameters.splice(slots.clone(), launched.parameters);
+        self.loaded_slots.splice(slots, launched.loaded_slots);
+        launched.session
+    }
+
+    /// Where worker `index` should send its output: the next segment whose worker runs, past any
+    /// that are down. `None` for the last segment, which sends nothing on.
+    fn wanted_chain(&self, index: usize) -> Option<SentChain> {
+        if index >= self.segments.len() {
+            return None;
+        }
+        let own = self.worker_slots(index);
+        let mut skipped_latency = 0_u32;
+        let mut next = None;
+        for (position, segment) in self.segments.iter().enumerate().skip(index) {
+            if segment.session.is_some() {
+                next = Some(position + 1);
+                break;
+            }
+            skipped_latency = skipped_latency.saturating_add(segment.own_latency);
+        }
+        let next_slot = next.map_or(self.rack.slots.len(), |next| self.worker_slots(next).start);
+        Some(SentChain {
+            next,
+            target: ChainTarget {
+                bank: next.map(|next| {
+                    let segment = &self.segments[next - 1];
+                    segment.banks[segment.active_bank_index].name().to_owned()
+                }),
+                first_slot: u8::try_from(next_slot - own.start).expect("rack slots fit u8"),
+                skipped_latency,
+            },
+        })
+    }
+
+    /// Sends each running worker its wanted chain target, from the last segment back, so a
+    /// worker is linked onward before anything links to it.
+    ///
+    /// # Errors
+    /// Returns the worker (as in [`Self::worker_slots`]) that refused its target.
+    fn sync_chain(&mut self) -> Result<(), (usize, String)> {
+        // A skipped segment is bypassed with the latency its worker last reported.
+        for segment in &mut self.segments {
+            if segment.session.is_some() {
+                segment.own_latency = segment.banks[segment.active_bank_index]
+                    .bank()
+                    .header
+                    .segment_latency_samples
+                    .load(Ordering::Acquire);
+            }
+        }
+        for index in (0..self.segments.len()).rev() {
+            let wanted = self.wanted_chain(index);
+            let (session, bank, sent, failures) = match index.checked_sub(1) {
+                Some(position) => {
+                    let segment = &mut self.segments[position];
+                    (
+                        segment.session.as_mut(),
+                        &segment.banks[segment.active_bank_index],
+                        &mut segment.chain,
+                        &mut segment.link_failures,
+                    )
+                }
+                None => (
+                    self.session.as_mut(),
+                    &self.banks[self.active_bank_index],
+                    &mut self.chain,
+                    &mut self.link_failures,
+                ),
+            };
+            let (Some(session), Some(wanted)) = (session, wanted) else {
+                continue;
+            };
+            if sent.as_ref() == Some(&wanted) {
+                continue;
+            }
+            let payload = wanted
+                .target
+                .encode()
+                .map_err(|error| (index, error.to_string()))?;
+            // The health reply follows the worker's next telemetry publication, so the latency
+            // it reports already includes its new chain.
+            request_ok(session, ControlOperation::Rechain, None, &payload)
+                .and_then(|_| request_ok(session, ControlOperation::QueryHealth, None, &[]))
+                .map_err(|error| (index, error))?;
+            // Failures of the link it replaced are already counted.
+            *failures = bank
+                .bank()
+                .header
+                .chain_link_failures
+                .load(Ordering::Acquire);
+            *sent = Some(wanted);
+        }
         Ok(())
     }
 }
@@ -951,6 +1204,7 @@ impl ProductRuntime {
             self.recover_worker(rack, kind);
         }
         self.poll_planned_restarts();
+        self.poll_segments();
         if let Some(owns) = stopped_owns {
             self.service_unattached_recoveries(owns);
         }
@@ -1311,7 +1565,9 @@ impl ProductRuntime {
         let now = Instant::now();
         let mut notices = Vec::new();
         for (&rack_index, worker) in &mut self.workers {
+            // Planned maintenance restarts one worker for a whole rack; mixed racks do not use it.
             if worker.maintenance.is_some()
+                || !worker.segments.is_empty()
                 || worker
                     .maintenance
                     .as_ref()
@@ -1407,16 +1663,24 @@ impl ProductRuntime {
                 if worker.loaded_slots.get(slot_index) != Some(&true) {
                     continue;
                 }
-                let Some(cursor) = worker.parameter_feedback.get_mut(slot_index) else {
+                let Some(&ParameterFeedbackCursor {
+                    epoch, revision, ..
+                }) = worker.parameter_feedback.get(slot_index)
+                else {
                     continue;
                 };
-                let Some(snapshot) = bank.bank().feedback.snapshot_changed(
-                    slot_index,
-                    cursor.epoch,
-                    cursor.revision,
-                ) else {
+                // A mixed rack's later slots report through their segment's bank.
+                let Some((feedback, local)) = worker.slot_bank(slot_index) else {
                     continue;
                 };
+                let Some(snapshot) = feedback
+                    .bank()
+                    .feedback
+                    .snapshot_changed(local, epoch, revision)
+                else {
+                    continue;
+                };
+                let cursor = &mut worker.parameter_feedback[slot_index];
                 let accepted = cursor.accept(
                     snapshot.epoch,
                     snapshot.revision,
@@ -1522,50 +1786,65 @@ impl ProductRuntime {
         if rack.slots.is_empty() {
             return Ok(None);
         }
-        let candidates = self.resolve_rack_slots(rack)?;
-        if candidates.iter().all(Option::is_none) {
+        let plans = rack_segments(&self.resolve_rack_slots(rack)?);
+        let Some((first, later)) = plans.split_first() else {
             self.note(format!(
                 "rack {} contains only missing plug-in placeholders; dry fallback remains active",
                 rack_index + 1
             ));
             return Ok(None);
-        }
+        };
         let generation = self.next_generation(rack_index);
-        let banks = [
-            SharedMemoryRegion::create(generation)
-                .map_err(|error| format!("cannot create active rack bank: {error}"))?,
-            SharedMemoryRegion::create(generation.saturating_add(1))
-                .map_err(|error| format!("cannot create inactive rack bank: {error}"))?,
-        ];
-        let launched = self.launch_worker(
-            rack_index,
-            rack,
-            saved_states,
-            &banks[0],
-            0,
-            generation,
-            None,
-        )?;
+        // Later segments start first, last to first: a worker links onward before anything
+        // links to it.
+        let mut segments = Vec::with_capacity(later.len());
+        for plan in later.iter().rev() {
+            match self.start_segment(rack_index, rack, saved_states, plan, generation) {
+                Ok(segment) => segments.push(segment),
+                Err(error) => {
+                    self.stop_segments(segments);
+                    return Err(error);
+                }
+            }
+        }
+        segments.reverse();
+        let first_worker = bank_pair(generation).and_then(|banks| {
+            let slots = first.slots.clone();
+            self.launch_worker(
+                rack_index,
+                rack,
+                saved_states,
+                slots,
+                &banks[0],
+                0,
+                generation,
+                None,
+            )
+            .map(|launched| (banks, launched))
+        });
+        let (banks, launched) = match first_worker {
+            Ok(first_worker) => first_worker,
+            Err(error) => {
+                self.stop_segments(segments);
+                return Err(error);
+            }
+        };
         let mut retained_states = saved_states.to_vec();
         retained_states.resize(rack.slots.len(), None);
-        let parameter_feedback = launched
-            .parameters
-            .iter()
-            .map(|parameters| ParameterFeedbackCursor::new(parameters))
-            .collect();
-        let restart_cursors = vec![RestartCursor::default(); launched.parameters.len()];
-        let worker = RetainedWorker {
+        let mut worker = RetainedWorker {
             wire_index: rack_index,
             platform: launched.platform,
             sample_rate_hz: self.sample_rate_hz,
-            fingerprint: launched.fingerprint,
+            fingerprint: launched.fingerprint.clone(),
             banks,
             active_bank_index: 0,
-            session: Some(launched.session),
-            parameters: launched.parameters,
-            parameter_feedback,
-            restart_cursors,
-            loaded_slots: launched.loaded_slots,
+            session: None,
+            parameters: vec![Vec::new(); rack.slots.len()],
+            parameter_feedback: (0..rack.slots.len())
+                .map(|_| ParameterFeedbackCursor::default())
+                .collect(),
+            restart_cursors: vec![RestartCursor::default(); rack.slots.len()],
+            loaded_slots: vec![false; rack.slots.len()],
             rack: rack.clone(),
             saved_states: retained_states,
             recovery: Arc::new(RackRecoverySignal::new()),
@@ -1582,12 +1861,69 @@ impl ProductRuntime {
             restarts: 0,
             editors: vec![EditorWindowState::default(); rack.slots.len()],
             next_preview_poll: Instant::now(),
+            segments: Vec::new(),
+            chain: None,
+            link_failures: 0,
+            editor_worker: 0,
         };
+        worker.session = Some(worker.adopt_slots(first.slots.clone(), launched));
+        for (mut segment, launched) in segments {
+            segment.session = Some(worker.adopt_slots(segment.slots.clone(), launched));
+            worker.segments.push(segment);
+        }
+        if let Err((index, error)) = worker.sync_chain() {
+            self.stop_worker(worker);
+            return Err(format!(
+                "rack {} segment {} could not join the chain: {error}",
+                rack_index + 1,
+                index + 1
+            ));
+        }
         self.note(format!(
-            "rack {} worker initialized (generation {generation})",
-            rack_index + 1
+            "rack {} worker initialized (generation {generation}, {} segments)",
+            rack_index + 1,
+            plans.len()
         ));
         Ok(Some(worker))
+    }
+
+    /// Starts the worker of one later segment of a mixed rack, on the first of a new bank pair.
+    /// The segment takes the worker's session when the rack adopts it.
+    fn start_segment(
+        &mut self,
+        rack_index: usize,
+        rack: &sp_model::Rack,
+        saved_states: &[Option<CapturedPluginState>],
+        plan: &SegmentPlan,
+        generation: u64,
+    ) -> Result<(ChainSegment, LaunchedWorker), String> {
+        let banks = bank_pair(generation)?;
+        let launched = self.launch_worker(
+            rack_index,
+            rack,
+            saved_states,
+            plan.slots.clone(),
+            &banks[0],
+            0,
+            generation,
+            None,
+        )?;
+        Ok((
+            ChainSegment {
+                slots: plan.slots.clone(),
+                banks,
+                active_bank_index: 0,
+                session: None,
+                heartbeat: HeartbeatWatch::new(Instant::now()),
+                own_latency: 0,
+                chain: None,
+                link_failures: 0,
+                restart_budget: RestartBudget::default(),
+                failed: false,
+                restarts: 0,
+            },
+            launched,
+        ))
     }
 
     /// Changes the rack layout while audio runs. Racks listed in `plan` with
@@ -1664,7 +2000,7 @@ impl ProductRuntime {
                             Arc::clone(&worker.recovery),
                         )
                         .map_err(|error| format!("cannot prepare rack for audio: {error}"))?
-                        .with_pipelined(worker.platform == PluginPlatform::Windows),
+                        .with_pipelined(worker.pipelined()),
                     )
                 }
                 _ => LaneWorker::Dry,
@@ -1744,11 +2080,12 @@ impl ProductRuntime {
         };
         if worker.loaded_slots.len() != slots_before
             || !worker.loaded_slots.iter().all(|&loaded| loaded)
+            || !worker.segments.is_empty()
             || candidate
                 .as_ref()
                 .is_some_and(|candidate| candidate.platform != worker.platform)
         {
-            // Another platform's plug-in needs a rebuild, which reports the mixed rack.
+            // A mixed rack, or one that becomes mixed, is rebuilt with its new segments.
             return Ok(false);
         }
         if let Err(error) = worker.apply_slot_edit(rack, edit, candidate) {
@@ -1779,17 +2116,33 @@ impl ProductRuntime {
 
     /// Stops a worker that the callback no longer reads.
     fn stop_worker(&mut self, mut worker: RetainedWorker) {
-        let Some(session) = worker.session.take() else {
-            return;
-        };
+        for segment in std::mem::take(&mut worker.segments) {
+            if let Some(session) = segment.session {
+                self.retire_process(session, segment.banks);
+            }
+        }
+        if let Some(session) = worker.session.take() {
+            self.retire_process(session, worker.banks);
+        }
+    }
+
+    /// Stops a worker, keeping its banks until its process is reaped.
+    fn retire_process(&mut self, session: WorkerControlSession, banks: [SharedMemoryRegion; 2]) {
         let pid = session.process_id();
         let _ = session.shutdown(&mut self.processes);
         if !self.processes.is_reaped(pid) {
             let _ = self.processes.request_stop(pid);
             self.cancelled_banks.push(CancelledBanks {
-                banks: worker.banks,
+                banks,
                 process_ids: vec![pid],
             });
+        }
+    }
+
+    /// Stops segment workers started for a rack that did not come up.
+    fn stop_segments(&mut self, segments: Vec<(ChainSegment, LaunchedWorker)>) {
+        for (segment, launched) in segments {
+            self.retire_process(launched.session, segment.banks);
         }
     }
 
@@ -1815,16 +2168,8 @@ impl ProductRuntime {
                     banks: worker.banks,
                     process_ids,
                 });
-            } else if let Some(session) = worker.session.take() {
-                let pid = session.process_id();
-                let _ = session.shutdown(&mut self.processes);
-                if !self.processes.is_reaped(pid) {
-                    let _ = self.processes.request_stop(pid);
-                    self.cancelled_banks.push(CancelledBanks {
-                        banks: worker.banks,
-                        process_ids: vec![pid],
-                    });
-                }
+            } else {
+                self.stop_worker(worker);
             }
         }
         self.editor_requests.remove(&rack_index);
@@ -1842,17 +2187,22 @@ impl ProductRuntime {
         clippy::too_many_lines,
         reason = "worker launch names every isolation input and step in one sequence"
     )]
+    /// Launches and configures the worker for `slots` of `rack`: the whole rack, or one segment
+    /// of a mixed rack. The worker numbers its slots from `slots.start`.
     fn launch_worker(
         &mut self,
         rack_index: usize,
         rack: &sp_model::Rack,
         saved_states: &[Option<CapturedPluginState>],
+        slots: Range<usize>,
         bank: &SharedMemoryRegion,
         bank_index: usize,
         generation: u64,
         suspected_slot: Option<usize>,
     ) -> Result<LaunchedWorker, String> {
-        let candidates = self.resolve_rack_slots(rack)?;
+        let mut candidates = self.resolve_rack_slots(rack)?;
+        candidates.truncate(slots.end);
+        candidates.drain(..slots.start);
         for candidate in candidates.iter().flatten() {
             self.scanner.quarantine().expect("product scanner has quarantine")
                 .ensure_launch_permitted(&candidate.fingerprint)
@@ -1872,7 +2222,26 @@ impl ProductRuntime {
         let session = WorkerControlSession::launch(&mut self.processes, &launch)
             .map_err(|error| format!("could not launch rack worker: {error}"))?;
         let process_id = session.process_id();
-        match configure_worker_session(session, rack, &candidates, saved_states, suspected_slot) {
+        let segment = sp_model::Rack {
+            slots: rack.slots[slots.clone()].to_vec(),
+            ..rack.clone()
+        };
+        let saved_states: Vec<_> = saved_states
+            .iter()
+            .skip(slots.start)
+            .take(slots.len())
+            .cloned()
+            .collect();
+        let suspected_slot = suspected_slot
+            .and_then(|slot| slot.checked_sub(slots.start))
+            .filter(|slot| *slot < slots.len());
+        match configure_worker_session(
+            session,
+            &segment,
+            &candidates,
+            &saved_states,
+            suspected_slot,
+        ) {
             Ok(launched) => Ok(launched),
             Err(error) => {
                 let _ = self.processes.stop(process_id);
@@ -1928,19 +2297,20 @@ impl ProductRuntime {
                 rack_index + 1
             ));
         }
-        let Some(session) = worker.session.as_mut() else {
-            return Err(format!("rack {} worker is recovering", rack_index + 1));
-        };
         let mut captures = Vec::new();
-        for (slot, model_slot) in worker.rack.slots.iter().enumerate() {
+        for slot in 0..worker.rack.slots.len() {
             if worker.loaded_slots.get(slot) != Some(&true) {
                 continue;
             }
+            let (session, local) = worker
+                .slot_session(slot)
+                .map_err(|error| format!("rack {}: {error}", rack_index + 1))?;
             // The worker serializes state on its loading thread; the slot keeps processing.
             let state = session
                 .client_mut()
-                .capture_state(slot_identity(slot)?)
+                .capture_state(slot_identity(local)?)
                 .map_err(|error| format!("could not capture plug-in state: {error}"))?;
+            let model_slot = &worker.rack.slots[slot];
             let fingerprint = model_slot.plugin.fingerprint.digest.clone();
             let captured_state = CapturedPluginState {
                 instance_id: model_slot.id.0.clone(),
@@ -1978,12 +2348,9 @@ impl ProductRuntime {
         if worker.maintenance.is_some() || worker.recovery.state() != RackRecoveryState::Idle {
             return Err("rack is waiting for plug-in maintenance".to_owned());
         }
-        let session = worker
-            .session
-            .as_mut()
-            .ok_or("rack worker is currently recovering")?;
         let slot_index = slot;
-        let slot = slot_identity(slot_index)?;
+        let (session, local) = worker.slot_session(slot_index)?;
+        let slot = slot_identity(local)?;
         let payload = Bypass { enabled }
             .encode()
             .map_err(|error| error.to_string())?;
@@ -2014,11 +2381,8 @@ impl ProductRuntime {
             .workers
             .get_mut(&rack_index)
             .ok_or("rack worker is not running")?;
-        let session = worker
-            .session
-            .as_mut()
-            .ok_or("rack worker is currently recovering")?;
-        write_worker_parameter(session, slot, parameter_id, normalized)?;
+        let (session, local) = worker.slot_session(slot)?;
+        write_worker_parameter(session, local, parameter_id, normalized)?;
         if let Some(model_slot) = worker.rack.slots.get_mut(slot) {
             #[allow(
                 clippy::cast_possible_truncation,
@@ -2041,12 +2405,12 @@ impl ProductRuntime {
         slot: usize,
         parameter_id: u32,
     ) -> Result<f64, String> {
-        let session = self
+        let (session, local) = self
             .workers
             .get_mut(&rack_index)
-            .and_then(|worker| worker.session.as_mut())
-            .ok_or("rack worker is not running")?;
-        worker_parameter_metadata(session, slot, parameter_id).map(|metadata| metadata.normalized)
+            .ok_or("rack worker is not running")?
+            .slot_session(slot)?;
+        worker_parameter_metadata(session, local, parameter_id).map(|metadata| metadata.normalized)
     }
 
     /// Starts editor attachment without blocking the desktop event loop or stopping audio.
@@ -2058,7 +2422,6 @@ impl ProductRuntime {
         audio_running: bool,
         placement: Option<EditorPlacement>,
     ) -> Result<(), String> {
-        let identity = slot_identity(slot)?;
         let payload = placement
             .map(|placement| {
                 EditorPosition {
@@ -2077,13 +2440,11 @@ impl ProductRuntime {
         if worker.maintenance.is_some() || worker.recovery.state() != RackRecoveryState::Idle {
             return Err("rack is waiting for plug-in maintenance".to_owned());
         }
-        let session = worker
-            .session
-            .as_mut()
-            .ok_or("rack worker is currently recovering")?;
+        let owner = worker.worker_of(slot);
+        let (session, local) = worker.slot_session(slot)?;
         let result = session.client_mut().begin_request(
             ControlOperation::OpenNativeEditor,
-            Some(identity),
+            Some(slot_identity(local)?),
             &payload,
         );
         match result {
@@ -2092,9 +2453,10 @@ impl ProductRuntime {
                 return Err("An editor request is already in progress for this rack".to_owned());
             }
             Err(error) => {
-                return self.finish_editor_request(rack_index, audio_running, Err(error));
+                return self.finish_editor_request(rack_index, owner, audio_running, Err(error));
             }
         }
+        worker.editor_worker = owner;
         if let Some(editor) = worker.editors.get_mut(slot) {
             editor.opening = true;
         }
@@ -2113,15 +2475,15 @@ impl ProductRuntime {
         audio_running: bool,
     ) -> Option<Result<(), String>> {
         let completed = self.editor_requests.iter().find_map(|&rack| {
-            self.workers
-                .get_mut(&rack)?
-                .session
-                .as_mut()?
+            let worker = self.workers.get_mut(&rack)?;
+            let owner = worker.editor_worker;
+            worker
+                .worker_session(owner)?
                 .client_mut()
                 .poll_request()
-                .map(|response| (rack, response))
+                .map(|response| (rack, owner, response))
         });
-        let (rack, response) = completed?;
+        let (rack, owner, response) = completed?;
         self.editor_requests.remove(&rack);
         let opened = response
             .as_ref()
@@ -2133,7 +2495,7 @@ impl ProductRuntime {
                 }
             }
         }
-        Some(self.finish_editor_request(rack, audio_running, response))
+        Some(self.finish_editor_request(rack, owner, audio_running, response))
     }
 
     /// Previews captured since the last call. Cheap to call every UI frame: it polls a rack's
@@ -2156,23 +2518,26 @@ impl ProductRuntime {
             {
                 continue;
             }
-            let Some(session) = worker.session.as_mut() else {
-                continue;
-            };
             worker.next_preview_poll = now + EDITOR_PREVIEW_POLL_INTERVAL;
             let mut failure = None;
-            for (slot_index, editor) in worker.editors.iter_mut().enumerate() {
-                let Ok(slot) = slot_identity(slot_index) else {
-                    continue;
-                };
+            for slot_index in 0..worker.editors.len() {
+                let editor = worker.editors[slot_index];
                 if !editor.open {
                     continue;
                 }
+                // A segment being replaced has no editors; its slots were reset.
+                let Ok((session, local)) = worker.slot_session(slot_index) else {
+                    continue;
+                };
+                let Ok(slot) = slot_identity(local) else {
+                    continue;
+                };
                 match session
                     .client_mut()
                     .capture_editor_preview(slot, editor.preview_sequence)
                 {
                     Ok(poll) => {
+                        let editor = &mut worker.editors[slot_index];
                         editor.open = poll.editor_open;
                         editor.preview_sequence = poll.sequence;
                         if let (Some(png), Some(model_slot)) =
@@ -2233,24 +2598,39 @@ impl ProductRuntime {
         } else {
             ControlOperation::CloseNativeEditor
         };
-        let session = self
+        let worker = self
             .workers
             .get_mut(&rack_index)
-            .and_then(|worker| worker.session.as_mut())
             .ok_or("rack worker is not running")?;
+        let owner = worker.worker_of(slot);
+        let (session, local) = worker.slot_session(slot)?;
         let response = session
             .client_mut()
-            .request(operation, Some(slot_identity(slot)?), &[]);
-        self.finish_editor_request(rack_index, audio_running, response)
+            .request(operation, Some(slot_identity(local)?), &[]);
+        self.finish_editor_request(rack_index, owner, audio_running, response)
     }
 
+    /// Ends an editor request to worker `owner` of a rack (as in
+    /// [`RetainedWorker::worker_slots`]). A worker that can no longer answer is replaced: a
+    /// later segment's by the chain's own recovery.
     fn finish_editor_request(
         &mut self,
         rack_index: usize,
+        owner: usize,
         audio_running: bool,
         response: Result<ControlResponse, sp_supervisor::WorkerControlError>,
     ) -> Result<(), String> {
-        if editor_response_requires_recovery(response.as_ref().ok().map(ControlResponse::status)) {
+        let recover =
+            editor_response_requires_recovery(response.as_ref().ok().map(ControlResponse::status));
+        if let (true, Some(position)) = (recover, owner.checked_sub(1)) {
+            if let Some(session) = self
+                .workers
+                .get_mut(&rack_index)
+                .and_then(|worker| worker.segments[position].session.take())
+            {
+                let _ = self.processes.stop(session.process_id());
+            }
+        } else if recover {
             if audio_running {
                 // Callback mappings must remain alive until the callback confirms quiescence.
                 // A control failure alone is not evidence that a plug-in should be quarantined.
@@ -2284,7 +2664,9 @@ impl ProductRuntime {
 
     pub(crate) fn slot_running(&self, rack_index: usize, slot: usize) -> bool {
         self.workers.get(&rack_index).is_some_and(|worker| {
-            worker.session.is_some() && worker.loaded_slots.get(slot) == Some(&true)
+            worker.session.is_some()
+                && worker.slot_bank(slot).is_some()
+                && worker.loaded_slots.get(slot) == Some(&true)
         })
     }
 
@@ -2315,9 +2697,14 @@ impl ProductRuntime {
     /// Worker restarts (crash recovery and planned maintenance) for the rack at this position
     /// since its worker was first loaded.
     pub(crate) fn rack_restart_count(&self, rack_index: usize) -> u32 {
-        self.workers
-            .get(&rack_index)
-            .map_or(0, |worker| worker.restarts)
+        self.workers.get(&rack_index).map_or(0, |worker| {
+            worker
+                .segments
+                .iter()
+                .fold(worker.restarts, |total, segment| {
+                    total.saturating_add(segment.restarts)
+                })
+        })
     }
 
     pub(crate) fn rack_restart_flags(&self, rack_index: usize) -> u32 {
@@ -2468,10 +2855,6 @@ impl ProductRuntime {
                 .iter()
                 .position(|slot| slot.id == target.slot_id)
                 .ok_or("a selected scene parameter no longer has a plug-in slot")?;
-            let session = worker
-                .session
-                .as_mut()
-                .ok_or("a selected scene parameter's worker is recovering")?;
             let parameter_id = target
                 .parameter_id
                 .0
@@ -2495,10 +2878,13 @@ impl ProductRuntime {
                 ));
             }
             let step_count = parameter.step_count;
+            let (session, local) = worker
+                .slot_session(slot_index)
+                .map_err(|_| "a selected scene parameter's worker is recovering")?;
             // A live read: the worker answers from its loading thread while audio continues.
             let read = worker_parameter_values(
                 session,
-                slot_index,
+                local,
                 vec![WireParameterId {
                     value: u64::from(parameter_id),
                 }],
@@ -2549,19 +2935,15 @@ impl ProductRuntime {
                     rack_index + 1
                 ));
             }
-            let session = worker
-                .session
-                .as_mut()
-                .ok_or_else(|| format!("rack {} worker is recovering", rack_index + 1))?;
-            let rack_id = &worker.rack.id;
-            for (slot_index, worker_slot) in worker.rack.slots.iter_mut().enumerate() {
+            for slot_index in 0..worker.rack.slots.len() {
                 if worker.loaded_slots.get(slot_index) != Some(&true) {
                     continue;
                 }
+                let worker_slot = &worker.rack.slots[slot_index];
                 let Some(model_slot) = model
                     .racks
                     .iter_mut()
-                    .find(|rack| rack.id == *rack_id)
+                    .find(|rack| rack.id == worker.rack.id)
                     .and_then(|rack| {
                         rack.slots.iter_mut().find(|slot| {
                             slot.id == worker_slot.id
@@ -2572,32 +2954,41 @@ impl ProductRuntime {
                 else {
                     continue;
                 };
-                let parameters = worker
+                let batches: Vec<Vec<WireParameterId>> = worker
                     .parameters
                     .get(slot_index)
-                    .map_or(&[][..], Vec::as_slice);
-                for batch in parameters.chunks(MAX_PARAMETER_BATCH_SIZE) {
-                    let ids = batch
-                        .iter()
-                        .filter(|parameter| !parameter.read_only)
-                        .map(|parameter| WireParameterId {
-                            value: u64::from(parameter.id),
-                        })
-                        .collect::<Vec<_>>();
-                    if ids.is_empty() {
-                        continue;
-                    }
-                    for parameter in worker_parameter_values(session, slot_index, ids)? {
+                    .map_or(&[][..], Vec::as_slice)
+                    .chunks(MAX_PARAMETER_BATCH_SIZE)
+                    .map(|batch| {
+                        batch
+                            .iter()
+                            .filter(|parameter| !parameter.read_only)
+                            .map(|parameter| WireParameterId {
+                                value: u64::from(parameter.id),
+                            })
+                            .collect()
+                    })
+                    .filter(|ids: &Vec<_>| !ids.is_empty())
+                    .collect();
+                let (session, local) = worker
+                    .slot_session(slot_index)
+                    .map_err(|error| format!("rack {}: {error}", rack_index + 1))?;
+                let mut values = Vec::new();
+                for ids in batches {
+                    for parameter in worker_parameter_values(session, local, ids)? {
                         #[allow(
                             clippy::cast_possible_truncation,
                             reason = "VST3 normalized values are bounded to 0.0..=1.0"
                         )]
                         let value = sp_model::NormalizedValue::new(parameter.normalized as f32)
                             .map_err(|error| error.to_string())?;
-                        let id = sp_model::ParameterId(parameter.id.value.to_string());
-                        worker_slot.parameters.values.insert(id.clone(), value);
-                        model_slot.parameters.values.insert(id, value);
+                        values.push((sp_model::ParameterId(parameter.id.value.to_string()), value));
                     }
+                }
+                let worker_slot = &mut worker.rack.slots[slot_index];
+                for (id, value) in values {
+                    worker_slot.parameters.values.insert(id.clone(), value);
+                    model_slot.parameters.values.insert(id, value);
                 }
             }
         }
@@ -2716,6 +3107,192 @@ impl ProductRuntime {
             self.note(format!(
                 "rack {rack_index} exceeded {RAPID_RESTART_LIMIT} recoveries in 10 seconds ({kind:?}); its worker will stop after callback quiescence and dry fallback will remain active"
             ));
+        }
+    }
+
+    /// Mixed racks: finds failed segments after the first, routes their chain around them so
+    /// they play bypassed with their latency, and replaces their workers. A segment fails when
+    /// its worker exits or stops its heartbeat, or when the worker before it reports a broken
+    /// link (a missed deadline). The rack's first worker is the host's lane and recovers as any
+    /// rack worker does.
+    fn poll_segments(&mut self) {
+        let racks: Vec<usize> = self
+            .workers
+            .iter()
+            .filter(|(_, worker)| {
+                !worker.segments.is_empty()
+                    && worker.session.is_some()
+                    && worker.maintenance.is_none()
+                    && worker.recovery.state() == RackRecoveryState::Idle
+            })
+            .map(|(&rack, _)| rack)
+            .collect();
+        for rack_index in racks {
+            let Some(mut worker) = self.workers.remove(&rack_index) else {
+                continue;
+            };
+            let failed = self.failed_segments(&mut worker);
+            for (&index, reason) in &failed {
+                let segment = &mut worker.segments[index - 1];
+                if let Some(session) = segment.session.take() {
+                    let _ = self.processes.stop(session.process_id());
+                }
+                for editor in &mut worker.editors[segment.slots.clone()] {
+                    *editor = EditorWindowState::default();
+                }
+                self.note(format!(
+                    "rack {} segment {} failed ({reason}); it plays bypassed while its worker is replaced",
+                    rack_index + 1,
+                    index + 1
+                ));
+            }
+            // Route around the stopped workers first: the replacements take a while to start.
+            self.sync_rack_chain(rack_index, &mut worker);
+            self.replace_segments(rack_index, &mut worker);
+            self.sync_rack_chain(rack_index, &mut worker);
+            self.workers.insert(rack_index, worker);
+        }
+    }
+
+    /// The later segments (as in [`RetainedWorker::worker_slots`]) of `worker` that have failed,
+    /// and why.
+    fn failed_segments(&self, worker: &mut RetainedWorker) -> BTreeMap<usize, &'static str> {
+        /// The worker a link points at, when the link's failure count moved since last seen.
+        fn broken_link(
+            count: &AtomicU32,
+            seen: &mut u32,
+            chain: Option<&SentChain>,
+        ) -> Option<usize> {
+            let count = count.load(Ordering::Acquire);
+            (std::mem::replace(seen, count) != count)
+                .then(|| chain.and_then(|chain| chain.next))
+                .flatten()
+        }
+        const MISSED: &str = "it missed the block deadline";
+        let now = Instant::now();
+        let mut failed = BTreeMap::new();
+        failed.extend(
+            broken_link(
+                &worker.banks[worker.active_bank_index]
+                    .bank()
+                    .header
+                    .chain_link_failures,
+                &mut worker.link_failures,
+                worker.chain.as_ref(),
+            )
+            .map(|index| (index, MISSED)),
+        );
+        for (position, segment) in worker.segments.iter_mut().enumerate() {
+            let Some(session) = segment.session.as_ref() else {
+                continue;
+            };
+            let header = &segment.banks[segment.active_bank_index].bank().header;
+            segment.own_latency = header.segment_latency_samples.load(Ordering::Acquire);
+            failed.extend(
+                broken_link(
+                    &header.chain_link_failures,
+                    &mut segment.link_failures,
+                    segment.chain.as_ref(),
+                )
+                .map(|index| (index, MISSED)),
+            );
+            if self.processes.status(session.process_id()) == HelperStatus::Failed {
+                failed.insert(position + 1, "its worker exited");
+            } else if segment.heartbeat.stalled(header.worker_heartbeat(), now) {
+                failed.insert(position + 1, "its worker stopped");
+            }
+        }
+        failed
+    }
+
+    /// Sends each worker of a mixed rack its chain target. A worker that refuses is failed: the
+    /// first recovers as the rack's lane, a later one is stopped for replacement.
+    fn sync_rack_chain(&mut self, rack_index: usize, worker: &mut RetainedWorker) {
+        let Err((index, error)) = worker.sync_chain() else {
+            return;
+        };
+        self.note(format!(
+            "rack {} segment {} refused its chain target: {error}",
+            rack_index + 1,
+            index + 1
+        ));
+        match index.checked_sub(1) {
+            Some(position) => {
+                if let Some(session) = worker.segments[position].session.take() {
+                    let _ = self.processes.stop(session.process_id());
+                }
+            }
+            // The lane quiesces and the rack's recovery replaces the worker.
+            None => {
+                worker.recovery.request_quiesce();
+            }
+        }
+    }
+
+    /// Starts a new worker for each stopped later segment of a mixed rack, on the segment's
+    /// other bank, with the rack's saved states. A segment that fails too often stays bypassed
+    /// until the rack reloads.
+    fn replace_segments(&mut self, rack_index: usize, worker: &mut RetainedWorker) {
+        let now = Instant::now();
+        for position in 0..worker.segments.len() {
+            let segment = &mut worker.segments[position];
+            if segment.session.is_some() || segment.failed {
+                continue;
+            }
+            if !segment.restart_budget.allows_restart(now) {
+                segment.failed = true;
+                self.note(format!(
+                    "rack {} segment {} failed {RAPID_RESTART_LIMIT} times in 10 seconds; it stays bypassed until the rack reloads",
+                    rack_index + 1,
+                    position + 2
+                ));
+                continue;
+            }
+            let replacement_index = segment.active_bank_index ^ 1;
+            let generation = next_bank_generation(&segment.banks);
+            // Nothing maps the other bank: its worker was stopped and reaped, and the worker
+            // before linked away from it when this one started.
+            let launched = reset_reaped_region(&mut segment.banks[replacement_index], generation)
+                .map_err(|error| format!("cannot reset segment bank: {error}"))
+                .and_then(|()| {
+                    let segment = &worker.segments[position];
+                    self.launch_worker(
+                        worker.wire_index,
+                        &worker.rack,
+                        &worker.saved_states,
+                        segment.slots.clone(),
+                        &segment.banks[replacement_index],
+                        replacement_index,
+                        generation,
+                        None,
+                    )
+                });
+            match launched {
+                Ok(launched) => {
+                    let slots = worker.segments[position].slots.clone();
+                    let session = worker.adopt_slots(slots, launched);
+                    let segment = &mut worker.segments[position];
+                    segment.session = Some(session);
+                    segment.active_bank_index = replacement_index;
+                    segment.heartbeat = HeartbeatWatch::new(Instant::now());
+                    segment.chain = None;
+                    segment.link_failures = 0;
+                    segment.restarts = segment.restarts.saturating_add(1);
+                    self.note(format!(
+                        "rack {} segment {} replacement worker is ready on bank {replacement_index}",
+                        rack_index + 1,
+                        position + 2
+                    ));
+                }
+                Err(error) => {
+                    worker.segments[position].failed = true;
+                    self.note(format!(
+                        "rack {} segment {} replacement failed: {error}; it stays bypassed",
+                        rack_index + 1,
+                        position + 2
+                    ));
+                }
+            }
         }
     }
 
@@ -2866,7 +3443,8 @@ impl ProductRuntime {
         if let Some(session) = worker.session.take() {
             let _ = session.shutdown(&mut self.processes);
         }
-        worker.editors = vec![EditorWindowState::default(); worker.rack.slots.len()];
+        let own_slots = worker.worker_slots(0);
+        worker.editors[own_slots.clone()].fill(EditorWindowState::default());
         if worker.recovery_failed {
             self.workers.insert(rack_index, worker);
             return;
@@ -2881,25 +3459,28 @@ impl ProductRuntime {
                     worker.wire_index,
                     &worker.rack,
                     &worker.saved_states,
+                    own_slots.clone(),
                     &worker.banks[replacement_index],
                     replacement_index,
                     generation,
                     worker.suspected_slot,
                 )
             });
+        let launched = launched.and_then(|launched| {
+            worker.fingerprint = launched.fingerprint.clone();
+            worker.session = Some(worker.adopt_slots(own_slots, launched));
+            worker.active_bank_index = replacement_index;
+            // A mixed rack's first worker links onward before the callback switches to it.
+            worker.chain = None;
+            worker.sync_chain().map_err(|(_, error)| {
+                if let Some(session) = worker.session.take() {
+                    let _ = session.shutdown(&mut self.processes);
+                }
+                format!("the new worker could not join the chain: {error}")
+            })
+        });
         match launched {
-            Ok(launched) => {
-                worker.fingerprint = launched.fingerprint;
-                worker.session = Some(launched.session);
-                worker.parameter_feedback = launched
-                    .parameters
-                    .iter()
-                    .map(|parameters| ParameterFeedbackCursor::new(parameters))
-                    .collect();
-                worker.restart_cursors = vec![RestartCursor::default(); launched.parameters.len()];
-                worker.parameters = launched.parameters;
-                worker.loaded_slots = launched.loaded_slots;
-                worker.active_bank_index = replacement_index;
+            Ok(()) => {
                 worker.heartbeat = HeartbeatWatch::new(Instant::now());
                 worker.suspected_slot = None;
                 if worker
@@ -2976,8 +3557,8 @@ impl ProductRuntime {
         }
     }
 
-    /// The launch of a worker for the resolved slots of rack `rack_index`: the native worker, or
-    /// the Windows worker under Wine for a rack of Windows plug-ins.
+    /// The launch of a worker for resolved slots of rack `rack_index`, all of one platform: the
+    /// native worker, or the Windows worker under Wine for Windows plug-ins.
     fn worker_launch(
         &self,
         rack_index: usize,
@@ -2990,7 +3571,6 @@ impl ProductRuntime {
             .flatten()
             .next()
             .ok_or("rack contains no available plug-ins")?;
-        let platform = rack_platform(rack_index, candidates)?;
         let arguments = worker_arguments(
             bank_name,
             target,
@@ -2998,7 +3578,7 @@ impl ProductRuntime {
             &first.bundle_argument(),
             &first.class_id,
         );
-        let launch = match platform {
+        let launch = match first.platform {
             PluginPlatform::Native => {
                 HelperLaunch::native(HelperKind::PluginWorker, &self.helpers.worker, arguments)
             }
@@ -3024,11 +3604,12 @@ impl ProductRuntime {
         })
     }
 
-    /// Windows racks run one block late; their result is mixed with the next block.
+    /// Racks with a Windows plug-in, mixed racks included, run one block late; their result is
+    /// mixed with the next block.
     pub(crate) fn rack_is_pipelined(&self, rack_index: usize) -> bool {
         self.workers
             .get(&rack_index)
-            .is_some_and(|worker| worker.platform == PluginPlatform::Windows)
+            .is_some_and(RetainedWorker::pipelined)
     }
 
     fn resolve_rack_slots(
@@ -3273,27 +3854,6 @@ impl ResolvedSlot {
     }
 }
 
-/// The one platform of a rack's plug-ins. Mixed racks need one worker per platform, which a
-/// later phase adds.
-fn rack_platform(
-    rack_index: usize,
-    candidates: &[Option<ResolvedSlot>],
-) -> Result<PluginPlatform, String> {
-    let mut platforms = candidates
-        .iter()
-        .flatten()
-        .map(|candidate| candidate.platform);
-    let first = platforms.next().unwrap_or_default();
-    if platforms.any(|platform| platform != first) {
-        return Err(format!(
-            "rack {} mixes Linux and Windows plug-ins; a rack runs plug-ins of one platform, so \
-             move the Windows plug-ins to a rack of their own",
-            rack_index + 1
-        ));
-    }
-    Ok(first)
-}
-
 fn request_ok(
     session: &mut WorkerControlSession,
     operation: ControlOperation,
@@ -3427,6 +3987,14 @@ impl Drop for ProductRuntime {
                 }
                 process_ids.push(pid);
             }
+            let mut segment_banks = Vec::new();
+            for segment in std::mem::take(&mut worker.segments) {
+                if let Some(session) = segment.session {
+                    process_ids.push(session.process_id());
+                    let _ = session.shutdown(&mut self.processes);
+                }
+                segment_banks.push(segment.banks);
+            }
             process_ids.sort_unstable();
             process_ids.dedup();
             for &pid in &process_ids {
@@ -3439,6 +4007,7 @@ impl Drop for ProductRuntime {
                 .any(|pid| !self.processes.is_reaped(*pid))
             {
                 std::mem::forget(worker.banks);
+                std::mem::forget(segment_banks);
             }
         }
         for cancelled in std::mem::take(&mut self.cancelled_banks) {
@@ -3516,6 +4085,15 @@ fn control_target(
     )
     .map_err(|error| error.to_string())?;
     Ok(ControlTarget::new(rack, bank))
+}
+
+/// A worker's bank pair: the active bank, and the one its replacement starts on.
+fn bank_pair(generation: u64) -> Result<[SharedMemoryRegion; 2], String> {
+    let create = |generation| {
+        SharedMemoryRegion::create(generation)
+            .map_err(|error| format!("cannot create rack bank: {error}"))
+    };
+    Ok([create(generation)?, create(generation.saturating_add(1))?])
 }
 
 fn next_bank_generation(banks: &[SharedMemoryRegion; 2]) -> u64 {
@@ -3633,8 +4211,8 @@ fn dirs_fallback() -> PathBuf {
 mod tests {
     use super::{
         BundleFingerprint, HeartbeatWatch, ParameterFeedbackCursor, PluginPlatform,
-        RAPID_RESTART_LIMIT, ResolvedSlot, RestartBudget, editor_response_requires_recovery,
-        rack_platform,
+        RAPID_RESTART_LIMIT, ResolvedSlot, RestartBudget, SegmentPlan,
+        editor_response_requires_recovery, rack_segments,
     };
     use sp_model::PluginParameterMetadata;
     use sp_protocol::control::ControlResponseStatus;
@@ -3671,26 +4249,42 @@ mod tests {
         }
     }
 
-    /// A rack runs plug-ins of one platform; a Windows rack's worker sees bundles through `Z:`.
+    /// Each run of one platform is a segment with its own worker; a missing plug-in stays with
+    /// the segment before it. A Windows worker sees bundles through `Z:`.
     #[test]
-    fn a_rack_is_native_or_windows_and_never_both() {
-        let windows = resolved("/prefix/VST3/Effect.vst3", PluginPlatform::Windows);
-        let native = resolved("/usr/lib/vst3/Effect.vst3", PluginPlatform::Native);
+    fn a_rack_splits_into_one_segment_per_platform_run() {
+        let windows = || {
+            Some(resolved(
+                "/prefix/VST3/Effect.vst3",
+                PluginPlatform::Windows,
+            ))
+        };
+        let native = || {
+            Some(resolved(
+                "/usr/lib/vst3/Effect.vst3",
+                PluginPlatform::Native,
+            ))
+        };
+        let segment = |platform, slots| SegmentPlan { platform, slots };
         assert_eq!(
-            rack_platform(0, &[Some(windows.clone()), None, Some(windows.clone())]),
-            Ok(PluginPlatform::Windows)
+            rack_segments(&[None, native(), windows(), None, windows(), native()]),
+            [
+                segment(PluginPlatform::Native, 0..2),
+                segment(PluginPlatform::Windows, 2..5),
+                segment(PluginPlatform::Native, 5..6),
+            ]
         );
         assert_eq!(
-            rack_platform(0, &[None, Some(native.clone())]),
-            Ok(PluginPlatform::Native)
+            rack_segments(&[windows(), None, windows()]),
+            [segment(PluginPlatform::Windows, 0..3)]
         );
-        let mixed = rack_platform(2, &[Some(native.clone()), Some(windows.clone())]).unwrap_err();
-        assert!(
-            mixed.contains("rack 3 mixes Linux and Windows plug-ins"),
-            "{mixed}"
-        );
+        assert!(rack_segments(&[None, None]).is_empty());
+        let windows = windows().unwrap();
         assert_eq!(windows.bundle_argument(), "Z:\\prefix\\VST3\\Effect.vst3");
-        assert_eq!(native.bundle_argument(), "/usr/lib/vst3/Effect.vst3");
+        assert_eq!(
+            native().unwrap().bundle_argument(),
+            "/usr/lib/vst3/Effect.vst3"
+        );
     }
 
     #[test]
