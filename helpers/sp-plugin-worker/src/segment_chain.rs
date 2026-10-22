@@ -24,8 +24,8 @@ use crate::worker_runtime::{BypassDelay, PlanarBlock, SLOT_FADE_FRAMES, WARMUP_B
 
 /// Each segment finishes this much earlier than the one before it, so the upstream worker has
 /// time to notice the completion, copy it, and complete its own request. An eighth of the block,
-/// and at least the polling slice of a waiting link plus some scheduling delay.
-const MIN_HOP_MARGIN: Duration = Duration::from_micros(250);
+/// and at least the polling slice of a waiting link.
+const MIN_HOP_MARGIN: Duration = Duration::from_micros(100);
 /// Misses a new link forgives before the next segment is first heard: a worker's first blocks
 /// can be slow (first plug-in calls, first scheduling). Each forgiven miss plays the bypass.
 const MAX_WARMUP_MISSES: u8 = 32;
@@ -232,9 +232,10 @@ impl SegmentChain {
 
 /// The publication tick a block is forwarded with and the deadline for its result.
 ///
-/// Every segment derives its deadline from the publication tick it received: the rack's block
-/// period after it. A segment forwards a tick one hop margin earlier, so each later segment
-/// finishes one margin before the segment waiting on it. An untimed request (tick 0) starts now.
+/// Every segment derives its deadline from the publication tick it received: one block period
+/// after it, less one hop margin, so the first segment completes with time to spare for the
+/// host. A segment forwards a tick one margin earlier, so each later segment finishes one margin
+/// before the segment waiting on it. An untimed request (tick 0) starts now.
 fn hop_ticks(published: u64, clock: MonotonicClock, frames: usize, sample_rate: u32) -> (u64, u64) {
     let origin = if published == 0 {
         clock.now_ticks()
@@ -247,7 +248,7 @@ fn hop_ticks(published: u64, clock: MonotonicClock, frames: usize, sample_rate: 
     let margin = (period / 8).max(clock.duration_to_ticks(MIN_HOP_MARGIN));
     (
         origin.saturating_sub(margin).max(1),
-        origin.saturating_add(period),
+        origin.saturating_add(period).saturating_sub(margin),
     )
 }
 
