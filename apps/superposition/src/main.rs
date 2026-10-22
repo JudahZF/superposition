@@ -13,6 +13,7 @@ mod maintenance;
 mod maintenance_tests;
 #[cfg(audio_backend)]
 mod platform_audio;
+mod remote;
 mod ui;
 
 use std::{
@@ -3358,6 +3359,13 @@ fn worker_arguments(
 
 fn main() -> eframe::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if remote::is_remote(&arguments) {
+        if let Err(error) = remote::run(&arguments) {
+            eprintln!("Superposition: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if !arguments.is_empty() {
         if let Err(error) = headless::run(&arguments) {
             eprintln!("Superposition: {error}");
@@ -3391,11 +3399,19 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+/// The catalog, quarantine, Wine prefix, and remote identity live here.
+/// `~/Library/Application Support/Superposition` on macOS; `$XDG_DATA_HOME/superposition`
+/// (default `~/.local/share/superposition`) elsewhere. `SUPERPOSITION_APP_SUPPORT` overrides both.
 fn default_application_support() -> PathBuf {
-    std::env::var_os("SUPERPOSITION_APP_SUPPORT").map_or_else(
-        || dirs_fallback().join("Library/Application Support/Superposition"),
-        PathBuf::from,
-    )
+    if let Some(path) = std::env::var_os("SUPERPOSITION_APP_SUPPORT") {
+        return PathBuf::from(path);
+    }
+    if cfg!(target_os = "macos") {
+        return dirs_fallback().join("Library/Application Support/Superposition");
+    }
+    std::env::var_os("XDG_DATA_HOME")
+        .map_or_else(|| dirs_fallback().join(".local/share"), PathBuf::from)
+        .join("superposition")
 }
 fn default_session_root() -> PathBuf {
     std::env::var_os("SUPERPOSITION_SESSION").map_or_else(

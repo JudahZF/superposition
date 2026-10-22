@@ -16,10 +16,12 @@ sp-engine = { path = "../../crates/sp-engine" }
 sp-midi = { path = "../../crates/sp-midi" }
 sp-model = { path = "../../crates/sp-model" }
 sp-protocol = { path = "../../crates/sp-protocol" }
+sp-remote = { path = "../../crates/sp-remote" }
 sp-session = { path = "../../crates/sp-session" }
 sp-shared-memory-os = { path = "../../crates/sp-shared-memory-os" }
 sp-supervisor = { path = "../../crates/sp-supervisor" }
 sp-ui = { path = "../../crates/sp-ui" }
+signal-hook = "0.3.18"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Reads the system reduced-motion preference; already in the graph through winit.

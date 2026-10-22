@@ -202,6 +202,12 @@ impl RemoteServer {
             .map(|pairing| pairing.code.clone())
     }
 
+    /// How many clients have paired with this engine.
+    #[must_use]
+    pub fn paired_clients(&self) -> usize {
+        self.shared.state().trust.clients().len()
+    }
+
     /// Connected clients.
     #[must_use]
     pub fn clients(&self) -> Vec<ClientInfo> {

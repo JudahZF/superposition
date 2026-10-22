@@ -2623,8 +2623,9 @@ impl eframe::App for LiveRackApp {
 }
 
 impl LiveRackApp {
-    /// Runs one UI frame. Kept separate from `eframe::App` so tests can drive it headlessly.
-    fn frame(&mut self, ctx: &egui::Context) {
+    /// Runs one UI frame. Kept separate from `eframe::App` so tests and the remote server can
+    /// drive it headlessly.
+    pub(crate) fn frame(&mut self, ctx: &egui::Context) {
         let online = self.online();
         while let Some(result) = self
             .product
