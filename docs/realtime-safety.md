@@ -68,6 +68,7 @@ current active bank index and refuses an unfinished handoff.
 - Capacity, channel layout, maximum frames, event capacity, and the four-slot bank layout are fixed before activation. The callback never resizes a queue, a bank, a mixer buffer, or a device format.
 - The dispatcher bounds its completion observation with a `MonotonicClock` deadline. It closes the affected rack gate for malformed metadata, non-finite output, stale ticket, unavailable slot, or deadline expiry; it never waits for a worker beyond that deadline.
 - A timed-out processing slot is not casually reused. Control-plane recovery and worker death handle retirement; callback code accepts only the exact live ticket.
+- In a mixed rack, a segment's worker is the producer of the next segment's bank. Its processing thread forwards each block through a `ChainLink` with no allocation or lock: it fills a free slot, publishes it, wakes the worker, and waits until the rack's deadline by spinning, then sleeping (yielding under Wine) in short slices. An owned slot during the wait is a completion being published, not a fault. A miss abandons an unclaimed request; a claimed one stays with its worker and its slot is reclaimed when it completes. The bypass delay line is allocated when the worker is first rechained, at a control command between blocks. A bank has one producer at a time: the host stops a segment's worker before it points another worker at the following segment's bank.
 - Atomic telemetry uses relaxed counter increments where a coherent cross-counter relationship is not required. Publication and ownership transitions use the acquire/release protocol defined by `sp-protocol`; C's writer/telemetry sequence uses sequential consistency. Any weaker order added later requires a code-review justification.
 
 ## POSIX mapping and `mmap`/`shm_open` invariants
@@ -139,8 +140,9 @@ No waiter is a normal result. Other wake errors and maximum observed wake-call
 ticks are recorded atomically. This narrowly scoped kernel wake is a deliberate
 addition to the callback contract, not permission to wait on a synchronization
 primitive. The underlying kernel call is not a hard real-time guarantee; live
-timing evidence must include its cost. The shared-memory ABI is version 9 and
-requires matching app/helpers. Version 9 raises the rack capacity from 8 to 64; every
+timing evidence must include its cost. The shared-memory ABI is version 10 and
+requires matching app/helpers. Version 10 adds a segment's own latency and its
+chain-link failure count to the bank header. Version 9 raised the rack capacity from 8 to 64; every
 per-rack callback array is preallocated for 64, and per-block telemetry visits all 64
 slots with bounded, allocation-free work. Live timing evidence so far covers eight racks. The dispatcher deadline and failure criteria are
 unchanged. On a miss,

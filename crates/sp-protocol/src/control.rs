@@ -17,7 +17,7 @@ use std::{
 };
 
 pub const CONTROL_PROTOCOL_MAGIC: u32 = u32::from_le_bytes(*b"SPC1");
-pub const CONTROL_PROTOCOL_VERSION: u16 = 6;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 7;
 pub const CONTROL_REQUEST_HEADER_BYTES: usize = 48;
 pub const CONTROL_RESPONSE_HEADER_BYTES: usize = 52;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 1_048_576;
@@ -74,10 +74,12 @@ pub enum ControlOperation {
     ReleaseStateTransfer = 31,
     ReadParameters = 32,
     CaptureEditorPreview = 33,
+    /// Points a mixed-rack segment's worker at the next segment's bank ([`crate::payload::ChainTarget`]).
+    Rechain = 34,
 }
 
 impl ControlOperation {
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::PreloadPlugin,
         Self::LoadPlugin,
         Self::ActivateSlot,
@@ -111,6 +113,7 @@ impl ControlOperation {
         Self::ReleaseStateTransfer,
         Self::ReadParameters,
         Self::CaptureEditorPreview,
+        Self::Rechain,
     ];
 
     pub const fn from_wire(value: u16) -> Result<Self, ControlProtocolError> {
@@ -148,6 +151,7 @@ impl ControlOperation {
             31 => Ok(Self::ReleaseStateTransfer),
             32 => Ok(Self::ReadParameters),
             33 => Ok(Self::CaptureEditorPreview),
+            34 => Ok(Self::Rechain),
             _ => Err(ControlProtocolError::UnknownOperation(value)),
         }
     }
@@ -165,7 +169,8 @@ impl ControlOperation {
             | Self::Shutdown
             | Self::QueryHealth
             | Self::QuerySlotAttribution
-            | Self::SetRackBypass => SlotRule::Forbidden,
+            | Self::SetRackBypass
+            | Self::Rechain => SlotRule::Forbidden,
             Self::NotifyRestart => SlotRule::Optional,
             _ => SlotRule::Required,
         }
@@ -195,6 +200,10 @@ impl ControlOperation {
             Self::OpenNativeEditor => (0, 8),
             Self::RestoreState => (1, MAX_CONTROL_STATE_BYTES),
             Self::NotifyRestart => (4, 16),
+            Self::Rechain => (
+                crate::payload::CHAIN_TARGET_FIXED_BYTES,
+                crate::payload::CHAIN_TARGET_FIXED_BYTES + crate::payload::MAX_BANK_NAME_BYTES,
+            ),
             Self::SetSlotBypass | Self::SetRackBypass => (1, 1),
             Self::ReadStateChunk => (20, 20),
             Self::ReadParameters => (1 + 8, 1 + crate::payload::MAX_PARAMETER_BATCH_SIZE * 8),
@@ -232,8 +241,8 @@ impl ControlOperation {
 
     fn validate_payload_bytes(self, payload: &[u8]) -> Result<(), ControlProtocolError> {
         use crate::payload::{
-            ControlPayloadCodec, EditorPosition, ParameterIds, StateChunkRequest, StateChunkWrite,
-            StateTransferId, StateTransferLengths,
+            ChainTarget, ControlPayloadCodec, EditorPosition, ParameterIds, StateChunkRequest,
+            StateChunkWrite, StateTransferId, StateTransferLengths,
         };
         self.validate_payload(payload.len())?;
         if matches!(self, Self::SetSlotBypass | Self::SetRackBypass) && !matches!(payload, [0 | 1])
@@ -261,6 +270,9 @@ impl ControlOperation {
             }
             Self::OpenNativeEditor if !payload.is_empty() => {
                 EditorPosition::decode(payload)?;
+            }
+            Self::Rechain => {
+                ChainTarget::decode(payload)?;
             }
             _ => {}
         }
@@ -1476,6 +1488,14 @@ mod tests {
             }
             .encode()
             .expect("chunk")
+        } else if operation == ControlOperation::Rechain {
+            crate::payload::ChainTarget {
+                bank: Some("sp-test".to_owned()),
+                first_slot: 1,
+                skipped_latency: 0,
+            }
+            .encode()
+            .expect("chain target")
         } else if matches!(
             operation,
             ControlOperation::CommitStateRestore | ControlOperation::ReleaseStateTransfer

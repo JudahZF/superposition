@@ -173,6 +173,10 @@ fn quiescent_worker(task_id: u64) -> RetainedWorker {
         parameter_mirror_incomplete: false,
         editors: Vec::new(),
         next_preview_poll: Instant::now(),
+        segments: Vec::new(),
+        chain: None,
+        link_failures: 0,
+        editor_worker: 0,
         maintenance: Some(PlannedMaintenance {
             flags: 1,
             requests: Vec::new(),
