@@ -6,8 +6,10 @@
 //! superposition --connect HOST[:PORT] [--pair CODE] [--viewer]
 //! ```
 //!
-//! The served UI is the normal app UI, so streamed plug-in editors appear on the client too. An
-//! engine opens pairing on its first start, or with `--pair`, and prints the six-digit code.
+//! The served UI is the normal app UI, so streamed plug-in editors appear on the client too. On
+//! macOS the served engine also has its workers stream their native editor windows, while a client
+//! is connected. An engine opens pairing on its first start, or with `--pair`, and prints the
+//! six-digit code.
 
 use std::{
     net::{SocketAddr, ToSocketAddrs},
@@ -91,7 +93,12 @@ fn serve(arguments: &[String]) -> Result<(), String> {
     let controller = SessionController::open(default_session_root())
         .map_err(|error| format!("cannot open the session: {error}"))?;
     let recovery_offered = controller.recovery_offered();
-    let runtime = ProductRuntime::open(default_application_support());
+    #[allow(unused_mut, reason = "macOS streams worker editors to clients")]
+    let mut runtime = ProductRuntime::open(default_application_support());
+    #[cfg(target_os = "macos")]
+    if let Ok(product) = runtime.as_mut() {
+        product.stream_editors();
+    }
     let ctx = egui::Context::default();
     ui::install_style(&ctx);
     let mut app = ui::LiveRackApp::new(controller, recovery_offered, runtime);
@@ -148,6 +155,8 @@ fn serve(arguments: &[String]) -> Result<(), String> {
             viewports.clone_from(&input.viewports);
         }
         input.time = Some(started.elapsed().as_secs_f64());
+        #[cfg(target_os = "macos")]
+        app.set_remote_watched(!server.clients().is_empty());
         let output = ctx.run(input, |ctx| app.frame(ctx));
         server.publish(&ctx, &output);
         let repaint = output

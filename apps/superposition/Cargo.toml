@@ -30,6 +30,7 @@ sp-wine = { path = "../../crates/sp-wine" }
 # Reads the system reduced-motion preference; already in the graph through winit.
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSAccessibility", "NSWorkspace"] }
 sp-audio-io-macos = { path = "../../crates/sp-audio-io-macos" }
+sp-window-stream = { path = "../../crates/sp-window-stream" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sp-audio-io-linux = { path = "../../crates/sp-audio-io-linux" }

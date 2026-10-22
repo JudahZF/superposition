@@ -535,6 +535,9 @@ pub struct ProcessSupervisor {
     /// Private X server for children on Linux. `None` gives children no display at all.
     #[cfg(target_os = "linux")]
     display: Option<DisplayEnvironment>,
+    /// macOS: the socket workers stream their editor windows to, while remote clients watch.
+    #[cfg(target_os = "macos")]
+    editor_stream: Option<std::path::PathBuf>,
 }
 
 impl ProcessSupervisor {
@@ -550,6 +553,8 @@ impl ProcessSupervisor {
             shutdown_timeout: Duration::from_millis(100),
             #[cfg(target_os = "linux")]
             display: None,
+            #[cfg(target_os = "macos")]
+            editor_stream: None,
         }
     }
 
@@ -563,12 +568,19 @@ impl ProcessSupervisor {
         self.display = display;
     }
 
+    /// macOS: gives children launched from now on the socket that they stream their editor
+    /// windows to (`sp_window_stream::EDITOR_STREAM_ENV`), or none.
+    #[cfg(target_os = "macos")]
+    pub fn set_editor_stream(&mut self, socket: Option<std::path::PathBuf>) {
+        self.editor_stream = socket;
+    }
+
     /// Creates a command for `launch` with this supervisor's child environment.
     #[cfg_attr(
-        not(target_os = "linux"),
+        not(any(target_os = "linux", target_os = "macos")),
         expect(
             clippy::unused_self,
-            reason = "only Linux children get a private display"
+            reason = "only Linux and macOS children get editor-display settings"
         )
     )]
     fn command(&self, launch: &HelperLaunch) -> Command {
@@ -579,6 +591,11 @@ impl ProcessSupervisor {
         command.args(&launch.arguments);
         #[cfg(target_os = "linux")]
         private_display::apply_display(&mut command, self.display.as_ref());
+        #[cfg(target_os = "macos")]
+        match &self.editor_stream {
+            Some(socket) => command.env(sp_window_stream::EDITOR_STREAM_ENV, socket),
+            None => command.env_remove(sp_window_stream::EDITOR_STREAM_ENV),
+        };
         command
     }
 

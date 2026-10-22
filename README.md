@@ -102,7 +102,8 @@ superposition --connect HOST[:PORT] [--pair CODE] [--viewer] # show and drive it
 
 The engine prints a six-digit pairing code on its first start (or with `--pair`); a client uses it
 once, then both sides remember each other. The client shows the engine's whole UI, including
-plug-in editors on Linux engines. One client controls at a time; others watch and may take
+plug-in editors. A Mac engine streams its editors only while a client is connected, and their
+native windows stay open on the Mac. One client controls at a time; others watch and may take
 control.
 
 ## Development

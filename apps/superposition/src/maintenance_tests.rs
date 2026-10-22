@@ -62,6 +62,8 @@ fn runtime() -> ProductRuntime {
         windows_programs: Vec::new(),
         #[cfg(target_os = "linux")]
         editor_display: None,
+        #[cfg(target_os = "macos")]
+        editor_stream: None,
     }
 }
 

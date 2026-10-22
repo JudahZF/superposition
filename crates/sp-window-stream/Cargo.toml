@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Wire protocol and client framebuffer for streaming private X server windows"
+description = "Wire protocol, client framebuffer, and single-client source for streaming editor windows"
 
 [dependencies]
 thiserror.workspace = true

@@ -3738,6 +3738,7 @@ dependencies = [
  "sp-shared-memory-os",
  "sp-supervisor",
  "sp-vst3",
+ "sp-window-stream",
  "sp-wine",
  "windows-sys 0.61.2",
  "xcb",
@@ -3803,6 +3804,7 @@ dependencies = [
  "sha2 0.11.0",
  "sp-model",
  "sp-protocol",
+ "sp-window-stream",
  "sp-wine",
 ]
 

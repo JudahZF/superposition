@@ -55,3 +55,23 @@ pub fn tile_grid(width: u16, height: u16) -> impl Iterator<Item = Rect> {
         })
     })
 }
+
+/// The [`tile_grid`] tiles in which two `width` x `height` images differ. Both images hold 4 bytes
+/// per pixel with rows tightly packed; the caller checks their lengths.
+pub fn changed_tiles<'a>(
+    before: &'a [u8],
+    after: &'a [u8],
+    width: u16,
+    height: u16,
+) -> impl Iterator<Item = Rect> + 'a {
+    let stride = usize::from(width) * 4;
+    tile_grid(width, height).filter(move |rect| {
+        let left = usize::from(rect.x) * 4;
+        let row_bytes = usize::from(rect.width) * 4;
+        let top = usize::from(rect.y);
+        (top..top + usize::from(rect.height)).any(|row| {
+            let start = row * stride + left;
+            before[start..start + row_bytes] != after[start..start + row_bytes]
+        })
+    })
+}

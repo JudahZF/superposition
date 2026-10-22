@@ -1,22 +1,34 @@
-//! Linux: the engine's private X server shown inside the app.
+//! Streamed plug-in editor windows shown inside the app.
 //!
-//! Plug-in editors, Windows installers, and licence managers draw on the engine-owned Xvfb.
-//! `sp-window-streamer` sends their pixels as lossless tiles; this module keeps one texture per
-//! window, draws each top-level window as an egui window (popups float over their parent), and
-//! sends pointer, wheel, key, and text input back. Because the windows are egui content, a remote
-//! client sees and drives them like the rest of the UI.
+//! Linux: plug-in editors, Windows installers, and licence managers draw on the engine-owned
+//! Xvfb, and `sp-window-streamer` sends their pixels over one connection.
+//!
+//! macOS: editors are native windows of their workers. While the engine serves remote clients,
+//! each worker connects to the engine's editor-stream socket and streams its own windows. The UI
+//! greets the workers only while a remote client watches and hangs up when the last one leaves,
+//! so an unwatched Mac pictures nothing; local users keep using the native windows.
+//!
+//! Either way the pixels arrive as lossless tiles. This module keeps one texture per window, draws
+//! each top-level window as an egui window (popups float over their parent), and sends pointer,
+//! wheel, key, and text input back to the connection that owns the window. Because the windows are
+//! egui content, a remote client sees and drives them like the rest of the UI.
 
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 use std::{
     collections::HashMap,
     io,
+    net::Shutdown,
     os::unix::net::UnixStream,
-    path::PathBuf,
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
 };
+#[cfg(target_os = "macos")]
+use std::{os::unix::net::UnixListener, sync::mpsc};
 
 use egui::{Context, Event, Key, Modifiers, PointerButton, Sense, TextureHandle, TextureOptions};
 use sp_window_stream::{
@@ -27,6 +39,7 @@ use sp_window_stream::{
 
 /// Wheel input per notch, in egui points.
 const POINTS_PER_NOTCH: f32 = 40.0;
+#[cfg(target_os = "linux")]
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A request the app must handle itself.
@@ -42,8 +55,8 @@ struct Connection {
 }
 
 impl Connection {
-    fn open(socket: &PathBuf, ctx: &Context) -> io::Result<Self> {
-        let mut stream = UnixStream::connect(socket)?;
+    /// Greets the window source at the other end of `stream` and starts reading its windows.
+    fn start(mut stream: UnixStream, ctx: &Context) -> io::Result<Self> {
         ClientMessage::Hello {
             version: PROTOCOL_VERSION,
             role: Role::Controller,
@@ -91,32 +104,54 @@ impl Connection {
     }
 }
 
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // Shutting the socket down also ends the reader thread's clone, so the peer sees EOF.
+        let _ = self.writer.shutdown(Shutdown::Both);
+    }
+}
+
+/// Where window-stream connections come from.
+enum Source {
+    /// Linux: the streamer's socket, reconnected after the streamer restarts.
+    #[cfg(target_os = "linux")]
+    Streamer { socket: PathBuf, retry_at: Instant },
+    /// macOS: workers that connected to the engine's editor-stream socket and wait to be greeted.
+    #[cfg(target_os = "macos")]
+    Workers {
+        incoming: mpsc::Receiver<UnixStream>,
+        waiting: Vec<UnixStream>,
+        /// A remote client watches, so workers stream.
+        watched: bool,
+    },
+}
+
 struct Shown {
     info: WindowInfo,
     size: [usize; 2],
+    /// Index of the connection that streams the window.
+    connection: usize,
 }
 
-/// The streamed windows of the engine's private display.
+/// The streamed windows of the engine's private display or of its workers.
 pub(crate) struct StreamedWindows {
-    socket: PathBuf,
-    connection: Option<Connection>,
-    retry_at: Instant,
+    source: Source,
+    connections: Vec<Connection>,
     textures: HashMap<WindowId, TextureHandle>,
     scroll: HashMap<WindowId, ScrollAccumulator>,
     /// The window under a held pointer button, which keeps receiving the drag.
     pointer_capture: Option<WindowId>,
     /// The window that receives keys: the last one clicked.
     keyboard: Option<WindowId>,
+    /// Modifiers held in the keyboard window.
     modifiers: Modifiers,
 }
 
 impl StreamedWindows {
-    /// Streams from the streamer listening at `socket`.
-    pub(crate) fn new(socket: PathBuf) -> Self {
+    fn with_source(source: Source) -> Self {
         Self {
-            socket,
-            connection: None,
-            retry_at: Instant::now(),
+            source,
+            connections: Vec::new(),
             textures: HashMap::new(),
             scroll: HashMap::new(),
             pointer_capture: None,
@@ -125,9 +160,86 @@ impl StreamedWindows {
         }
     }
 
+    /// Linux: streams from the streamer listening at `socket`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_streamer(socket: PathBuf) -> Self {
+        Self::with_source(Source::Streamer {
+            socket,
+            retry_at: Instant::now(),
+        })
+    }
+
+    /// macOS: streams from the workers that connect to `listener`, once a remote client watches.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn from_workers(listener: UnixListener) -> Self {
+        let (accepted, incoming) = mpsc::channel();
+        let accept = std::thread::Builder::new()
+            .name("sp-editor-stream-accept".into())
+            .spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    if accepted.send(stream).is_err() {
+                        return;
+                    }
+                }
+            });
+        if let Err(error) = accept {
+            eprintln!("superposition: plug-in editors will not stream: {error}");
+        }
+        Self::with_source(Source::Workers {
+            incoming,
+            waiting: Vec::new(),
+            watched: false,
+        })
+    }
+
+    /// macOS: whether a remote client watches. Workers stream only then.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_watched(&mut self, watched: bool) {
+        let Source::Workers { watched: now, .. } = &mut self.source;
+        *now = watched;
+    }
+
     /// Whether a streamed window has keyboard focus (the user last clicked inside one).
     pub(crate) fn has_keyboard_focus(&self) -> bool {
         self.keyboard.is_some()
+    }
+
+    /// Opens, greets, and closes connections as the source requires.
+    fn connect(&mut self, ctx: &Context) {
+        // A dead connection's window IDs are gone with it; its textures go below.
+        self.connections
+            .retain(|connection| connection.alive.load(Ordering::Acquire));
+        match &mut self.source {
+            #[cfg(target_os = "linux")]
+            Source::Streamer { socket, retry_at } => {
+                if self.connections.is_empty() && Instant::now() >= *retry_at {
+                    *retry_at = Instant::now() + RECONNECT_INTERVAL;
+                    if let Ok(connection) = UnixStream::connect(&*socket)
+                        .and_then(|stream| Connection::start(stream, ctx))
+                    {
+                        self.connections.push(connection);
+                    }
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Source::Workers {
+                incoming,
+                waiting,
+                watched,
+            } => {
+                waiting.extend(incoming.try_iter());
+                if *watched {
+                    self.connections.extend(
+                        waiting
+                            .drain(..)
+                            .filter_map(|stream| Connection::start(stream, ctx).ok()),
+                    );
+                } else {
+                    // Hanging up stops each worker's pictures; it reconnects and waits.
+                    self.connections.clear();
+                }
+            }
+        }
     }
 
     /// Draws every streamed window and forwards input. Returns editor close requests.
@@ -136,29 +248,14 @@ impl StreamedWindows {
         reason = "one pass: sync textures, draw windows, then popups over their parents"
     )]
     pub(crate) fn show(&mut self, ctx: &Context) -> Vec<StreamedWindowEvent> {
-        if self
-            .connection
-            .as_ref()
-            .is_some_and(|connection| !connection.alive.load(Ordering::Acquire))
-        {
-            // The streamer restarted (for example with the display); its window IDs are gone.
-            self.connection = None;
-            self.textures.clear();
-        }
-        if self.connection.is_none() && Instant::now() >= self.retry_at {
-            self.retry_at = Instant::now() + RECONNECT_INTERVAL;
-            self.connection = Connection::open(&self.socket, ctx).ok();
-        }
-        let Some(connection) = self.connection.as_mut() else {
-            return Vec::new();
-        };
-        let windows = {
+        self.connect(ctx);
+        let mut windows = Vec::new();
+        for (index, connection) in self.connections.iter().enumerate() {
             let mut state = connection
                 .state
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             let ids: Vec<_> = state.windows().map(|window| window.info().id).collect();
-            let mut shown = Vec::with_capacity(ids.len());
             for id in ids {
                 let Some(window) = state.window_mut(id) else {
                     continue;
@@ -168,23 +265,28 @@ impl StreamedWindows {
                     continue;
                 }
                 upload(ctx, &mut self.textures, id, window);
-                shown.push(Shown {
+                windows.push(Shown {
                     info: window.info().clone(),
                     size,
+                    connection: index,
                 });
             }
-            shown
-        };
+        }
         self.textures
             .retain(|id, _| windows.iter().any(|window| window.info.id == *id));
         if self
             .keyboard
             .is_some_and(|id| windows.iter().all(|window| window.info.id != id))
         {
+            // The window is gone, and with it the modifiers held there.
             self.keyboard = None;
+            self.modifiers = Modifiers::NONE;
         }
         self.scroll
             .retain(|id, _| windows.iter().any(|window| window.info.id == *id));
+        if windows.is_empty() {
+            return Vec::new();
+        }
 
         let pixels_per_point = ctx.pixels_per_point();
         let mut events = Vec::new();
@@ -220,7 +322,7 @@ impl StreamedWindows {
                         rack: rack as usize,
                         slot: slot as usize,
                     }),
-                    _ => connection.send(InputEvent::Close {
+                    _ => self.connections[window.connection].send(InputEvent::Close {
                         window: window.info.id,
                     }),
                 }
@@ -254,7 +356,11 @@ impl StreamedWindows {
                 });
             image_rects.insert(window.info.id, shown.inner.rect);
         }
-        self.forward_input(ctx, &image_rects, pixels_per_point);
+        let owners = windows
+            .iter()
+            .map(|window| (window.info.id, window.connection))
+            .collect();
+        self.forward_input(ctx, &image_rects, &owners, pixels_per_point);
         events
     }
 
@@ -266,10 +372,17 @@ impl StreamedWindows {
         &mut self,
         ctx: &Context,
         image_rects: &HashMap<WindowId, egui::Rect>,
+        owners: &HashMap<WindowId, usize>,
         pixels_per_point: f32,
     ) {
-        let Some(connection) = self.connection.as_mut() else {
-            return;
+        let connections = &mut self.connections;
+        let mut send = |event: InputEvent| {
+            if let Some(connection) = owners
+                .get(&event.window())
+                .and_then(|&index| connections.get_mut(index))
+            {
+                connection.send(event);
+            }
         };
         // Popups draw last, so test them first.
         let target_at = |position: egui::Pos2| {
@@ -299,7 +412,7 @@ impl StreamedWindows {
                         .or_else(|| target_at(position));
                     if let Some((window, rect)) = target {
                         let (x, y) = local(rect, position);
-                        connection.send(InputEvent::PointerMove { window, x, y });
+                        send(InputEvent::PointerMove { window, x, y });
                     }
                 }
                 Event::PointerButton {
@@ -316,22 +429,35 @@ impl StreamedWindows {
                     };
                     let Some((window, rect)) = target else {
                         // A click in the app's own UI takes the keyboard back.
-                        if pressed {
-                            self.keyboard = None;
+                        if pressed && let Some(previous) = self.keyboard.take() {
+                            sync_modifiers(
+                                &mut send,
+                                previous,
+                                &mut self.modifiers,
+                                Modifiers::NONE,
+                            );
                         }
                         continue;
                     };
                     if pressed {
                         self.pointer_capture = Some(window);
                         if self.keyboard != Some(window) {
-                            self.keyboard = Some(window);
-                            connection.send(InputEvent::Focus { window });
+                            // Modifiers held in another window are released there first.
+                            if let Some(previous) = self.keyboard.replace(window) {
+                                sync_modifiers(
+                                    &mut send,
+                                    previous,
+                                    &mut self.modifiers,
+                                    Modifiers::NONE,
+                                );
+                            }
+                            send(InputEvent::Focus { window });
                         }
                     } else {
                         self.pointer_capture = None;
                     }
                     let (x, y) = local(rect, pos);
-                    connection.send(InputEvent::PointerButton {
+                    send(InputEvent::PointerButton {
                         window,
                         x,
                         y,
@@ -359,7 +485,7 @@ impl StreamedWindows {
                         .push(-delta.x * scale, -delta.y * scale);
                     if let Some((dx, dy)) = notches {
                         let (x, y) = local(rect, position);
-                        connection.send(InputEvent::Scroll {
+                        send(InputEvent::Scroll {
                             window,
                             x,
                             y,
@@ -378,11 +504,11 @@ impl StreamedWindows {
                     else {
                         continue;
                     };
-                    sync_modifiers(connection, window, &mut self.modifiers, modifiers);
+                    sync_modifiers(&mut send, window, &mut self.modifiers, modifiers);
                     // Printable keys arrive as text unless a shortcut modifier is held.
                     let shortcut = modifiers.ctrl || modifiers.alt || modifiers.command;
                     if let Some(keysym) = keysym(key, shortcut) {
-                        connection.send(InputEvent::Key {
+                        send(InputEvent::Key {
                             window,
                             keysym,
                             pressed,
@@ -395,7 +521,7 @@ impl StreamedWindows {
                         continue;
                     };
                     if !text.is_empty() {
-                        connection.send(InputEvent::Text { window, text });
+                        send(InputEvent::Text { window, text });
                     }
                 }
                 _ => {}
@@ -472,9 +598,10 @@ fn stream_button(button: PointerButton) -> StreamButton {
     }
 }
 
-/// Presses or releases modifier keys so the window sees the same state as egui.
+/// Presses or releases modifier keys so `window` sees the same state as egui. A Mac's Command key
+/// travels as `Super_L`, which macOS workers turn back into Command.
 fn sync_modifiers(
-    connection: &mut Connection,
+    send: &mut impl FnMut(InputEvent),
     window: WindowId,
     current: &mut Modifiers,
     wanted: Modifiers,
@@ -483,9 +610,10 @@ fn sync_modifiers(
         (current.shift, wanted.shift, 0xffe1),
         (current.ctrl, wanted.ctrl, 0xffe3),
         (current.alt, wanted.alt, 0xffe9),
+        (current.mac_cmd, wanted.mac_cmd, 0xffeb),
     ] {
         if was != is {
-            connection.send(InputEvent::Key {
+            send(InputEvent::Key {
                 window,
                 keysym,
                 pressed: is,
