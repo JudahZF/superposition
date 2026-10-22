@@ -987,6 +987,45 @@ impl ProductRuntime {
         self.scanner.catalog().entries().count()
     }
 
+    /// Rebinds each slot whose plug-in build is not installed to an installed build of the same
+    /// VST3 class, preferring a native build to a Windows one. A session from another machine or
+    /// platform then opens with its plug-ins and their saved states; a slot whose class is not
+    /// installed stays a placeholder. Notes each rebound slot.
+    pub(crate) fn rebind_session(&mut self, model: &mut sp_model::Session) {
+        let installed = self.catalog_plugins();
+        let mut notes = Vec::new();
+        for (rack_index, rack) in model.racks.iter_mut().enumerate() {
+            for (slot_index, slot) in rack.slots.iter_mut().enumerate() {
+                let same_class = || {
+                    installed.iter().filter(|plugin| {
+                        plugin.descriptor.identity.unique_id == slot.plugin.identity.unique_id
+                    })
+                };
+                if same_class().any(|plugin| {
+                    plugin.descriptor.fingerprint.digest == slot.plugin.fingerprint.digest
+                }) {
+                    continue;
+                }
+                let Some(plugin) = same_class().min_by_key(|plugin| plugin.windows) else {
+                    continue;
+                };
+                notes.push(format!(
+                    "rack {} slot {}: {} {} is not installed; using the installed {} build {}",
+                    rack_index + 1,
+                    slot_index + 1,
+                    slot.plugin.identity.name,
+                    slot.plugin.fingerprint.plugin_version,
+                    if plugin.windows { "Windows" } else { "native" },
+                    plugin.descriptor.fingerprint.plugin_version,
+                ));
+                slot.plugin.fingerprint = plugin.descriptor.fingerprint.clone();
+            }
+        }
+        for note in notes {
+            self.note(note);
+        }
+    }
+
     pub(crate) fn catalog_plugins(&self) -> Vec<CatalogPlugin> {
         self.scanner
             .catalog()
@@ -4268,9 +4307,13 @@ fn main() -> eframe::Result<()> {
     if arguments.iter().any(|argument| argument == "--doctor") {
         std::process::exit(doctor::run());
     }
-    // A remote client needs none of the engine's system settings.
+    // Only an engine (the window, `--headless`, or `--serve`) needs the system settings.
     #[cfg(target_os = "linux")]
-    if !arguments.iter().any(|argument| argument == "--connect") {
+    if arguments.is_empty()
+        || arguments
+            .iter()
+            .any(|argument| argument == "--headless" || argument == "--serve")
+    {
         doctor::warn_at_start();
     }
     if remote::is_remote(&arguments) {
@@ -4352,6 +4395,100 @@ mod tests {
     use sp_model::PluginParameterMetadata;
     use sp_protocol::control::ControlResponseStatus;
     use std::time::{Duration, Instant};
+
+    /// A session from another machine names builds this one lacks; each slot takes the
+    /// installed build of its VST3 class, native before Windows, and unknown classes stay.
+    #[test]
+    fn sessions_rebind_missing_builds_by_class_id_preferring_native() {
+        let scan = |bundle: &str, digest: &str, platform| {
+            let mut metadata = sp_model::PluginScanMetadata::new(
+                sp_model::PluginArchitecture::X86_64,
+                sp_model::PluginScanOutcome::Supported,
+            );
+            metadata.classes.push(sp_model::PluginClassScanMetadata {
+                identity: sp_model::PluginIdentity {
+                    vendor: "Vendor".to_owned(),
+                    name: "Reverb".to_owned(),
+                    unique_id: "CLASS".to_owned(),
+                },
+                version: digest.to_owned(),
+                buses: sp_model::PluginBusConfiguration::default(),
+                parameters: Vec::new(),
+                editor_supported: false,
+                sidechain_capable: false,
+            });
+            sp_supervisor::CachedScan {
+                bundle: std::path::PathBuf::from(bundle),
+                fingerprint: sp_supervisor::BundleFingerprint {
+                    algorithm: "sha256".to_owned(),
+                    digest: digest.to_owned(),
+                },
+                platform,
+                metadata,
+            }
+        };
+        let mut product = crate::maintenance_tests::runtime(vec![
+            scan(
+                "/vst3/Windows.vst3",
+                "windows-build",
+                PluginPlatform::Windows,
+            ),
+            scan("/vst3/Native.vst3", "native-build", PluginPlatform::Native),
+        ]);
+        let slot = |class: &str, digest: &str| sp_model::PluginSlot {
+            id: sp_model::PluginInstanceId(format!("{class}-{digest}")),
+            plugin: sp_model::PluginDescriptor {
+                identity: sp_model::PluginIdentity {
+                    vendor: "Vendor".to_owned(),
+                    name: "Reverb".to_owned(),
+                    unique_id: class.to_owned(),
+                },
+                fingerprint: sp_model::PluginFingerprint {
+                    algorithm: "sha256".to_owned(),
+                    digest: digest.to_owned(),
+                    plugin_version: "1.0".to_owned(),
+                },
+            },
+            bypassed: false,
+            parameters: sp_model::NormalizedParameters::default(),
+            sidechain: None,
+        };
+        let mut model = sp_model::Session::new();
+        model.racks.push(sp_model::Rack {
+            id: sp_model::RackId("rack-1".to_owned()),
+            name: "Rack 1".to_owned(),
+            source_id: sp_model::SourceId("input-1".to_owned()),
+            endpoint_id: sp_model::EndpointId("output-1".to_owned()),
+            topology: sp_model::RackTopology::Serial,
+            gain_db: sp_model::GainDb::default(),
+            muted: false,
+            bypassed: false,
+            slots: vec![
+                slot("CLASS", "mac-build"),
+                slot("CLASS", "windows-build"),
+                slot("OTHER", "mac-build"),
+            ],
+        });
+
+        product.rebind_session(&mut model);
+
+        let digests: Vec<&str> = model.racks[0]
+            .slots
+            .iter()
+            .map(|slot| slot.plugin.fingerprint.digest.as_str())
+            .collect();
+        assert_eq!(digests, ["native-build", "windows-build", "mac-build"]);
+        assert_eq!(
+            model.racks[0].slots[0].plugin.fingerprint.plugin_version,
+            "native-build"
+        );
+        assert_eq!(
+            product.diagnostics().len(),
+            1,
+            "{:?}",
+            product.diagnostics()
+        );
+    }
 
     #[test]
     fn rapid_restarts_are_bounded_per_rack_and_reset_after_ten_seconds() {

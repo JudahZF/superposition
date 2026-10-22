@@ -156,7 +156,7 @@ Package and document schemas migrate independently through explicit, directional
 
 ## Activation and placeholders
 
-At restore, the app/supervisor compares the session fingerprint and `metadata.json` capture fingerprint with scanner results and quarantine state. Missing, changed, quarantined, or restore-failed plug-ins remain inert and bypassed; the host retains their slots, parameters, state files, and diagnostics for a user decision. No automatic replacement is selected from a display name. A compatible worker restores only while stopped/muted, in component state → controller synchronization → controller state order; failures keep the rack gated and report the recorded activation state.
+At open, a slot whose exact build (fingerprint) is not installed is rebound to an installed build of the same VST3 class ID, a native build before a Windows one, and its saved state is restored into that build. Sessions therefore move between machines and between macOS and Linux; saving records the new build. The app/supervisor then compares fingerprints with scanner results and quarantine state. A plug-in whose class is not installed, or that is quarantined or fails to restore, remains inert and bypassed; the host retains its slot, parameters, state files, and diagnostics for a user decision. No replacement is ever selected from a display name. A compatible worker restores only while stopped/muted, in component state → controller synchronization → controller state order; failures keep the rack gated and report the recorded activation state.
 
 Parameter scenes remain host-owned normalized snapshots. They may change rack gain,
 mute, rack bypass, plug-in-slot bypass, and selected parameter values. Each parameter

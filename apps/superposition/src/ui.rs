@@ -272,10 +272,13 @@ impl LiveRackApp {
         reason = "initializes live handles and presentation state together"
     )]
     pub fn new(
-        controller: SessionController,
+        mut controller: SessionController,
         recovery_offered: bool,
-        product: Result<ProductRuntime, String>,
+        mut product: Result<ProductRuntime, String>,
     ) -> Self {
+        if let Ok(product) = product.as_mut() {
+            product.rebind_session(&mut controller.document_mut().model);
+        }
         #[cfg(audio_backend)]
         let audio = PlatformAudioEndpoint::new().allow_device_reconfiguration();
         #[cfg(audio_backend)]

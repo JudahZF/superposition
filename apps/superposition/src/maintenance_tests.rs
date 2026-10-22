@@ -16,7 +16,7 @@ use sp_model::{EndpointId, GainDb, Rack, RackId, RackTopology, SourceId};
 use sp_protocol::control::{ControlRequestId, ControlResponse};
 use sp_shared_memory_os::{RackRecoverySignal, RackRecoveryState, SharedMemoryRegion};
 use sp_supervisor::{
-    BundleFingerprint, HelperKind, HelperLaunch, PersistentQuarantine, PluginCatalog,
+    BundleFingerprint, CachedScan, HelperKind, HelperLaunch, PersistentQuarantine, PluginCatalog,
     ProcessSupervisor, Scanner, WorkerControlLaunch, WorkerControlSession,
 };
 
@@ -27,13 +27,17 @@ use super::{
 
 static NEXT_TEST_PATH: AtomicU64 = AtomicU64::new(1);
 
-fn runtime() -> ProductRuntime {
+/// A runtime with no helpers or workers, whose catalog holds `scans`.
+pub(crate) fn runtime(scans: Vec<CachedScan>) -> ProductRuntime {
     let support = std::env::temp_dir().join(format!(
         "sp-maintenance-test-{}-{}",
         std::process::id(),
         NEXT_TEST_PATH.fetch_add(1, Ordering::Relaxed)
     ));
-    let catalog = PluginCatalog::open(support.join("catalog.json")).expect("empty catalog");
+    let mut catalog = PluginCatalog::open(support.join("catalog.json")).expect("empty catalog");
+    for scan in scans {
+        catalog.insert(scan);
+    }
     let quarantine =
         PersistentQuarantine::open(support.join("quarantine.json"), 3).expect("empty quarantine");
     let (maintenance_events_tx, maintenance_events_rx) = mpsc::channel();
@@ -200,7 +204,7 @@ fn quiescent_worker(task_id: u64) -> RetainedWorker {
 
 #[test]
 fn maintenance_events_require_exact_task_generation_and_recovery_identity() {
-    let mut runtime = runtime();
+    let mut runtime = runtime(Vec::new());
     runtime.workers.insert(0, quiescent_worker(9));
     let recovery = Arc::clone(&runtime.workers[&0].recovery);
     assert!(runtime.maintenance_event_matches(0, 9, 12, &recovery));
@@ -223,7 +227,7 @@ fn maintenance_events_require_exact_task_generation_and_recovery_identity() {
 
 #[test]
 fn cancelled_spawn_event_is_rejected_before_launch_validation() {
-    let mut runtime = runtime();
+    let mut runtime = runtime(Vec::new());
     runtime.workers.insert(0, quiescent_worker(9));
     let recovery = Arc::clone(&runtime.workers[&0].recovery);
     runtime
@@ -277,7 +281,7 @@ fn cancelled_spawn_event_is_rejected_before_launch_validation() {
 
 #[test]
 fn unload_after_spawn_retains_banks_until_both_children_are_reaped() {
-    let mut runtime = runtime();
+    let mut runtime = runtime(Vec::new());
     runtime.workers.insert(0, quiescent_worker(9));
     let child = HelperLaunch::native(HelperKind::PluginWorker, "/bin/sleep", vec!["5".to_owned()]);
     let old_pid = runtime.processes.launch(&child).expect("old child");
@@ -312,7 +316,7 @@ fn unload_after_spawn_retains_banks_until_both_children_are_reaped() {
 
 #[test]
 fn reaped_replacement_cannot_be_installed_even_when_ready() {
-    let mut runtime = runtime();
+    let mut runtime = runtime(Vec::new());
     runtime.workers.insert(0, quiescent_worker(9));
     let child = HelperLaunch::native(HelperKind::PluginWorker, "/bin/sleep", vec!["5".to_owned()]);
     let old_pid = runtime.processes.launch(&child).expect("old child");

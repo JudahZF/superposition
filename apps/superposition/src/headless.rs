@@ -322,6 +322,12 @@ fn host(options: &HostOptions) -> Result<(), String> {
     };
 
     let mut product = crate::ProductRuntime::open(crate::default_application_support())?;
+    let mut rebound = model.clone();
+    product.rebind_session(&mut rebound);
+    let model = &rebound;
+    for note in product.diagnostics() {
+        eprintln!("host: {note}");
+    }
     let mut loaded_racks = Vec::new();
     for (rack_index, rack) in model.racks.iter().enumerate() {
         if rack.slots.is_empty() {
