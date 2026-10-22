@@ -3,6 +3,7 @@
 //! `cargo xtask doctor` is intentionally dependency-light so it can diagnose a newly
 //! bootstrapped workspace before the product crates are built.
 
+mod linux_bundle;
 mod outcome;
 mod scan_isolation;
 mod verification;
@@ -213,6 +214,11 @@ fn run(arguments: &[String]) -> Result<u8, XtaskError> {
             run_doctor(&workspace_root()).map_err(XtaskError::Standard)?;
             return Ok(0);
         }
+        "bundle-linux" => {
+            linux_bundle::run_bundle(&workspace_root(), &arguments[1..])
+                .map_err(XtaskError::Standard)?;
+            return Ok(0);
+        }
         "wine-bridge" => {
             wine::run_bridge(&workspace_root(), &arguments[1..]).map_err(XtaskError::Standard)?;
             return Ok(0);
@@ -247,6 +253,7 @@ fn run(arguments: &[String]) -> Result<u8, XtaskError> {
 fn usage() -> String {
     format!(
         "Usage: cargo xtask <command>\n\nCommands:\n  doctor\n  \
+         bundle-linux  build the relocatable Linux tarball (needs docker)\n  \
          wine-bridge   build the sp_wine_bridge unixlib into target/wine-bridge\n  \
          wine-check    run the Windows shared-memory client under Wine and time its wakes\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}",
         verification::usage_host_checker(),
