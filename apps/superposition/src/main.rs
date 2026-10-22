@@ -4402,7 +4402,8 @@ mod tests {
     fn sessions_rebind_missing_builds_by_class_id_preferring_native() {
         let scan = |bundle: &str, digest: &str, platform| {
             let mut metadata = sp_model::PluginScanMetadata::new(
-                sp_model::PluginArchitecture::X86_64,
+                // Supported on every host, so the test runs on Linux and Apple Silicon alike.
+                sp_model::PluginArchitecture::Universal,
                 sp_model::PluginScanOutcome::Supported,
             );
             metadata.classes.push(sp_model::PluginClassScanMetadata {
