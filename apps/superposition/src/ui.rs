@@ -12,6 +12,8 @@ mod show;
 #[cfg(target_os = "linux")]
 mod streamed;
 mod style;
+#[cfg(target_os = "linux")]
+mod tunnel;
 
 pub use style::install_style;
 
@@ -254,6 +256,9 @@ pub struct LiveRackApp {
     /// Linux: plug-in editors and Windows programs from the engine's private display.
     #[cfg(target_os = "linux")]
     streamed: Option<streamed::StreamedWindows>,
+    /// Linux: the Tunnel device settings being edited.
+    #[cfg(target_os = "linux")]
+    tunnel_settings: tunnel::TunnelSettings,
     /// Snapshot fixtures draw racks as if their workers were loaded.
     #[cfg(test)]
     test_workers_running: bool,
@@ -388,6 +393,8 @@ impl LiveRackApp {
             telemetry: None,
             #[cfg(target_os = "linux")]
             streamed,
+            #[cfg(target_os = "linux")]
+            tunnel_settings: tunnel::TunnelSettings::load(),
             #[cfg(test)]
             test_workers_running: false,
         }

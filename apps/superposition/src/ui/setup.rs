@@ -248,6 +248,8 @@ impl LiveRackApp {
         if action(ui, "Refresh devices", None, !locked).clicked() {
             self.refresh_audio_devices();
         }
+        #[cfg(target_os = "linux")]
+        self.draw_tunnel(ui, locked);
         if self.selected_route != previous_route
             || self.buffer_frames != previous_buffer
             || self.sample_rate_hz != previous_rate
@@ -794,7 +796,7 @@ fn setup_tab(ui: &mut Ui, label: &str, active: bool) -> Response {
 }
 
 /// A section title with space above it.
-fn section(ui: &mut Ui, text: &str) {
+pub(super) fn section(ui: &mut Ui, text: &str) {
     ui.add_space(sp(Spacing::S16));
     title(ui, text);
     ui.add_space(sp(Spacing::S4));

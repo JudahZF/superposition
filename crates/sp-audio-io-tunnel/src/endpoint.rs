@@ -145,6 +145,16 @@ impl TunnelAudioEndpoint {
             .map(|running| running.session.scheduling())
     }
 
+    /// The stopped renderer, for a caller that moves it to another endpoint. `None` while
+    /// audio runs or after a retirement fault.
+    #[must_use]
+    pub fn into_renderer(mut self) -> Option<Box<ProductRenderer>> {
+        if self.is_faulted() || self.running.is_some() {
+            return None;
+        }
+        self.pending_renderer.take()
+    }
+
     /// Configures the pending mixer while the endpoint is stopped.
     ///
     /// # Errors
