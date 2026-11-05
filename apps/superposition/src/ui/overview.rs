@@ -15,8 +15,8 @@ use sp_ui::design::{ColorToken, Layout, Radius, Spacing, TypographyRole};
 use super::previews::{peek_on_hover, thumbnail};
 use super::show::{RouteChips, margin, paint_gain, pointer_or};
 use super::style::{
-    card, color, dashed_rect, dot, focus_outline, hairline, line, paint_text, px, radius, sp,
-    toggle_at,
+    card, color, dashed_rect, dot, focus_outline, galley, hairline, line, paint_text, px, radius,
+    sp, toggle_at,
 };
 use super::{LiveRackApp, Overlay, Picker};
 
@@ -634,18 +634,23 @@ impl LiveRackApp {
             Pos2::new(rect.left() + px(Layout::Dot) / 2.0, rect.center().y),
             token.color(),
         );
-        let label = paint_text(
-            ui,
-            Pos2::new(
-                rect.left() + px(Layout::Dot) + sp(Spacing::S6),
-                rect.center().y,
-            ),
-            Align2::LEFT_CENTER,
-            token.label(),
-            TypographyRole::Label,
-            ColorToken::Text,
-            rect.width(),
-        );
+        // The row is narrow: `muted` keeps its place at the right, the count follows the state
+        // word when it fits, and the word truncates.
+        let right = if muted {
+            paint_text(
+                ui,
+                rect.right_center(),
+                Align2::RIGHT_CENTER,
+                "muted",
+                TypographyRole::Label,
+                ColorToken::Warn,
+                rect.width(),
+            )
+            .left()
+                - sp(Spacing::S6)
+        } else {
+            rect.right()
+        };
         let slots = self
             .controller
             .document()
@@ -656,24 +661,29 @@ impl LiveRackApp {
         let ready = (0..slots)
             .filter(|slot| self.slot_token(rack, *slot) == StateToken::Ready)
             .count();
-        paint_text(
+        let count = galley(
             ui,
-            Pos2::new(label.right() + sp(Spacing::S6), rect.center().y),
-            Align2::LEFT_CENTER,
             format!("{ready}/{slots}"),
             TypographyRole::Mono,
             ColorToken::Dim,
-            rect.width(),
+            f32::INFINITY,
         );
-        if muted {
-            paint_text(
-                ui,
-                rect.right_center(),
-                Align2::RIGHT_CENTER,
-                "muted",
-                TypographyRole::Label,
-                ColorToken::Warn,
-                rect.width(),
+        let left = rect.left() + px(Layout::Dot) + sp(Spacing::S6);
+        let label = paint_text(
+            ui,
+            Pos2::new(left, rect.center().y),
+            Align2::LEFT_CENTER,
+            token.label(),
+            TypographyRole::Label,
+            ColorToken::Text,
+            (right - left - count.size().x - sp(Spacing::S6)).max(0.0),
+        );
+        let count_left = label.right() + sp(Spacing::S6);
+        if count_left + count.size().x <= right {
+            ui.painter().galley(
+                Pos2::new(count_left, rect.center().y - count.size().y / 2.0),
+                count,
+                color(ColorToken::Dim),
             );
         }
         ui.interact(rect, ui.id().with(("status", rack)), Sense::hover())
