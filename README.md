@@ -114,7 +114,10 @@ control.
 ```sh
 cargo xtask doctor   # platform, toolchain, workspace, and dependency-boundary checks
 cargo xtask help     # lists the hardware verification commands
+cargo xtask lane-soak --frames 32 --racks mixed --duration 60s   # rack lanes on Lambda's timing
 ```
+
+`sp-rack-lane` is the per-rack lane that Superposition's dispatcher and Lambda's rack inserts share; see [rack lanes](docs/architecture.md#rack-lanes-shared-with-lambda).
 
 The hardware verification commands (`host-checker`, `compatibility`, `loopback`, `click-test`, `midi-timing`, `soak`, `bundle`) check captured evidence from real devices. See [testing](docs/testing.md).
 
