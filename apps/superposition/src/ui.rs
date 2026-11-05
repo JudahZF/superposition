@@ -2048,10 +2048,20 @@ impl LiveRackApp {
             }
             self.docked = Some((rack, slot));
         }
-        let open = self
-            .product
-            .as_ref()
-            .is_ok_and(|product| product.editor_open(rack, slot));
+        // An editor the rack view just closed still reads as open until the worker's next
+        // picture poll, so reopening it must not trust that flag.
+        #[cfg(target_os = "linux")]
+        let just_closed = self
+            .undocked
+            .take_if(|(closed, _)| *closed == (rack, slot))
+            .is_some();
+        #[cfg(not(target_os = "linux"))]
+        let just_closed = false;
+        let open = !just_closed
+            && self
+                .product
+                .as_ref()
+                .is_ok_and(|product| product.editor_open(rack, slot));
         if open && cfg!(target_os = "linux") {
             return;
         }
@@ -2077,7 +2087,18 @@ impl LiveRackApp {
     #[cfg(target_os = "linux")]
     fn sync_docked_editor(&mut self) {
         const HIDE_CLOSING: Duration = Duration::from_secs(1);
-        self.undocked = self.undocked.filter(|(_, at)| at.elapsed() < HIDE_CLOSING);
+        // The closed editor stays hidden, and reopenable, until its window has had time to go
+        // and the worker has reported it closed.
+        let closing = self.undocked.is_some_and(|((rack, slot), at)| {
+            at.elapsed() < HIDE_CLOSING
+                || self
+                    .product
+                    .as_ref()
+                    .is_ok_and(|product| product.editor_open(rack, slot))
+        });
+        if !closing {
+            self.undocked = None;
+        }
         let Some((rack, slot)) = self.docked else {
             return;
         };
