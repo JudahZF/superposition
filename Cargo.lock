@@ -3700,6 +3700,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sp-lane-adapter"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sp-rack-lane",
+ "sp-shared-memory",
+ "sp-shared-memory-os",
+]
+
+[[package]]
 name = "sp-midi"
 version = "0.1.0"
 dependencies = [

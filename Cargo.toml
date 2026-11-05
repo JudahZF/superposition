@@ -23,6 +23,7 @@ members = [
     "crates/sp-ui",
     "crates/sp-remote",
     "crates/sp-window-stream",
+    "tools/lane-adapter",
     "tools/xtask",
 ]
 default-members = ["apps/superposition"]

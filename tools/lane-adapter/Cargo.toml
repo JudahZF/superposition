@@ -1,0 +1,19 @@
+[package]
+name = "sp-lane-adapter"
+description = "A Lambda-shaped rack-insert adapter over sp-rack-lane, its tests, and the lane soak"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+sp-rack-lane = { path = "../../crates/sp-rack-lane" }
+sp-shared-memory = { path = "../../crates/sp-shared-memory" }
+sp-shared-memory-os = { path = "../../crates/sp-shared-memory-os" }
+
+[lints]
+workspace = true
