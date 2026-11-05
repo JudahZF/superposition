@@ -122,6 +122,23 @@ fn render_show_screen_snapshots() {
         (1512.0, 982.0),
         &directory.join("rack-laptop.png"),
     );
+    // Twelve pins on the default window: tiles shrink so every pin stays reachable.
+    let pins: Vec<(usize, usize)> = (0..8)
+        .map(|slot| (6, slot))
+        .chain([(1, 0), (1, 1), (2, 0), (2, 1)])
+        .filter(|&(rack, slot)| !app.is_hot(rack, slot))
+        .collect();
+    for &(rack, slot) in &pins {
+        app.toggle_hot_plugin(rack, slot);
+    }
+    snapshot(
+        &mut app,
+        (1180.0, 720.0),
+        &directory.join("rack-twelve-pins.png"),
+    );
+    for (rack, slot) in pins {
+        app.toggle_hot_plugin(rack, slot);
+    }
     app.selected_slot = None;
     snapshot(
         &mut app,

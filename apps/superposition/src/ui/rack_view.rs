@@ -612,9 +612,13 @@ impl LiveRackApp {
         let docked = self.docked == Some((rack, slot));
         #[cfg(not(target_os = "linux"))]
         let docked = false;
+        let pending = self
+            .product
+            .as_ref()
+            .is_ok_and(crate::ProductRuntime::native_editor_pending);
         let state = if token == StateToken::Missing {
             PaneState::Missing
-        } else if docked {
+        } else if docked && (open || pending) {
             PaneState::Opening
         } else if open {
             PaneState::Floating
@@ -671,7 +675,16 @@ impl LiveRackApp {
         );
         let id = ui.id().with("hot_rail");
         let mut y = header.bottom() + sp(Spacing::S10);
-        let tile_height = px(Layout::HotTile);
+        // Tiles shrink so every pin fits, with room for the pin row while one is free.
+        let pin_row_height = if pinned.len() < MAX_HOT_PLUGINS {
+            px(Layout::Control) + sp(Spacing::S6) * 2.0
+        } else {
+            0.0
+        };
+        #[allow(clippy::cast_precision_loss, reason = "at most twelve pins")]
+        let fit =
+            (inner.bottom() - y - pin_row_height) / pinned.len().max(1) as f32 - sp(Spacing::S6);
+        let tile_height = px(Layout::HotTile).min(fit);
         let mut unpin = None;
         for (index, &(rack, slot)) in pinned.iter().enumerate() {
             let tile = Rect::from_min_size(
@@ -710,34 +723,7 @@ impl LiveRackApp {
                 } else {
                     "Select a plug-in to pin"
                 };
-                let response = ui.interact(add, id.with("pin"), Sense::click());
-                let enabled = selected.is_some();
-                dashed_rect(
-                    ui,
-                    add,
-                    if enabled && response.hovered() {
-                        ColorToken::Dim
-                    } else {
-                        ColorToken::Faint
-                    },
-                    Radius::Control,
-                );
-                paint_text(
-                    ui,
-                    add.center(),
-                    Align2::CENTER_CENTER,
-                    label,
-                    TypographyRole::Label,
-                    if enabled {
-                        ColorToken::Dim
-                    } else {
-                        ColorToken::Faint
-                    },
-                    add.width(),
-                );
-                response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
-                if enabled
-                    && response.clicked()
+                if pin_row(ui, add, id.with("pin"), label, selected.is_some()).clicked()
                     && let Some(slot) = selected
                 {
                     self.toggle_hot_plugin(self.selected_rack, slot);
@@ -790,7 +776,10 @@ impl LiveRackApp {
                 tile.height() - line() - sp(Spacing::S6) * 2.0,
             ),
         );
-        thumbnail(ui, thumb, picture, token, Radius::Small);
+        // Tiles shrunk to fit twelve pins on a short window keep only their caption.
+        if thumb.height() >= px(Layout::Chip) {
+            thumbnail(ui, thumb, picture, token, Radius::Small);
+        }
         let caption_y = tile.bottom() - sp(Spacing::S4) - line() / 2.0;
         dot(
             ui,
@@ -927,4 +916,39 @@ fn pane_notice(
             .layout(EguiLayout::top_down(Align::Center)),
     );
     button(&mut row, label, key, ButtonKind::Primary, true).clicked()
+}
+
+/// The dashed row that pins the selected slot; faint and inert when nothing can be pinned.
+fn pin_row(ui: &mut Ui, rect: Rect, id: egui::Id, label: &str, enabled: bool) -> egui::Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let response = ui.interact(rect, id, sense);
+    dashed_rect(
+        ui,
+        rect,
+        if enabled && response.hovered() {
+            ColorToken::Dim
+        } else {
+            ColorToken::Faint
+        },
+        Radius::Control,
+    );
+    paint_text(
+        ui,
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        TypographyRole::Label,
+        if enabled {
+            ColorToken::Dim
+        } else {
+            ColorToken::Faint
+        },
+        rect.width(),
+    );
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
+    response
 }

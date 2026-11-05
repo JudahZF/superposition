@@ -2042,8 +2042,11 @@ impl LiveRackApp {
         }
         #[cfg(target_os = "linux")]
         {
+            // One docked editor at a time: the one shown before closes, not floats.
+            if let Some(previous) = self.docked.filter(|docked| *docked != (rack, slot)) {
+                self.close_docked(previous);
+            }
             self.docked = Some((rack, slot));
-            self.undocked = None;
         }
         let open = self
             .product
@@ -2086,6 +2089,12 @@ impl LiveRackApp {
             return;
         }
         self.docked = None;
+        self.close_docked((rack, slot));
+    }
+
+    /// Linux: closes an editor the rack view docked, hiding its window until it goes away.
+    #[cfg(target_os = "linux")]
+    fn close_docked(&mut self, (rack, slot): (usize, usize)) {
         let running = self.online();
         let Ok(product) = self.product.as_mut() else {
             return;
