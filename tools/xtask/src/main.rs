@@ -28,6 +28,7 @@ const REQUIRED_DIRECTORIES: &[&str] = &[
     "crates/sp-protocol",
     "crates/sp-shared-memory",
     "crates/sp-shared-memory-os",
+    "crates/sp-rack-lane",
     "crates/sp-engine",
     "crates/sp-audio-io",
     "crates/sp-vst3",
@@ -61,6 +62,8 @@ const REQUIRED_PATHS: &[&str] = &[
     "crates/sp-shared-memory/src/lib.rs",
     "crates/sp-shared-memory-os/Cargo.toml",
     "crates/sp-shared-memory-os/src/lib.rs",
+    "crates/sp-rack-lane/Cargo.toml",
+    "crates/sp-rack-lane/src/lib.rs",
     "crates/sp-engine/Cargo.toml",
     "crates/sp-engine/src/lib.rs",
     "crates/sp-audio-io/Cargo.toml",
@@ -232,6 +235,11 @@ fn run(arguments: &[String]) -> Result<u8, XtaskError> {
                 .map_err(XtaskError::Standard)?;
             return Ok(0);
         }
+        "lane-soak" => {
+            wine::run_lane_soak(&workspace_root(), &arguments[1..])
+                .map_err(XtaskError::Standard)?;
+            return Ok(0);
+        }
         "help" | "--help" | "-h" => {
             println!("{}", usage());
             return Ok(0);
@@ -259,9 +267,10 @@ fn usage() -> String {
     format!(
         "Usage: cargo xtask <command>\n\nCommands:\n  doctor\n  \
          bundle-linux  build the Linux tarball and AppImage (needs docker)\n  \
-         wine-bridge   build the sp_wine_bridge unixlib into target/wine-bridge\n  \
+         wine-bridge   build the sp_wine_bridge unixlib into <target dir>/wine-bridge\n  \
          wine-check    run the Windows shared-memory client under Wine and time its wakes\n  \
-         windows-helpers [--release] [--out DIR]\n                build the Windows plug-in helpers and bridge into DIR/windows and DIR/wine-bridge\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}",
+         windows-helpers [--release] [--out DIR]\n                build the Windows plug-in helpers and bridge into DIR/windows and DIR/wine-bridge\n  \
+         lane-soak [--build-only] [sp-lane-soak options]\n                build the lane workers and bridge, then soak racks on Lambda's block timing\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}\n  {}",
         verification::usage_host_checker(),
         verification::usage_compatibility(),
         verification::usage_loopback(),
@@ -726,6 +735,7 @@ fn dependency_boundary_check(graph: &PackageGraph) -> CheckResult {
         "sp-model",
         "sp-protocol",
         "sp-shared-memory",
+        "sp-rack-lane",
         "sp-engine",
         "sp-audio-io",
         "sp-vst3",
@@ -742,12 +752,23 @@ fn dependency_boundary_check(graph: &PackageGraph) -> CheckResult {
                 .map(move |target| format!("{root} -> {target}"))
         })
         .collect::<Vec<_>>();
+    // Lambda drives lanes from its own task pool, so the lane crate stays free of
+    // Superposition's engine and session model.
+    let lane_violations = ["sp-engine", "sp-model", "sp-supervisor"]
+        .into_iter()
+        .filter(|target| graph.contains_path("sp-rack-lane", target))
+        .map(|target| format!("sp-rack-lane -> {target}"))
+        .collect::<Vec<_>>();
 
-    if vst3_violations.is_empty() && unexpected_dependents.is_empty() && layer_violations.is_empty()
+    if vst3_violations.is_empty()
+        && unexpected_dependents.is_empty()
+        && layer_violations.is_empty()
+        && lane_violations.is_empty()
     {
         CheckResult::pass(
             "dependency boundary",
-            "VST3 loading is helper-only and lower layers do not depend on the app or UI",
+            "VST3 loading is helper-only, lower layers do not depend on the app or UI, and \
+             sp-rack-lane does not depend on the engine or model",
         )
     } else {
         let mut problems = Vec::new();
@@ -769,10 +790,16 @@ fn dependency_boundary_check(graph: &PackageGraph) -> CheckResult {
                 layer_violations.join(", ")
             ));
         }
+        if !lane_violations.is_empty() {
+            problems.push(format!(
+                "the lane crate reaches Superposition's engine or model: {}",
+                lane_violations.join(", ")
+            ));
+        }
         CheckResult::fail(
             "dependency boundary",
             problems.join("; "),
-            "Keep VST3 loading in helpers and remove app/UI dependencies from lower-layer crates.",
+            "Keep VST3 loading in helpers, remove app/UI dependencies from lower-layer crates, and keep sp-rack-lane free of the engine and model.",
         )
     }
 }
@@ -803,6 +830,17 @@ mod tests {
         let result = dependency_boundary_check(&graph);
         assert!(!result.passed);
         assert!(result.detail.contains("sp-engine -> sp-ui"));
+    }
+
+    #[test]
+    fn rejects_a_lane_crate_that_reaches_the_engine_or_model() {
+        let mut graph = PackageGraph::default();
+        graph.insert_edge("sp-rack-lane", "sp-shared-memory-os");
+        graph.insert_edge("sp-shared-memory-os", "sp-model");
+
+        let result = dependency_boundary_check(&graph);
+        assert!(!result.passed);
+        assert!(result.detail.contains("sp-rack-lane -> sp-model"));
     }
 
     #[test]

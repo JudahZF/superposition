@@ -32,9 +32,16 @@ const ROUNDS: u32 = 20_000;
 const LOST_WAKE: Duration = Duration::from_secs(1);
 const READY_TIMEOUT: Duration = Duration::from_mins(2);
 
+/// Cargo's target directory: `CARGO_TARGET_DIR` (relative to the workspace), or `target`.
+pub(crate) fn target_dir(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(
+        std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| PathBuf::from("target"), PathBuf::from),
+    )
+}
+
 /// The directory that holds `x86_64-windows/` and `x86_64-unix/`.
 pub(crate) fn bridge_dir(workspace_root: &Path) -> PathBuf {
-    workspace_root.join("target").join("wine-bridge")
+    target_dir(workspace_root).join("wine-bridge")
 }
 
 /// The pinned Wine installation: `SUPERPOSITION_WINE_ROOT`, or the parent of `wine` on PATH.
@@ -131,7 +138,7 @@ pub(crate) fn run_windows_helpers(
         }
     }
     let profile = if release { "release" } else { "debug" };
-    let out = out.unwrap_or_else(|| workspace_root.join("target").join(profile));
+    let out = out.unwrap_or_else(|| target_dir(workspace_root).join(profile));
     let bridge = build_bridge(workspace_root)?;
     run(
         Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned()))
@@ -140,8 +147,8 @@ pub(crate) fn run_windows_helpers(
             .args(release.then_some("--release"))
             .args(["-p", "sp-plugin-worker", "-p", "sp-plugin-scanner"]),
     )?;
-    let built = workspace_root
-        .join("target/x86_64-pc-windows-gnu")
+    let built = target_dir(workspace_root)
+        .join("x86_64-pc-windows-gnu")
         .join(profile);
     let copy = |from: &Path, to: &Path| {
         if let Some(parent) = to.parent() {
@@ -190,8 +197,9 @@ pub(crate) fn run_check(workspace_root: &Path, arguments: &[String]) -> Result<(
             .args(["build", "--release", "--target", "x86_64-pc-windows-gnu"])
             .args(["-p", "sp-shared-memory-os", "--example", "wine_ping"]),
     )?;
-    let exe = workspace_root.join("target/x86_64-pc-windows-gnu/release/examples/wine_ping.exe");
-    let prefix = workspace_root.join("target/wine-check-prefix");
+    let target = target_dir(workspace_root);
+    let exe = target.join("x86_64-pc-windows-gnu/release/examples/wine_ping.exe");
+    let prefix = target.join("wine-check-prefix");
 
     let region = SharedMemoryRegion::create(1).map_err(|error| error.to_string())?;
     let clock = MonotonicClock::new().map_err(|error| error.to_string())?;
@@ -204,6 +212,9 @@ pub(crate) fn run_check(workspace_root: &Path, arguments: &[String]) -> Result<(
             .env("WINEPREFIX", &prefix)
             .env("WINEDLLPATH", &bridge)
             .env("WINEDEBUG", "-all")
+            // As in the app's prefix setup: a new prefix would otherwise try to install Wine
+            // Mono and Gecko, which hangs without a display.
+            .env("WINEDLLOVERRIDES", "mscoree,mshtml=")
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY")
             .stdin(Stdio::null())
@@ -275,4 +286,38 @@ pub(crate) fn run_check(workspace_root: &Path, arguments: &[String]) -> Result<(
         over(Duration::from_millis(5)),
     );
     Ok(())
+}
+
+/// Builds the lane soak, its Linux and Windows workers, and the bridge, then runs the soak with
+/// the remaining arguments (see `sp-lane-soak`). `--build-only` stops after the build.
+pub(crate) fn run_lane_soak(workspace_root: &Path, arguments: &[String]) -> Result<(), String> {
+    let build_only = arguments
+        .first()
+        .is_some_and(|argument| argument == "--build-only");
+    let bridge = build_bridge(workspace_root)?;
+    let cargo = || {
+        let mut command =
+            Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned()));
+        command.current_dir(workspace_root);
+        command
+    };
+    run(cargo()
+        .args(["build", "--release", "--target", "x86_64-pc-windows-gnu"])
+        .args(["-p", "sp-lane-adapter", "--bin", "sp-lane-worker"]))?;
+    run(cargo().args(["build", "--release", "-p", "sp-lane-adapter", "--bins"]))?;
+    let target = target_dir(workspace_root);
+    let wine_worker = target.join("x86_64-pc-windows-gnu/release/sp-lane-worker.exe");
+    if build_only {
+        println!("Windows worker: {}", wine_worker.display());
+        println!("Wine bridge: {}", bridge.display());
+        return Ok(());
+    }
+    run(Command::new(target.join("release/sp-lane-soak"))
+        .arg("--wine-worker")
+        .arg(&wine_worker)
+        .arg("--wine-bridge")
+        .arg(&bridge)
+        .arg("--wine-prefix")
+        .arg(target.join("lane-soak-prefix"))
+        .args(arguments))
 }
