@@ -1,6 +1,6 @@
 //! Shared UI design foundations for Superposition.
 //!
-//! This crate contains the film-strip design tokens and renderer-independent component models.
+//! This crate contains the rack UI's design tokens and renderer-independent component models.
 //! It has no rendering-framework dependency.
 
 #![forbid(unsafe_code)]
@@ -73,17 +73,17 @@ mod design_source_tests {
             let production_source = production_source(&contents);
             for literal in [
                 "Color::rgb(",
-                "0x12, 0x13, 0x15",
-                "0xD9, 0xDA, 0xD6",
-                "0x7C, 0x80, 0x88",
-                "0x3A, 0x3E, 0x45",
-                "0x26, 0x29, 0x2E",
-                "0x24, 0x27, 0x2C",
-                "0x1B, 0x1D, 0x21",
-                "0xD9, 0xA2, 0x1B",
-                "0xE5, 0x48, 0x4D",
-                "0x7F, 0xB0, 0xFF",
-                "0x1A, 0x12, 0x14",
+                "0x0A, 0x0A, 0x0A",
+                "0x11, 0x11, 0x11",
+                "0xF5, 0xF5, 0xF5",
+                "0x81, 0x81, 0x81",
+                "0x4D, 0x4D, 0x4D",
+                "0x23, 0x23, 0x23",
+                "0x34, 0x6B, 0xF1",
+                "0x10, 0xB9, 0x81",
+                "0xFE, 0x9A, 0x00",
+                "0xFB, 0x41, 0x4A",
+                "0x3B, 0x82, 0xF6",
             ] {
                 assert!(
                     !production_source.contains(literal),

@@ -1,17 +1,16 @@
 //! Editor pictures: the newest capture per plug-in instance, uploaded once as egui textures,
-//! and the preview tile that shows one in a rack column.
+//! and the thumbnails and fitted pictures that show them.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{
     self, Align2, ColorImage, Pos2, Rect, Response, Sense, TextureHandle, TextureOptions, Ui, Vec2,
-    WidgetInfo, WidgetType,
 };
 use sp_ui::components::StateToken;
-use sp_ui::design::{ColorToken, Layout, Spacing, TypographyRole};
+use sp_ui::design::{ColorToken, Layout, Radius, Spacing, TypographyRole};
 
-use super::style::{color, dashed_rect, hairline, line, paint_text, px, sp};
+use super::style::{color, hairline, line, paint_text, px, radius, sp};
 use sp_session::EditorPreviewFile;
 
 /// Picture opacity for bypassed slots, and for unavailable ones drawn in grayscale.
@@ -20,7 +19,7 @@ const UNAVAILABLE_OPACITY: f32 = 0.35;
 
 /// One stored picture with its colour and grayscale textures.
 pub(super) struct Preview {
-    file: EditorPreviewFile,
+    pub(super) file: EditorPreviewFile,
     color: TextureHandle,
     gray: TextureHandle,
 }
@@ -101,181 +100,83 @@ impl PreviewCache {
     }
 }
 
-/// What one filled preview slot shows.
-pub(super) struct Tile<'a> {
-    pub(super) name: &'a str,
-    pub(super) token: StateToken,
-    pub(super) picture: Option<&'a Preview>,
-    /// The plug-in's editor window is open.
-    pub(super) live: bool,
-    /// `SC Drums` or `SC in 7-8`.
-    pub(super) sidechain: Option<String>,
-    pub(super) selected: bool,
+/// Whether a slot's state draws its picture dimmed and in grayscale.
+fn unavailable(token: StateToken) -> bool {
+    matches!(
+        token,
+        StateToken::Missing
+            | StateToken::Faulted
+            | StateToken::Loading
+            | StateToken::Recovering
+            | StateToken::Unloaded
+    )
 }
 
-/// Draws a preview tile. Click opens the editor, right-click opens the slot menu, and hover
-/// shows the full capture beside the tile.
-pub(super) fn tile(ui: &mut Ui, rect: Rect, id: egui::Id, tile: &Tile<'_>) -> Response {
-    let response = ui.interact(rect, id, Sense::click());
-    let border = if tile.selected {
-        ColorToken::Text
-    } else if response.hovered() {
-        ColorToken::Dim
+/// The texture and opacity a slot in `token` state draws its picture with.
+fn treatment(picture: &Preview, token: StateToken) -> (&TextureHandle, f32) {
+    if unavailable(token) {
+        (&picture.gray, UNAVAILABLE_OPACITY)
+    } else if token == StateToken::Bypassed {
+        (&picture.color, BYPASSED_OPACITY)
     } else {
-        ColorToken::Hairline
-    };
-    if tile.picture.is_none() && !tile.live {
-        never_opened(ui, rect, tile, border);
-    } else {
-        let painter = ui.painter();
-        painter.rect_filled(rect, 0.0, color(ColorToken::Base));
-        if let Some(picture) = tile.picture {
-            let unavailable = matches!(
-                tile.token,
-                StateToken::Missing
-                    | StateToken::Faulted
-                    | StateToken::Loading
-                    | StateToken::Recovering
-                    | StateToken::Unloaded
-            );
-            let (texture, opacity) = if unavailable {
-                (&picture.gray, UNAVAILABLE_OPACITY)
-            } else if tile.token == StateToken::Bypassed {
-                (&picture.color, BYPASSED_OPACITY)
-            } else {
-                (&picture.color, 1.0)
-            };
-            painter.image(
-                texture.id(),
-                rect,
-                cover_uv(texture.size_vec2(), rect.size()),
-                egui::Color32::WHITE.gamma_multiply(opacity),
-            );
-        }
-        caption(ui, rect, tile);
-        ui.painter()
-            .rect_stroke(rect, 0.0, hairline(border), egui::StrokeKind::Inside);
+        (&picture.color, 1.0)
     }
-    super::style::focus_outline(ui, &response, rect);
-    response.widget_info(|| {
-        WidgetInfo::selected(
-            WidgetType::Button,
-            true,
-            tile.selected,
-            format!("{}, {}", tile.name, tile.token.meaning()),
-        )
-    });
+}
+
+/// A rounded thumbnail of a slot's editor picture, cropped to cover `rect`. A slot without a
+/// picture shows an empty tile.
+pub(super) fn thumbnail(
+    ui: &Ui,
+    rect: Rect,
+    picture: Option<&Preview>,
+    token: StateToken,
+    corner: Radius,
+) {
+    ui.painter()
+        .rect_filled(rect, radius(corner), color(ColorToken::SegmentOff));
+    if let Some(picture) = picture {
+        let (texture, opacity) = treatment(picture, token);
+        egui::Image::new((texture.id(), rect.size()))
+            .uv(cover_uv(texture.size_vec2(), rect.size()))
+            .corner_radius(radius(corner))
+            .tint(egui::Color32::WHITE.gamma_multiply(opacity))
+            .paint_at(ui, rect);
+    }
+}
+
+/// A slot's editor picture scaled to fit inside `rect`, centred, and at most twice its captured
+/// size so a small capture never smears across a large pane. Returns where it drew.
+pub(super) fn fitted(ui: &Ui, rect: Rect, picture: &Preview, token: StateToken) -> Rect {
+    const MAX_SCALE: f32 = 2.0;
+    let (texture, opacity) = treatment(picture, token);
+    let size = texture.size_vec2();
+    let scale = (rect.width() / size.x)
+        .min(rect.height() / size.y)
+        .min(MAX_SCALE);
+    let shown = Rect::from_center_size(rect.center(), size * scale);
+    egui::Image::new((texture.id(), shown.size()))
+        .corner_radius(radius(Radius::Control))
+        .tint(egui::Color32::WHITE.gamma_multiply(opacity))
+        .paint_at(ui, shown);
+    shown
+}
+
+/// Shows the full capture beside `rect` while `response` is hovered.
+pub(super) fn peek_on_hover(
+    ui: &Ui,
+    response: &Response,
+    rect: Rect,
+    name: &str,
+    picture: Option<&Preview>,
+) {
     if response.hovered()
-        && let Some(picture) = tile.picture
+        && let Some(picture) = picture
     {
-        peek(ui, rect, id, tile.name, picture);
+        peek(ui, rect, response.id, name, picture);
     }
-    response
 }
 
-/// A slot whose editor has never been opened: dashed, with the name and a note.
-fn never_opened(ui: &Ui, rect: Rect, tile: &Tile<'_>, border: ColorToken) {
-    let border = if border == ColorToken::Hairline {
-        ColorToken::Faint
-    } else {
-        border
-    };
-    dashed_rect(ui, rect, border);
-    let center = rect.center();
-    let half = px(Layout::Caption) / 2.0;
-    paint_text(
-        ui,
-        Pos2::new(center.x, center.y - half),
-        Align2::CENTER_CENTER,
-        tile.name,
-        TypographyRole::Label,
-        ColorToken::Dim,
-        rect.width() - sp(Spacing::S12),
-    );
-    let (note, token) = match (&tile.sidechain, tile.token) {
-        (_, StateToken::Missing | StateToken::Faulted) => {
-            (tile.token.code().to_owned(), tile.token.color())
-        }
-        (Some(sidechain), _) => (sidechain.clone(), ColorToken::Info),
-        (None, _) => ("not opened yet".to_owned(), ColorToken::Faint),
-    };
-    paint_text(
-        ui,
-        Pos2::new(center.x, center.y + half),
-        Align2::CENTER_CENTER,
-        note,
-        TypographyRole::Label,
-        token,
-        rect.width() - sp(Spacing::S12),
-    );
-}
-
-/// The 14 px caption bar: name at the left; sidechain marker, token, and capture age or `live`
-/// at the right. The bar is opaque so plug-in pictures never reduce its contrast.
-fn caption(ui: &Ui, rect: Rect, tile: &Tile<'_>) {
-    let bar = Rect::from_min_max(
-        Pos2::new(rect.left(), rect.bottom() - px(Layout::Caption)),
-        rect.max,
-    );
-    ui.painter().rect_filled(bar, 0.0, color(ColorToken::Base));
-    let inset = sp(Spacing::S6);
-    let name_token = match tile.token {
-        StateToken::Missing | StateToken::Faulted => ColorToken::Fault,
-        StateToken::Loading | StateToken::Recovering => ColorToken::Warn,
-        _ => ColorToken::Text,
-    };
-    let mut right = bar.right() - inset;
-    let age = if tile.live {
-        "live".to_owned()
-    } else {
-        tile.picture.map_or_else(String::new, |picture| {
-            age_label(picture.file.captured_at_unix_ms)
-        })
-    };
-    let age_rect = caption_right(ui, bar, &mut right, &age, ColorToken::Dim);
-    if tile.live {
-        let dot = px(Layout::LiveDot);
-        ui.painter().circle_filled(
-            Pos2::new(
-                age_rect.left() - sp(Spacing::S4) - dot / 2.0,
-                bar.center().y,
-            ),
-            dot / 2.0,
-            color(ColorToken::Fault),
-        );
-        right -= dot + sp(Spacing::S4);
-    }
-    caption_right(ui, bar, &mut right, tile.token.code(), tile.token.color());
-    if let Some(sidechain) = &tile.sidechain {
-        caption_right(ui, bar, &mut right, sidechain, ColorToken::Info);
-    }
-    paint_text(
-        ui,
-        Pos2::new(bar.left() + inset, bar.center().y),
-        Align2::LEFT_CENTER,
-        tile.name,
-        TypographyRole::Label,
-        name_token,
-        (right - bar.left() - inset).max(0.0),
-    );
-}
-
-/// Paints caption text right-aligned at `right`, then moves `right` left past it.
-fn caption_right(ui: &Ui, bar: Rect, right: &mut f32, text: &str, token: ColorToken) -> Rect {
-    let placed = paint_text(
-        ui,
-        Pos2::new(*right, bar.center().y),
-        Align2::RIGHT_CENTER,
-        text,
-        TypographyRole::Label,
-        token,
-        bar.width() / 2.0,
-    );
-    *right = placed.left() - sp(Spacing::S8);
-    placed
-}
-
-/// The full 320×200 capture in a bordered popover beside the tile.
+/// The full 320×200 capture in a rounded card beside `rect`.
 fn peek(ui: &Ui, rect: Rect, id: egui::Id, name: &str, picture: &Preview) {
     let size = Vec2::new(px(Layout::CaptureWidth), px(Layout::CaptureHeight))
         + Vec2::splat(px(Layout::Hairline) * 2.0);
@@ -297,25 +198,27 @@ fn peek(ui: &Ui, rect: Rect, id: egui::Id, name: &str, picture: &Preview) {
         .show(ui.ctx(), |ui| {
             let (frame, _) = ui.allocate_exact_size(size, Sense::hover());
             let painter = ui.painter();
-            painter.rect_filled(frame, 0.0, color(ColorToken::Base));
+            painter.rect_filled(frame, radius(Radius::Control), color(ColorToken::Surface));
             let inner = frame.shrink(px(Layout::Hairline));
-            painter.image(
-                picture.color.id(),
-                inner,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-            painter.rect_stroke(
-                frame,
-                0.0,
-                hairline(ColorToken::Text),
-                egui::StrokeKind::Inside,
-            );
+            egui::Image::new((picture.color.id(), inner.size()))
+                .corner_radius(radius(Radius::Control))
+                .paint_at(ui, inner);
             let bar = Rect::from_min_max(
-                Pos2::new(inner.left(), inner.bottom() - px(Layout::Caption)),
+                Pos2::new(
+                    inner.left(),
+                    inner.bottom() - px(Layout::Caption) - sp(Spacing::S4),
+                ),
                 inner.max,
             );
-            painter.rect_filled(bar, 0.0, color(ColorToken::Base));
+            ui.painter().rect_filled(
+                bar,
+                egui::CornerRadius {
+                    sw: Radius::Control.pixels(),
+                    se: Radius::Control.pixels(),
+                    ..egui::CornerRadius::ZERO
+                },
+                color(ColorToken::Surface),
+            );
             paint_text(
                 ui,
                 Pos2::new(bar.left() + sp(Spacing::S8), bar.center().y),
@@ -327,6 +230,12 @@ fn peek(ui: &Ui, rect: Rect, id: egui::Id, name: &str, picture: &Preview) {
                 TypographyRole::Label,
                 ColorToken::Text,
                 bar.width() - sp(Spacing::S16),
+            );
+            ui.painter().rect_stroke(
+                frame,
+                radius(Radius::Control),
+                hairline(ColorToken::Hairline),
+                egui::StrokeKind::Inside,
             );
         });
 }
@@ -346,7 +255,7 @@ fn cover_uv(picture: Vec2, target: Vec2) -> Rect {
 }
 
 /// `now`, `2 min`, `1 h`, or `Sep 18`.
-fn age_label(captured_at_unix_ms: u64) -> String {
+pub(super) fn age_label(captured_at_unix_ms: u64) -> String {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| {

@@ -1,5 +1,5 @@
-//! The setup page: Audio, MIDI, Plug-ins, and Diagnostics. It takes the column area; head and
-//! foot stay. Device choices lock while the engine runs.
+//! The setup page: Audio, MIDI, Plug-ins, and Diagnostics. It replaces the rack views; the top
+//! bar and scene bar stay. Device choices lock while the engine runs.
 
 use eframe::egui::{self, Align2, Frame, Margin, Pos2, Rect, Response, Sense, Ui, Vec2};
 use sp_model::MAX_RACKS;
@@ -34,27 +34,31 @@ fn columns(lines: &[f32]) -> Vec<f32> {
 impl LiveRackApp {
     pub(super) fn draw_setup(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(color(ColorToken::Base)))
+            .frame(
+                Frame::new()
+                    .fill(color(ColorToken::Base))
+                    .inner_margin(super::show::margin(Spacing::S12, Spacing::S12)),
+            )
             .show(ctx, |ui| {
                 let area = ui.max_rect();
                 let rail = Rect::from_min_size(
                     area.min,
                     Vec2::new(px(Layout::SetupRailWidth), area.height()),
                 );
-                ui.painter().vline(
-                    rail.right() - px(Layout::Hairline) / 2.0,
-                    rail.y_range(),
-                    hairline(ColorToken::Hairline),
-                );
-                let mut tabs = ui.new_child(
-                    egui::UiBuilder::new().max_rect(rail.shrink2(Vec2::Y * sp(Spacing::S16))),
-                );
+                super::style::card(ui, rail, false);
+                let mut tabs =
+                    ui.new_child(egui::UiBuilder::new().max_rect(rail.shrink(sp(Spacing::S8))));
+                tabs.spacing_mut().item_spacing.y = sp(Spacing::S2);
                 for (tab, label) in TABS {
                     if setup_tab(&mut tabs, label, self.setup_tab == tab).clicked() {
                         self.setup_tab = tab;
                     }
                 }
-                let page = Rect::from_min_max(Pos2::new(rail.right(), area.top()), area.max);
+                let page = Rect::from_min_max(
+                    Pos2::new(rail.right() + sp(Spacing::S8), area.top()),
+                    area.max,
+                );
+                super::style::card(ui, page, false);
                 let mut page_ui = ui.new_child(egui::UiBuilder::new().max_rect(page));
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -840,23 +844,27 @@ impl LiveRackApp {
     }
 }
 
-/// A setup rail tab: dim, text on hover, inverted while active.
+/// A setup rail tab: dim, filled on hover, accent while active.
 fn setup_tab(ui: &mut Ui, label: &str, active: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), line() + sp(Spacing::S4)),
+        Vec2::new(ui.available_width(), px(Layout::Control)),
         Sense::click(),
     );
+    let corner = super::style::radius(sp_ui::design::Radius::Control);
     let token = if active {
-        ui.painter().rect_filled(rect, 0.0, color(ColorToken::Text));
-        ColorToken::Base
+        ui.painter()
+            .rect_filled(rect, corner, color(ColorToken::Accent));
+        ColorToken::AccentText
     } else if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, corner, color(ColorToken::HoverFill));
         ColorToken::Text
     } else {
         ColorToken::Dim
     };
     paint_text(
         ui,
-        Pos2::new(rect.left() + sp(Spacing::S20), rect.center().y),
+        Pos2::new(rect.left() + sp(Spacing::S10), rect.center().y),
         Align2::LEFT_CENTER,
         label,
         TypographyRole::Body,

@@ -15,7 +15,7 @@ pub enum MotionPreference {
 /// A kind of motion requested by a component.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MotionKind {
-    /// A hover, selection, or layout transition. The film-strip UI has none.
+    /// A hover, selection, or layout transition. The rack UI has none.
     InterfaceTransition,
     /// Live audio metering, repainted at [`crate::components::METER_REPAINT_INTERVAL`].
     Meter,

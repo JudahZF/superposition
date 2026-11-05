@@ -1,4 +1,4 @@
-//! Three-letter state tokens, always shown with their colour and never colour alone.
+//! Rack and slot states, always shown as a word beside a coloured dot and never colour alone.
 
 use crate::design::ColorToken;
 
@@ -22,17 +22,17 @@ pub enum StateToken {
 }
 
 impl StateToken {
-    /// The uppercase token shown in the UI.
+    /// The short word shown beside the state dot.
     #[must_use]
-    pub const fn code(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
-            Self::Ready => "RDY",
-            Self::Loading => "LDG",
-            Self::Bypassed => "BYP",
-            Self::Missing => "MIS",
-            Self::Faulted => "FLT",
-            Self::Recovering => "REC",
-            Self::Unloaded => "UNL",
+            Self::Ready => "Ready",
+            Self::Loading => "Loading",
+            Self::Bypassed => "Bypassed",
+            Self::Missing => "Missing",
+            Self::Faulted => "Failed",
+            Self::Recovering => "Recovering",
+            Self::Unloaded => "Not loaded",
         }
     }
 
@@ -50,11 +50,11 @@ impl StateToken {
         }
     }
 
-    /// The token's colour.
+    /// The state dot's colour.
     #[must_use]
     pub const fn color(self) -> ColorToken {
         match self {
-            Self::Ready => ColorToken::Text,
+            Self::Ready => ColorToken::Success,
             Self::Loading | Self::Recovering => ColorToken::Warn,
             Self::Bypassed | Self::Unloaded => ColorToken::Dim,
             Self::Missing | Self::Faulted => ColorToken::Fault,
