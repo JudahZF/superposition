@@ -140,8 +140,10 @@ No waiter is a normal result. Other wake errors and maximum observed wake-call
 ticks are recorded atomically. This narrowly scoped kernel wake is a deliberate
 addition to the callback contract, not permission to wait on a synchronization
 primitive. The underlying kernel call is not a hard real-time guarantee; live
-timing evidence must include its cost. The shared-memory ABI is version 10 and
-requires matching app/helpers. Version 10 adds a segment's own latency and its
+timing evidence must include its cost. The shared-memory ABI is version 11 and
+requires matching app/helpers. Version 11 carries the host's read deadline in
+each request, as a tick offset from its publication (`deadline_offset_ticks`;
+zero keeps the one-block rule). Version 10 adds a segment's own latency and its
 chain-link failure count to the bank header. Version 9 raised the rack capacity from 8 to 64; every
 per-rack callback array is preallocated for 64, and per-block telemetry visits all 64
 slots with bounded, allocation-free work. Live timing evidence so far covers eight racks. The dispatcher deadline and failure criteria are

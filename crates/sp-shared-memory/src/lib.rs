@@ -176,6 +176,23 @@ impl SharedBank {
         request: BlockRequest,
         published_tick: u64,
     ) -> Result<BlockTicket, SharedMemoryError> {
+        self.request_timed_block_at(slot_index, request, published_tick, 0)
+    }
+
+    /// Allocates and publishes a timed request that the host reads `deadline_offset_ticks`
+    /// after `published_tick`. Zero keeps the untimed one-block deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an out-of-range slot, zero timestamp, or rejected protocol
+    /// transition.
+    pub fn request_timed_block_at(
+        &mut self,
+        slot_index: usize,
+        request: BlockRequest,
+        published_tick: u64,
+        deadline_offset_ticks: u32,
+    ) -> Result<BlockTicket, SharedMemoryError> {
         let slot = self
             .slots
             .get_mut(slot_index)
@@ -184,7 +201,7 @@ impl SharedBank {
             return Err(ProtocolError::InvalidTimestamp.into());
         }
         let ticket = self.header.allocate_ticket()?;
-        slot.publish_request_at(ticket, request, published_tick)?;
+        slot.publish_timed_request_at(ticket, request, published_tick, deadline_offset_ticks)?;
         Ok(ticket)
     }
 

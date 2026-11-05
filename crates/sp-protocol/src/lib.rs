@@ -19,9 +19,10 @@ pub const PROTOCOL_MAGIC: u32 = u32::from_le_bytes(*b"SP00");
 /// Version of the shared-bank binary layout.
 ///
 /// Version 8 adds a stereo sidechain region per plug-in slot to every block slot. Version 10 adds
-/// the mixed-rack segment latency and chain-link failure counter to the header. Older mappings
-/// are rejected.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// the mixed-rack segment latency and chain-link failure counter to the header. Version 11 carries
+/// the host's read deadline in each request ([`BlockMetadata::deadline_offset_ticks`], formerly a
+/// reserved zero field). Older mappings are rejected.
+pub const PROTOCOL_VERSION: u32 = 11;
 /// The name of a worker's processing thread. The host finds a Wine worker's processing thread
 /// by this name, which Wine passes to Linux, to make it real-time.
 pub const WORKER_PROCESSING_THREAD: &str = "sp-worker-processing";
@@ -394,8 +395,10 @@ pub struct BlockMetadata {
     pub flags: u32,
     /// Plug-in slots whose sidechain region holds this block's audio, as a bitmask.
     pub sidechain_slots: u32,
-    /// Reserved for compatible layout expansion.
-    pub reserved: u32,
+    /// The host reads the completion at `request_published_tick` plus this many ticks. Zero
+    /// means untimed: the host reads one block period after publication. A timed offset needs
+    /// a timed request.
+    pub deadline_offset_ticks: u32,
 }
 
 impl BlockMetadata {
@@ -419,7 +422,7 @@ impl BlockMetadata {
             event_count: 0,
             flags: 0,
             sidechain_slots: 0,
-            reserved: 0,
+            deadline_offset_ticks: 0,
         }
     }
 
@@ -456,6 +459,15 @@ impl BlockMetadata {
             flags: self.flags,
             sidechain_slots: self.sidechain_slots,
         }
+    }
+
+    /// The tick by which the host reads this request's completion, or `None` for an untimed
+    /// deadline (one block period after publication). Read it only while the request is live.
+    #[must_use]
+    pub fn deadline_tick(&self) -> Option<u64> {
+        let published = self.request_published_tick.load(Ordering::Acquire);
+        (self.deadline_offset_ticks != 0 && published != 0)
+            .then(|| published.saturating_add(u64::from(self.deadline_offset_ticks)))
     }
 
     fn timing(&self) -> BlockTiming {
@@ -564,12 +576,12 @@ impl BlockSlot {
             return Err(ProtocolError::InvalidTicket);
         }
         self.validate_request_payload(request)?;
-        if self.metadata.reserved != 0 {
-            return Err(ProtocolError::InvalidRequest);
+        let timing = self.metadata.timing();
+        if self.metadata.deadline_offset_ticks != 0 && timing.request_published_tick == 0 {
+            return Err(ProtocolError::InvalidTimestamp);
         }
 
         let completion = self.metadata.completion_ticket();
-        let timing = self.metadata.timing();
         match state {
             SlotState::Requested => {
                 require_no_slot_owner(owner)?;
@@ -615,7 +627,7 @@ impl BlockSlot {
         ticket: BlockTicket,
         request: BlockRequest,
     ) -> Result<(), ProtocolError> {
-        self.publish_request_inner(ticket, request, 0)
+        self.publish_request_inner(ticket, request, 0, 0)
     }
 
     /// Publishes a producer request with a nonzero shared monotonic timestamp.
@@ -630,10 +642,27 @@ impl BlockSlot {
         request: BlockRequest,
         published_tick: u64,
     ) -> Result<(), ProtocolError> {
+        self.publish_timed_request_at(ticket, request, published_tick, 0)
+    }
+
+    /// Publishes a timed request that the host reads `deadline_offset_ticks` after
+    /// `published_tick`. A zero offset keeps the untimed one-block deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::InvalidTimestamp`] for a zero timestamp, in addition to the
+    /// errors documented by [`Self::publish_request`].
+    pub fn publish_timed_request_at(
+        &mut self,
+        ticket: BlockTicket,
+        request: BlockRequest,
+        published_tick: u64,
+        deadline_offset_ticks: u32,
+    ) -> Result<(), ProtocolError> {
         if published_tick == 0 {
             return Err(ProtocolError::InvalidTimestamp);
         }
-        self.publish_request_inner(ticket, request, published_tick)
+        self.publish_request_inner(ticket, request, published_tick, deadline_offset_ticks)
     }
 
     fn publish_request_inner(
@@ -641,14 +670,12 @@ impl BlockSlot {
         ticket: BlockTicket,
         request: BlockRequest,
         published_tick: u64,
+        deadline_offset_ticks: u32,
     ) -> Result<(), ProtocolError> {
         if !ticket.is_valid() {
             return Err(ProtocolError::InvalidTicket);
         }
         self.validate_request_payload(request)?;
-        if self.metadata.reserved != 0 {
-            return Err(ProtocolError::InvalidRequest);
-        }
         self.acquire_owner(OWNER_REQUESTING)?;
         let state = match self.metadata.state() {
             Ok(state) => state,
@@ -690,6 +717,7 @@ impl BlockSlot {
         self.metadata.event_count = request.event_count;
         self.metadata.flags = request.flags;
         self.metadata.sidechain_slots = request.sidechain_slots;
+        self.metadata.deadline_offset_ticks = deadline_offset_ticks;
         self.metadata
             .state
             .store(SlotState::Requested.raw(), Ordering::Release);
@@ -1009,11 +1037,13 @@ impl BlockSlot {
             return Err(ProtocolError::MalformedCompletion);
         }
         let request = self.metadata.request();
-        if self.metadata.reserved != 0 || self.validate_request_payload(request).is_err() {
+        if self.validate_request_payload(request).is_err() {
             return Err(ProtocolError::MalformedCompletion);
         }
         let timing = self.metadata.timing();
-        if !timing.is_valid() {
+        if !timing.is_valid()
+            || (self.metadata.deadline_offset_ticks != 0 && timing.request_published_tick == 0)
+        {
             return Err(ProtocolError::InvalidTimestamp);
         }
         Ok(Some(CompletionSnapshot {
@@ -1576,7 +1606,7 @@ mod tests {
 
     #[test]
     fn fixed_capacities_are_part_of_the_contract() {
-        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(PROTOCOL_VERSION, 11);
         assert_eq!(MAX_RACKS, 64);
         assert_eq!(MAX_PLUGINS_PER_RACK, 8);
         assert_eq!(MAX_CHANNELS, 2);
@@ -1584,6 +1614,60 @@ mod tests {
         assert_eq!(BLOCK_SLOT_COUNT, 4);
         assert_eq!(MAX_MIDI_EVENTS, 256);
         assert_eq!(MAX_EVENTS, 256);
+    }
+
+    #[test]
+    fn a_timed_request_carries_the_host_deadline_to_its_completion() {
+        let mut slot = BlockSlot::new();
+        let ticket = BlockTicket {
+            generation: 3,
+            sequence: 1,
+        };
+        slot.publish_timed_request_at(ticket, REQUEST, 1_000, 250)
+            .unwrap();
+        assert_eq!(slot.metadata.deadline_tick(), Some(1_250));
+        assert_eq!(slot.validate_mapped_contents(), Ok(()));
+        slot.claim_for_processing_at(7, 1_010).unwrap();
+        slot.publish_completion_at(7, ticket, 1_020).unwrap();
+        assert_eq!(
+            slot.completion_snapshot()
+                .map(|snapshot| snapshot.is_some()),
+            Ok(true)
+        );
+        slot.consume_completion(ticket).unwrap();
+
+        // The next request on the slot is untimed again.
+        let next = BlockTicket {
+            generation: 3,
+            sequence: 2,
+        };
+        slot.publish_request_at(next, REQUEST, 2_000).unwrap();
+        assert_eq!(slot.metadata.deadline_tick(), None);
+    }
+
+    #[test]
+    fn a_deadline_without_a_publication_tick_is_rejected() {
+        let mut slot = BlockSlot::new();
+        let ticket = BlockTicket {
+            generation: 3,
+            sequence: 1,
+        };
+        assert_eq!(
+            slot.publish_timed_request_at(ticket, REQUEST, 0, 250),
+            Err(ProtocolError::InvalidTimestamp)
+        );
+        slot.publish_request(ticket, REQUEST).unwrap();
+        slot.metadata.deadline_offset_ticks = 250;
+        assert_eq!(
+            slot.validate_mapped_contents(),
+            Err(ProtocolError::InvalidTimestamp)
+        );
+        slot.claim_for_processing(7).unwrap();
+        slot.publish_completion(7, ticket).unwrap();
+        assert_eq!(
+            slot.completion_snapshot(),
+            Err(ProtocolError::InvalidTimestamp)
+        );
     }
 
     #[test]

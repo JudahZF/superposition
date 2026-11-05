@@ -12,20 +12,15 @@
 //! segment is down, the host can point its upstream worker past it: the skipped plug-ins'
 //! latency is then applied here, before the block goes on.
 
-use std::{io, sync::atomic::Ordering, time::Duration};
+use std::{io, sync::atomic::Ordering};
 
 use sp_protocol::payload::ChainTarget;
 use sp_shared_memory::{
     BlockEvent, BlockRequest, BlockSlot, MAX_CHANNELS, MAX_PLUGINS_PER_RACK, ProtocolHeader,
 };
-use sp_shared_memory_os::{ChainLink, Forwarded, MonotonicClock};
+use sp_shared_memory_os::{ChainLink, Forwarded, Hop, MonotonicClock};
 
 use crate::worker_runtime::{BypassDelay, PlanarBlock, SLOT_FADE_FRAMES, WARMUP_BLOCKS, crossfade};
-
-/// Each segment finishes this much earlier than the one before it, so the upstream worker has
-/// time to notice the completion, copy it, and complete its own request. An eighth of the block,
-/// and at least the polling slice of a waiting link.
-const MIN_HOP_MARGIN: Duration = Duration::from_micros(100);
 /// Misses a new link forgives before the next segment is first heard: a worker's first blocks
 /// can be slow (first plug-in calls, first scheduling). Each forgiven miss plays the bypass.
 const MAX_WARMUP_MISSES: u8 = 32;
@@ -139,15 +134,17 @@ impl SegmentChain {
                 .read(&mut self.skipped, skipped_latency, frames);
             &self.skipped
         };
-        let (published, deadline) = hop_ticks(
+        // Each segment finishes one hop margin before the one waiting on it (see `Hop`).
+        let hop = Hop::derive(
             slot.metadata.request_published_tick.load(Ordering::Acquire),
+            slot.metadata.deadline_offset_ticks,
             clock,
             frames,
             sample_rate,
         );
         let first_slot = self.first_slot;
         let source: &BlockSlot = slot;
-        let forwarded = link.forward(published, deadline, |next| {
+        let forwarded = link.forward(hop.forward_tick, hop.deadline_tick, |next| {
             for channel in 0..channels {
                 next.input_audio[channel][..frames]
                     .copy_from_slice(&input.channels()[channel][..frames]);
@@ -228,28 +225,6 @@ impl SegmentChain {
         }
         self.downstream.copy_to_slot(slot, channels, frames);
     }
-}
-
-/// The publication tick a block is forwarded with and the deadline for its result.
-///
-/// Every segment derives its deadline from the publication tick it received: one block period
-/// after it, less one hop margin, so the first segment completes with time to spare for the
-/// host. A segment forwards a tick one margin earlier, so each later segment finishes one margin
-/// before the segment waiting on it. An untimed request (tick 0) starts now.
-fn hop_ticks(published: u64, clock: MonotonicClock, frames: usize, sample_rate: u32) -> (u64, u64) {
-    let origin = if published == 0 {
-        clock.now_ticks()
-    } else {
-        published
-    };
-    let period = clock.duration_to_ticks(Duration::from_nanos(
-        frames as u64 * 1_000_000_000 / u64::from(sample_rate.max(1)),
-    ));
-    let margin = (period / 8).max(clock.duration_to_ticks(MIN_HOP_MARGIN));
-    (
-        origin.saturating_sub(margin).max(1),
-        origin.saturating_add(period).saturating_sub(margin),
-    )
 }
 
 /// Copies the events meant for the next segment and later into `out`, renumbered from

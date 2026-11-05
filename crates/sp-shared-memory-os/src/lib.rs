@@ -18,7 +18,7 @@ pub use audio_thread::{
 pub use audio_thread::{
     current_thread_id, promote_thread, realtime_priority_limit, rtkit_max_priority,
 };
-pub use chain::{ChainLink, Forwarded};
+pub use chain::{ChainLink, Forwarded, Hop, MIN_HOP_MARGIN};
 
 use std::{
     ffi::CString,

@@ -13,12 +13,22 @@
 //! A bank has one producer at a time: the host replaces or kills a segment's worker before it
 //! points another worker at that segment's bank. Slots a gone producer left behind (an abandoned
 //! request, an unread completion) are therefore reclaimed when the link finds no free slot.
+//!
+//! Deadlines come from the request (see [`Hop`]). The host's read deadline is the request's
+//! publication tick plus its deadline offset, or one block period when the offset is zero. Each
+//! segment waits for the next one until its own deadline less one hop margin, and forwards the
+//! block with a publication tick one margin earlier and that wait deadline as the new request's
+//! deadline, so every segment finishes one margin before the segment waiting on it.
 
 use std::{io, sync::atomic::Ordering, time::Duration};
 
 use sp_shared_memory::{BlockRequest, BlockSlot, BlockTicket, ProtocolError, SlotState};
 
 use crate::{MonotonicClock, SharedMemoryRegion};
+
+/// The least time each segment of a chain leaves the segment before it: an eighth of the block,
+/// and at least the polling slice of a waiting link.
+pub const MIN_HOP_MARGIN: Duration = Duration::from_micros(100);
 
 /// How long a link spins before it sleeps between checks; most segments finish within it.
 const SPIN: Duration = Duration::from_micros(200);
@@ -35,6 +45,51 @@ pub enum Forwarded {
     Completed,
     /// The link is failed or the downstream segment missed the deadline; bypass it.
     Bypass,
+}
+
+/// The deadlines one segment works to, derived from the request it received.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Hop {
+    /// The publication tick to forward the block with: one hop margin before the received one.
+    pub forward_tick: u64,
+    /// When this segment stops waiting for the next one: its own read deadline less one hop
+    /// margin. It is also the forwarded request's read deadline.
+    pub deadline_tick: u64,
+}
+
+impl Hop {
+    /// Derives a segment's hop from its request's publication tick and deadline offset.
+    ///
+    /// The read deadline is `published_tick + deadline_offset_ticks`, or one block period after
+    /// `published_tick` when the offset is zero (untimed). An untimed request without a
+    /// publication tick (zero) starts now. The hop margin is an eighth of the block period and
+    /// at least [`MIN_HOP_MARGIN`].
+    #[must_use]
+    pub fn derive(
+        published_tick: u64,
+        deadline_offset_ticks: u32,
+        clock: MonotonicClock,
+        frames: usize,
+        sample_rate: u32,
+    ) -> Self {
+        let origin = if published_tick == 0 {
+            clock.now_ticks()
+        } else {
+            published_tick
+        };
+        let period = clock.duration_to_ticks(Duration::from_nanos(
+            frames as u64 * 1_000_000_000 / u64::from(sample_rate.max(1)),
+        ));
+        let margin = (period / 8).max(clock.duration_to_ticks(MIN_HOP_MARGIN));
+        let window = match deadline_offset_ticks {
+            0 => period,
+            offset => u64::from(offset),
+        };
+        Self {
+            forward_tick: origin.saturating_sub(margin).max(1),
+            deadline_tick: origin.saturating_add(window).saturating_sub(margin),
+        }
+    }
 }
 
 /// The upstream end of one segment-to-segment link.
@@ -77,8 +132,9 @@ impl ChainLink {
 
     /// Requests one block downstream and waits until `deadline_tick` (on the shared clock).
     ///
-    /// The request carries `published_tick` as its publication time, so a chain of segments can
-    /// share the rack request's time and derive one deadline from it. `fill` writes the request
+    /// The request carries `published_tick` as its publication time and `deadline_tick` as its
+    /// read deadline (an offset from that tick), so the next segment derives its own [`Hop`]
+    /// from them. `fill` writes the request
     /// payload (input audio, sidechains, events, MIDI) into the free slot and returns the
     /// request that describes it. Real-time safe: no allocation; it spins briefly, then sleeps
     /// in short slices (yields, under Wine).
@@ -103,10 +159,16 @@ impl ChainLink {
         };
         let request = fill(slot);
         let now = self.clock.now_ticks();
-        let Ok(ticket) = self.region.bank_mut().request_block_at(
+        let published_tick = published_tick.min(now).max(1);
+        // A deadline at or before publication is already due; zero would mean untimed.
+        let deadline_offset = u32::try_from(deadline_tick.saturating_sub(published_tick))
+            .unwrap_or(u32::MAX)
+            .max(1);
+        let Ok(ticket) = self.region.bank_mut().request_timed_block_at(
             slot_index,
             request,
-            published_tick.min(now).max(1),
+            published_tick,
+            deadline_offset,
         ) else {
             return self.fail();
         };
@@ -216,8 +278,45 @@ mod tests {
 
     use sp_shared_memory::{BlockRequest, SlotState};
 
-    use super::{ChainLink, Forwarded};
+    use super::{ChainLink, Forwarded, Hop};
     use crate::{MonotonicClock, SharedMemoryRegion};
+
+    /// 96 frames at 96 kHz: a 1 ms period with a 125 µs margin, in nanosecond ticks on Linux.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_hop_works_to_the_host_deadline_or_one_block() {
+        let clock = MonotonicClock::new().unwrap();
+        let untimed = Hop::derive(10_000_000, 0, clock, 96, 96_000);
+        assert_eq!(untimed.forward_tick, 10_000_000 - 125_000);
+        assert_eq!(untimed.deadline_tick, 10_000_000 + 1_000_000 - 125_000);
+        let timed = Hop::derive(10_000_000, 400_000, clock, 96, 96_000);
+        assert_eq!(timed.forward_tick, 10_000_000 - 125_000);
+        assert_eq!(timed.deadline_tick, 10_000_000 + 400_000 - 125_000);
+        // The next segment receives the forwarded tick and offset and finishes one margin earlier.
+        let offset = u32::try_from(timed.deadline_tick - timed.forward_tick).unwrap();
+        let next = Hop::derive(timed.forward_tick, offset, clock, 96, 96_000);
+        assert_eq!(next.deadline_tick, timed.deadline_tick - 125_000);
+    }
+
+    #[test]
+    fn a_forwarded_request_carries_the_link_deadline() {
+        let host = SharedMemoryRegion::create(4).unwrap();
+        let mut link = ChainLink::open(host.name()).unwrap();
+        let clock = MonotonicClock::new().unwrap();
+        let published = clock.now_ticks();
+        let deadline = published + clock.duration_to_ticks(Duration::from_millis(2));
+        assert_eq!(
+            link.forward(published, deadline, |_| request(64)),
+            Forwarded::Bypass
+        );
+        let slot = host
+            .bank()
+            .slots
+            .iter()
+            .find(|slot| slot.metadata.state() == Ok(SlotState::Abandoned))
+            .expect("the unclaimed request");
+        assert_eq!(slot.metadata.deadline_tick(), Some(deadline));
+    }
 
     fn request(frames: u32) -> BlockRequest {
         BlockRequest {
