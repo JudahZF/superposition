@@ -1308,8 +1308,8 @@ impl LiveRackApp {
         #[cfg(target_os = "linux")]
         {
             let from = self.selected_rack;
-            self.remap_editor_racks(|rack| {
-                Some(if rack == from {
+            self.remap_editors(|(rack, slot)| {
+                let rack = if rack == from {
                     neighbour
                 } else {
                     let shifted = if rack > from { rack - 1 } else { rack };
@@ -1318,7 +1318,8 @@ impl LiveRackApp {
                     } else {
                         shifted
                     }
-                })
+                };
+                Some((rack, slot))
             });
         }
         self.selected_rack = neighbour;
@@ -1372,10 +1373,10 @@ impl LiveRackApp {
         {
             // The removed rack's worker and editors stop with it.
             let removed = self.selected_rack;
-            self.remap_editor_racks(|index| match index.cmp(&removed) {
-                std::cmp::Ordering::Less => Some(index),
+            self.remap_editors(|(rack, slot)| match rack.cmp(&removed) {
+                std::cmp::Ordering::Less => Some((rack, slot)),
                 std::cmp::Ordering::Equal => None,
-                std::cmp::Ordering::Greater => Some(index - 1),
+                std::cmp::Ordering::Greater => Some((rack - 1, slot)),
             });
         }
         let model = &mut self.controller.document_mut().model;
@@ -1881,6 +1882,21 @@ impl LiveRackApp {
             return;
         }
         rack.slots.swap(from, to);
+        #[cfg(target_os = "linux")]
+        {
+            let swapped = self.selected_rack;
+            self.remap_editors(|(rack, slot)| {
+                Some((
+                    rack,
+                    match slot {
+                        _ if rack != swapped => slot,
+                        moved if moved == from => to,
+                        moved if moved == to => from,
+                        _ => slot,
+                    },
+                ))
+            });
+        }
         self.selected_slot = Some(to);
         self.reload_selected_rack_after_edit(SlotEdit::Swap(from, to));
     }
@@ -1909,6 +1925,20 @@ impl LiveRackApp {
         model
             .hot_plugins
             .retain(|pin| pin.rack_id != rack_id || pin.slot_id != removed.id);
+        #[cfg(target_os = "linux")]
+        {
+            let removed_from = self.selected_rack;
+            self.remap_editors(|(rack, other)| {
+                if rack != removed_from {
+                    return Some((rack, other));
+                }
+                match other.cmp(&slot) {
+                    std::cmp::Ordering::Less => Some((rack, other)),
+                    std::cmp::Ordering::Equal => None,
+                    std::cmp::Ordering::Greater => Some((rack, other - 1)),
+                }
+            });
+        }
         self.selected_slot = None;
         self.reload_selected_rack_after_edit(SlotEdit::Remove(slot));
     }
@@ -2180,16 +2210,15 @@ impl LiveRackApp {
         }
     }
 
-    /// Linux: follows a rack edit in the docked, closing, and pending-close editors. `map`
-    /// gives a rack's new index, or `None` when the rack is gone.
+    /// Linux: follows a rack or slot edit in the docked, closing, and pending-close editors.
+    /// `map` gives an editor's new rack and slot, or `None` when its slot is gone.
     #[cfg(target_os = "linux")]
-    fn remap_editor_racks(&mut self, map: impl Fn(usize) -> Option<usize>) {
-        let remap = |(rack, slot): (usize, usize)| Some((map(rack)?, slot));
-        self.docked = self.docked.and_then(remap);
+    fn remap_editors(&mut self, map: impl Fn((usize, usize)) -> Option<(usize, usize)>) {
+        self.docked = self.docked.and_then(&map);
         self.undocked = self
             .undocked
-            .and_then(|(editor, at)| Some((remap(editor)?, at)));
-        self.pending_close = self.pending_close.and_then(remap);
+            .and_then(|(editor, at)| Some((map(editor)?, at)));
+        self.pending_close = self.pending_close.and_then(&map);
     }
 
     /// Whether `rack` and `slot` is a hot plug-in.
