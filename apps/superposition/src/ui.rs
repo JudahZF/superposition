@@ -2040,14 +2040,6 @@ impl LiveRackApp {
             ));
             return;
         }
-        #[cfg(target_os = "linux")]
-        {
-            // One docked editor at a time: the one shown before closes, not floats.
-            if let Some(previous) = self.docked.filter(|docked| *docked != (rack, slot)) {
-                self.close_docked(previous);
-            }
-            self.docked = Some((rack, slot));
-        }
         // An editor the rack view just closed still reads as open until the worker's next
         // picture poll, so reopening it must not trust that flag.
         #[cfg(target_os = "linux")]
@@ -2057,6 +2049,14 @@ impl LiveRackApp {
             .is_some();
         #[cfg(not(target_os = "linux"))]
         let just_closed = false;
+        #[cfg(target_os = "linux")]
+        {
+            // One docked editor at a time: the one shown before closes, not floats.
+            if let Some(previous) = self.docked.filter(|docked| *docked != (rack, slot)) {
+                self.close_docked(previous);
+            }
+            self.docked = Some((rack, slot));
+        }
         let open = !just_closed
             && self
                 .product
