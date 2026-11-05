@@ -168,12 +168,6 @@ impl LaneFader {
         };
     }
 
-    /// Whether the lane plays its worker's output (after any fade in progress).
-    #[must_use]
-    pub fn is_wet(&self) -> bool {
-        self.rendered == RenderSource::Wet
-    }
-
     /// Renders one block into `out` (interleaved stereo, `frames * 2` samples): advances the
     /// dry path, chooses the source, and fades from the previous one. Real-time safe.
     ///
