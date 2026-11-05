@@ -109,6 +109,12 @@ fn render_show_screen_snapshots() {
         (1920.0, 1080.0),
         &directory.join("overview-1920.png"),
     );
+    // The window's default size: the top bar drops its readouts rather than overlap the tabs.
+    snapshot(
+        &mut app,
+        (1180.0, 720.0),
+        &directory.join("overview-default.png"),
+    );
     app.view = super::View::Rack;
     snapshot(&mut app, (1920.0, 1080.0), &directory.join("rack-1920.png"));
     snapshot(

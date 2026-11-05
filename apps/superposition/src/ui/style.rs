@@ -549,13 +549,23 @@ pub(super) fn chip(ui: &mut Ui, text: &str, tone: ChipTone, clickable: bool) -> 
     chip_at(ui, rect, id, text, tone, clickable)
 }
 
+/// Width of a [`pill`] holding `text`.
+pub(super) fn pill_width(ui: &Ui, text: &str, max_width: f32) -> f32 {
+    galley(ui, text, TypographyRole::Label, ColorToken::Text, max_width)
+        .size()
+        .x
+        + sp(Spacing::S8) * 2.0
+        + px(Layout::Dot)
+        + sp(Spacing::S6)
+}
+
 /// A bordered pill: a status dot of `dot_token`, then `text`, truncated to `max_width`.
 pub(super) fn pill(ui: &mut Ui, dot_token: ColorToken, text: &str, max_width: f32) -> Response {
     let galley = galley(ui, text, TypographyRole::Label, ColorToken::Text, max_width);
     let pad = sp(Spacing::S8);
     let dot_size = px(Layout::Dot);
     let size = Vec2::new(
-        pad * 2.0 + dot_size + sp(Spacing::S6) + galley.size().x,
+        pill_width(ui, text, max_width),
         px(Layout::Chip) + sp(Spacing::S4),
     );
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());

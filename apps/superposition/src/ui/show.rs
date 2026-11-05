@@ -12,7 +12,7 @@ use sp_ui::design::{ColorToken, Layout, Radius, Spacing, TypographyRole};
 
 use super::style::{
     ButtonKind, ChipTone, action, button, chip_at, chip_width, color, focus_outline, font, galley,
-    hairline, paint_text, pill, px, radius, segmented, sp, text,
+    hairline, paint_text, pill, pill_width, px, radius, segmented, sp, text,
 };
 use super::{LiveRackApp, Modal, Overlay, Screen, View, channels_label, gain_label};
 
@@ -107,21 +107,36 @@ impl LiveRackApp {
                             self.request_engine_toggle();
                         }
                         ui.add_space(sp(Spacing::S8));
-                        ui.spacing_mut().item_spacing.x = sp(Spacing::S12);
-                        for (value, token) in self.readouts().into_iter().rev() {
-                            text(ui, value, TypographyRole::Mono, token);
-                        }
+                        let gap = sp(Spacing::S12);
+                        ui.spacing_mut().item_spacing.x = gap;
                         let (state, dot) = match self.system.state {
                             SystemStatusState::Online => ("Online", ColorToken::Success),
                             SystemStatusState::Connecting => ("Connecting", ColorToken::Warn),
                             SystemStatusState::Offline => ("Offline", ColorToken::Dim),
                         };
-                        pill(
-                            ui,
-                            dot,
-                            &format!("{state} · {}", self.output_device_name()),
-                            px(Layout::TopBarTextWidth),
-                        );
+                        let engine_state = format!("{state} · {}", self.output_device_name());
+                        let state_width =
+                            pill_width(ui, &engine_state, px(Layout::TopBarTextWidth)) + gap;
+                        // A narrow window drops the readouts first, then the engine state, so
+                        // nothing overlaps the tabs.
+                        let readouts = self.readouts();
+                        let readouts_width: f32 = readouts
+                            .iter()
+                            .map(|(value, token)| {
+                                galley(ui, value, TypographyRole::Mono, *token, f32::INFINITY)
+                                    .size()
+                                    .x
+                                    + gap
+                            })
+                            .sum();
+                        if ui.available_width() >= readouts_width + state_width {
+                            for (value, token) in readouts.into_iter().rev() {
+                                text(ui, value, TypographyRole::Mono, token);
+                            }
+                        }
+                        if ui.available_width() >= state_width {
+                            pill(ui, dot, &engine_state, px(Layout::TopBarTextWidth));
+                        }
                         let message = self.saved_at.map_or_else(
                             || self.status_line.clone(),
                             |at| format!("Session saved, {}", elapsed_label(at.elapsed())),
