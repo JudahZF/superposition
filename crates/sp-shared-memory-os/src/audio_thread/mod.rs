@@ -36,8 +36,9 @@ pub enum SchedulingMode {
     Normal,
 }
 
-/// Block sizes the engine accepts, in frames.
-pub const SUPPORTED_BLOCK_FRAMES: [u32; 4] = [32, 64, 128, 256];
+/// Block sizes a processing thread accepts, in frames: the device sizes, and the 12- and
+/// 24-frame Tunnel cycles that a Lambda host runs racks at.
+pub const SUPPORTED_BLOCK_FRAMES: [u32; 6] = [12, 24, 32, 64, 128, 256];
 /// Sample rates the engine accepts, in hertz.
 pub const SUPPORTED_SAMPLE_RATES: [u32; 2] = [48_000, 96_000];
 
@@ -62,7 +63,14 @@ mod tests {
             let mut policy = AudioThreadPolicy::new().expect("thread policy");
             assert!(policy.enter(127, 48_000).is_err());
             assert!(policy.enter(128, 44_100).is_err());
-            for (frames, rate) in [(32, 48_000), (64, 48_000), (128, 96_000), (256, 96_000)] {
+            for (frames, rate) in [
+                (12, 96_000),
+                (24, 96_000),
+                (32, 48_000),
+                (64, 48_000),
+                (128, 96_000),
+                (256, 96_000),
+            ] {
                 policy.enter(frames, rate).expect("scheduling policy");
                 if policy.mode() == SchedulingMode::RealTime && cfg!(target_os = "macos") {
                     assert!(
