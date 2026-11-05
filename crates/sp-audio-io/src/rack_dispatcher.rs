@@ -1,25 +1,19 @@
 //! Fixed shared-memory rack dispatch for the product audio callback.
+//!
+//! The dispatcher drives one [`RackLane`] per loaded rack from the audio callback: it publishes
+//! each block to every open lane, observes completions until the block's deadline, and gives
+//! the mixer each lane's wet output and gate outcome.
 
-use std::{
-    io,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::{io, sync::Arc, time::Duration};
 
-use sp_engine::{
-    FallbackReason, GateOutcome, RackAudioSource, RackGate, RackGateState, RealtimeRackMixer,
-    SidechainSources, WorkerObservation,
-};
+use sp_engine::{RackAudioSource, RealtimeRackMixer, SidechainSources};
+pub use sp_rack_lane::LaneTelemetry as RackDispatchTelemetry;
+use sp_rack_lane::RackLane;
 use sp_shared_memory::{
-    BlockEvent, BlockRequest, BlockTicket, MAX_EVENTS, MAX_MIDI_EVENTS, MAX_RACKS, MidiEvent,
-    ProtocolError, SlotState,
+    BlockEvent, BlockRequest, MAX_EVENTS, MAX_MIDI_EVENTS, MAX_RACKS, MidiEvent,
 };
 use sp_shared_memory_os::{
-    MappedBankMetadata, MappedRackBanks, MonotonicClock, RackRecoverySignal, RackRecoveryState,
-    SharedMemoryRegion,
+    MappedBankMetadata, MappedRackBanks, MonotonicClock, RackRecoverySignal, SharedMemoryRegion,
 };
 
 const STEREO_CHANNELS: u32 = 2;
@@ -83,190 +77,12 @@ impl Default for RackAutomationEvents {
 static EMPTY_RACK_AUTOMATION: [RackAutomationEvents; MAX_RACKS] =
     [RackAutomationEvents::new(); MAX_RACKS];
 
-/// Lock-free counters for one rack, suitable for control-plane polling.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RackDispatchTelemetry {
-    /// Requests published to this rack bank.
-    pub published: u64,
-    /// Failed kernel wake calls after publishing a request.
-    pub wake_failures: u64,
-    /// Longest observed kernel wake call in shared monotonic clock ticks.
-    pub max_wake_ticks: u64,
-    /// Valid completions consumed from this rack bank.
-    pub completed: u64,
-    /// Requests that did not complete before the block deadline.
-    pub deadline_misses: u64,
-    /// Deadline misses where the worker had not claimed the request.
-    pub missed_unclaimed: u64,
-    /// Deadline misses where the worker owned or was processing the request.
-    pub missed_in_progress: u64,
-    /// Deadline misses where completion became visible after the final sweep.
-    pub missed_completed_late: u64,
-    /// Callback block index of the most recent deadline miss.
-    pub last_miss_block_index: u64,
-    /// Request ticket sequence of the most recent deadline miss.
-    pub last_miss_sequence: u64,
-    /// Shared monotonic tick when the most recent missed request was published.
-    pub last_miss_request_tick: u64,
-    /// Shared monotonic tick when the worker claimed the most recent missed request, or zero.
-    pub last_miss_claimed_tick: u64,
-    /// Shared monotonic tick when the callback observed the most recent deadline miss.
-    pub last_miss_observed_tick: u64,
-    /// Worker loop phase observed at the last miss (0 scan, 1 control, 2 editor, 3 wait).
-    pub last_miss_worker_phase: u64,
-    /// Wake sequence last observed by the worker at the last miss.
-    pub last_miss_worker_wait_sequence: u64,
-    /// Producer wake sequence at the last miss.
-    pub last_miss_wake_sequence: u64,
-    /// Most recent worker loop start at the last miss.
-    pub last_miss_worker_loop_tick: u64,
-    /// Malformed or otherwise invalid protocol observations.
-    pub protocol_rejections: u64,
-    /// Completion tickets that did not match the live ticket.
-    pub stale_completions: u64,
-    /// Transitions to rack-local fallback.
-    pub fallback_activations: u64,
-    /// Callback blocks rendered while this rack's gate is closed.
-    pub gate_closed_blocks: u64,
-    /// Completion-observation sweeps that inspected this rack.
-    pub completion_observation_passes: u64,
-    /// Observations that stopped because the absolute deadline was reached.
-    pub completion_observation_deadline_stops: u64,
-    /// Timed-out requested slots explicitly marked abandoned and retained for retirement.
-    pub abandoned_requests: u64,
-}
-
-#[derive(Default)]
-struct AtomicRackDispatchTelemetry {
-    published: AtomicU64,
-    wake_failures: AtomicU64,
-    max_wake_ticks: AtomicU64,
-    completed: AtomicU64,
-    deadline_misses: AtomicU64,
-    missed_unclaimed: AtomicU64,
-    missed_in_progress: AtomicU64,
-    missed_completed_late: AtomicU64,
-    last_miss_block_index: AtomicU64,
-    last_miss_sequence: AtomicU64,
-    last_miss_request_tick: AtomicU64,
-    last_miss_claimed_tick: AtomicU64,
-    last_miss_observed_tick: AtomicU64,
-    last_miss_worker_phase: AtomicU64,
-    last_miss_worker_wait_sequence: AtomicU64,
-    last_miss_wake_sequence: AtomicU64,
-    last_miss_worker_loop_tick: AtomicU64,
-    protocol_rejections: AtomicU64,
-    stale_completions: AtomicU64,
-    fallback_activations: AtomicU64,
-    gate_closed_blocks: AtomicU64,
-    completion_observation_passes: AtomicU64,
-    completion_observation_deadline_stops: AtomicU64,
-    abandoned_requests: AtomicU64,
-}
-
-impl AtomicRackDispatchTelemetry {
-    fn snapshot(&self) -> RackDispatchTelemetry {
-        let deadline_misses = self.deadline_misses.load(Ordering::Relaxed);
-        let (
-            missed_unclaimed,
-            missed_in_progress,
-            missed_completed_late,
-            last_miss_block_index,
-            last_miss_sequence,
-            last_miss_request_tick,
-            last_miss_claimed_tick,
-            last_miss_observed_tick,
-        ) = if deadline_misses == 0 {
-            (0, 0, 0, 0, 0, 0, 0, 0)
-        } else {
-            (
-                self.missed_unclaimed.load(Ordering::Relaxed),
-                self.missed_in_progress.load(Ordering::Relaxed),
-                self.missed_completed_late.load(Ordering::Relaxed),
-                self.last_miss_block_index.load(Ordering::Relaxed),
-                self.last_miss_sequence.load(Ordering::Relaxed),
-                self.last_miss_request_tick.load(Ordering::Relaxed),
-                self.last_miss_claimed_tick.load(Ordering::Relaxed),
-                self.last_miss_observed_tick.load(Ordering::Relaxed),
-            )
-        };
-        RackDispatchTelemetry {
-            published: self.published.load(Ordering::Relaxed),
-            wake_failures: self.wake_failures.load(Ordering::Relaxed),
-            max_wake_ticks: self.max_wake_ticks.load(Ordering::Relaxed),
-            completed: self.completed.load(Ordering::Relaxed),
-            deadline_misses,
-            missed_unclaimed,
-            missed_in_progress,
-            missed_completed_late,
-            last_miss_block_index,
-            last_miss_sequence,
-            last_miss_request_tick,
-            last_miss_claimed_tick,
-            last_miss_observed_tick,
-            last_miss_worker_phase: self.last_miss_worker_phase.load(Ordering::Relaxed),
-            last_miss_worker_wait_sequence: self
-                .last_miss_worker_wait_sequence
-                .load(Ordering::Relaxed),
-            last_miss_wake_sequence: self.last_miss_wake_sequence.load(Ordering::Relaxed),
-            last_miss_worker_loop_tick: self.last_miss_worker_loop_tick.load(Ordering::Relaxed),
-            protocol_rejections: self.protocol_rejections.load(Ordering::Relaxed),
-            stale_completions: self.stale_completions.load(Ordering::Relaxed),
-            fallback_activations: self.fallback_activations.load(Ordering::Relaxed),
-            gate_closed_blocks: self.gate_closed_blocks.load(Ordering::Relaxed),
-            completion_observation_passes: self
-                .completion_observation_passes
-                .load(Ordering::Relaxed),
-            completion_observation_deadline_stops: self
-                .completion_observation_deadline_stops
-                .load(Ordering::Relaxed),
-            abandoned_requests: self.abandoned_requests.load(Ordering::Relaxed),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct LiveRequest {
-    bank_index: usize,
-    ticket: BlockTicket,
-    slot_index: usize,
-    request: BlockRequest,
-}
-
 struct RackDispatchState {
     rack_index: usize,
     /// A pipelined rack is dispatched after this block's observations and its result is mixed
     /// one block later, giving a worker under Wine a whole block of slack.
     pipelined: bool,
-    banks: MappedRackBanks,
-    recovery: Option<Arc<RackRecoverySignal>>,
-    gate: RackGate,
-    live: Option<LiveRequest>,
-    outcome: GateOutcome,
-    wet: [f32; MAX_SAMPLES],
-    wet_valid: bool,
-    telemetry: AtomicRackDispatchTelemetry,
-}
-
-impl RackDispatchState {
-    fn new(
-        rack_index: usize,
-        banks: MappedRackBanks,
-        recovery: Option<Arc<RackRecoverySignal>>,
-    ) -> Self {
-        Self {
-            rack_index,
-            pipelined: false,
-            banks,
-            recovery,
-            gate: RackGate::new(),
-            live: None,
-            outcome: GateOutcome::DispatchAllowed,
-            wet: [0.0; MAX_SAMPLES],
-            wet_valid: false,
-            telemetry: AtomicRackDispatchTelemetry::default(),
-        }
-    }
+    lane: RackLane,
 }
 
 /// One rack's dispatch lane, built on the control thread and moved into a running callback.
@@ -279,26 +95,20 @@ impl PreparedRackLane {
     /// Maps a live worker's two banks for callback dispatch.
     ///
     /// # Errors
-    /// Returns an error for an unfinished handoff or an invalid bank pair.
+    /// Returns an error for an unfinished handoff, an invalid bank pair, or an unavailable
+    /// monotonic clock.
     pub fn new(
         regions: [SharedMemoryRegion; 2],
         active_index: usize,
         recovery: Arc<RackRecoverySignal>,
     ) -> io::Result<Self> {
-        if recovery.state() != RackRecoveryState::Idle {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "finish the rack bank handoff before adding it to live audio",
-            ));
-        }
-        // SAFETY: the control plane supplies the index owned by the live worker; the opposite
-        // bank has no worker.
-        let banks = unsafe { MappedRackBanks::from_indexed_regions(regions, active_index) }?;
-        Ok(Self(Box::new(RackDispatchState::new(
-            0,
-            banks,
-            Some(recovery),
-        ))))
+        let lane =
+            RackLane::from_live_regions(MonotonicClock::new()?, regions, active_index, recovery)?;
+        Ok(Self(Box::new(RackDispatchState {
+            rack_index: 0,
+            pipelined: false,
+            lane,
+        })))
     }
 
     /// Marks this lane as pipelined: its output is the previous block's input, one block late.
@@ -312,7 +122,7 @@ impl PreparedRackLane {
     /// The worker recovery signal that identifies this lane's worker.
     #[must_use]
     pub fn recovery(&self) -> Option<&Arc<RackRecoverySignal>> {
-        self.0.recovery.as_ref()
+        self.0.lane.recovery()
     }
 }
 
@@ -379,9 +189,13 @@ impl RackSharedMemoryDispatcher {
     pub fn new_indexed(regions: Vec<(usize, SharedMemoryRegion)>) -> io::Result<Self> {
         let mut banks = Vec::with_capacity(regions.len());
         for (rack_index, region) in regions {
-            banks.push((rack_index, MappedRackBanks::with_active_region(region)?));
+            banks.push((
+                rack_index,
+                MappedRackBanks::with_active_region(region)?,
+                None,
+            ));
         }
-        Self::with_indexed_mapped_banks(banks)
+        Self::with_recovery_mapped_banks(banks)
     }
 
     /// Creates a dispatcher from already-created stable active/inactive bank pairs.
@@ -395,7 +209,13 @@ impl RackSharedMemoryDispatcher {
     /// Returns an error when the rack count exceeds capacity or macOS cannot initialize its
     /// shared monotonic clock.
     pub fn with_mapped_banks(banks: Vec<MappedRackBanks>) -> io::Result<Self> {
-        Self::with_indexed_mapped_banks(banks.into_iter().enumerate().collect())
+        Self::with_recovery_mapped_banks(
+            banks
+                .into_iter()
+                .enumerate()
+                .map(|(index, banks)| (index, banks, None))
+                .collect(),
+        )
     }
 
     /// Creates a dispatcher with stable bank pairs and lock-free recovery handshakes.
@@ -430,44 +250,39 @@ impl RackSharedMemoryDispatcher {
             Arc<RackRecoverySignal>,
         )>,
     ) -> io::Result<Self> {
-        let banks = mappings
+        let clock = MonotonicClock::new()?;
+        let lanes = mappings
             .into_iter()
             .map(|(rack_index, regions, active_index, recovery)| {
-                if recovery.state() != RackRecoveryState::Idle {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "finish the rack bank handoff before preparing a new renderer",
-                    ));
-                }
-                // SAFETY: the control plane supplies the fixed index owned by its live worker;
-                // the opposite bank has no worker and has completed any prior retirement.
-                unsafe { MappedRackBanks::from_indexed_regions(regions, active_index) }
-                    .map(|banks| (rack_index, banks, recovery))
+                RackLane::from_live_regions(clock, regions, active_index, recovery)
+                    .map(|lane| (rack_index, lane))
             })
             .collect::<io::Result<Vec<_>>>()?;
-        Self::new_indexed_recoverable(banks)
-    }
-
-    fn with_indexed_mapped_banks(banks: Vec<(usize, MappedRackBanks)>) -> io::Result<Self> {
-        Self::with_recovery_mapped_banks(
-            banks
-                .into_iter()
-                .map(|(index, banks)| (index, banks, None))
-                .collect(),
-        )
+        Self::from_lanes(clock, lanes)
     }
 
     fn with_recovery_mapped_banks(
         banks: Vec<(usize, MappedRackBanks, Option<Arc<RackRecoverySignal>>)>,
     ) -> io::Result<Self> {
-        if banks.len() > MAX_RACKS {
+        let clock = MonotonicClock::new()?;
+        Self::from_lanes(
+            clock,
+            banks
+                .into_iter()
+                .map(|(index, banks, recovery)| (index, RackLane::new(clock, banks, recovery)))
+                .collect(),
+        )
+    }
+
+    fn from_lanes(clock: MonotonicClock, lanes: Vec<(usize, RackLane)>) -> io::Result<Self> {
+        if lanes.len() > MAX_RACKS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "too many rack shared-memory bank pairs",
             ));
         }
         let mut seen = [false; MAX_RACKS];
-        for (rack_index, _, _) in &banks {
+        for (rack_index, _) in &lanes {
             let Some(slot) = seen.get_mut(*rack_index) else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -481,13 +296,14 @@ impl RackSharedMemoryDispatcher {
                 ));
             }
         }
-        let clock = MonotonicClock::new()?;
         // Full capacity up front: live topology changes push lanes on the callback.
         let mut racks = Vec::with_capacity(MAX_RACKS);
-        for (rack_index, banks, recovery) in banks {
-            racks.push(Box::new(RackDispatchState::new(
-                rack_index, banks, recovery,
-            )));
+        for (rack_index, lane) in lanes {
+            racks.push(Box::new(RackDispatchState {
+                rack_index,
+                pipelined: false,
+                lane,
+            }));
         }
         Ok(Self {
             clock,
@@ -521,7 +337,7 @@ impl RackSharedMemoryDispatcher {
             .position(|rack| rack.rack_index == usize::MAX)
         {
             let mut rack = self.racks.swap_remove(index);
-            abandon_live_request(&mut rack);
+            rack.lane.release_live_request();
             retired.push(PreparedRackLane(rack));
         }
         // New lanes were queued in position order; install them from the back.
@@ -547,8 +363,8 @@ impl RackSharedMemoryDispatcher {
     ) -> [Option<Arc<RackRecoverySignal>>; MAX_RACKS] {
         let mut attached = std::array::from_fn(|_| None);
         for rack in &mut self.racks {
-            attached[rack.rack_index].clone_from(&rack.recovery);
-            service_recovery(rack, self.block_index);
+            attached[rack.rack_index] = rack.lane.recovery().cloned();
+            rack.lane.service_recovery(self.block_index);
         }
         attached
     }
@@ -566,28 +382,21 @@ impl RackSharedMemoryDispatcher {
     /// Returns a lock-free telemetry snapshot for one rack.
     #[must_use]
     pub fn telemetry(&self, rack_index: usize) -> Option<RackDispatchTelemetry> {
-        self.racks
-            .iter()
-            .find(|rack| rack.rack_index == rack_index)
-            .map(|rack| rack.telemetry.snapshot())
+        self.rack(rack_index).map(|rack| rack.lane.telemetry())
     }
 
     /// Returns stable address, lifecycle, and generation metadata for a rack's two mappings.
     #[must_use]
     pub fn bank_metadata(&self, rack_index: usize) -> Option<[MappedBankMetadata; 2]> {
-        self.racks
-            .iter()
-            .find(|rack| rack.rack_index == rack_index)
-            .map(|rack| rack.banks.metadata())
+        self.rack(rack_index)
+            .map(|rack| rack.lane.banks().metadata())
     }
 
     /// Returns the non-active mapping name for a replacement worker launch.
     #[must_use]
     pub fn inactive_bank_name(&self, rack_index: usize) -> Option<&str> {
-        self.racks
-            .iter()
-            .find(|rack| rack.rack_index == rack_index)
-            .map(|rack| rack.banks.inactive_bank_name())
+        self.rack(rack_index)
+            .map(|rack| rack.lane.inactive_bank_name())
     }
 
     /// Reinitializes the inactive stable mapping for a replacement worker before callback use.
@@ -603,17 +412,9 @@ impl RackSharedMemoryDispatcher {
         rack_index: usize,
         generation: u64,
     ) -> io::Result<MappedBankMetadata> {
-        let rack = self
-            .racks
-            .iter_mut()
-            .find(|rack| rack.rack_index == rack_index)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "rack index is outside dispatcher",
-                )
-            })?;
-        rack.banks.prepare_inactive(generation)
+        self.rack_mut(rack_index)?
+            .lane
+            .prepare_replacement_bank(generation)
     }
 
     /// Switches a faulted rack to its prepared replacement mapping at a callback boundary.
@@ -629,26 +430,9 @@ impl RackSharedMemoryDispatcher {
         &mut self,
         rack_index: usize,
     ) -> io::Result<MappedBankMetadata> {
-        let rack = self
-            .racks
-            .iter_mut()
-            .find(|rack| rack.rack_index == rack_index)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "rack index is outside dispatcher",
-                )
-            })?;
-        if rack.live.is_some() || !matches!(rack.gate.state(), RackGateState::Closed { .. }) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "rack must close and retire its live request before bank replacement",
-            ));
-        }
-        let retiring = rack.banks.activate_prepared()?;
-        rack.gate.reset_after_replacement();
-        rack.outcome = GateOutcome::DispatchAllowed;
-        Ok(retiring)
+        self.rack_mut(rack_index)?
+            .lane
+            .activate_prepared_replacement()
     }
 
     /// Makes a previously replaced mapping inactive after its old worker exits and is reaped.
@@ -666,20 +450,11 @@ impl RackSharedMemoryDispatcher {
         bank_index: usize,
         next_generation: u64,
     ) -> io::Result<MappedBankMetadata> {
-        let rack = self
-            .racks
-            .iter_mut()
-            .find(|rack| rack.rack_index == rack_index)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "rack index is outside dispatcher",
-                )
-            })?;
+        let rack = self.rack_mut(rack_index)?;
         // SAFETY: upheld by this method's safety contract after resolving the rack.
         unsafe {
-            rack.banks
-                .retire_after_worker_exit(bank_index, next_generation)
+            rack.lane
+                .retire_replaced_bank_after_worker_exit(bank_index, next_generation)
         }
     }
 
@@ -752,14 +527,15 @@ impl RackSharedMemoryDispatcher {
             || matches!(inputs, RackInputs::Shared(input) if input.len() < frames * 2)
             || midi.len() > MAX_MIDI_EVENTS
         {
-            self.close_all_invalid();
-            self.record_closed_gates();
+            for rack in &mut self.racks {
+                rack.lane.close_invalid(self.block_index);
+                rack.lane.end_block();
+            }
             return;
         }
 
         for rack in &mut self.racks {
-            rack.wet_valid = false;
-            service_recovery(rack, self.block_index);
+            rack.lane.begin_block(self.block_index);
         }
         let deadline_tick = self
             .clock
@@ -786,32 +562,20 @@ impl RackSharedMemoryDispatcher {
             automation,
             frames,
         );
-        self.record_closed_gates();
+        for rack in &self.racks {
+            rack.lane.end_block();
+        }
         self.block_index = self.block_index.wrapping_add(1);
     }
 
     /// Applies gate outcomes and the selected worker's published latency before mixing.
     pub fn apply_to_mixer(&self, mixer: &mut RealtimeRackMixer) {
         for rack in &self.racks {
-            mixer.set_gate_outcome(rack.rack_index, rack.outcome);
-            if rack.recovery.as_ref().is_some_and(|recovery| {
-                matches!(
-                    recovery.state(),
-                    RackRecoveryState::QuiesceRequested
-                        | RackRecoveryState::Quiescent
-                        | RackRecoveryState::ReplacementReady { .. }
-                )
-            }) {
-                // The control plane may replace/reset banks after the quiescence acknowledgement.
+            mixer.set_gate_outcome(rack.rack_index, rack.lane.outcome());
+            // The control plane may replace/reset banks after the quiescence acknowledgement.
+            let Some(latency) = rack.lane.worker_latency_samples() else {
                 continue;
-            }
-            let latency = rack
-                .banks
-                .active_bank()
-                .bank()
-                .header
-                .worker_latency_samples
-                .load(Ordering::Acquire);
+            };
             let pipeline = if rack.pipelined { self.block_frames } else { 0 };
             mixer.set_dry_delay_frames(
                 rack.rack_index,
@@ -827,52 +591,55 @@ impl RackSharedMemoryDispatcher {
     pub fn sources(&self) -> [RackAudioSource<'_>; MAX_RACKS] {
         let mut sources = [RackAudioSource::None; MAX_RACKS];
         for rack in &self.racks {
-            if rack.wet_valid {
-                sources[rack.rack_index] = RackAudioSource::Wet(&rack.wet);
+            if let Some(wet) = rack.lane.wet() {
+                sources[rack.rack_index] = RackAudioSource::Wet(wet);
             }
         }
         sources
     }
 
+    fn rack(&self, rack_index: usize) -> Option<&RackDispatchState> {
+        self.racks
+            .iter()
+            .find(|rack| rack.rack_index == rack_index)
+            .map(Box::as_ref)
+    }
+
+    fn rack_mut(&mut self, rack_index: usize) -> io::Result<&mut RackDispatchState> {
+        self.racks
+            .iter_mut()
+            .find(|rack| rack.rack_index == rack_index)
+            .map(Box::as_mut)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "rack index is outside dispatcher",
+                )
+            })
+    }
+
+    /// Polls every live lane until each has a result or `deadline_tick` passes, then expires the
+    /// lanes still awaiting: a hard miss that closes the lane until its worker is replaced.
     fn observe_until(&mut self, deadline_tick: u64) {
         loop {
             let mut awaiting = false;
             for rack in &mut self.racks {
-                if rack.live.is_none() {
+                if rack.lane.live().is_none() {
                     continue;
                 }
                 awaiting = true;
-                rack.telemetry
-                    .completion_observation_passes
-                    .fetch_add(1, Ordering::Relaxed);
-                observe_rack(rack, self.block_index);
+                rack.lane.poll(self.block_index);
             }
-            if !awaiting || self.racks.iter().all(|rack| rack.live.is_none()) {
+            if !awaiting || self.racks.iter().all(|rack| rack.lane.live().is_none()) {
                 break;
             }
             if self.clock.now_ticks() >= deadline_tick {
-                for rack in &self.racks {
-                    if rack.live.is_some() {
-                        rack.telemetry
-                            .completion_observation_deadline_stops
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
                 break;
             }
             std::hint::spin_loop();
         }
-
         for rack in &mut self.racks {
-            if matches!(rack.gate.state(), RackGateState::Awaiting { .. }) {
-                record_deadline_diagnostics(rack, self.block_index, self.clock.now_ticks());
-                abandon_live_request(rack);
-                let prior = rack.gate.state();
-                // The abandoned slot can never be reused, so the miss closes the rack
-                // immediately; recovery requires a worker and bank replacement.
-                rack.outcome = rack.gate.deadline_expired_hard(self.block_index);
-                record_outcome(rack, prior, rack.outcome);
-            }
+            rack.lane.expire(self.block_index);
         }
     }
 
@@ -913,206 +680,31 @@ impl RackSharedMemoryDispatcher {
             if !selected {
                 continue;
             }
-            if rack.recovery.as_ref().is_some_and(|recovery| {
-                matches!(
-                    recovery.state(),
-                    RackRecoveryState::QuiesceRequested
-                        | RackRecoveryState::Quiescent
-                        | RackRecoveryState::ReplacementReady { .. }
-                )
-            }) {
-                continue;
-            }
-            if !matches!(rack.gate.state(), RackGateState::Open) {
-                continue;
-            }
-            let bank_index = rack.banks.active_index();
-            let Ok(Some(slot_index)) = free_slot_index(rack.banks.active_bank()) else {
-                close_dispatch(rack, self.block_index);
-                continue;
-            };
-            let Some(region) = rack.banks.bank_mut(bank_index) else {
-                close_dispatch(rack, self.block_index);
-                continue;
-            };
-            let Some(slot) = region.bank_mut().slot_mut(slot_index) else {
-                close_dispatch(rack, self.block_index);
-                continue;
-            };
-            let events = automation[rack.rack_index].as_slice();
+            let rack_index = rack.rack_index;
+            let events = automation[rack_index].as_slice();
             let input = match inputs {
                 RackInputs::Shared(input) => input,
-                RackInputs::PerRack(inputs) => &inputs[rack.rack_index],
+                RackInputs::PerRack(inputs) => &inputs[rack_index],
             };
-            copy_interleaved_stereo_to_planar(input, frames, slot);
-            let sidechain_slots = sidechains.map_or(0, |sidechains| {
-                copy_sidechains(sidechains, rack.rack_index, frames, slot)
-            });
-            let request = BlockRequest {
-                frame_count: u32::try_from(frames).unwrap_or(u32::MAX),
-                input_channel_count: STEREO_CHANNELS,
-                output_channel_count: STEREO_CHANNELS,
-                midi_event_count: u32::try_from(midi.len()).unwrap_or(u32::MAX),
-                event_count: u32::try_from(events.len()).unwrap_or(u32::MAX),
-                flags: 0,
-                sidechain_slots,
-            };
-            slot.midi_events[..midi.len()].copy_from_slice(midi);
-            slot.events[..events.len()].copy_from_slice(events);
-            match rack
-                .banks
-                .bank_mut(bank_index)
-                .expect("active mapped bank index is valid")
-                .bank_mut()
-                .request_block_at(slot_index, request, self.clock.now_ticks())
-            {
-                Ok(ticket) => {
-                    let prior = rack.gate.state();
-                    rack.outcome = rack.gate.dispatch(ticket, self.block_index);
-                    record_outcome(rack, prior, rack.outcome);
-                    if rack.outcome == GateOutcome::DispatchAllowed {
-                        rack.live = Some(LiveRequest {
-                            bank_index,
-                            ticket,
-                            slot_index,
-                            request,
-                        });
-                        rack.telemetry.published.fetch_add(1, Ordering::Relaxed);
-                        let started = self.clock.now_ticks();
-                        let notified = rack.banks.active_bank().notify_request();
-                        let wake_ticks = self.clock.now_ticks().saturating_sub(started);
-                        rack.telemetry
-                            .max_wake_ticks
-                            .fetch_max(wake_ticks, Ordering::Relaxed);
-                        if !notified {
-                            rack.telemetry.wake_failures.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
+            let published = rack.lane.publish(self.block_index, None, |slot| {
+                copy_interleaved_stereo_to_planar(input, frames, slot);
+                let sidechain_slots = sidechains.map_or(0, |sidechains| {
+                    copy_sidechains(sidechains, rack_index, frames, slot)
+                });
+                slot.midi_events[..midi.len()].copy_from_slice(midi);
+                slot.events[..events.len()].copy_from_slice(events);
+                BlockRequest {
+                    frame_count: u32::try_from(frames).unwrap_or(u32::MAX),
+                    input_channel_count: STEREO_CHANNELS,
+                    output_channel_count: STEREO_CHANNELS,
+                    midi_event_count: u32::try_from(midi.len()).unwrap_or(u32::MAX),
+                    event_count: u32::try_from(events.len()).unwrap_or(u32::MAX),
+                    flags: 0,
+                    sidechain_slots,
                 }
-                Err(_) => close_dispatch(rack, self.block_index),
-            }
-        }
-    }
-
-    fn close_all_invalid(&mut self) {
-        for rack in &mut self.racks {
-            abandon_live_request(rack);
-            close_dispatch(rack, self.block_index);
-        }
-    }
-
-    fn record_closed_gates(&self) {
-        for rack in &self.racks {
-            if matches!(rack.gate.state(), RackGateState::Closed { .. }) {
-                rack.telemetry
-                    .gate_closed_blocks
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
-fn record_deadline_diagnostics(rack: &RackDispatchState, block_index: u64, observed_tick: u64) {
-    let live = rack.live.expect("awaiting rack has a live request");
-    let bank = rack
-        .banks
-        .bank(live.bank_index)
-        .expect("live request refers to one stable bank")
-        .bank();
-    rack.telemetry.last_miss_worker_phase.store(
-        u64::from(bank.header.worker_phase.load(Ordering::Acquire)),
-        Ordering::Relaxed,
-    );
-    rack.telemetry.last_miss_worker_wait_sequence.store(
-        u64::from(bank.header.worker_wait_sequence.load(Ordering::Acquire)),
-        Ordering::Relaxed,
-    );
-    rack.telemetry.last_miss_wake_sequence.store(
-        u64::from(bank.header.request_wake_sequence.load(Ordering::Acquire)),
-        Ordering::Relaxed,
-    );
-    rack.telemetry.last_miss_worker_loop_tick.store(
-        bank.header.worker_loop_tick.load(Ordering::Acquire),
-        Ordering::Relaxed,
-    );
-    let slot = bank
-        .slot(live.slot_index)
-        .expect("fixed slot index is in range");
-    let metadata = &slot.metadata;
-    let owner = metadata.owner.load(Ordering::Acquire);
-    let state = metadata.state();
-    let counter = match state {
-        Ok(SlotState::Requested) if owner == 0 => &rack.telemetry.missed_unclaimed,
-        Ok(SlotState::Complete) => &rack.telemetry.missed_completed_late,
-        _ => &rack.telemetry.missed_in_progress,
-    };
-    counter.fetch_add(1, Ordering::Relaxed);
-    rack.telemetry
-        .last_miss_block_index
-        .store(block_index, Ordering::Relaxed);
-    rack.telemetry
-        .last_miss_sequence
-        .store(live.ticket.sequence, Ordering::Relaxed);
-    rack.telemetry.last_miss_request_tick.store(
-        metadata.request_published_tick.load(Ordering::Acquire),
-        Ordering::Relaxed,
-    );
-    rack.telemetry.last_miss_claimed_tick.store(
-        metadata.worker_claimed_tick.load(Ordering::Acquire),
-        Ordering::Relaxed,
-    );
-    rack.telemetry
-        .last_miss_observed_tick
-        .store(observed_tick, Ordering::Relaxed);
-}
-
-fn service_recovery(rack: &mut RackDispatchState, block_index: u64) {
-    let Some(recovery) = rack.recovery.clone() else {
-        return;
-    };
-    match recovery.state() {
-        RackRecoveryState::Idle
-        | RackRecoveryState::ReplacementActive { .. }
-        | RackRecoveryState::Quiescent => {}
-        RackRecoveryState::QuiesceRequested => {
-            abandon_live_request(rack);
-            if !matches!(rack.gate.state(), RackGateState::Closed { .. }) {
-                close_dispatch(rack, block_index);
-            }
-            let _ = recovery.mark_quiescent();
-        }
-        RackRecoveryState::ReplacementReady {
-            bank_index,
-            generation,
-        } => {
-            if rack.live.is_some() || !matches!(rack.gate.state(), RackGateState::Closed { .. }) {
-                return;
-            }
-            if rack
-                .banks
-                .acknowledge_external_prepare(bank_index, generation)
-                .is_ok()
-                && let Ok(retiring) = rack.banks.activate_prepared()
-            {
-                rack.gate.reset_after_replacement();
-                rack.outcome = GateOutcome::DispatchAllowed;
-                let _ = recovery.mark_replacement_active(retiring.identity.index);
-            }
-        }
-        RackRecoveryState::RetiredReset {
-            bank_index,
-            generation,
-        } => {
-            if rack
-                .banks
-                .acknowledge_external_retirement(bank_index, generation)
-                .is_ok()
-                && recovery.complete_retirement()
-                && matches!(rack.gate.state(), RackGateState::Closed { .. })
-            {
-                // A replacement can itself miss its first deadline while the old
-                // bank is still retiring. Requeue recovery once this handshake is idle.
-                let _ = recovery.request_quiesce();
+            });
+            if published {
+                rack.lane.wake();
             }
         }
     }
@@ -1145,151 +737,6 @@ fn copy_sidechains(
     sidechain_slots
 }
 
-fn free_slot_index(region: &SharedMemoryRegion) -> Result<Option<usize>, ProtocolError> {
-    for (slot_index, slot) in region.bank().slots.iter().enumerate() {
-        match slot.metadata.state()? {
-            SlotState::Free => return Ok(Some(slot_index)),
-            SlotState::Requested
-            | SlotState::Processing
-            | SlotState::Complete
-            | SlotState::Abandoned => {}
-        }
-    }
-    Ok(None)
-}
-
-/// Abandons only a still-unclaimed request and forgets the callback's live ticket.
-///
-/// A processing, complete, malformed, or already abandoned slot intentionally remains intact.
-/// Its bank stays retired until the worker has exited, so no late result can be reused.
-fn abandon_live_request(rack: &mut RackDispatchState) {
-    let Some(live) = rack.live.take() else {
-        return;
-    };
-    let Some(slot) = rack
-        .banks
-        .bank(live.bank_index)
-        .and_then(|region| region.bank().slot(live.slot_index))
-    else {
-        return;
-    };
-    if slot.metadata.state() == Ok(SlotState::Requested)
-        && slot.abandon_request(live.ticket).is_ok()
-    {
-        rack.telemetry
-            .abandoned_requests
-            .fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// Observes one nonblocking completion sweep for a live rack request.
-fn observe_rack(rack: &mut RackDispatchState, block_index: u64) {
-    let live = rack.live.expect("live request checked before observation");
-    let slot = rack
-        .banks
-        .bank(live.bank_index)
-        .expect("live request refers to one stable bank")
-        .bank()
-        .slot(live.slot_index)
-        .expect("fixed slot index is in range");
-    let observation = match slot.completion_snapshot() {
-        Ok(Some(snapshot)) if snapshot.ticket != live.ticket => {
-            WorkerObservation::Completed(snapshot.ticket)
-        }
-        Ok(Some(snapshot)) if snapshot.request != live.request => {
-            WorkerObservation::ProtocolFault(ProtocolError::MalformedCompletion)
-        }
-        Ok(Some(_))
-            if !copy_finite_output(slot, &mut rack.wet, live.request.frame_count as usize) =>
-        {
-            WorkerObservation::ProtocolFault(ProtocolError::MalformedCompletion)
-        }
-        Ok(Some(_)) => match slot.consume_completion_timing(live.ticket) {
-            Ok(_) => WorkerObservation::Completed(live.ticket),
-            Err(ProtocolError::UnexpectedState | ProtocolError::Owned) => {
-                WorkerObservation::Pending
-            }
-            Err(error) => WorkerObservation::ProtocolFault(error),
-        },
-        Ok(None) | Err(ProtocolError::Owned) => WorkerObservation::Pending,
-        Err(error) => WorkerObservation::ProtocolFault(error),
-    };
-    let prior = rack.gate.state();
-    rack.outcome = rack.gate.observe(observation, block_index);
-    match rack.outcome {
-        GateOutcome::WorkerResultAccepted => {
-            rack.live = None;
-            rack.wet_valid = true;
-            rack.telemetry.completed.fetch_add(1, Ordering::Relaxed);
-        }
-        GateOutcome::Awaiting => {}
-        GateOutcome::UseFallback(_) => {
-            if matches!(observation, WorkerObservation::ProtocolFault(_)) {
-                rack.telemetry
-                    .protocol_rejections
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            if matches!(observation, WorkerObservation::Completed(_)) {
-                rack.telemetry
-                    .stale_completions
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            abandon_live_request(rack);
-            record_outcome(rack, prior, rack.outcome);
-        }
-        GateOutcome::DispatchAllowed => unreachable!("observation cannot open a dispatch gate"),
-    }
-}
-
-fn copy_finite_output(
-    slot: &sp_shared_memory::BlockSlot,
-    wet: &mut [f32; MAX_SAMPLES],
-    frames: usize,
-) -> bool {
-    for frame in 0..frames {
-        let left = slot.output_audio[0][frame];
-        let right = slot.output_audio[1][frame];
-        if !left.is_finite() || !right.is_finite() {
-            return false;
-        }
-        wet[frame * 2] = left;
-        wet[frame * 2 + 1] = right;
-    }
-    true
-}
-
-fn close_dispatch(rack: &mut RackDispatchState, block_index: u64) {
-    let prior = rack.gate.state();
-    rack.outcome = rack.gate.dispatch(
-        BlockTicket {
-            generation: 0,
-            sequence: 0,
-        },
-        block_index,
-    );
-    record_outcome(rack, prior, rack.outcome);
-}
-
-fn record_outcome(rack: &RackDispatchState, prior: RackGateState, outcome: GateOutcome) {
-    if !matches!(prior, RackGateState::Closed { .. })
-        && let GateOutcome::UseFallback(reason) = outcome
-    {
-        rack.telemetry
-            .fallback_activations
-            .fetch_add(1, Ordering::Relaxed);
-        if reason == FallbackReason::DeadlineMiss {
-            rack.telemetry
-                .deadline_misses
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        // A hard deadline miss abandons the live slot and closes this gate. The stable
-        // bank must be retired before any further request can reach this rack.
-        if let Some(recovery) = &rack.recovery {
-            let _ = recovery.request_quiesce();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1320,10 +767,14 @@ mod tests {
     }
 
     fn complete(dispatcher: &mut RackSharedMemoryDispatcher, rack_index: usize, samples: [f32; 4]) {
-        let live = dispatcher.racks[rack_index].live.expect("live request");
+        let live = dispatcher.racks[rack_index]
+            .lane
+            .live()
+            .expect("live request");
         let claimed_tick = dispatcher.clock.now_ticks();
         let slot = dispatcher.racks[rack_index]
-            .banks
+            .lane
+            .banks_mut()
             .bank_mut(live.bank_index)
             .expect("live bank")
             .bank_mut()
@@ -1359,7 +810,7 @@ mod tests {
         };
         let input = [0.0; 4];
         publish(&mut dispatcher, &input, &[]);
-        let live = dispatcher.racks[0].live.expect("request");
+        let live = dispatcher.racks[0].lane.live().expect("request");
 
         dispatcher.process_block(&input, &[], 2, Duration::from_millis(2));
         let telemetry = dispatcher.telemetry(0).expect("telemetry");
@@ -1374,10 +825,11 @@ mod tests {
         assert!(telemetry.last_miss_request_tick > 0);
         assert_eq!(telemetry.last_miss_claimed_tick, 0);
         assert!(telemetry.last_miss_observed_tick >= telemetry.last_miss_request_tick);
-        assert!(dispatcher.racks[0].live.is_none());
+        assert!(dispatcher.racks[0].lane.live().is_none());
         assert_eq!(
             dispatcher.racks[0]
-                .banks
+                .lane
+                .banks()
                 .bank(live.bank_index)
                 .expect("live bank")
                 .bank()
@@ -1396,9 +848,10 @@ mod tests {
         };
         let input = [0.0; 4];
         publish(&mut dispatcher, &input, &[]);
-        let live = dispatcher.racks[0].live.expect("request");
+        let live = dispatcher.racks[0].lane.live().expect("request");
         let slot = dispatcher.racks[0]
-            .banks
+            .lane
+            .banks()
             .bank(live.bank_index)
             .expect("live bank")
             .bank()
@@ -1459,9 +912,10 @@ mod tests {
         };
         publish(&mut dispatcher, &[0.0; 4], &[event]);
 
-        let live = dispatcher.racks[0].live.expect("live request");
+        let live = dispatcher.racks[0].lane.live().expect("live request");
         let slot = dispatcher.racks[0]
-            .banks
+            .lane
+            .banks()
             .bank(live.bank_index)
             .expect("bank")
             .bank()
@@ -1547,7 +1001,7 @@ mod tests {
                 retiring_bank_index: 0,
             }
         );
-        assert_eq!(dispatcher.racks[0].banks.active_index(), 1);
+        assert_eq!(dispatcher.racks[0].lane.banks().active_index(), 1);
 
         // SAFETY: no worker exists and the callback switched away from the retired mapping.
         unsafe { owners[0].reset_after_worker_exit(13) }.expect("reset retired bank");
@@ -1555,7 +1009,7 @@ mod tests {
         dispatcher.process_block(&[0.0; 4], &[], 2, Duration::ZERO);
         assert_eq!(recovery.state(), RackRecoveryState::QuiesceRequested);
         assert_eq!(
-            dispatcher.racks[0].banks.metadata()[0].lifecycle,
+            dispatcher.racks[0].lane.banks().metadata()[0].lifecycle,
             MappedBankLifecycle::Inactive
         );
     }
@@ -1615,12 +1069,12 @@ mod tests {
             return;
         };
         let recovery = Arc::new(RackRecoverySignal::new());
-        dispatcher.racks[0].recovery = Some(Arc::clone(&recovery));
+        dispatcher.racks[0].lane.set_recovery(Arc::clone(&recovery));
         let mut active_owner =
-            SharedMemoryRegion::open(dispatcher.racks[0].banks.bank(0).unwrap().name())
+            SharedMemoryRegion::open(dispatcher.racks[0].lane.banks().bank(0).unwrap().name())
                 .expect("active owner mapping");
         let mut inactive_owner =
-            SharedMemoryRegion::open(dispatcher.racks[0].banks.bank(1).unwrap().name())
+            SharedMemoryRegion::open(dispatcher.racks[0].lane.banks().bank(1).unwrap().name())
                 .expect("inactive owner mapping");
         let other_metadata = dispatcher.bank_metadata(1).unwrap();
 
@@ -1638,7 +1092,7 @@ mod tests {
         unsafe { inactive_owner.reset_after_worker_exit(11) }.expect("replacement mapping");
         assert!(recovery.publish_replacement(1, 11));
         dispatcher.service_stopped_recoveries();
-        assert_eq!(dispatcher.racks[0].banks.active_index(), 1);
+        assert_eq!(dispatcher.racks[0].lane.banks().active_index(), 1);
         assert_eq!(
             recovery.state(),
             RackRecoveryState::ReplacementActive {
@@ -1664,8 +1118,11 @@ mod tests {
         dispatcher.apply_to_mixer(&mut mixer);
         assert_eq!(mixer.rack_settings(0).unwrap().latency_frames, 37);
         publish(&mut dispatcher, &[0.0; 4], &[]);
-        assert_eq!(dispatcher.racks[0].live.unwrap().ticket.generation, 11);
-        assert_eq!(dispatcher.racks[1].live.unwrap().bank_index, 0);
+        assert_eq!(
+            dispatcher.racks[0].lane.live().unwrap().ticket.generation,
+            11
+        );
+        assert_eq!(dispatcher.racks[1].lane.live().unwrap().bank_index, 0);
         assert!(recovery.request_quiesce());
         dispatcher.service_stopped_recoveries();
         inactive_owner
@@ -1696,9 +1153,10 @@ mod tests {
         };
         assert_eq!(&wet[..4], &[1.0, -1.0, 0.5, -0.5]);
         // The block's own request is published after observation.
-        let live = dispatcher.racks[0].live.expect("next request");
+        let live = dispatcher.racks[0].lane.live().expect("next request");
         let slot = dispatcher.racks[0]
-            .banks
+            .lane
+            .banks()
             .bank(live.bank_index)
             .unwrap()
             .bank()
@@ -1709,7 +1167,8 @@ mod tests {
         assert_eq!((telemetry.completed, telemetry.deadline_misses), (1, 0));
 
         dispatcher.racks[0]
-            .banks
+            .lane
+            .banks()
             .active_bank()
             .bank()
             .header
@@ -1735,7 +1194,7 @@ mod tests {
         let telemetry = dispatcher.telemetry(1).unwrap();
         assert_eq!(telemetry.deadline_misses, 1);
         assert!(
-            dispatcher.racks[1].live.is_none(),
+            dispatcher.racks[1].lane.live().is_none(),
             "the missed request is abandoned"
         );
     }
@@ -1747,9 +1206,10 @@ mod tests {
         };
         let input = [0.25, -0.25, 0.5, -0.5];
         publish(&mut dispatcher, &input, &[]);
-        let live = dispatcher.racks[0].live.expect("request");
+        let live = dispatcher.racks[0].lane.live().expect("request");
         let slot = dispatcher.racks[0]
-            .banks
+            .lane
+            .banks()
             .bank(live.bank_index)
             .expect("live bank")
             .bank()
@@ -1778,10 +1238,11 @@ mod tests {
                 .map(|sample| f32::from(u8::try_from(sample).expect("small block sample index")))
                 .collect();
             dispatcher.dispatch_open(&input, &[], &super::EMPTY_RACK_AUTOMATION, frames);
-            let live = dispatcher.racks[0].live.expect("request");
+            let live = dispatcher.racks[0].lane.live().expect("request");
             assert_eq!(live.request.frame_count as usize, frames);
             let slot = dispatcher.racks[0]
-                .banks
+                .lane
+                .banks_mut()
                 .bank_mut(live.bank_index)
                 .expect("bank")
                 .bank_mut()
@@ -1805,7 +1266,7 @@ mod tests {
             slot.publish_completion_at(1, live.ticket, dispatcher.clock.now_ticks())
                 .unwrap();
 
-            super::observe_rack(&mut dispatcher.racks[0], dispatcher.block_index);
+            dispatcher.racks[0].lane.poll(dispatcher.block_index);
             let sources = dispatcher.sources();
             let RackAudioSource::Wet(wet) = sources[0] else {
                 panic!("small completion must provide wet audio");
@@ -1839,7 +1300,8 @@ mod tests {
         );
         for (rack_index, input) in inputs.iter().enumerate().take(2) {
             let slot = dispatcher.racks[rack_index]
-                .banks
+                .lane
+                .banks()
                 .active_bank()
                 .bank()
                 .slot(0)
@@ -1870,9 +1332,10 @@ mod tests {
         };
         assert!(automation[0].push(event));
         dispatcher.dispatch_open(&[0.0; 4], &[], &automation, 2);
-        let live = dispatcher.racks[0].live.expect("request");
+        let live = dispatcher.racks[0].lane.live().expect("request");
         let slot = dispatcher.racks[0]
-            .banks
+            .lane
+            .banks()
             .bank(live.bank_index)
             .expect("bank")
             .bank()
@@ -1897,9 +1360,10 @@ mod tests {
         publish(&mut dispatcher, &input, &[]);
         complete(&mut dispatcher, 0, [0.25, -0.25, 0.5, -0.5]);
 
-        let live = dispatcher.racks[1].live.expect("live request");
+        let live = dispatcher.racks[1].lane.live().expect("live request");
         let slot = dispatcher.racks[1]
-            .banks
+            .lane
+            .banks_mut()
             .bank_mut(live.bank_index)
             .expect("live bank")
             .bank_mut()
@@ -1931,9 +1395,13 @@ mod tests {
         publish(&mut dispatcher, &input, &[]);
         complete(&mut dispatcher, 0, [0.25, -0.25, 0.5, -0.5]);
         complete(&mut dispatcher, 1, [0.0; 4]);
-        let target = dispatcher.racks[1].live.expect("target live request");
+        let target = dispatcher.racks[1]
+            .lane
+            .live()
+            .expect("target live request");
         dispatcher.racks[1]
-            .banks
+            .lane
+            .banks_mut()
             .bank_mut(target.bank_index)
             .expect("target bank")
             .bank_mut()
@@ -1960,10 +1428,11 @@ mod tests {
         };
         let input = [0.0; 4];
         publish(&mut dispatcher, &input, &[]);
-        let live = dispatcher.racks[0].live.expect("live request");
+        let live = dispatcher.racks[0].lane.live().expect("live request");
         complete(&mut dispatcher, 0, [0.0; 4]);
         dispatcher.racks[0]
-            .banks
+            .lane
+            .banks_mut()
             .bank_mut(live.bank_index)
             .expect("live bank")
             .bank_mut()

@@ -6,32 +6,22 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use sp_model::{MAX_RACKS, PhysicalChannels};
+use sp_rack_lane::{FaderBlock, FaderSettings, LaneFader, LaneFallback, LaneLayout};
+pub use sp_rack_lane::{
+    JOIN_FADE_FRAMES, MAX_DRY_DELAY_FRAMES, MAX_TRANSITION_FRAMES, MIN_TRANSITION_FRAMES,
+    WET_RECOVERY_BLOCKS,
+};
 
 use crate::{
     BlockActivation, DryDelayError, FallbackAudio, FallbackReason, GateOutcome, GraphArena,
-    LiveBlockPlanner, PreparedChannelConversion, PreparedChannelLayout, PreparedGraph,
-    PreparedSidechain, PreparedSlot, RackBlockAction,
+    LiveBlockPlanner, PreparedChannelLayout, PreparedGraph, PreparedSidechain, PreparedSlot,
+    RackBlockAction,
 };
 
-/// Maximum frames supported by the product mixer (256-frame mode).
-pub const MAX_MIX_FRAMES: usize = 256;
-/// Largest latency the preallocated dry path can match exactly. Higher reported values are
-/// retained in rack settings, but bypass and dry fallback render silence.
-pub const MAX_DRY_DELAY_FRAMES: usize = 65_536;
-/// Stereo channel count used by the hardware output mixer.
-pub const MIX_CHANNELS: usize = 2;
-/// Minimum click-bounded transition length.
-pub const MIN_TRANSITION_FRAMES: usize = 64;
-/// Maximum click-bounded transition length.
-pub const MAX_TRANSITION_FRAMES: usize = 128;
-/// Fade length when a layout change replaces a rack's worker, both to dry and to the new chain.
-pub const JOIN_FADE_FRAMES: usize = 16;
-/// Number of consecutive valid wet blocks required after a fallback before wet recovery.
-pub const WET_RECOVERY_BLOCKS: u8 = 3;
-// The mixer writes an entire block before reading delayed frames, so the ring needs one full
-// callback block beyond the maximum supported delay. Eight stereo rings use about 4.2 MB,
-// allocated when the mixer is built; the audio callback never allocates.
-const DRY_DELAY_CAPACITY_FRAMES: usize = MAX_DRY_DELAY_FRAMES + MAX_MIX_FRAMES;
+/// Maximum frames supported by the product mixer (256-frame mode): one lane block.
+pub const MAX_MIX_FRAMES: usize = sp_rack_lane::MAX_LANE_FRAMES;
+/// Stereo channel count used by the hardware output mixer: one lane's interleaved width.
+pub const MIX_CHANNELS: usize = sp_rack_lane::LANE_CHANNELS;
 const SILENT_RACK_INPUT: [f32; MAX_MIX_FRAMES * MIX_CHANNELS] =
     [0.0; MAX_MIX_FRAMES * MIX_CHANNELS];
 
@@ -146,55 +136,15 @@ impl AtomicMeter {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RenderSource {
-    Wet,
-    Dry,
-    Silence,
-    /// The last frame a replaced plug-in chain played, held and faded out during a worker
-    /// handoff so the join to the new source is continuous.
-    Held,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct TransitionState {
-    from: RenderSource,
-    position: usize,
-    frames: usize,
-}
-
-impl TransitionState {
-    const fn idle() -> Self {
-        Self {
-            from: RenderSource::Silence,
-            position: 0,
-            frames: 0,
-        }
-    }
-
-    const fn active(self) -> bool {
-        self.position < self.frames
-    }
-}
-
 /// Fixed-capacity realtime mixer for the product `CoreAudio` path.
 pub struct RealtimeRackMixer {
     arena: GraphArena,
     gate_outcomes: [GateOutcome; MAX_RACKS],
     planner: LiveBlockPlanner,
-    dry_storage: Box<[Box<[f32]>; MAX_RACKS]>,
-    dry_write_frame: [usize; MAX_RACKS],
     settings: [RackSettings; MAX_RACKS],
-    transitions: [TransitionState; MAX_RACKS],
-    rendered_source: [RenderSource; MAX_RACKS],
-    valid_wet_blocks: [u8; MAX_RACKS],
-    /// A new worker was placed by a layout change; its wet output fades in over
-    /// [`JOIN_FADE_FRAMES`].
-    joining: [bool; MAX_RACKS],
+    /// Each rack's dry delay and dry/wet fades.
+    faders: Box<[LaneFader; MAX_RACKS]>,
     scratch: [f32; MAX_MIX_FRAMES * MIX_CHANNELS],
-    last_wet: Box<[Box<[f32]>; MAX_RACKS]>,
-    /// Last frame each rack rendered, before gain.
-    last_frame: [[f32; MIX_CHANNELS]; MAX_RACKS],
     /// Each rack's post-fader output from the latest block, read by rack-output sidechains
     /// before the next block is mixed. One block per rack lane, `MAX_RACKS` long, on the heap
     /// because 64 lanes are too large for the stack.
@@ -214,25 +164,13 @@ impl RealtimeRackMixer {
         for index in 0..initial.rack_count() {
             planner.set_dry_delay_available(index, true);
         }
-        let dry_storage = Box::new(std::array::from_fn(|_| {
-            vec![0.0_f32; DRY_DELAY_CAPACITY_FRAMES * MIX_CHANNELS].into_boxed_slice()
-        }));
         Self {
             arena: GraphArena::new(initial),
             gate_outcomes: [GateOutcome::DispatchAllowed; MAX_RACKS],
             planner,
-            dry_storage,
-            dry_write_frame: [0; MAX_RACKS],
             settings: [RackSettings::default(); MAX_RACKS],
-            transitions: [TransitionState::idle(); MAX_RACKS],
-            rendered_source: [RenderSource::Silence; MAX_RACKS],
-            valid_wet_blocks: [0; MAX_RACKS],
-            joining: [false; MAX_RACKS],
+            faders: Box::new(std::array::from_fn(|_| LaneFader::new())),
             scratch: [0.0; MAX_MIX_FRAMES * MIX_CHANNELS],
-            last_wet: Box::new(std::array::from_fn(|_| {
-                vec![0.0_f32; MAX_MIX_FRAMES * MIX_CHANNELS].into_boxed_slice()
-            })),
-            last_frame: [[0.0; MIX_CHANNELS]; MAX_RACKS],
             rack_outputs: vec![[0.0; MAX_MIX_FRAMES * MIX_CHANNELS]; MAX_RACKS].into_boxed_slice(),
             rack_output_frames: [0; MAX_RACKS],
             rack_meters: std::array::from_fn(|_| AtomicMeter::new()),
@@ -259,15 +197,8 @@ impl RealtimeRackMixer {
     pub fn apply_topology(&mut self, graph: PreparedGraph, lanes: &[MixerLane; MAX_RACKS]) {
         let from = lane_permutation(lanes);
         permute_lanes(&mut self.gate_outcomes, &from);
-        permute_lanes(&mut *self.dry_storage, &from);
-        permute_lanes(&mut self.dry_write_frame, &from);
         permute_lanes(&mut self.settings, &from);
-        permute_lanes(&mut self.transitions, &from);
-        permute_lanes(&mut self.rendered_source, &from);
-        permute_lanes(&mut self.valid_wet_blocks, &from);
-        permute_lanes(&mut self.joining, &from);
-        permute_lanes(&mut *self.last_wet, &from);
-        permute_lanes(&mut self.last_frame, &from);
+        permute_lanes(&mut *self.faders, &from);
         permute_lanes(&mut self.rack_outputs, &from);
         permute_lanes(&mut self.rack_output_frames, &from);
         permute_lanes(&mut self.rack_meters, &from);
@@ -278,31 +209,13 @@ impl RealtimeRackMixer {
                 if lane.restart {
                     // The old chain is gone. Play dry until the new one proves itself.
                     self.gate_outcomes[index] = GateOutcome::DispatchAllowed;
-                    self.valid_wet_blocks[index] = 0;
-                    self.joining[index] = true;
-                    self.transitions[index] = TransitionState {
-                        from: RenderSource::Held,
-                        position: 0,
-                        frames: JOIN_FADE_FRAMES,
-                    };
-                    self.rendered_source[index] = if lane.dry_fallback {
-                        RenderSource::Dry
-                    } else {
-                        RenderSource::Silence
-                    };
+                    self.faders[index].restart(lane.dry_fallback);
                 }
                 continue;
             }
             self.gate_outcomes[index] = GateOutcome::DispatchAllowed;
-            self.dry_storage[index].fill(0.0);
-            self.dry_write_frame[index] = 0;
             self.set_rack_settings(index, lane.settings);
-            self.transitions[index] = TransitionState::idle();
-            self.rendered_source[index] = RenderSource::Silence;
-            self.valid_wet_blocks[index] = 0;
-            self.joining[index] = true;
-            self.last_wet[index].fill(0.0);
-            self.last_frame[index] = [0.0; MIX_CHANNELS];
+            self.faders[index].reset();
             self.rack_output_frames[index] = 0;
         }
         self.arena.stage(graph);
@@ -518,23 +431,7 @@ impl RealtimeRackMixer {
             } else {
                 &SILENT_RACK_INPUT
             };
-            self.advance_dry(rack_index, input, frames);
-            let source = sources
-                .get(rack_index)
-                .copied()
-                .unwrap_or(RackAudioSource::None);
-            let target = self.select_source(rack_index, source);
-            self.begin_source_change(rack_index, target);
-            self.capture_wet(rack_index, rack.endpoint_layout(), source, frames);
-            self.render_rack(
-                rack_index,
-                rack.source_layout(),
-                rack.endpoint_layout(),
-                rack.conversion(),
-                source,
-                target,
-                frames,
-            );
+            self.render_lane(rack_index, rack, input, sources, frames);
             let gain = if self.settings[rack_index].muted {
                 0.0
             } else {
@@ -602,23 +499,7 @@ impl RealtimeRackMixer {
                 .graph()
                 .rack(rack_index)
                 .expect("prepared active rack");
-            self.advance_dry(rack_index, input, frames);
-            let source = sources
-                .get(rack_index)
-                .copied()
-                .unwrap_or(RackAudioSource::None);
-            let target = self.select_source(rack_index, source);
-            self.begin_source_change(rack_index, target);
-            self.capture_wet(rack_index, rack.endpoint_layout(), source, frames);
-            self.render_rack(
-                rack_index,
-                rack.source_layout(),
-                rack.endpoint_layout(),
-                rack.conversion(),
-                source,
-                target,
-                frames,
-            );
+            self.render_lane(rack_index, rack, input, sources, frames);
             let gain = if self.settings[rack_index].muted {
                 0.0
             } else {
@@ -645,229 +526,54 @@ impl RealtimeRackMixer {
         self.rack_output_frames[rack_index] = frames;
     }
 
-    fn select_source(&mut self, rack_index: usize, supplied: RackAudioSource<'_>) -> RenderSource {
-        let valid_wet = matches!(supplied, RackAudioSource::Wet(_))
-            && matches!(
-                self.action_for(rack_index),
-                RackBlockAction::AcceptWorkerResult | RackBlockAction::Dispatch
-            );
-        if self.settings[rack_index].bypassed {
-            return RenderSource::Dry;
-        }
-        if valid_wet {
-            self.valid_wet_blocks[rack_index] = self.valid_wet_blocks[rack_index].saturating_add(1);
-            if self.rendered_source[rack_index] == RenderSource::Wet
-                || self.valid_wet_blocks[rack_index] >= WET_RECOVERY_BLOCKS
-            {
-                RenderSource::Wet
-            } else if self.planner.dry_delay_available(rack_index) {
-                RenderSource::Dry
-            } else {
-                RenderSource::Silence
-            }
-        } else {
-            self.valid_wet_blocks[rack_index] = 0;
-            match self.action_for(rack_index) {
-                RackBlockAction::UseFallback(FallbackAudio::Silence) => RenderSource::Silence,
-                _ => RenderSource::Dry,
-            }
-        }
-    }
-
-    /// Fades to a new source. A joining worker's chain uses the shorter join fade.
-    fn begin_source_change(&mut self, rack: usize, target: RenderSource) {
-        let from = self.rendered_source[rack];
-        if from == target || self.transitions[rack].active() {
-            return;
-        }
-        self.transitions[rack] = TransitionState {
-            from,
-            position: 0,
-            frames: if self.joining[rack] && target == RenderSource::Wet {
-                JOIN_FADE_FRAMES
-            } else {
-                self.transition_frames
-            },
-        };
-    }
-
-    fn capture_wet(
-        &mut self,
-        rack: usize,
-        endpoint_layout: PreparedChannelLayout,
-        wet: RackAudioSource<'_>,
-        frames: usize,
-    ) {
-        let RackAudioSource::Wet(samples) = wet else {
-            return;
-        };
-        for frame in 0..frames {
-            let destination = frame * MIX_CHANNELS;
-            match endpoint_layout {
-                PreparedChannelLayout::Mono => {
-                    let sample = samples.get(frame * MIX_CHANNELS).copied().unwrap_or(0.0);
-                    self.last_wet[rack][destination] = sample;
-                    self.last_wet[rack][destination + 1] = sample;
-                }
-                PreparedChannelLayout::Stereo => {
-                    self.last_wet[rack][destination] =
-                        samples.get(destination).copied().unwrap_or(0.0);
-                    self.last_wet[rack][destination + 1] =
-                        samples.get(destination + 1).copied().unwrap_or(0.0);
-                }
-            }
-        }
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "per-rack render parameters stay on the stack of the realtime callback"
-    )]
-    fn render_rack(
+    /// Renders one rack's dry/wet lane into the scratch buffer, before gain.
+    fn render_lane(
         &mut self,
         rack_index: usize,
-        source_layout: PreparedChannelLayout,
-        endpoint_layout: PreparedChannelLayout,
-        conversion: PreparedChannelConversion,
-        wet: RackAudioSource<'_>,
-        target: RenderSource,
+        rack: &crate::PreparedRack,
+        input: &[f32],
+        sources: &[RackAudioSource<'_>],
         frames: usize,
     ) {
-        let transition = self.transitions[rack_index];
-        for frame in 0..frames {
-            let (from_l, from_r) = self.source_frame(
-                rack_index,
-                source_layout,
-                endpoint_layout,
-                conversion,
+        let wet = match sources.get(rack_index) {
+            Some(RackAudioSource::Wet(samples)) => Some(*samples),
+            Some(RackAudioSource::None) | None => None,
+        };
+        let action = self.action_for(rack_index);
+        let settings = self.settings[rack_index];
+        self.faders[rack_index].render(
+            FaderBlock {
+                dry: input,
                 wet,
-                transition.from,
-                frame,
-                frames,
-            );
-            let (to_l, to_r) = self.source_frame(
-                rack_index,
-                source_layout,
-                endpoint_layout,
-                conversion,
-                wet,
-                target,
-                frame,
-                frames,
-            );
-            let (left, right) = if transition.active() {
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "transition positions are bounded well below f32 precision limits"
-                )]
-                let amount = (transition.position + frame).min(transition.frames) as f32
-                    / transition.frames as f32;
-                (
-                    from_l + (to_l - from_l) * amount,
-                    from_r + (to_r - from_r) * amount,
-                )
-            } else {
-                (to_l, to_r)
-            };
-            self.scratch[frame * 2] = left;
-            self.scratch[frame * 2 + 1] = right;
-        }
-        if frames > 0 {
-            let last = (frames - 1) * 2;
-            self.last_frame[rack_index] = [self.scratch[last], self.scratch[last + 1]];
-        }
-        if transition.active() {
-            let updated = transition.position.saturating_add(frames);
-            if updated >= transition.frames {
-                self.transitions[rack_index] = TransitionState::idle();
-                self.rendered_source[rack_index] = target;
-            } else {
-                self.transitions[rack_index].position = updated;
-            }
-        } else {
-            self.rendered_source[rack_index] = target;
-        }
-        if self.rendered_source[rack_index] == RenderSource::Wet {
-            self.joining[rack_index] = false;
-        }
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "per-frame source selection stays on the stack of the realtime callback"
-    )]
-    fn source_frame(
-        &self,
-        rack: usize,
-        source_layout: PreparedChannelLayout,
-        endpoint_layout: PreparedChannelLayout,
-        conversion: PreparedChannelConversion,
-        wet: RackAudioSource<'_>,
-        source: RenderSource,
-        frame: usize,
-        frames: usize,
-    ) -> (f32, f32) {
-        match source {
-            RenderSource::Silence => (0.0, 0.0),
-            RenderSource::Held => (self.last_frame[rack][0], self.last_frame[rack][1]),
-            RenderSource::Dry => self.dry_frame(rack, source_layout, conversion, frame, frames),
-            RenderSource::Wet => match wet {
-                RackAudioSource::Wet(samples) => match endpoint_layout {
-                    PreparedChannelLayout::Mono => {
-                        let value = samples.get(frame * MIX_CHANNELS).copied().unwrap_or(0.0);
-                        (value, value)
-                    }
-                    PreparedChannelLayout::Stereo => {
-                        let index = frame * 2;
-                        (
-                            samples.get(index).copied().unwrap_or(0.0),
-                            samples.get(index + 1).copied().unwrap_or(0.0),
-                        )
-                    }
+                accepted: matches!(
+                    action,
+                    RackBlockAction::AcceptWorkerResult | RackBlockAction::Dispatch
+                ),
+                fallback: if action == RackBlockAction::UseFallback(FallbackAudio::Silence) {
+                    LaneFallback::Silence
+                } else {
+                    LaneFallback::Dry
                 },
-                RackAudioSource::None => {
-                    let index = frame * MIX_CHANNELS;
-                    (self.last_wet[rack][index], self.last_wet[rack][index + 1])
-                }
+                frames,
             },
-        }
+            &FaderSettings {
+                source: rack.source_layout().lane(),
+                endpoint: rack.endpoint_layout().lane(),
+                bypassed: settings.bypassed,
+                latency_frames: settings.latency_frames,
+                dry_fallback: self.planner.dry_delay_available(rack_index),
+                transition_frames: self.transition_frames,
+            },
+            &mut self.scratch,
+        );
     }
+}
 
-    fn advance_dry(&mut self, rack: usize, input: &[f32], frames: usize) {
-        let storage = &mut self.dry_storage[rack];
-        let mut write = self.dry_write_frame[rack];
-        for frame in 0..frames {
-            let index = frame * 2;
-            let write_index = write * 2;
-            storage[write_index] = input[index];
-            storage[write_index + 1] = input[index + 1];
-            write = (write + 1) % DRY_DELAY_CAPACITY_FRAMES;
-        }
-        self.dry_write_frame[rack] = write;
-    }
-
-    fn dry_frame(
-        &self,
-        rack: usize,
-        input_layout: PreparedChannelLayout,
-        conversion: PreparedChannelConversion,
-        frame: usize,
-        frames: usize,
-    ) -> (f32, f32) {
-        if self.settings[rack].latency_frames > MAX_DRY_DELAY_FRAMES {
-            return (0.0, 0.0);
-        }
-        let written = (self.dry_write_frame[rack] + DRY_DELAY_CAPACITY_FRAMES - frames + frame)
-            % DRY_DELAY_CAPACITY_FRAMES;
-        let read = (written + DRY_DELAY_CAPACITY_FRAMES - self.settings[rack].latency_frames)
-            % DRY_DELAY_CAPACITY_FRAMES;
-        let base = read * 2;
-        let left = self.dry_storage[rack][base];
-        let right = self.dry_storage[rack][base + 1];
-        let _ = conversion;
-        match input_layout {
-            PreparedChannelLayout::Stereo => (left, right),
-            PreparedChannelLayout::Mono => (left, left),
+impl PreparedChannelLayout {
+    const fn lane(self) -> LaneLayout {
+        match self {
+            Self::Mono => LaneLayout::Mono,
+            Self::Stereo => LaneLayout::Stereo,
         }
     }
 }

@@ -3643,6 +3643,7 @@ dependencies = [
  "sp-engine",
  "sp-midi",
  "sp-model",
+ "sp-rack-lane",
  "sp-shared-memory",
  "sp-shared-memory-os",
 ]
@@ -3694,6 +3695,7 @@ version = "0.1.0"
 dependencies = [
  "sp-model",
  "sp-protocol",
+ "sp-rack-lane",
  "thiserror 2.0.18",
 ]
 
@@ -3748,6 +3750,14 @@ dependencies = [
 [[package]]
 name = "sp-protocol"
 version = "0.1.0"
+
+[[package]]
+name = "sp-rack-lane"
+version = "0.1.0"
+dependencies = [
+ "sp-shared-memory",
+ "sp-shared-memory-os",
+]
 
 [[package]]
 name = "sp-remote"

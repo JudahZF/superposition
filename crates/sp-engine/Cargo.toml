@@ -12,5 +12,8 @@ workspace = true
 
 [dependencies]
 sp-model = { path = "../sp-model" }
-sp-protocol = { path = "../sp-protocol" }
+sp-rack-lane = { path = "../sp-rack-lane" }
 thiserror.workspace = true
+
+[dev-dependencies]
+sp-protocol = { path = "../sp-protocol" }
