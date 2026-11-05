@@ -135,6 +135,8 @@ impl WorkerHandle {
                             .env("WINEPREFIX", &wine.prefix)
                             .env("WINEDLLPATH", &wine.bridge_dir)
                             .env("WINEDEBUG", "-all")
+                            // A new prefix would otherwise try to install Mono and Gecko.
+                            .env("WINEDLLOVERRIDES", "mscoree,mshtml=")
                             .env_remove("DISPLAY")
                             .env_remove("WAYLAND_DISPLAY");
                         command
