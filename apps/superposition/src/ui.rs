@@ -270,13 +270,12 @@ pub struct LiveRackApp {
     /// Linux: the slot whose editor the rack view docks in its pane.
     #[cfg(target_os = "linux")]
     docked: Option<(usize, usize)>,
-    /// Linux: an editor the rack view just closed, hidden until its window goes away.
+    /// Linux: editors just closed, hidden until their windows go away, with when each closed.
     #[cfg(target_os = "linux")]
-    undocked: Option<((usize, usize), Instant)>,
-    /// Linux: an editor the rack view let go of while it was still opening. It closes as soon
-    /// as it opens.
+    undocked: Vec<((usize, usize), Instant)>,
+    /// Linux: editors the rack view let go of while still opening. Each closes once it opens.
     #[cfg(target_os = "linux")]
-    pending_close: Option<(usize, usize)>,
+    pending_close: Vec<(usize, usize)>,
     /// Linux: the Tunnel device settings being edited.
     #[cfg(target_os = "linux")]
     tunnel_settings: tunnel::TunnelSettings,
@@ -427,9 +426,9 @@ impl LiveRackApp {
             #[cfg(target_os = "linux")]
             docked: None,
             #[cfg(target_os = "linux")]
-            undocked: None,
+            undocked: Vec::new(),
             #[cfg(target_os = "linux")]
-            pending_close: None,
+            pending_close: Vec::new(),
             #[cfg(target_os = "linux")]
             tunnel_settings: tunnel::TunnelSettings::load(),
             #[cfg(test)]
@@ -2106,13 +2105,13 @@ impl LiveRackApp {
         // An editor the rack view just closed still reads as open until the worker's next
         // picture poll, so reopening it must not trust that flag.
         #[cfg(target_os = "linux")]
-        let just_closed = self
-            .undocked
-            .take_if(|(closed, _)| *closed == (rack, slot))
-            .is_some();
-        #[cfg(target_os = "linux")]
-        self.pending_close
-            .take_if(|pending| *pending == (rack, slot));
+        let just_closed = {
+            let closing = self.undocked.len();
+            self.undocked.retain(|(closed, _)| *closed != (rack, slot));
+            self.pending_close
+                .retain(|pending| *pending != (rack, slot));
+            self.undocked.len() != closing
+        };
         #[cfg(not(target_os = "linux"))]
         let just_closed = false;
         #[cfg(target_os = "linux")]
@@ -2153,31 +2152,28 @@ impl LiveRackApp {
     #[cfg(target_os = "linux")]
     fn sync_docked_editor(&mut self) {
         const HIDE_CLOSING: Duration = Duration::from_secs(1);
-        // The closed editor stays hidden, and reopenable, until its window has had time to go
-        // and the worker has reported it closed.
-        let closing = self.undocked.is_some_and(|((rack, slot), at)| {
-            at.elapsed() < HIDE_CLOSING
-                || self
-                    .product
-                    .as_ref()
-                    .is_ok_and(|product| product.editor_open(rack, slot))
-        });
-        if !closing {
-            self.undocked = None;
-        }
-        if let Some(pending) = self.pending_close {
-            let (open, opening) = self.product.as_ref().map_or((false, false), |product| {
-                (
-                    product.editor_open(pending.0, pending.1),
-                    product.native_editor_pending(),
-                )
-            });
-            if open {
-                self.pending_close = None;
-                self.close_docked(pending);
-            } else if !opening {
-                self.pending_close = None;
+        let ready = {
+            let product = self.product.as_ref().ok();
+            let open = |(rack, slot): (usize, usize)| {
+                product.is_some_and(|product| product.editor_open(rack, slot))
+            };
+            // A closed editor stays hidden, and reopenable, until its window has had time to go
+            // and the worker has reported it closed.
+            self.undocked
+                .retain(|(editor, at)| at.elapsed() < HIDE_CLOSING || open(*editor));
+            // An editor let go of while opening closes once it opens, or is forgotten when its
+            // open failed.
+            let opening = product.is_some_and(ProductRuntime::native_editor_pending);
+            let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_close)
+                .into_iter()
+                .partition(|editor| open(*editor));
+            if opening {
+                self.pending_close = waiting;
             }
+            ready
+        };
+        for editor in ready {
+            self.close_docked(editor);
         }
         let Some((rack, slot)) = self.docked else {
             return;
@@ -2201,12 +2197,15 @@ impl LiveRackApp {
             return;
         };
         if product.editor_open(rack, slot) {
-            self.undocked = Some(((rack, slot), Instant::now()));
-            if let Err(error) = product.set_native_editor_open(rack, slot, false, running) {
-                self.show_fault(error);
+            let closed = product.set_native_editor_open(rack, slot, false, running);
+            self.undocked.retain(|(editor, _)| *editor != (rack, slot));
+            match closed {
+                Ok(()) => self.undocked.push(((rack, slot), Instant::now())),
+                // Still open: let it float rather than hide it.
+                Err(error) => self.show_fault(error),
             }
-        } else if product.native_editor_pending() {
-            self.pending_close = Some((rack, slot));
+        } else if product.native_editor_pending() && !self.pending_close.contains(&(rack, slot)) {
+            self.pending_close.push((rack, slot));
         }
     }
 
@@ -2215,10 +2214,14 @@ impl LiveRackApp {
     #[cfg(target_os = "linux")]
     fn remap_editors(&mut self, map: impl Fn((usize, usize)) -> Option<(usize, usize)>) {
         self.docked = self.docked.and_then(&map);
-        self.undocked = self
-            .undocked
-            .and_then(|(editor, at)| Some((map(editor)?, at)));
-        self.pending_close = self.pending_close.and_then(&map);
+        self.undocked = std::mem::take(&mut self.undocked)
+            .into_iter()
+            .filter_map(|(editor, at)| Some((map(editor)?, at)))
+            .collect();
+        self.pending_close = std::mem::take(&mut self.pending_close)
+            .into_iter()
+            .filter_map(&map)
+            .collect();
     }
 
     /// Whether `rack` and `slot` is a hot plug-in.
@@ -2670,17 +2673,18 @@ impl LiveRackApp {
     fn finish_streamed_windows(&mut self, ctx: &egui::Context) {
         let running = self.online();
         #[cfg(target_os = "linux")]
-        let hidden = [
-            self.docked,
-            self.undocked.map(|(slot, _)| slot),
-            self.pending_close,
-        ];
+        let hidden: Vec<(usize, usize)> = self
+            .docked
+            .into_iter()
+            .chain(self.undocked.iter().map(|(editor, _)| *editor))
+            .chain(self.pending_close.iter().copied())
+            .collect();
         #[cfg(target_os = "macos")]
-        let hidden: [Option<(usize, usize)>; 0] = [];
+        let hidden: Vec<(usize, usize)> = Vec::new();
         let Some(streamed) = self.streamed.as_mut() else {
             return;
         };
-        let events = streamed.finish_frame(ctx, |rack, slot| hidden.contains(&Some((rack, slot))));
+        let events = streamed.finish_frame(ctx, |rack, slot| hidden.contains(&(rack, slot)));
         for event in events {
             match event {
                 streamed::StreamedWindowEvent::CloseEditor { rack, slot } => {
@@ -2706,19 +2710,29 @@ impl LiveRackApp {
     fn close_open_editor(&mut self) -> bool {
         let racks = self.controller.document().model.racks.len();
         let running = self.online();
+        // Linux: editors closed a moment ago still read as open until the next picture poll.
+        #[cfg(target_os = "linux")]
+        let closing: Vec<(usize, usize)> =
+            self.undocked.iter().map(|(editor, _)| *editor).collect();
+        #[cfg(not(target_os = "linux"))]
+        let closing: Vec<(usize, usize)> = Vec::new();
         let Ok(product) = self.product.as_mut() else {
             return false;
         };
         let open = (0..racks).find_map(|rack| {
             (0..MAX_SLOTS_PER_RACK)
-                .find(|&slot| product.editor_open(rack, slot))
+                .find(|&slot| product.editor_open(rack, slot) && !closing.contains(&(rack, slot)))
                 .map(|slot| (rack, slot))
         });
         let Some((rack, slot)) = open else {
             return false;
         };
-        if let Err(error) = product.set_native_editor_open(rack, slot, false, running) {
-            self.show_fault(error);
+        match product.set_native_editor_open(rack, slot, false, running) {
+            #[cfg(target_os = "linux")]
+            Ok(()) => self.undocked.push(((rack, slot), Instant::now())),
+            #[cfg(not(target_os = "linux"))]
+            Ok(()) => {}
+            Err(error) => self.show_fault(error),
         }
         true
     }

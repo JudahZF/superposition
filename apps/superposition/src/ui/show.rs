@@ -431,14 +431,26 @@ impl LiveRackApp {
                     }
                     ui.with_layout(EguiLayout::left_to_right(Align::Center), |ui| {
                         let width = ui.available_width();
-                        let galley =
-                            galley(ui, message, TypographyRole::Body, ColorToken::Text, width);
+                        let galley = galley(
+                            ui,
+                            message.clone(),
+                            TypographyRole::Body,
+                            ColorToken::Text,
+                            width,
+                        );
                         let (rect, response) =
                             ui.allocate_exact_size(galley.size(), Sense::hover());
                         ui.painter()
                             .galley(rect.min, galley, color(ColorToken::Text));
-                        response
-                            .widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, "Fault"));
+                        // A long message is cut short; hover and assistive technology get it all.
+                        response.widget_info(|| {
+                            WidgetInfo::labeled(
+                                WidgetType::Label,
+                                true,
+                                format!("Fault: {message}"),
+                            )
+                        });
+                        let _ = response.on_hover_text(&message);
                     });
                 });
             });
@@ -898,9 +910,10 @@ fn pad(
             ColorToken::AccentText,
             ColorToken::AccentText,
         ),
+        // Dim on the hover fill is below 4.5:1, so a hovered pad's number turns text colour.
         (true, false, true) => (
             Some(ColorToken::HoverFill),
-            ColorToken::Dim,
+            ColorToken::Text,
             ColorToken::Text,
         ),
         (true, false, false) => (None, ColorToken::Dim, ColorToken::Dim),
