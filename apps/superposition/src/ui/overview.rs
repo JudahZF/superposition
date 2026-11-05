@@ -64,7 +64,6 @@ impl LiveRackApp {
             ColorToken::Dim,
             inner.width(),
         );
-        let mut y = inner.top() + line() + sp(Spacing::S6);
         let model = &self.controller.document().model;
         let all: Vec<usize> = (0..model.racks.len()).collect();
         let pages: Vec<(String, Vec<usize>)> = model
@@ -81,58 +80,64 @@ impl LiveRackApp {
                 (page.name.clone(), racks)
             })
             .collect();
-        let row_height = page_row_height();
-        let row = |y: f32| {
-            Rect::from_min_size(
-                Pos2::new(inner.left(), y),
-                Vec2::new(inner.width(), row_height),
-            )
-        };
-        if self
-            .page_row(
-                ui,
-                row(y),
-                id.with("all"),
-                None,
-                "All racks",
-                &all,
-                self.page.is_none(),
-            )
-            .clicked()
-        {
-            self.show_page(None);
-        }
-        y += row_height + sp(Spacing::S2);
-        for (index, (name, racks)) in pages.iter().enumerate() {
-            let response = self.page_row(
-                ui,
-                row(y),
-                id.with(("page", index)),
-                Some(index + 1),
-                name,
-                racks,
-                self.page == Some(index),
-            );
-            if response.clicked() {
-                self.show_page(Some(index));
-            }
-            if response.secondary_clicked() {
-                self.overlay = Overlay::PageMenu {
-                    page: index,
-                    at: pointer_or(ui, response.rect.left_bottom()),
+        // Sixteen pages outgrow a short window, so the rows scroll.
+        let rows = Rect::from_min_max(
+            Pos2::new(inner.left(), inner.top() + line() + sp(Spacing::S6)),
+            inner.max,
+        );
+        let mut rows_ui = ui.new_child(UiBuilder::new().max_rect(rows));
+        egui::ScrollArea::vertical()
+            .id_salt("page_rail")
+            .auto_shrink([false, false])
+            .show(&mut rows_ui, |ui| {
+                ui.spacing_mut().item_spacing.y = sp(Spacing::S2);
+                let row = |ui: &mut Ui, height: f32| {
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover())
+                        .0
                 };
-            }
-            y += row_height + sp(Spacing::S2);
-        }
-        if pages.len() < MAX_PAGES {
-            let add = Rect::from_min_size(
-                Pos2::new(inner.left(), y),
-                Vec2::new(inner.width(), px(Layout::Control)),
-            );
-            if new_page_row(ui, add, id.with("new_page")).clicked() {
-                self.new_page(None);
-            }
-        }
+                let all_row = row(ui, page_row_height());
+                if self
+                    .page_row(
+                        ui,
+                        all_row,
+                        id.with("all"),
+                        None,
+                        "All racks",
+                        &all,
+                        self.page.is_none(),
+                    )
+                    .clicked()
+                {
+                    self.show_page(None);
+                }
+                for (index, (name, racks)) in pages.iter().enumerate() {
+                    let page_row = row(ui, page_row_height());
+                    let response = self.page_row(
+                        ui,
+                        page_row,
+                        id.with(("page", index)),
+                        Some(index + 1),
+                        name,
+                        racks,
+                        self.page == Some(index),
+                    );
+                    if response.clicked() {
+                        self.show_page(Some(index));
+                    }
+                    if response.secondary_clicked() {
+                        self.overlay = Overlay::PageMenu {
+                            page: index,
+                            at: pointer_or(ui, response.rect.left_bottom()),
+                        };
+                    }
+                }
+                if pages.len() < MAX_PAGES {
+                    let add = row(ui, px(Layout::Control));
+                    if new_page_row(ui, add, id.with("new_page")).clicked() {
+                        self.new_page(None);
+                    }
+                }
+            });
     }
 
     /// One page row: number and name, the rack count, and one level bar per rack. Accent while
@@ -257,6 +262,7 @@ impl LiveRackApp {
         let content_width = (width + gap) * visible.len() as f32 - gap + add_width;
         let scroll_to_selected = std::mem::take(&mut self.scroll_to_selected);
         egui::ScrollArea::horizontal()
+            .id_salt("strips")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let (content, _) =

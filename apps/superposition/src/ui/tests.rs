@@ -231,6 +231,19 @@ fn render_show_screen_snapshots() {
     );
     app.show_page(Some(0));
     snapshot(&mut app, (1920.0, 1080.0), &directory.join("page.png"));
+    // Sixteen pages on the default window: the page rail scrolls.
+    let fixture_pages = app.controller.document().model.pages.clone();
+    while app.controller.document().model.pages.len() < sp_model::MAX_PAGES {
+        app.new_page(None);
+    }
+    app.show_page(Some(0));
+    snapshot(
+        &mut app,
+        (1180.0, 720.0),
+        &directory.join("pages-sixteen.png"),
+    );
+    app.controller.document_mut().model.pages = fixture_pages;
+    app.show_page(Some(0));
     app.overlay = Overlay::RackPages {
         rack: 0,
         at: egui::pos2(20.0, 140.0),
