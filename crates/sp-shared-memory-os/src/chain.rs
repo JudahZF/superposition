@@ -281,21 +281,23 @@ mod tests {
     use super::{ChainLink, Forwarded, Hop};
     use crate::{MonotonicClock, SharedMemoryRegion};
 
-    /// 96 frames at 96 kHz: a 1 ms period with a 125 µs margin, in nanosecond ticks on Linux.
+    /// 96 frames at 96 kHz: a 1 ms period and a 125 µs margin.
     #[test]
-    #[cfg(target_os = "linux")]
     fn a_hop_works_to_the_host_deadline_or_one_block() {
         let clock = MonotonicClock::new().unwrap();
-        let untimed = Hop::derive(10_000_000, 0, clock, 96, 96_000);
-        assert_eq!(untimed.forward_tick, 10_000_000 - 125_000);
-        assert_eq!(untimed.deadline_tick, 10_000_000 + 1_000_000 - 125_000);
-        let timed = Hop::derive(10_000_000, 400_000, clock, 96, 96_000);
-        assert_eq!(timed.forward_tick, 10_000_000 - 125_000);
-        assert_eq!(timed.deadline_tick, 10_000_000 + 400_000 - 125_000);
+        let ticks = |micros| clock.duration_to_ticks(Duration::from_micros(micros));
+        let published = ticks(10_000);
+        let untimed = Hop::derive(published, 0, clock, 96, 96_000);
+        assert_eq!(untimed.forward_tick, published - ticks(125));
+        assert_eq!(untimed.deadline_tick, published + ticks(1_000) - ticks(125));
+        let offset = u32::try_from(ticks(400)).unwrap();
+        let timed = Hop::derive(published, offset, clock, 96, 96_000);
+        assert_eq!(timed.forward_tick, published - ticks(125));
+        assert_eq!(timed.deadline_tick, published + ticks(400) - ticks(125));
         // The next segment receives the forwarded tick and offset and finishes one margin earlier.
         let offset = u32::try_from(timed.deadline_tick - timed.forward_tick).unwrap();
         let next = Hop::derive(timed.forward_tick, offset, clock, 96, 96_000);
-        assert_eq!(next.deadline_tick, timed.deadline_tick - 125_000);
+        assert_eq!(next.deadline_tick, timed.deadline_tick - ticks(125));
     }
 
     #[test]
