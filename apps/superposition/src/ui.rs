@@ -2224,6 +2224,22 @@ impl LiveRackApp {
             .collect();
     }
 
+    /// Whether a slot's editor is open. On Linux an editor the app just closed counts as closed,
+    /// although the worker reports it open until its next picture poll.
+    fn editor_open(&self, rack: usize, slot: usize) -> bool {
+        #[cfg(target_os = "linux")]
+        if self
+            .undocked
+            .iter()
+            .any(|(closed, _)| *closed == (rack, slot))
+        {
+            return false;
+        }
+        self.product
+            .as_ref()
+            .is_ok_and(|product| product.editor_open(rack, slot))
+    }
+
     /// Whether `rack` and `slot` is a hot plug-in.
     fn is_hot(&self, rack: usize, slot: usize) -> bool {
         let model = &self.controller.document().model;
@@ -2673,18 +2689,23 @@ impl LiveRackApp {
     fn finish_streamed_windows(&mut self, ctx: &egui::Context) {
         let running = self.online();
         #[cfg(target_os = "linux")]
-        let hidden: Vec<(usize, usize)> = self
-            .docked
-            .into_iter()
-            .chain(self.undocked.iter().map(|(editor, _)| *editor))
-            .chain(self.pending_close.iter().copied())
-            .collect();
+        let hidden: Vec<(u32, usize)> = self.product.as_ref().map_or_else(
+            |_| Vec::new(),
+            |product| {
+                self.docked
+                    .into_iter()
+                    .chain(self.undocked.iter().map(|(editor, _)| *editor))
+                    .chain(self.pending_close.iter().copied())
+                    .filter_map(|(rack, slot)| product.editor_window_owner(rack, slot))
+                    .collect()
+            },
+        );
         #[cfg(target_os = "macos")]
-        let hidden: Vec<(usize, usize)> = Vec::new();
+        let hidden: Vec<(u32, usize)> = Vec::new();
         let Some(streamed) = self.streamed.as_mut() else {
             return;
         };
-        let events = streamed.finish_frame(ctx, |rack, slot| hidden.contains(&(rack, slot)));
+        let events = streamed.finish_frame(ctx, &hidden);
         for event in events {
             match event {
                 streamed::StreamedWindowEvent::CloseEditor { rack, slot } => {

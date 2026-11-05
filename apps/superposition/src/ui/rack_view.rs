@@ -297,10 +297,7 @@ impl LiveRackApp {
         };
         let token = self.slot_token(rack, slot);
         let selected = self.selected_slot == Some(slot);
-        let live = self
-            .product
-            .as_ref()
-            .is_ok_and(|product| product.editor_open(rack, slot));
+        let live = self.editor_open(rack, slot);
         let response = ui.interact(row, id, Sense::click());
         if selected || response.hovered() {
             ui.painter()
@@ -448,8 +445,13 @@ impl LiveRackApp {
         );
         #[cfg(target_os = "linux")]
         if self.docked == Some((rack, slot))
+            && let Some(owner) = self
+                .product
+                .as_ref()
+                .ok()
+                .and_then(|product| product.editor_window_owner(rack, slot))
             && let Some(streamed) = self.streamed.as_mut()
-            && streamed.draw_docked(ui, body, rack, slot)
+            && streamed.draw_docked(ui, body, owner)
         {
             return;
         }
@@ -534,10 +536,7 @@ impl LiveRackApp {
             ui.spacing_mut().item_spacing.x = sp(Spacing::S6);
             #[cfg(target_os = "linux")]
             {
-                let open = self
-                    .product
-                    .as_ref()
-                    .is_ok_and(|product| product.editor_open(rack, slot));
+                let open = self.editor_open(rack, slot);
                 if self.docked == Some((rack, slot)) && open {
                     if button(ui, "Pop out", None, ButtonKind::Outline, true).clicked() {
                         self.pop_out_editor();
@@ -604,10 +603,7 @@ impl LiveRackApp {
         } else {
             dashed_rect(ui, body, ColorToken::Hairline, Radius::Card);
         }
-        let open = self
-            .product
-            .as_ref()
-            .is_ok_and(|product| product.editor_open(rack, slot));
+        let open = self.editor_open(rack, slot);
         #[cfg(target_os = "linux")]
         let docked = self.docked == Some((rack, slot));
         #[cfg(not(target_os = "linux"))]

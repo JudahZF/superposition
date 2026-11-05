@@ -139,11 +139,9 @@ struct Shown {
 }
 
 impl Shown {
-    #[cfg(target_os = "linux")]
-    fn is_slot(&self, rack: usize, slot: usize) -> bool {
-        self.info.kind == WindowKind::Normal
-            && self.info.rack.and_then(|rack| usize::try_from(rack).ok()) == Some(rack)
-            && self.info.slot.and_then(|slot| usize::try_from(slot).ok()) == Some(slot)
+    /// The editor's owner: its worker's process ID and the slot's number in that worker.
+    fn owner(&self) -> Option<(u32, usize)> {
+        Some((self.info.pid?, usize::try_from(self.info.slot?).ok()?))
     }
 
     /// The plug-in slot whose editor this is, if any.
@@ -336,18 +334,21 @@ impl StreamedWindows {
         self.shown = windows;
     }
 
-    /// Draws a slot's editor docked in `area`: top-centred, shrunk to fit but never enlarged.
-    /// Returns false when that editor has no window yet. Linux only: macOS editors stay native
-    /// windows.
+    /// Draws the editor `owner` (see [`Shown::owner`]) docked in `area`: top-centred, shrunk to
+    /// fit but never enlarged. Returns false when that editor has no window yet. Linux only:
+    /// macOS editors stay native windows.
     #[cfg(target_os = "linux")]
     pub(crate) fn draw_docked(
         &mut self,
         ui: &mut egui::Ui,
         area: egui::Rect,
-        rack: usize,
-        slot: usize,
+        owner: (u32, usize),
     ) -> bool {
-        let Some(window) = self.shown.iter().find(|window| window.is_slot(rack, slot)) else {
+        let Some(window) = self
+            .shown
+            .iter()
+            .find(|window| window.info.kind == WindowKind::Normal && window.owner() == Some(owner))
+        else {
             return false;
         };
         let Some(texture) = self.textures.get(&window.info.id) else {
@@ -377,8 +378,9 @@ impl StreamedWindows {
         true
     }
 
-    /// Draws the windows not docked this frame, except editors `hidden` names, then forwards
-    /// input. Returns editor close requests. Call after the panels.
+    /// Draws the windows not docked this frame, except the editors whose owners (see
+    /// [`Shown::owner`]) `hidden` lists, then forwards input. Returns editor close requests.
+    /// Call after the panels.
     #[allow(
         clippy::too_many_lines,
         reason = "one pass: draw windows, then popups over their parents, then input"
@@ -386,7 +388,7 @@ impl StreamedWindows {
     pub(crate) fn finish_frame(
         &mut self,
         ctx: &Context,
-        hidden: impl Fn(usize, usize) -> bool,
+        hidden: &[(u32, usize)],
     ) -> Vec<StreamedWindowEvent> {
         let windows = std::mem::take(&mut self.shown);
         if windows.is_empty() {
@@ -400,7 +402,7 @@ impl StreamedWindows {
                 window.info.kind == WindowKind::Normal
                     && !is_decoration(&window.info)
                     && !self.placed.contains_key(&window.info.id)
-                    && !window.slot().is_some_and(|(rack, slot)| hidden(rack, slot))
+                    && !window.owner().is_some_and(|owner| hidden.contains(&owner))
             })
             .collect();
         for window in floating {
@@ -815,9 +817,9 @@ mod tests {
         assert_eq!(keysym(Key::ArrowLeft, true), Some(0xff51));
     }
 
-    /// The rack view's docked editor: drawn in its pane at the pane's scale rather than as a
-    /// floating window, clicks land at the editor's own pixel coordinates, and nothing reaches it
-    /// through a popover drawn over it.
+    /// The rack view's docked editor: found by its worker whatever its rack tag says, drawn in
+    /// its pane at the pane's scale rather than as a floating window, clicks land at the editor's
+    /// own pixel coordinates, and nothing reaches it through a popover drawn over it.
     #[cfg(target_os = "linux")]
     mod docking {
         use std::io::Read;
@@ -834,6 +836,8 @@ mod tests {
         use super::super::{Connection, StreamedWindows};
 
         const EDITOR: WindowId = WindowId(7);
+        /// The worker process that owns the editor.
+        const WORKER: u32 = 4242;
         const WIDTH: u16 = 800;
         const HEIGHT: u16 = 600;
 
@@ -842,7 +846,7 @@ mod tests {
             Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::new(400.0, 300.0))
         }
 
-        /// A window source on the far end of a socket that streams one editor for rack 0,
+        /// A window source on the far end of a socket that streams one editor: worker `WORKER`,
         /// slot 1.
         fn streamed_editor(ctx: &Context) -> (StreamedWindows, UnixStream) {
             let (client, mut server) = UnixStream::pair().expect("socket pair");
@@ -866,9 +870,10 @@ mod tests {
                 y: 0,
                 width: WIDTH,
                 height: HEIGHT,
-                rack: Some(0),
+                // A stale tag, as after a live rack move: docking goes by the worker instead.
+                rack: Some(5),
                 slot: Some(1),
-                pid: None,
+                pid: Some(WORKER),
                 transient_for: None,
             };
             let image = vec![0x80; usize::from(WIDTH) * usize::from(HEIGHT) * 4];
@@ -901,7 +906,7 @@ mod tests {
             (windows, server)
         }
 
-        /// One frame: the pane docks slot 1's editor, an optional popover covers `cover`, and
+        /// One frame: the pane docks the worker's slot 1 editor, an optional popover covers `cover`, and
         /// `events` arrive. Returns whether the editor was docked.
         fn frame(
             ctx: &Context,
@@ -918,7 +923,7 @@ mod tests {
             let _ = ctx.run(input, |ctx| {
                 windows.begin_frame(ctx);
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    docked = windows.draw_docked(ui, pane(), 0, 1);
+                    docked = windows.draw_docked(ui, pane(), (WORKER, 1));
                 });
                 if let Some(cover) = cover {
                     egui::Area::new(egui::Id::new("popover"))
@@ -928,7 +933,7 @@ mod tests {
                             ui.allocate_exact_size(cover.size(), egui::Sense::click())
                         });
                 }
-                let _ = windows.finish_frame(ctx, |_, _| false);
+                let _ = windows.finish_frame(ctx, &[]);
             });
             docked
         }

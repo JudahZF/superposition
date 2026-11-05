@@ -2740,6 +2740,25 @@ impl ProductRuntime {
         updates
     }
 
+    /// Which window is a slot's editor: its worker's process ID and the slot's number in that
+    /// worker. Workers tag their windows with the rack index they were started at, which a live
+    /// rack move leaves stale; the process ID never is. Linux docks editors by it.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn editor_window_owner(
+        &self,
+        rack_index: usize,
+        slot: usize,
+    ) -> Option<(u32, usize)> {
+        let worker = self.workers.get(&rack_index)?;
+        let index = worker.worker_of(slot);
+        let session = match index.checked_sub(1) {
+            Some(segment) => worker.segments.get(segment)?.session.as_ref(),
+            None => worker.session.as_ref(),
+        }?;
+        let local = slot.checked_sub(worker.worker_slots(index).start)?;
+        Some((u32::try_from(session.process_id()).ok()?, local))
+    }
+
     /// Whether this slot's native editor window is open, as last reported by its worker.
     pub(crate) fn editor_open(&self, rack_index: usize, slot: usize) -> bool {
         self.workers
