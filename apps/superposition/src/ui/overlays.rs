@@ -35,6 +35,7 @@ enum PageCommand {
 enum SlotCommand {
     Action(SlotAction),
     Sidechain,
+    Pin,
 }
 
 /// A plug-in picker row.
@@ -146,13 +147,21 @@ impl LiveRackApp {
             .product
             .as_ref()
             .is_ok_and(|product| product.stale_catalog_entries() > 0);
-        let items: [MenuItem<SlotCommand>; 8] = [
+        let hot = self.is_hot(rack, slot);
+        let pin_room =
+            self.controller.document().model.hot_plugins.len() < sp_model::MAX_HOT_PLUGINS;
+        let items: [MenuItem<SlotCommand>; 9] = [
             Some((
                 "Open editor",
                 "↩",
                 !missing,
                 SlotCommand::Action(SlotAction::Editor(slot)),
             )),
+            Some(if hot {
+                ("Unpin from hot plug-ins", "", true, SlotCommand::Pin)
+            } else {
+                ("Pin to hot plug-ins", "", pin_room, SlotCommand::Pin)
+            }),
             Some((
                 if model_slot.bypassed {
                     "Enable"
@@ -205,6 +214,7 @@ impl LiveRackApp {
         match command {
             SlotCommand::Action(action) => self.slot_action(ctx, action),
             SlotCommand::Sidechain => self.overlay = Overlay::Sidechain { rack, slot, at },
+            SlotCommand::Pin => self.toggle_hot_plugin(rack, slot),
         }
     }
 
@@ -331,7 +341,7 @@ impl LiveRackApp {
     }
 
     /// Whether a slot's plug-in declares a stereo aux input usable as a sidechain.
-    fn accepts_sidechain(&self, slot: &sp_model::PluginSlot) -> bool {
+    pub(super) fn accepts_sidechain(&self, slot: &sp_model::PluginSlot) -> bool {
         self.catalog_plugins.iter().any(|plugin| {
             plugin.sidechain_capable
                 && plugin.descriptor.identity.unique_id == slot.plugin.identity.unique_id

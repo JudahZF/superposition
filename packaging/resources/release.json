@@ -46,8 +46,20 @@
       }
     },
     {
-      "source": "packaging/fonts/IBMPlexMono-Medium.ttf",
-      "destination": "Fonts/IBMPlexMono-Medium.ttf",
+      "source": "packaging/fonts/Inter-Regular.ttf",
+      "destination": "Fonts/Inter-Regular.ttf",
+      "sha256": null,
+      "provenance": {
+        "source": null,
+        "license": null,
+        "rights_holder": null,
+        "approval_owner": null,
+        "approval_reference": null
+      }
+    },
+    {
+      "source": "packaging/fonts/Inter-SemiBold.ttf",
+      "destination": "Fonts/Inter-SemiBold.ttf",
       "sha256": null,
       "provenance": {
         "source": null,

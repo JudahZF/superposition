@@ -2,7 +2,7 @@
 //!
 //! The renderer resolves colours straight from [`ColorToken`]; this module is the inventory of
 //! which tokens meet on screen. Faint text is reserved for disabled and decorative content (empty
-//! slots, tick labels), which WCAG exempts. Hovered list rows promote secondary text to
+//! slots, tick labels), which WCAG exempts. Hovered rows promote secondary text to
 //! [`ColorToken::Text`], because dim on the hover fill is below 4.5:1.
 
 use super::tokens::ColorToken;
@@ -40,38 +40,52 @@ impl Pairing {
 
 /// Every text pairing the UI draws. Each must meet [`AA_NORMAL_TEXT_RATIO`].
 ///
-/// Preview captions use an opaque base bar, so plug-in pictures never reduce caption contrast.
-pub const TEXT_PAIRINGS: [Pairing; 12] = [
-    // Primary, secondary, and state-token text on the window and preview captions.
+/// Preview captions use an opaque surface bar, so plug-in pictures never reduce caption contrast.
+pub const TEXT_PAIRINGS: [Pairing; 19] = [
+    // Primary, secondary, and state text on the window.
     Pairing::new(ColorToken::Text, ColorToken::Base),
     Pairing::new(ColorToken::Dim, ColorToken::Base),
     Pairing::new(ColorToken::Warn, ColorToken::Base),
     Pairing::new(ColorToken::Fault, ColorToken::Base),
     Pairing::new(ColorToken::Info, ColorToken::Base),
-    // Inverted-video selection: selected rack header, active scene, hovered menu row.
-    Pairing::new(ColorToken::Base, ColorToken::Text),
-    Pairing::new(ColorToken::Faint, ColorToken::Text),
-    // Lit Mute and Byp toggles.
-    Pairing::new(ColorToken::Base, ColorToken::Warn),
-    Pairing::new(ColorToken::Base, ColorToken::Info),
-    // Fault line.
+    // The same on cards, rails, popovers, and preview captions.
+    Pairing::new(ColorToken::Text, ColorToken::Surface),
+    Pairing::new(ColorToken::Dim, ColorToken::Surface),
+    Pairing::new(ColorToken::Warn, ColorToken::Surface),
+    Pairing::new(ColorToken::Fault, ColorToken::Surface),
+    Pairing::new(ColorToken::Info, ColorToken::Surface),
+    // Route and count chips.
+    Pairing::new(ColorToken::Text, ColorToken::SegmentOff),
+    // Active tab, active scene, primary buttons, and the selected menu row.
+    Pairing::new(ColorToken::AccentText, ColorToken::Accent),
+    // Lit Mute and Bypass toggles, warn chips, and sidechain chips.
+    Pairing::new(ColorToken::Warn, ColorToken::WarnTint),
+    Pairing::new(ColorToken::Info, ColorToken::InfoTint),
+    // Fault banner.
     Pairing::new(ColorToken::Text, ColorToken::FaultTint),
     Pairing::new(ColorToken::Fault, ColorToken::FaultTint),
-    // Hovered list rows.
+    // Hovered rows and buttons.
     Pairing::new(ColorToken::Text, ColorToken::HoverFill),
+    Pairing::new(ColorToken::Fault, ColorToken::HoverFill),
+    Pairing::new(ColorToken::Warn, ColorToken::HoverFill),
 ];
 
 /// Every non-text boundary the UI relies on. Each must meet [`AA_NON_TEXT_RATIO`].
-pub const BOUNDARY_PAIRINGS: [Pairing; 5] = [
-    // Selected preview, focus outline, and gain marker.
-    Pairing::new(ColorToken::Text, ColorToken::Base),
-    // Hovered preview and popover border.
-    Pairing::new(ColorToken::Dim, ColorToken::Base),
+pub const BOUNDARY_PAIRINGS: [Pairing; 8] = [
+    // Selection rings and the focus outline on the window and on cards.
+    Pairing::new(ColorToken::Accent, ColorToken::Base),
+    Pairing::new(ColorToken::Accent, ColorToken::Surface),
+    // Hovered card and popover borders.
+    Pairing::new(ColorToken::Dim, ColorToken::Surface),
     // Lit and clipping meter segments against unlit ones.
     Pairing::new(ColorToken::Text, ColorToken::SegmentOff),
     Pairing::new(ColorToken::Fault, ColorToken::SegmentOff),
-    // Lit toggles on the window.
-    Pairing::new(ColorToken::Info, ColorToken::Base),
+    // Status dots on cards.
+    Pairing::new(ColorToken::Success, ColorToken::Surface),
+    // Fader thumbs on their track.
+    Pairing::new(ColorToken::Text, ColorToken::Surface),
+    // Lit toggle borders.
+    Pairing::new(ColorToken::Info, ColorToken::Surface),
 ];
 
 #[cfg(test)]

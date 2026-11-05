@@ -1,362 +1,226 @@
-# Superposition UI design: film strip
+# Superposition UI design: overview and rack view
 
-Status: approved design, 2026-09-25; implemented the same day. This document is the
-implementation brief for the egui show screen. It is self-contained; the interactive
-mock and the exploration documents are references, not requirements.
+Status: implemented 2026-11-05. It replaces the film-strip design of 2026-09-25 (see
+this file's history). The style follows T3 Code's dark theme; the layout follows Waves
+SuperRack's Overview and Rack windows and its hot plug-ins panel.
 
-Where the build differs from this brief, and why:
-
-- Columns are a fixed 240 px instead of the mock's stretching `minmax(196px, 1fr)`
-  grid, so a column looks the same with two racks or eight.
-- LED segments are 3 px, not 4 px. Sixteen 4 px segments with 2 px gaps need 94 px,
-  which does not fit the 80 px meter.
-- Preview height adapts to the column: 84 px at 1920×1080, shrinking to at least
-  60 px on the laptop preset or while the fault line shows, so nothing scrolls
-  vertically.
-- Preview caption bars are opaque base, not 85 %, so a bright plug-in picture never
-  lowers caption contrast below AA.
-- The scene counter shows the model's limit (`n of 256 parameters`), not 64.
-- The recovery modal gives ages ("from 12 min ago") rather than clock times.
-- Hovered list rows draw their secondary text in text colour; dim on the hover
-  fill is below 4.5:1.
-- A rack-sourced sidechain carries whatever that rack sends to the device, so a
-  rack in dry fallback feeds its dry audio; a muted rack feeds silence.
-- Only meters animate: egui's own hover and popover fades are turned off.
-
-References:
-
-- Interactive mock (authoritative for look and behaviour): `plans/2026-09-25-film-strip-full-mock.html`,
-  published at https://pl8admm8jpr4.postplan.dev
-- Variation study with the preview capture design: `plans/2026-09-25-bench-variations.html`
-- Five-direction exploration (history only): `plans/2026-09-25-ui-design-directions.html`
+The code is in `apps/superposition/src/ui/`: `show.rs` (top bar, fault banner, scene bar,
+shared rack controls), `overview.rs`, `rack_view.rs`, `overlays.rs`, `setup.rs`,
+`previews.rs`, and `streamed.rs` (streamed and docked editor windows). Tokens are in
+`crates/sp-ui/src/design/`.
 
 ## 1. Decisions
 
-1. The app is a plug-in host, not a mixer. There is no master bus, no master strip,
-   no master meter. Each rack's output pair goes straight to the device. Remove
-   `main_output_meter` and the master strip from the app.
-2. All parameter editing happens in the plug-in's own editor window. The generic
-   parameter editor, the parameter drawer and the bottom rack detail pane are
-   removed from the product UI. Keep the worker parameter protocol; scenes and MIDI
-   mappings still read and write normalized values through it.
-3. Every rack has an audio input, mono or stereo. The UI never offers a "no input"
-   or "return" rack. The model keeps `RackChannelRoute.input: Option<..>` for
-   compatibility with saved sessions, but the UI always writes `Some`. If
-   instrument racks are wanted later, add them as a distinct input mode, not as
-   "no input".
+1. The app is a plug-in host, not a mixer. There is no master bus. Each rack's output pair
+   goes straight to the device.
+2. All parameter editing happens in the plug-in's own editor. Scenes and MIDI mappings
+   still read and write normalized values through the worker parameter protocol.
+3. Every rack has an audio input, mono or stereo. The UI never offers a "no input" rack.
+   The model keeps `RackChannelRoute.input: Option<..>` for older sessions, but the UI
+   always writes `Some`.
 4. Plug-ins can take a sidechain from a physical input pair or from another rack's
-   post-fader output. This is new model, protocol and data-plane work (section 8).
-5. Each plug-in slot shows a small picture of its editor as it last looked. The
-   worker captures it; the host stores it in the session package (section 7).
-6. Style is the "Bench" instrument-panel direction: one monospace face on a 16 px
-   line grid, hairline dividers, no cards, no corner radii, no shadows,
-   inverted-video selection, segmented meters. Judah has explicitly rejected: neon
-   or saturated LED colours, uppercase labels, ASCII widgets such as `[====|--]`
-   faders and unicode sparklines, and run-on status lines.
-7. Layout target is a 1920×1080 display at 1× scale: eight rack columns across,
-   eight preview slots down, nothing scrolls vertically. A laptop preset exists for
-   1512×982.
-8. A session holds up to 64 racks. More racks than fit scroll horizontally, and
-   user-defined pages choose which racks show (section 3a).
+   post-fader output (section 10).
+5. Each slot shows a small picture of its editor as it last looked (section 10).
+6. Style: T3 Code's dark theme. Near-black surfaces, cards with hairline borders and 10 px
+   corners, one blue accent for selection and primary actions, Inter for text and IBM Plex
+   Mono for numbers, sentence case everywhere. A state always shows as a word beside a
+   coloured dot, never colour alone. Still ruled out: neon or saturated meter colours,
+   uppercase labels, ASCII widgets such as `[====|--]`, and run-on status lines.
+7. Two views of the racks, as in SuperRack. The overview shows every rack as a narrow strip.
+   The rack view shows one rack in detail, with its plug-in's editor in the centre pane.
+8. Layout targets: 1920×1080 at 1× scale, and a 1512×982 laptop. Nothing scrolls
+   vertically. The overview scrolls sideways when strips do not fit.
+9. A session holds up to 64 racks, 16 pages, and 12 hot plug-ins.
+10. Only meters animate. Hover and popover fades are off.
 
 ## 2. Tokens
 
-Colours (the only ones in the UI chrome; plug-in pictures supply everything else):
+`crates/sp-ui/src/design/tokens.rs` is the only source of colours, spacing, radii, and fixed
+sizes. [brand-assets.md](brand-assets.md) lists the 17 colours. The renderer resolves every
+value through `ui/style.rs`, and source tests fail on raw colours or literal sizes.
 
-| Name | Value | Use |
-| --- | --- | --- |
-| base | `#121315` | window background |
-| text | `#D9DAD6` | primary text, lit meter segments, inverted-selection fill |
-| dim | `#7C8088` | labels, secondary text, tick marks |
-| faint | `#3A3E45` | empty slots, unlit borders, disabled text |
-| hairline | `#26292E` | column dividers, head and foot rules |
-| segment off | `#24272C` | unlit meter segment |
-| hover fill | `#1B1D21` | row hover in lists |
-| warn | `#D9A21B` | LDG and REC tokens, mute lit, route warnings |
-| fault | `#E5484D` | MIS and FLT tokens, top two meter segments, fault line |
-| info | `#7FB0FF` | bypass lit, sidechain marker, mapped CC |
-| fault tint | `#1A1214` | fault line background |
+Radii: 4 px small marks and thumbnails, 6 px controls (buttons, chips, rows, toggles),
+10 px cards and popovers, 14 px the scene bar, full for pills, dots, and scene pads.
 
-Type: IBM Plex Mono (OFL, embedded from `crates/sp-ui/assets/fonts/`) at 12 px
-on a 16 px line. Readout labels are 10 px. Weight
-500 for the wordmark, rack names and popover titles; 400 everywhere else.
-Sentence case for all labels. The only uppercase strings are the three-letter
-state tokens.
+Type (12 px text on a 16 px line):
 
-State tokens, always paired with their colour and never colour alone:
+| Role | Face | Size | Use |
+| --- | --- | --- | --- |
+| Body | Inter 400 | 12 | most text |
+| Strong | Inter 600 | 12 | plug-in and rack names |
+| Title | Inter 600 | 13 | pane and popover titles |
+| Label | Inter 400 | 11 | secondary labels, captions |
+| Wordmark | Inter 600 | 14 | the wordmark |
+| Mono | Plex Mono 400 | 11 | gains, routes, timings, counts, key hints |
+| MonoSmall | Plex Mono 400 | 10 | meter labels, key boxes |
 
-| Token | Meaning | Colour |
-| --- | --- | --- |
-| RDY | ready and processing | text |
-| LDG | loading, or worker recovering | warn |
-| BYP | bypassed (slot or rack) | dim |
-| MIS | plug-in missing on this machine | fault |
-| FLT | worker recovery failed, rack passes dry | fault |
-| REC | rack worker recovering | warn |
-| UNL | engine offline, worker not loaded | dim |
+States, each a word with a dot of its colour: Ready (success), Loading and Recovering
+(warn), Bypassed and Not loaded (dim), Missing and Failed (fault). An open editor shows
+"Editor open" with a fault-colour dot.
 
-Spacing: 4 px unit. Column padding 12 px. Head 56 px, fault line 32 px, foot 40 px.
+Spacing is a 4 px unit. The window gutter and card padding are 12 px; cards sit 6–8 px
+apart.
 
-Motion: only meters animate. Meter repaint keeps the existing 30 Hz cadence and
-ballistics from `sp-ui::components::meter`; no other ambient motion. Respect the
-reduced-motion preference by holding meters still.
+## 3. Top bar (52 px)
 
-## 3. Show screen layout (1920×1080)
+Left to right: the wordmark; the session name with `· unsaved` while dirty; the rack
+selector; the tabs Overview, Rack, Setup. At the right: the latest status message (dim,
+truncated), an engine pill (dot and `Online · <device>`), mono readouts (rate, buffer,
+latency, load, misses, and restarts in warn colour when any worker restarted), then
+Start/Stop engine (outline) and Save ⌘S (primary).
 
-```
-┌ head 56 ───────────────────────────────────────────────────────────────────┐
-│ Superposition  Engine  Device  Rate  Buffer  Latency  Load  Misses          │
-│                Restarts  Session            status message   Stop engine   │
-│                                                              Save ⌘S  Setup ⌘, │
-├ fault line 32, only when a fault is showing ───────────────────────────────┤
-├ columns ───────────────────────────────────────────────────────────────────┤
-│ 01 Vox   │ 02 Keys  │ 03 Gtr   │ …  │ 08 Click │ + add rack (only if < 8)  │
-│ in 1 out 1-2                                                                 │
-│ [preview] ×8 slots                                                           │
-│ Gain -3.0 dB  track                                                          │
-│ LED meters in / L / R                                                        │
-│ Mute Byp                                                                     │
-│ RDY 4/4                                                                      │
-├ foot 40 ───────────────────────────────────────────────────────────────────┤
-│ Scene 1 Intro 2 Verse [3 Chorus] 4 Bridge 5 Outro   Fade − 250 ms +        │
-│ Capture ⌘⇧C  Update  Edit                       Callback ▁▂▃ load bars      │
-└────────────────────────────────────────────────────────────────────────────┘
-```
+The rack selector, `‹ 01 Vox ›`, steps through the racks the current page shows. Click the
+name for the rack menu; double-click to rename (the rack view renames here, the overview in
+the strip header).
 
-Head readouts are cells: a 10 px dim label above a 12 px value. Cells: Engine
-(Online / Connecting / Offline), Device (output device name), Rate, Buffer,
-Latency (buffer ÷ 48 in ms), Load (callback %), Misses (deadline misses),
-Restarts (sum of worker restarts, warn colour when non-zero), Session (name, with
-` *` when dirty). Then the latest status message in dim, right-aligned, then the
-actions: Start/Stop engine, Save ⌘S, Setup ⌘, (inverted while the setup page is
-open). Actions are plain text; hover underlines them.
+## 4. Overview
 
-Columns are a fixed 240 px, whatever the rack count, plus a 120 px "+ add rack"
-column right after the last rack while fewer than 64 racks exist. Spare width stays
-empty; a narrow window scrolls horizontally. Columns are separated by hairlines. Each column, top to
-bottom:
+A 184 px page rail, then one 124 px strip per shown rack, then a dashed "Add rack" strip
+while fewer than 64 racks exist. Thirteen strips fit across 1920 px; more scroll sideways.
 
-1. Header: `0n` index in dim, rack name, gain in dB at the right. The selected
-   rack's header is inverted (text fill, base text). Click selects, double-click
-   renames inline, right-click opens the rack menu.
-2. Route line in dim: `in 1   out 1-2`. Warn colour if any channel is not on the
-   current device. Click opens the route popover.
-3. Eight preview slots of 216×84 (column width less padding × 84 px), 4 px apart. Filled slots
-   show the preview; the first empty slot is a dashed "+ add plug-in"; later empty
-   slots are dashed and blank so all columns share one rhythm.
-4. Gain: label row (`Gain` dim, value in text), a 2 px track with a 1 px tick at
-   0 dB and a 2×12 px marker, tick labels -60, 0, +12 in faint. Range -60 to +12
-   dB. Click or drag sets; double-click resets to 0 dB.
-5. Meters: three LED columns (in, L, R), 12 px wide, 16 segments of 4 px with 2 px
-   gaps, 80 px tall. Lit segments are text colour, the top two are fault colour.
-   Offline: lit segments drop to faint.
-6. Mute and Byp: bordered text toggles. Mute lit = warn fill; Byp lit = info fill.
-7. Status: rack token, then `ready/total` slot count, then `muted` in dim.
+Page rail: "All racks", then each page as `n Name` with its rack count and one small level
+bar per rack, then "+ New page". The shown page is accent-filled. Right-click a page for
+Rename… and Remove page. The rail replaces the old page line.
 
-Laptop preset (1512×982): previews drop to 60 px tall, six 240 px columns fit, the
-rest scroll horizontally. Nothing else changes.
+A strip, top to bottom, follows its signal:
 
-Empty session: the column area shows one centred message, "No racks yet. Add a
-rack, then choose a plug-in after scanning." with the add-rack column.
+1. Header: `01` in mono dim and the rack name. Click selects, double-click renames,
+   right-click opens the rack menu. The selected rack's card has the accent ring.
+2. Route chips `In 1` and `Out 1-2`, warn-coloured if the device lacks a channel. Click
+   opens the route popover.
+3. Eight slot rows: thumbnail, name, state dot. Hover shows the full picture beside the
+   row. Click opens the plug-in in the rack view; right-click opens the slot menu. The first
+   empty row is a dashed "+ Add plug-in"; later empty rows are dashed and blank so every
+   strip shares one rhythm.
+4. Meters (in, L, R) beside a vertical gain fader, filling the remaining height, with the
+   gain in mono below.
+5. Mute (warn tint when lit) and Bypass (info tint when lit).
+6. The rack state, `ready/total`, and `muted` in warn colour.
 
-## 4. Preview tile
+An empty session or page shows a centred message beside the "Add rack" strip.
 
-```
-┌──────────────────────────────┐
-│ (editor picture, cropped)    │
-│                              │
-│ Pro-C 2        SC Drums RDY 2 min │  ← caption bar, 14 px, 85 % base
-└──────────────────────────────┘
-```
+## 5. Rack view
 
-- Picture: the 320×200 capture scaled to the tile width and cropped to its middle
-  band. Hover shows the full capture at 322×202 in a popover beside the tile.
-- Caption: name at the left (truncates with an ellipsis); at the right the
-  sidechain marker in info colour if set, the slot token, then the capture age
-  (`2 min`, `1 h`, `Sep 18`) or `live` with a 6 px fault-colour dot while the
-  editor is open.
-- States: live (editor open); captured (age shown); recovering or unloaded
-  (grayscale at 35 % opacity, token LDG or UNL); missing (grayscale, caption in
-  fault colour, MIS); bypassed (picture at 40 % opacity, BYP); never opened
-  (dashed tile with the name and "not opened yet", sidechain marker if set).
-- Selected slot: text-colour border. Hover: dim border.
-- Click opens the editor. Right-click opens the slot menu. Enter opens the
-  editor of the selected slot, B toggles its bypass, arrows move the selection.
+The selected rack, left to right: input strip (92 px), chain (260 px), editor pane (the
+rest), output strip (116 px), and the hot plug-ins rail (176 px). At 1920 px the pane is
+about 1200 px wide; at 1512 px about 800 px.
 
-## 5. Overlays
+- Input strip: the `In` chip (route popover), a tall input meter, and rack Bypass.
+- Chain: "Chain" and `n of 8`, then up to eight rows with a 72 px thumbnail, the name, a
+  sidechain chip, and the state with the picture's age (`Ready · 2 min`) or "Editor open".
+  Click opens the editor; right-click opens the slot menu; ↑↓ move the selection.
+- Editor pane: a header with the plug-in name, `Slot n · Vendor`, and at the right the
+  sidechain chip (opens the sidechain popover), Bypass, Pin/Unpin, and on Linux Pop out or
+  Dock. The body shows the docked editor (section 6). Otherwise it shows the slot's last
+  picture, fitted and at most twice its captured size, with a small card: "The editor is
+  closed." and Open editor ↩; "Opening the editor…"; "The editor is open in its own
+  window." and Dock here (Linux); or the missing-plug-in note. With no slot selected it
+  says how to fill it, with Add plug-in for an empty rack.
+- Output strip: the `Out` chip, L and R meters beside the gain fader, the gain, and Mute.
+- Hot plug-ins: up to 12 pinned plug-ins from any rack, each a picture with its name and
+  rack. Click opens it in the rack view; hover shows × to unpin. "+ Pin selected" pins the
+  selected slot. The slot menu and the pane header also pin and unpin. Removing a slot or
+  its rack unpins it. The pins are saved as `hot_plugins` (see
+  [session-format.md](session-format.md)).
 
-All popovers and modals are bordered boxes (1 px dim border, base fill, 10×12 px
-padding, drop shadow is the one permitted shadow), positioned near what opened
-them. A transparent scrim closes popovers on outside click; modals ignore it.
-Esc closes the topmost overlay, in this order: menu, route popover, sidechain
-popover, plug-in picker, modal, editor window, fault line, setup page.
+With no racks, the view says so and offers Add rack ⌘N.
 
-Rack menu: Rename (double-click), Route…, Move left ⌘←, Move right ⌘→, Remove
-rack…. Move items are disabled at the ends.
+## 6. Editors
 
-Slot menu: Open editor ↩ (disabled when MIS), Bypass/Enable B, Sidechain… (or
-"No sidechain input", disabled, when the plug-in has no aux bus), Move up, Move
-down, Remove plug-in ⌫.
+Workers own their editor windows ([ADR 0005](adr/0005-worker-owned-native-windows.md)).
 
-Route popover: title `Route for <rack>` with the output device in dim. `Input`
-with Mono and Stereo text toggles (selected one inverted), then a jack grid of
-the device's input channels (mono: 16 singles; stereo: 8 pairs), then `Output,
-stereo pair` and the output pair grid. Channels beyond the device are faint and
-disabled. A warn line appears when the route uses channels the device lacks.
-Done Esc. Changing a route re-routes at the next block; no restart.
+Linux: editors draw on the engine's Xvfb and stream into the app. Opening a slot from the
+overview, the chain, a hot plug-in, or ↩ shows the rack view and docks that editor in the
+pane: top-centred, shrunk to fit and never enlarged. One editor is docked at a time. It
+closes when the selection leaves its slot or the rack view hides, and stays hidden for a
+second while its window goes away. Pop out lets it float as its own window and keeps it
+open; Dock brings it back. A docked editor takes pointer input only where nothing is drawn
+over it, so popovers and menus above it work. Pointer positions map to editor pixels at the
+docked scale.
 
-Sidechain popover: title `Sidechain for <plug-in>` with rack and slot in dim.
-Options: None ("plug-in uses its own input"); `From a physical input, stereo
-pair` with an 8-pair grid; `From another rack, post fader` listing every other
-rack with its output pair. One dim line states: "Rack sources arrive one buffer
-late, 1.3 ms at 64 samples. Physical inputs are sample aligned." Changing the
-sidechain reloads the rack transactionally like a topology edit.
+macOS: editors are native windows. Opening a slot shows the rack view and opens or raises
+the editor beside the app window; the pane shows its picture.
 
-Plug-in picker (centred, 560 px wide): title `Add plug-in to <rack>` with `slot n
-of 8`, a search field, the catalog grouped by vendor with hover and keyboard
-cursor (↑↓ ↩ Esc). Quarantined and non-loadable entries are faint with a reason.
-Choosing adds the slot with no preview and reloads the rack. Empty catalog shows
-"No plug-ins yet. Rescan from Setup, Plug-ins."
+## 7. Fault banner and scene bar
 
-Scene capture and edit (centred, 640 px): name field, filter field, the list of
-automatable parameters grouped by `rack, plug-in` with checkboxes and current
-values, a counter `n of 64 parameters`, and one dim line: "Scenes recall only the
-parameters selected here, over the fade time. Opaque plug-in state is never part
-of a scene." Capture defaults to the first two automatable parameters of every
-slot; Edit opens with the scene's current set.
+Fault banner: under the top bar, a rounded fault-tinted card with "Fault", the message,
+and Dismiss Esc.
 
-Modals: Stop the audio engine? (Cancel Esc / Stop engine ↩); Remove <rack>? with
-"Its plug-ins and their settings are removed. Other racks keep playing."; Recover
-the last session? on boot after an unclean shutdown, with Discard / Restore.
+Scene bar: a floating card at the bottom. "Scene", then each scene as a pill `n Name`
+(accent while active, faint while the engine is offline); Fade `− 250 ms +` stepping 50 ms
+from 0 to 10 000; Update and Edit. At the right: "Callback" with twelve bars of recent
+callback load (warn over 90 %), then Capture ⌘⇧C.
 
-Fault line: `Fault` in fault colour, the message in text, Dismiss Esc at the
-right. Replaces the current fault banner card.
+## 8. Overlays
 
-Editor window: the worker-owned native `NSWindow`, unchanged. The host positions
-a newly opened editor beside its column (x ≈ 520 + rack × 40, y ≈ 180 + slot ×
-20 in window coordinates) and brings an already open one to front.
+Popovers and modals are rounded surface cards with a soft shadow, positioned near what
+opened them. A transparent scrim closes popovers on an outside click; modals ignore it. Esc
+closes the topmost overlay, in this order: a menu, popover, picker, or modal; the scene
+editor; an open editor; the fault banner; the setup page.
 
-## 6. Foot line
+Rack menu: Rename, Route…, Pages…, Move left ⌘←, Move right ⌘→, Remove rack…. Move
+items are disabled at the ends of the shown racks.
 
-`Scene` in dim, then each scene as `n Name` (number in dim); the active scene is
-inverted. Scenes are disabled (faint) while the engine is offline. Then `Fade − 250
-ms +` stepping 50 ms from 0 to 10 000. Then Capture ⌘⇧C, Update (rewrites the
-active scene from current values), Edit (opens the picker for the active scene).
-At the right, `Callback` with twelve 3 px bars of recent callback load; a bar
-over 90 % is warn colour. Number keys 1–8 recall scenes.
+Slot menu: Open editor ↩ (disabled when missing), Pin to hot plug-ins or Unpin, Bypass or
+Enable B, Sidechain… (or "No sidechain input" when the plug-in has no aux bus), Move up,
+Move down, Remove plug-in.
 
-## 7. Setup page
+Route popover: `Route for <rack>` with the output device. Input with Mono and Stereo, a jack
+grid of the device's input channels, then the output pair grid. Selected jacks are accent;
+channels beyond the device are faint. A warn line appears when the route uses channels the
+device lacks. Changing a route re-routes at the next block, without a restart.
 
-Replaces the settings drawer. Opened with Setup or ⌘,, it takes the column area;
-head and foot stay. A 200 px tab rail (Audio, MIDI, Plug-ins, Diagnostics; the
-active tab inverted) and a page limited to 900 px.
+Sidechain popover: None; a physical stereo input pair; or another rack's post-fader
+output. Rack sources arrive one buffer late; physical inputs are sample aligned. Changing
+the sidechain reloads the rack like a topology edit.
 
-- Audio: Output device list, Input device list (including "No audio input"),
-  Buffer at 48 kHz (32/64/128/256 with ms), Refresh devices. All locked with a
-  warn note while the engine is online. Warn when input and output share a device.
-- MIDI: MIDI input list, Refresh MIDI, mappings table (CC, Ch, Target, Remove),
-  "Learn new mapping" which arms learn; the next CC maps to the parameter last
-  touched in any plug-in editor. Note: "Armed mappings apply normalized values
-  only."
-- Plug-ins: Rescan plug-ins, last scan time, catalog and quarantine counts, the
-  catalog table (Plug-in, Vendor, State, Allow retry for quarantined entries) and
-  the note that Allow retry clears only that plug-in's failure history.
-- Diagnostics: per-rack table (Worker state, Restarts, Deadline misses,
-  Rejections, State captured, Retry restart or Preload action) and engine rows
-  (Callback load, Deadline misses, Aggregate device).
+Plug-in picker (560 px): `Add plug-in to <rack>` with `slot n of 8`, a search field, and
+the catalog grouped by vendor with an accent keyboard cursor (↑↓ ↩ Esc). Quarantined and
+non-loadable entries are faint with a reason.
 
-## 8. Model, protocol and data-plane changes
+Scene capture and edit (640 px): name, filter, the automatable parameters grouped by rack
+and plug-in with check boxes and values, and `n of 256 parameters`.
 
-Sidechain (new):
+Modals: Stop the audio engine?; Remove <rack>?; Recover the last session?
 
-- `sp-model`: add to `PluginSlot` a `#[serde(default)] sidechain: Option<SlotSidechain>`
-  with `enum SlotSidechain { PhysicalInput(PhysicalChannels), RackOutput(RackId) }`.
-  Validation: a physical pair must be stereo; a rack source must exist and must not
-  be the slot's own rack; no cycles are needed to check because rack sources are
-  one block delayed (see below). Bump the document schema and add the migration.
-- Shared memory: each rack bank gains an aux input region of two channels per
-  slot that declares a sidechain. Fixed layout, sized at rack build time like the
-  main channels.
-- Engine: physical-input sidechains are copied from the callback input buffer in
-  the same block (sample aligned). Rack-output sidechains are copied from the
-  source rack's previous-block output (one buffer of latency). Document this in
-  `docs/realtime-safety.md`.
-- Worker / `sp-vst3`: activate the plug-in's aux input bus when a sidechain is
-  set and feed it from the aux region. Report whether a plug-in has an aux bus in
-  the scan descriptor so the UI can disable the menu item.
-- This removes "no sidechains" from the original alpha scope.
+## 9. Setup page
 
-Editor preview (new):
+Setup (⌘,) replaces the views; the top bar and scene bar stay. A 200 px tab rail (Audio,
+MIDI, Plug-ins, Diagnostics) and a page limited to 900 px.
 
-- Control protocol: add `CaptureEditorPreview` (request) returning a PNG payload,
-  chunked with the existing state-stream mechanism. The worker captures its own
-  editor window with a window-list image call (own-process windows do not trigger
-  the screen-recording prompt; verify on the target macOS versions), downscales to
-  320×200 and encodes PNG on its main thread between event pumps. Never on the
-  audio thread.
-- Cadence: while an editor is open, capture every 2 s if any parameter changed;
-  once more when the editor closes. Explicit Save writes the newest picture per
-  instance into the package. Autosave does not.
-- Package: `plugin-state/<instance-id>/preview.png`, declared in `metadata.json`
-  with byte count and capture time, committed with the manifest like the state
-  streams. Load shows stored pictures before any worker starts, including for
-  missing plug-ins.
-- Host: keep the newest picture per instance in memory as an egui texture;
-  re-upload only when a new capture arrives.
+- Audio: output and input devices, buffer size, Refresh devices. Locked with a warn note
+  while the engine is online.
+- MIDI: MIDI input, mappings table, Learn new mapping.
+- Plug-ins: Rescan plug-ins, scan time, catalog and quarantine, Allow retry.
+- Diagnostics: per-rack worker state, restarts, deadline misses, and engine rows.
 
-Removed:
+## 10. Editor pictures and sidechains
 
-- `main_output_meter`, the master strip and the aggregate output meter path.
-- The generic parameter editor UI, `parameters` grid, `selected_slot` editor
-  state, the bottom rack detail pane and the settings drawer in `apps/superposition`.
-- The component gallery screen (⌘G) from the product build; its fixtures may stay
-  for tests.
+Editor pictures: the worker captures its editor at 320×200 PNG while it is open (every 2 s
+if a parameter changed, and once as it closes). An explicit Save writes the newest picture
+per instance to `plugin-state/<instance-id>/preview.png`; autosave does not. A loaded
+session shows stored pictures before any worker starts, including for missing plug-ins.
+Bypassed slots draw their picture at 40 % opacity; unavailable ones in grayscale at 35 %.
 
-Unchanged and reused: session package format for state, recovery markers and the
-recovery offer, scene model and recall, MIDI learn controller, worker health and
-recovery states, rack gain/mute/bypass control queue, meter ballistics.
+Sidechains: `PluginSlot.sidechain` is a physical stereo pair or another rack's ID. Physical
+inputs are copied from the callback input in the same block; rack sources come from the
+source rack's previous block. See [realtime-safety.md](realtime-safety.md).
 
-## 3a. Pages
-
-A page is a named set of racks, saved in the session. It only chooses which columns
-the show screen shows; routing and audio never change. A rack may be on several
-pages, and the columns keep session rack order. Up to 16 pages.
-
-The page line (32 px, under the head and any fault line) appears once a page exists
-or the session has more than eight racks: `Page` in dim, `All racks`, each page as
-`n Name`, then `+ page`. The shown page is inverted. Right-click a page for Rename…
-and Remove page (its racks stay in the session).
-
-The rack menu gains Pages…: a popover with a check row per page and "New page with
-this rack". On a page, a new rack joins that page, and Move left/right step past the
-racks the page hides. Removing a rack takes it off every page.
-
-## 9. Keyboard
+## 11. Keyboard
 
 | Keys | Action |
 | --- | --- |
 | 1–8 | recall scene |
 | ⌘S | save |
-| ⌘, | toggle setup page |
-| ⌘⇧C | capture scene |
-| ⌘← ⌘→ | move selected rack past its visible neighbour |
+| ⌘, | toggle the setup page |
+| ⌘N | add a rack |
+| ⌘⇧C | capture a scene |
+| ⌘← ⌘→ | move the selected rack past its shown neighbour |
 | ⌘1–⌘9 | show page 1–9 |
 | ⌘0 | show all racks |
-| ↑ ↓ | move slot selection within the selected rack |
-| ↩ | open the selected slot's editor |
+| ↑ ↓ | move the slot selection in the selected rack |
+| ↩ | open the selected slot in the rack view |
 | B | bypass the selected slot |
 | Esc | close the topmost overlay |
 
-## 10. Suggested order of work
-
-1. Theme: new tokens and IBM Plex Mono in `sp-ui`; drop the multi-accent palette.
-   Keep the AA contrast tests and add the new pairings to them.
-2. Show screen without previews: head readouts, columns with text slots, gain
-   track, LED meters, toggles, foot line, fault line. Delete the detail pane,
-   settings drawer, master strip and generic parameter editor.
-3. Overlays: menus, route popover, plug-in picker, scene picker, modals.
-4. Setup page.
-5. Preview capture: protocol operation, worker capture, package file, host
-   texture, tile states, hover popover.
-6. Sidechain: model, shared-memory aux region, engine copy paths, worker aux bus,
-   popover and caption marker.
+Keys typed into a streamed editor go to that editor, not to these shortcuts.
