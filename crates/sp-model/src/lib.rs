@@ -60,9 +60,19 @@ pub struct Session {
     /// Named views of racks on the show screen.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pages: Vec<RackPage>,
-    /// Plug-in instances pinned for one-click access, in display order.
+    /// Plug-in slots pinned for one-click access, in display order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub hot_plugins: Vec<PluginInstanceId>,
+    pub hot_plugins: Vec<HotPlugin>,
+}
+
+/// A plug-in slot pinned to the rack view's hot plug-ins rail. Slot IDs are unique only within
+/// their rack, so a pin names both.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotPlugin {
+    /// The rack holding the slot.
+    pub rack_id: RackId,
+    /// The pinned slot.
+    pub slot_id: PluginInstanceId,
 }
 
 /// A named view of racks. A page only chooses which racks the show screen shows; it never
@@ -208,24 +218,18 @@ impl Session {
 
     /// Checks that each hot plug-in names an existing slot, at most once.
     fn validate_hot_plugins(&self) -> Result<(), ValidationError> {
-        let slot_ids: BTreeSet<&PluginInstanceId> = self
-            .racks
-            .iter()
-            .flat_map(|rack| rack.slots.iter().map(|slot| &slot.id))
-            .collect();
         let mut pinned = BTreeSet::new();
-        for id in &self.hot_plugins {
-            if !slot_ids.contains(id) {
-                return Err(ValidationError::UnknownReference {
-                    owner: EntityKind::HotPlugin,
-                    reference: EntityKind::PluginSlot,
-                    id: id.0.clone(),
-                });
-            }
-            if !pinned.insert(id) {
+        for pin in &self.hot_plugins {
+            resolve_slot(
+                &pin.rack_id,
+                &pin.slot_id,
+                &self.racks,
+                EntityKind::HotPlugin,
+            )?;
+            if !pinned.insert((&pin.rack_id, &pin.slot_id)) {
                 return Err(ValidationError::DuplicateId {
                     kind: EntityKind::HotPlugin,
-                    id: id.0.clone(),
+                    id: pin.slot_id.0.clone(),
                 });
             }
         }

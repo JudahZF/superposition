@@ -273,6 +273,10 @@ pub struct LiveRackApp {
     /// Linux: an editor the rack view just closed, hidden until its window goes away.
     #[cfg(target_os = "linux")]
     undocked: Option<((usize, usize), Instant)>,
+    /// Linux: an editor the rack view let go of while it was still opening. It closes as soon
+    /// as it opens.
+    #[cfg(target_os = "linux")]
+    pending_close: Option<(usize, usize)>,
     /// Linux: the Tunnel device settings being edited.
     #[cfg(target_os = "linux")]
     tunnel_settings: tunnel::TunnelSettings,
@@ -424,6 +428,8 @@ impl LiveRackApp {
             docked: None,
             #[cfg(target_os = "linux")]
             undocked: None,
+            #[cfg(target_os = "linux")]
+            pending_close: None,
             #[cfg(target_os = "linux")]
             tunnel_settings: tunnel::TunnelSettings::load(),
             #[cfg(test)]
@@ -1299,6 +1305,22 @@ impl LiveRackApp {
         let racks = &mut self.controller.document_mut().model.racks;
         let moved = racks.remove(self.selected_rack);
         racks.insert(neighbour, moved);
+        #[cfg(target_os = "linux")]
+        {
+            let from = self.selected_rack;
+            self.remap_editor_racks(|rack| {
+                Some(if rack == from {
+                    neighbour
+                } else {
+                    let shifted = if rack > from { rack - 1 } else { rack };
+                    if shifted >= neighbour {
+                        shifted + 1
+                    } else {
+                        shifted
+                    }
+                })
+            });
+        }
         self.selected_rack = neighbour;
         self.scroll_to_selected = true;
         self.apply_rack_edit(&before, &[]);
@@ -1344,10 +1366,19 @@ impl LiveRackApp {
         for page in &mut model.pages {
             page.racks.retain(|id| *id != rack.id);
         }
-        model
-            .hot_plugins
-            .retain(|id| rack.slots.iter().all(|slot| slot.id != *id));
+        model.hot_plugins.retain(|pin| pin.rack_id != rack.id);
         // Slots keyed by the removed rack lose their sidechain; their racks reload.
+        #[cfg(target_os = "linux")]
+        {
+            // The removed rack's worker and editors stop with it.
+            let removed = self.selected_rack;
+            self.remap_editor_racks(|index| match index.cmp(&removed) {
+                std::cmp::Ordering::Less => Some(index),
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some(index - 1),
+            });
+        }
+        let model = &mut self.controller.document_mut().model;
         let removed_source = Some(sp_model::SlotSidechain::RackOutput(rack.id.clone()));
         let mut rebuilt = Vec::new();
         for other in &mut model.racks {
@@ -1875,7 +1906,9 @@ impl LiveRackApp {
         model.midi_mappings.retain(|mapping| {
             mapping.target.rack_id != rack_id || mapping.target.slot_id != removed.id
         });
-        model.hot_plugins.retain(|id| *id != removed.id);
+        model
+            .hot_plugins
+            .retain(|pin| pin.rack_id != rack_id || pin.slot_id != removed.id);
         self.selected_slot = None;
         self.reload_selected_rack_after_edit(SlotEdit::Remove(slot));
     }
@@ -2047,6 +2080,9 @@ impl LiveRackApp {
             .undocked
             .take_if(|(closed, _)| *closed == (rack, slot))
             .is_some();
+        #[cfg(target_os = "linux")]
+        self.pending_close
+            .take_if(|pending| *pending == (rack, slot));
         #[cfg(not(target_os = "linux"))]
         let just_closed = false;
         #[cfg(target_os = "linux")]
@@ -2099,6 +2135,20 @@ impl LiveRackApp {
         if !closing {
             self.undocked = None;
         }
+        if let Some(pending) = self.pending_close {
+            let (open, opening) = self.product.as_ref().map_or((false, false), |product| {
+                (
+                    product.editor_open(pending.0, pending.1),
+                    product.native_editor_pending(),
+                )
+            });
+            if open {
+                self.pending_close = None;
+                self.close_docked(pending);
+            } else if !opening {
+                self.pending_close = None;
+            }
+        }
         let Some((rack, slot)) = self.docked else {
             return;
         };
@@ -2125,7 +2175,21 @@ impl LiveRackApp {
             if let Err(error) = product.set_native_editor_open(rack, slot, false, running) {
                 self.show_fault(error);
             }
+        } else if product.native_editor_pending() {
+            self.pending_close = Some((rack, slot));
         }
+    }
+
+    /// Linux: follows a rack edit in the docked, closing, and pending-close editors. `map`
+    /// gives a rack's new index, or `None` when the rack is gone.
+    #[cfg(target_os = "linux")]
+    fn remap_editor_racks(&mut self, map: impl Fn(usize) -> Option<usize>) {
+        let remap = |(rack, slot): (usize, usize)| Some((map(rack)?, slot));
+        self.docked = self.docked.and_then(remap);
+        self.undocked = self
+            .undocked
+            .and_then(|(editor, at)| Some((remap(editor)?, at)));
+        self.pending_close = self.pending_close.and_then(remap);
     }
 
     /// Whether `rack` and `slot` is a hot plug-in.
@@ -2134,26 +2198,31 @@ impl LiveRackApp {
         model
             .racks
             .get(rack)
-            .and_then(|rack| rack.slots.get(slot))
-            .is_some_and(|slot| model.hot_plugins.contains(&slot.id))
+            .and_then(|rack| Some((rack, rack.slots.get(slot)?)))
+            .is_some_and(|(rack, slot)| {
+                model
+                    .hot_plugins
+                    .iter()
+                    .any(|pin| pin.rack_id == rack.id && pin.slot_id == slot.id)
+            })
     }
 
     /// Pins a slot to the hot plug-ins rail, or unpins it.
     fn toggle_hot_plugin(&mut self, rack: usize, slot: usize) {
         let model = &mut self.controller.document_mut().model;
-        let Some(id) = model
-            .racks
-            .get(rack)
-            .and_then(|rack| rack.slots.get(slot))
-            .map(|slot| slot.id.clone())
-        else {
+        let Some(pin) = model.racks.get(rack).and_then(|rack| {
+            Some(sp_model::HotPlugin {
+                rack_id: rack.id.clone(),
+                slot_id: rack.slots.get(slot)?.id.clone(),
+            })
+        }) else {
             return;
         };
-        if let Some(position) = model.hot_plugins.iter().position(|pinned| *pinned == id) {
+        if let Some(position) = model.hot_plugins.iter().position(|pinned| *pinned == pin) {
             model.hot_plugins.remove(position);
             self.set_status("Plug-in unpinned");
         } else if model.hot_plugins.len() < sp_model::MAX_HOT_PLUGINS {
-            model.hot_plugins.push(id);
+            model.hot_plugins.push(pin);
             self.set_status("Plug-in pinned to hot plug-ins");
         } else {
             self.set_status("Hot plug-ins are full (12). Unpin one first.");
@@ -2166,18 +2235,13 @@ impl LiveRackApp {
         model
             .hot_plugins
             .iter()
-            .filter_map(|id| {
-                model
-                    .racks
+            .filter_map(|pin| {
+                let rack = model.racks.iter().position(|rack| rack.id == pin.rack_id)?;
+                let slot = model.racks[rack]
+                    .slots
                     .iter()
-                    .enumerate()
-                    .find_map(|(rack, model_rack)| {
-                        model_rack
-                            .slots
-                            .iter()
-                            .position(|slot| slot.id == *id)
-                            .map(|slot| (rack, slot))
-                    })
+                    .position(|slot| slot.id == pin.slot_id)?;
+                Some((rack, slot))
             })
             .collect()
     }
@@ -2577,7 +2641,11 @@ impl LiveRackApp {
     fn finish_streamed_windows(&mut self, ctx: &egui::Context) {
         let running = self.online();
         #[cfg(target_os = "linux")]
-        let hidden = [self.docked, self.undocked.map(|(slot, _)| slot)];
+        let hidden = [
+            self.docked,
+            self.undocked.map(|(slot, _)| slot),
+            self.pending_close,
+        ];
         #[cfg(target_os = "macos")]
         let hidden: [Option<(usize, usize)>; 0] = [];
         let Some(streamed) = self.streamed.as_mut() else {

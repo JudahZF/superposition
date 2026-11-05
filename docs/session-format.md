@@ -49,9 +49,11 @@ existing rack IDs, each at most once; it only chooses which racks the overview
 shows and never affects audio. A session holds up to 64 racks, with one source and
 one endpoint declaration per rack.
 
-`hot_plugins` (left out when empty) lists up to 12 plug-in instance IDs pinned to
-the rack view's hot plug-ins rail, in display order: `["vox-comp", "gtr-delay"]`.
-Each names an existing slot at most once. Removing a slot unpins it.
+`hot_plugins` (left out when empty) lists up to 12 slots pinned to the rack view's
+hot plug-ins rail, in display order:
+`[{"rack_id": "rack-1", "slot_id": "rack-1-slot-2"}]`. Slot IDs are unique only
+within a rack, so each pin names both. Each names an existing slot at most once.
+Removing a slot or its rack unpins it.
 
 The default `vst3-host` adapter stores its versioned complete-state envelope in
 `component.bin`. That envelope contains component state and any controller state

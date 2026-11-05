@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use sp_model::{
-    ChannelLayout, Endpoint, EndpointId, GainDb, MAX_RACKS, MidiController, MidiMapping,
+    ChannelLayout, Endpoint, EndpointId, GainDb, HotPlugin, MAX_RACKS, MidiController, MidiMapping,
     MidiMappingId, NormalizedParameters, NormalizedValue, PageId, ParameterAddress, ParameterId,
     PhysicalChannels, PluginArchitecture, PluginBusConfiguration, PluginBusMetadata,
     PluginClassScanMetadata, PluginDescriptor, PluginFingerprint, PluginIdentity, PluginInstanceId,
@@ -254,13 +254,17 @@ fn hot_plugins_name_existing_slots_once_and_are_omitted_when_empty() {
             .is_none(),
         "sessions without hot plug-ins keep their JSON shape"
     );
+    let pin = |rack: &str, slot: &PluginInstanceId| HotPlugin {
+        rack_id: RackId(rack.into()),
+        slot_id: slot.clone(),
+    };
     let slot = session.racks[0].slots[0].id.clone();
-    session.hot_plugins = vec![slot.clone()];
+    session.hot_plugins = vec![pin("rack-a", &slot)];
     session.validate().unwrap();
     let encoded = serde_json::to_value(&session).unwrap();
     assert_eq!(serde_json::from_value::<Session>(encoded).unwrap(), session);
 
-    session.hot_plugins = vec![PluginInstanceId("missing".into())];
+    session.hot_plugins = vec![pin("rack-a", &PluginInstanceId("missing".into()))];
     assert!(matches!(
         session.validate(),
         Err(ValidationError::UnknownReference {
@@ -269,7 +273,16 @@ fn hot_plugins_name_existing_slots_once_and_are_omitted_when_empty() {
             ..
         })
     ));
-    session.hot_plugins = vec![slot.clone(), slot];
+    session.hot_plugins = vec![pin("missing", &slot)];
+    assert!(matches!(
+        session.validate(),
+        Err(ValidationError::UnknownReference {
+            owner: sp_model::EntityKind::HotPlugin,
+            reference: sp_model::EntityKind::Rack,
+            ..
+        })
+    ));
+    session.hot_plugins = vec![pin("rack-a", &slot), pin("rack-a", &slot)];
     assert!(matches!(
         session.validate(),
         Err(ValidationError::DuplicateId {

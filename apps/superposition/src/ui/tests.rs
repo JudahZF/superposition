@@ -768,8 +768,8 @@ fn enter_opens_the_selected_plugin_in_the_rack_view() {
     assert_eq!((app.selected_rack, app.selected_slot), (0, Some(1)));
 }
 
-/// Hot plug-ins name slots: pinning toggles, and removing a slot or its rack unpins it so the
-/// session stays valid.
+/// Hot plug-ins name a rack and a slot (slot IDs repeat across racks): pinning toggles, and
+/// removing a slot or its rack unpins it so the session stays valid.
 #[test]
 fn hot_plugins_follow_slot_and_rack_removal() {
     let mut app = empty_app("hot-plugins");
@@ -779,7 +779,7 @@ fn hot_plugins_follow_slot_and_rack_removal() {
         for slot in 0..2 {
             app.controller.document_mut().model.racks[rack]
                 .slots
-                .push(plugin_slot(&format!("rack{rack}-slot{slot}"), "test", 1));
+                .push(plugin_slot(&format!("slot{slot}"), "test", 1));
         }
     }
     app.toggle_hot_plugin(0, 1);
@@ -800,6 +800,34 @@ fn hot_plugins_follow_slot_and_rack_removal() {
         .model
         .validate()
         .expect("hot plug-ins stay valid");
+}
+
+/// The docked editor follows its rack when racks move or are removed, so leaving it never
+/// closes another rack's editor.
+#[cfg(target_os = "linux")]
+#[test]
+fn docked_editor_follows_rack_moves_and_removal() {
+    let mut app = empty_app("dock-remap");
+    for _ in 0..3 {
+        app.add_rack();
+    }
+    app.select_rack(0);
+    app.docked = Some((0, 1));
+    app.move_selected_rack(1);
+    assert_eq!((app.selected_rack, app.docked), (1, Some((1, 1))));
+    app.move_selected_rack(1);
+    assert_eq!((app.selected_rack, app.docked), (2, Some((2, 1))));
+
+    app.select_rack(0);
+    app.remove_selected_rack();
+    assert_eq!(
+        app.docked,
+        Some((1, 1)),
+        "racks after the removed one shift down"
+    );
+    app.select_rack(1);
+    app.remove_selected_rack();
+    assert_eq!(app.docked, None, "the removed rack's editor goes with it");
 }
 
 #[test]
