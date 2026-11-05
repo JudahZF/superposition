@@ -20,6 +20,8 @@ pub const MAX_SOURCES: usize = MAX_RACKS;
 pub const MAX_ENDPOINTS: usize = MAX_RACKS;
 /// Maximum number of rack pages in one session.
 pub const MAX_PAGES: usize = 16;
+/// Maximum number of hot plug-ins in one session.
+pub const MAX_HOT_PLUGINS: usize = 12;
 /// Maximum number of saved scenes in one session.
 pub const MAX_SCENES: usize = 128;
 /// Maximum number of MIDI mappings in one session.
@@ -58,6 +60,9 @@ pub struct Session {
     /// Named views of racks on the show screen.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pages: Vec<RackPage>,
+    /// Plug-in instances pinned for one-click access, in display order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hot_plugins: Vec<PluginInstanceId>,
 }
 
 /// A named view of racks. A page only chooses which racks the show screen shows; it never
@@ -85,6 +90,7 @@ impl Default for Session {
             scenes: Vec::new(),
             midi_mappings: Vec::new(),
             pages: Vec::new(),
+            hot_plugins: Vec::new(),
         }
     }
 }
@@ -196,7 +202,34 @@ impl Session {
             mapping.validate(&rack_ids, &self.racks)?;
         }
 
-        self.validate_pages(&rack_ids)
+        self.validate_pages(&rack_ids)?;
+        self.validate_hot_plugins()
+    }
+
+    /// Checks that each hot plug-in names an existing slot, at most once.
+    fn validate_hot_plugins(&self) -> Result<(), ValidationError> {
+        let slot_ids: BTreeSet<&PluginInstanceId> = self
+            .racks
+            .iter()
+            .flat_map(|rack| rack.slots.iter().map(|slot| &slot.id))
+            .collect();
+        let mut pinned = BTreeSet::new();
+        for id in &self.hot_plugins {
+            if !slot_ids.contains(id) {
+                return Err(ValidationError::UnknownReference {
+                    owner: EntityKind::HotPlugin,
+                    reference: EntityKind::PluginSlot,
+                    id: id.0.clone(),
+                });
+            }
+            if !pinned.insert(id) {
+                return Err(ValidationError::DuplicateId {
+                    kind: EntityKind::HotPlugin,
+                    id: id.0.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Checks page IDs, names, and the racks each page lists.
@@ -242,6 +275,11 @@ impl Session {
         }
         validate_capacity(Collection::Scenes, self.scenes.len(), MAX_SCENES)?;
         validate_capacity(Collection::Pages, self.pages.len(), MAX_PAGES)?;
+        validate_capacity(
+            Collection::HotPlugins,
+            self.hot_plugins.len(),
+            MAX_HOT_PLUGINS,
+        )?;
         validate_capacity(
             Collection::MidiMappings,
             self.midi_mappings.len(),
@@ -1224,6 +1262,8 @@ pub enum Collection {
     MidiMappings,
     /// Rack pages collection.
     Pages,
+    /// Hot plug-ins collection.
+    HotPlugins,
     /// Per-plug-in parameter collection.
     PluginParameters,
     /// Scene gains collection.
@@ -1261,6 +1301,8 @@ pub enum EntityKind {
     MidiMapping,
     /// Rack page entity.
     Page,
+    /// Hot plug-in entry.
+    HotPlugin,
 }
 
 /// Reasons a session model cannot be accepted.

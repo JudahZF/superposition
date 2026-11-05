@@ -245,6 +245,41 @@ fn rack_pages_reference_known_racks_once_and_are_omitted_when_empty() {
 }
 
 #[test]
+fn hot_plugins_name_existing_slots_once_and_are_omitted_when_empty() {
+    let mut session = valid_session();
+    assert!(
+        serde_json::to_value(&session)
+            .unwrap()
+            .get("hot_plugins")
+            .is_none(),
+        "sessions without hot plug-ins keep their JSON shape"
+    );
+    let slot = session.racks[0].slots[0].id.clone();
+    session.hot_plugins = vec![slot.clone()];
+    session.validate().unwrap();
+    let encoded = serde_json::to_value(&session).unwrap();
+    assert_eq!(serde_json::from_value::<Session>(encoded).unwrap(), session);
+
+    session.hot_plugins = vec![PluginInstanceId("missing".into())];
+    assert!(matches!(
+        session.validate(),
+        Err(ValidationError::UnknownReference {
+            owner: sp_model::EntityKind::HotPlugin,
+            reference: sp_model::EntityKind::PluginSlot,
+            ..
+        })
+    ));
+    session.hot_plugins = vec![slot.clone(), slot];
+    assert!(matches!(
+        session.validate(),
+        Err(ValidationError::DuplicateId {
+            kind: sp_model::EntityKind::HotPlugin,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn scene_rack_bypass_requires_one_known_target_per_rack() {
     let mut session = valid_session();
     session.scenes[0].rack_bypasses[0].rack_id = RackId("missing".into());
