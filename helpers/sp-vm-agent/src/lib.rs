@@ -18,6 +18,8 @@ use std::time::Duration;
 
 /// How long [`Request::Stop`] waits for a worker process to exit.
 pub const STOP_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long one bundle's scan may take, as for a Windows scan under Wine.
+pub const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often the agent sends [`Event::Heartbeat`] and looks for exited workers.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -39,6 +41,9 @@ pub enum Request {
         /// The VM port.
         port: u32,
     },
+    /// Scans every VST3 bundle in the guest's VST3 folder, one scanner process each. The
+    /// agent answers with one [`Event::Scanned`] per bundle, then [`Event::ScanDone`].
+    Scan,
 }
 
 /// An agent event on the agent port.
@@ -72,6 +77,22 @@ pub enum Event {
         port: u32,
         /// Its exit code, if it has one.
         code: Option<i32>,
+    },
+    /// One bundle's scan.
+    Scanned {
+        /// The bundle's guest path.
+        bundle: String,
+        /// The scanner's exit code, or `None` if it timed out or had none.
+        code: Option<i32>,
+        /// True if the scanner ran past [`SCAN_TIMEOUT`] and was ended.
+        timed_out: bool,
+        /// The scanner's report (JSON), if it wrote one.
+        report: Option<String>,
+    },
+    /// The scan has ended.
+    ScanDone {
+        /// The bundles scanned.
+        bundles: u32,
     },
     /// The agent is alive. `sequence` counts up from 1.
     Heartbeat {

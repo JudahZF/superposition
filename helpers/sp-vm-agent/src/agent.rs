@@ -1,9 +1,9 @@
-use crate::{Event, HEARTBEAT_INTERVAL, Request, STOP_TIMEOUT};
+use crate::{Event, HEARTBEAT_INTERVAL, Request, SCAN_TIMEOUT, STOP_TIMEOUT};
 use std::{
     collections::HashMap,
     fs::File,
     io::{self, BufRead, BufReader, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     thread,
@@ -40,6 +40,12 @@ pub type PortOpener = dyn Fn(Option<u32>) -> io::Result<Box<dyn PortIo>> + Send 
 pub struct AgentConfig {
     /// The worker executable.
     pub worker: PathBuf,
+    /// The scanner executable.
+    pub scanner: PathBuf,
+    /// The folder of installed VST3 bundles.
+    pub vst3: PathBuf,
+    /// A writable folder for scan reports.
+    pub reports: PathBuf,
     /// The ID of the image that holds the agent and the worker.
     pub image_id: String,
     /// Opens the ports.
@@ -203,6 +209,16 @@ impl Agent {
                     workers,
                 });
             }
+            Request::Scan => {
+                let state = Arc::clone(&self.state);
+                let (scanner, vst3, reports) = (
+                    self.config.scanner.clone(),
+                    self.config.vst3.clone(),
+                    self.config.reports.clone(),
+                );
+                // Scans take seconds each; requests keep being served meanwhile.
+                thread::spawn(move || scan(&state, &scanner, &vst3, &reports));
+            }
             Request::Stop { port } => {
                 let exited = self.state.stop(port);
                 self.state.emit(&Event::Stopped { port, exited });
@@ -312,5 +328,79 @@ fn relay_output(mut stdout: impl Read, mut to_host: Box<dyn PortIo>) {
             return;
         }
         let _ = to_host.flush();
+    }
+}
+
+/// Scans every bundle under `vst3`, one scanner process each, and reports each one.
+fn scan(state: &State, scanner: &Path, vst3: &Path, reports: &Path) {
+    let mut bundles = Vec::new();
+    find_bundles(vst3, &mut bundles);
+    bundles.sort();
+    let _ = std::fs::create_dir_all(reports);
+    for (index, bundle) in bundles.iter().enumerate() {
+        let report_path = reports.join(format!("scan-{index}.json"));
+        let _ = std::fs::remove_file(&report_path);
+        let (code, timed_out) = run_scanner(scanner, bundle, &report_path);
+        state.emit(&Event::Scanned {
+            bundle: bundle.display().to_string(),
+            code,
+            timed_out,
+            report: std::fs::read_to_string(&report_path).ok(),
+        });
+    }
+    state.emit(&Event::ScanDone {
+        bundles: u32::try_from(bundles.len()).unwrap_or(u32::MAX),
+    });
+}
+
+/// Every `.vst3` bundle (file or folder) under `folder`, without looking inside bundles.
+fn find_bundles(folder: &Path, bundles: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("vst3"))
+        {
+            bundles.push(path);
+        } else if path.is_dir() {
+            find_bundles(&path, bundles);
+        }
+    }
+}
+
+/// Runs the scanner on one bundle. Returns its exit code and whether it timed out.
+fn run_scanner(scanner: &Path, bundle: &Path, report: &Path) -> (Option<i32>, bool) {
+    let mut command = Command::new(scanner);
+    command
+        .arg("--bundle")
+        .arg(bundle)
+        .arg("--sdk-enumerate")
+        .arg("--report-path")
+        .arg(report)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let Ok(mut child) = command.spawn() else {
+        return (None, false);
+    };
+    let deadline = Instant::now() + SCAN_TIMEOUT;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return (status.code(), false);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return (None, true);
+        }
+        thread::sleep(Duration::from_millis(20));
     }
 }

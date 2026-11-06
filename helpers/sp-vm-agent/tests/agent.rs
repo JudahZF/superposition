@@ -42,6 +42,10 @@ impl Host {
 }
 
 fn start_agent(ports: &[u32]) -> Host {
+    start_agent_with(ports, "true".into(), std::env::temp_dir())
+}
+
+fn start_agent_with(ports: &[u32], scanner: std::path::PathBuf, vst3: std::path::PathBuf) -> Host {
     let (host_agent, agent_agent) = UnixStream::pair().unwrap();
     let mut agent_ports: HashMap<Option<u32>, UnixStream> = HashMap::new();
     agent_ports.insert(None, agent_agent);
@@ -55,6 +59,9 @@ fn start_agent(ports: &[u32]) -> Host {
     let agent_ports = Arc::new(Mutex::new(agent_ports));
     let config = AgentConfig {
         worker: "cat".into(),
+        scanner,
+        reports: vst3.join("reports"),
+        vst3,
         image_id: "test-image".into(),
         open_port: Box::new(move |port| {
             let stream = agent_ports
@@ -147,4 +154,56 @@ fn a_bad_request_is_an_error_event_and_the_agent_keeps_serving() {
     assert!(matches!(host.event(), Event::Error { port: None, .. }));
     host.send(&Request::Hello);
     assert!(matches!(host.event(), Event::Hello { .. }));
+}
+
+#[test]
+fn a_scan_reports_every_bundle_under_the_vst3_folder() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!("sp-vm-agent-scan-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let vst3 = root.join("VST3");
+    std::fs::create_dir_all(vst3.join("Vendor/Folder.vst3/Contents")).unwrap();
+    std::fs::write(vst3.join("Single.vst3"), b"").unwrap();
+    std::fs::write(vst3.join("readme.txt"), b"").unwrap();
+    // The scanner's stand-in writes a report naming its bundle (arguments 2 and 5).
+    let scanner = root.join("scanner.sh");
+    std::fs::write(
+        &scanner,
+        "#!/bin/sh\nprintf '{\"bundle\":\"%s\"}' \"$2\" > \"$5\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&scanner, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut host = start_agent_with(&[], scanner, vst3.clone());
+    host.send(&Request::Scan);
+    let mut bundles = Vec::new();
+    loop {
+        match host.event() {
+            Event::Scanned {
+                bundle,
+                code,
+                timed_out,
+                report,
+            } => {
+                assert_eq!(code, Some(0));
+                assert!(!timed_out);
+                assert!(report.unwrap().contains(&bundle));
+                bundles.push(bundle);
+            }
+            Event::ScanDone { bundles: count } => {
+                assert_eq!(count, 2);
+                break;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(
+        bundles,
+        [
+            vst3.join("Single.vst3").display().to_string(),
+            vst3.join("Vendor/Folder.vst3").display().to_string()
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
