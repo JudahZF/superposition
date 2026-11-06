@@ -10,8 +10,12 @@
 //! [`STOP_TIMEOUT`] for its process to exit: the IVSHMEM driver frees the port only then.
 
 mod agent;
+#[cfg(windows)]
+mod port_windows;
 
 pub use agent::{Agent, AgentConfig, PortIo};
+#[cfg(windows)]
+pub use port_windows::OverlappedPort;
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;

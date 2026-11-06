@@ -7,7 +7,7 @@
 //! image ID to `image-id.txt`. It scans `C:\Program Files\Common Files\VST3`.
 
 use sp_vm_agent::{Agent, AgentConfig, PortIo};
-use std::{fs::OpenOptions, io, path::PathBuf, process::ExitCode, thread, time::Duration};
+use std::{io, path::PathBuf, process::ExitCode, thread, time::Duration};
 
 fn main() -> ExitCode {
     let here = std::env::current_exe()
@@ -55,7 +55,22 @@ fn open_port(port: Option<u32>) -> io::Result<Box<dyn PortIo>> {
         || r"\\.\Global\lambda.agent".to_owned(),
         |port| format!(r"\\.\Global\lambda.worker.{port}"),
     );
+    open_path(&path)
+}
+
+/// A virtio-serial port must not serialize its reads and writes (`OverlappedPort`).
+#[cfg(windows)]
+fn open_path(path: &str) -> io::Result<Box<dyn PortIo>> {
+    Ok(Box::new(sp_vm_agent::OverlappedPort::open(path)?))
+}
+
+/// Other systems build the agent only for its tests.
+#[cfg(not(windows))]
+fn open_path(path: &str) -> io::Result<Box<dyn PortIo>> {
     Ok(Box::new(
-        OpenOptions::new().read(true).write(true).open(path)?,
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?,
     ))
 }
