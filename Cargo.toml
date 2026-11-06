@@ -25,6 +25,7 @@ members = [
     "crates/sp-remote",
     "crates/sp-window-stream",
     "tools/lane-adapter",
+    "tools/vm-probe",
     "tools/xtask",
 ]
 default-members = ["apps/superposition"]

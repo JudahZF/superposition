@@ -53,6 +53,18 @@ impl Doorbell {
     }
 }
 
+impl AsFd for Doorbell {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+impl From<Doorbell> for OwnedFd {
+    fn from(doorbell: Doorbell) -> Self {
+        doorbell.0
+    }
+}
+
 /// This peer's own interrupt for one vector: the read side of its eventfd.
 #[derive(Debug)]
 pub struct Interrupt(OwnedFd);
@@ -98,5 +110,11 @@ impl Interrupt {
 impl AsFd for Interrupt {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.0.as_fd()
+    }
+}
+
+impl From<Interrupt> for OwnedFd {
+    fn from(interrupt: Interrupt) -> Self {
+        interrupt.0
     }
 }
