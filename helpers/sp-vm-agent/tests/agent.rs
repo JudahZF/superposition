@@ -61,6 +61,7 @@ fn start_agent_with(ports: &[u32], scanner: std::path::PathBuf, vst3: std::path:
         worker: "cat".into(),
         scanner,
         reports: vst3.join("reports"),
+        uploads: vst3.join("uploads"),
         vst3,
         image_id: "test-image".into(),
         open_port: Box::new(move |port| {
@@ -213,5 +214,43 @@ fn a_scan_reports_every_bundle_under_the_vst3_folder() {
             vst3.join("Vendor/Folder.vst3").display().to_string()
         ]
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_upload_in_parts_is_written_and_runs() {
+    let root = std::env::temp_dir().join(format!("sp-vm-agent-upload-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut host = start_agent_with(&[], "true".into(), root.clone());
+
+    // More than one part, so the offsets matter.
+    let mut script = b"#!/bin/sh\nexit 7\n".to_vec();
+    script.resize(sp_vm_agent::UPLOAD_CHUNK + 100, b'#');
+    script.push(b'\n');
+    for request in Request::uploads("setup.sh", &script) {
+        host.send(&request);
+        assert!(matches!(host.event(), Event::Uploaded { .. }));
+    }
+    assert_eq!(
+        std::fs::read(root.join("uploads/setup.sh")).unwrap(),
+        script
+    );
+
+    host.send(&Request::Run {
+        name: "setup.sh".into(),
+    });
+    assert_eq!(
+        host.event(),
+        Event::Ran {
+            name: "setup.sh".into(),
+            code: Some(7)
+        }
+    );
+
+    host.send(&Request::Run {
+        name: "../escape".into(),
+    });
+    assert!(matches!(host.event(), Event::Error { .. }));
     let _ = std::fs::remove_dir_all(&root);
 }

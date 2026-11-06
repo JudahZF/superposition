@@ -46,6 +46,8 @@ pub struct AgentConfig {
     pub vst3: PathBuf,
     /// A writable folder for scan reports.
     pub reports: PathBuf,
+    /// A writable folder for uploaded files.
+    pub uploads: PathBuf,
     /// The ID of the image that holds the agent and the worker.
     pub image_id: String,
     /// Opens the ports.
@@ -219,6 +221,26 @@ impl Agent {
                 // Scans take seconds each; requests keep being served meanwhile.
                 thread::spawn(move || scan(&state, &scanner, &vst3, &reports));
             }
+            Request::Upload { name, offset, data } => match self.upload(&name, offset, &data) {
+                Ok(size) => self.state.emit(&Event::Uploaded { name, size }),
+                Err(error) => self.state.emit(&Event::Error {
+                    port: None,
+                    message: format!("upload of {name}: {error}"),
+                }),
+            },
+            Request::Run { name } => match upload_path(&self.config.uploads, &name) {
+                Ok(path) => {
+                    let state = Arc::clone(&self.state);
+                    thread::spawn(move || {
+                        let code = run_upload(&path);
+                        state.emit(&Event::Ran { name, code });
+                    });
+                }
+                Err(error) => self.state.emit(&Event::Error {
+                    port: None,
+                    message: format!("run of {name}: {error}"),
+                }),
+            },
             Request::Stop { port } => {
                 let exited = self.state.stop(port);
                 self.state.emit(&Event::Stopped { port, exited });
@@ -290,6 +312,26 @@ impl Agent {
         }
         lock(&self.state.workers).insert(port, child);
         Ok(pid)
+    }
+
+    /// Writes one upload part. Returns the file's size.
+    fn upload(&self, name: &str, offset: u64, data: &str) -> io::Result<u64> {
+        use base64::Engine as _;
+        use std::io::{Seek, SeekFrom};
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        std::fs::create_dir_all(&self.config.uploads)?;
+        let path = upload_path(&self.config.uploads, name)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(offset == 0)
+            .open(path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(&bytes)?;
+        file.metadata().map(|metadata| metadata.len())
     }
 
     /// The stdin slot of `port` and a handle to its worker port. The first call opens the
@@ -469,4 +511,40 @@ fn run_scanner(scanner: &Path, bundle: &Path, report: &Path) -> (Option<i32>, bo
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// The path of upload `name`: a plain file name in `uploads`, never a path elsewhere.
+fn upload_path(uploads: &Path, name: &str) -> io::Result<PathBuf> {
+    let plain = !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', ':']);
+    if !plain {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an upload name is a plain file name",
+        ));
+    }
+    Ok(uploads.join(name))
+}
+
+/// Runs an uploaded file and waits for it. Returns its exit code.
+fn run_upload(path: &Path) -> Option<i32> {
+    let msi = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("msi"));
+    let mut command = if msi {
+        let mut command = Command::new("msiexec");
+        command.arg("/i").arg(path);
+        command
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+        }
+        Command::new(path)
+    };
+    command
+        .stdin(Stdio::null())
+        .status()
+        .ok()
+        .and_then(|status| status.code())
 }

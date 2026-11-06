@@ -38,6 +38,7 @@ fn main() -> ExitCode {
             scanner: scanner.clone(),
             vst3: PathBuf::from(r"C:\Program Files\Common Files\VST3"),
             reports: std::env::temp_dir().join("lambda-scan"),
+            uploads: std::env::temp_dir().join("lambda-install"),
             image_id: image_id.clone(),
             open_port: Box::new(open_port),
         };

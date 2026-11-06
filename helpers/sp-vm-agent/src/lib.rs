@@ -55,6 +55,22 @@ pub enum Request {
     /// Scans every VST3 bundle in the guest's VST3 folder, one scanner process each. The
     /// agent answers with one [`Event::Scanned`] per bundle, then [`Event::ScanDone`].
     Scan,
+    /// Writes part of an uploaded file (an installer) at `offset`; offset 0 starts the file
+    /// again. Make these with [`Request::uploads`].
+    Upload {
+        /// The file name, without a folder.
+        name: String,
+        /// Where `data` goes in the file.
+        offset: u64,
+        /// The bytes, base64.
+        data: String,
+    },
+    /// Runs an uploaded file in the user's session, so its windows show on the VM screen;
+    /// an `.msi` through `msiexec /i`. The agent answers with [`Event::Ran`] when it exits.
+    Run {
+        /// The file name.
+        name: String,
+    },
 }
 
 /// An agent event on the agent port.
@@ -103,6 +119,20 @@ pub enum Event {
         /// The scanner's report (JSON), if it wrote one.
         report: Option<String>,
     },
+    /// Part of an upload is written.
+    Uploaded {
+        /// The file name.
+        name: String,
+        /// The file's size now.
+        size: u64,
+    },
+    /// An uploaded file ran and exited.
+    Ran {
+        /// The file name.
+        name: String,
+        /// Its exit code, if it has one.
+        code: Option<i32>,
+    },
     /// The scan has ended.
     ScanDone {
         /// The bundles scanned.
@@ -130,7 +160,26 @@ fn line(value: &impl Serialize) -> Vec<u8> {
     line
 }
 
+/// The bytes in one [`Request::Upload`]: a line stays below 64 KiB.
+pub const UPLOAD_CHUNK: usize = 48 * 1024;
+
 impl Request {
+    /// The uploads of `bytes` as the file `name`, in order.
+    pub fn uploads<'a>(name: &'a str, bytes: &'a [u8]) -> impl Iterator<Item = Self> + 'a {
+        use base64::Engine as _;
+        let chunks = bytes.chunks(UPLOAD_CHUNK);
+        // An empty file is one empty upload, so the file exists.
+        let empty = bytes.is_empty().then_some(&[][..]);
+        chunks
+            .chain(empty)
+            .enumerate()
+            .map(move |(index, chunk)| Self::Upload {
+                name: name.to_owned(),
+                offset: (index * UPLOAD_CHUNK) as u64,
+                data: base64::engine::general_purpose::STANDARD.encode(chunk),
+            })
+    }
+
     /// The request as one line for the agent port.
     #[must_use]
     pub fn to_line(&self) -> Vec<u8> {
