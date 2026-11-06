@@ -144,8 +144,11 @@ impl Agent {
     }
 
     /// Serves requests for ever. Sends a heartbeat every [`HEARTBEAT_INTERVAL`] from a
-    /// thread of its own. When the agent port fails (the host went away), it opens the port
-    /// again, once a second, and keeps its workers.
+    /// thread of its own.
+    ///
+    /// A virtio-serial port reads nothing while no host is connected, and a second open of
+    /// the port fails while the first is open. So after an empty or failed read the agent
+    /// waits and reads the same handle again; its workers keep running.
     pub fn run(self) -> ! {
         let state = Arc::clone(&self.state);
         thread::spawn(move || {
@@ -155,38 +158,38 @@ impl Agent {
                 state.emit(&Event::Heartbeat { sequence });
             }
         });
-        loop {
-            // Not in the `if let`: its lock guard would live through `serve`.
-            let requests = lock(&self.state.events).try_clone_port();
-            if let Ok(port) = requests {
-                self.serve(BufReader::new(port));
+        let mut requests = loop {
+            // Not in a `match` scrutinee: its lock guard would live through the arms.
+            let port = lock(&self.state.events).try_clone_port();
+            match port {
+                Ok(port) => break BufReader::new(port),
+                Err(_) => thread::sleep(Duration::from_secs(1)),
             }
-            loop {
-                thread::sleep(Duration::from_secs(1));
-                if let Ok(port) = (self.config.open_port)(None) {
-                    *lock(&self.state.events) = port;
-                    break;
+        };
+        let mut line = String::new();
+        loop {
+            match requests.read_line(&mut line) {
+                Ok(_) if line.ends_with('\n') => {
+                    self.handle_line(line.trim());
+                    line.clear();
                 }
+                Ok(0) | Err(_) => thread::sleep(Duration::from_millis(100)),
+                // Part of a line: read the rest.
+                Ok(_) => {}
             }
         }
     }
 
-    /// Handles requests until the agent port ends or fails.
-    fn serve(&self, requests: impl BufRead) {
-        for line in requests.lines() {
-            let Ok(line) = line else {
-                return;
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            match Request::from_line(&line) {
-                Ok(request) => self.handle(request),
-                Err(error) => self.state.emit(&Event::Error {
-                    port: None,
-                    message: format!("bad request: {error}"),
-                }),
-            }
+    fn handle_line(&self, line: &str) {
+        if line.is_empty() {
+            return;
+        }
+        match Request::from_line(line) {
+            Ok(request) => self.handle(request),
+            Err(error) => self.state.emit(&Event::Error {
+                port: None,
+                message: format!("bad request: {error}"),
+            }),
         }
     }
 
