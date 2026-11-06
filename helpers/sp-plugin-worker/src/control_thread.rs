@@ -188,7 +188,12 @@ fn control_loop(
     while !shutdown.load(Ordering::Acquire) {
         let frame = match frames.wait(IDLE_INTERVAL) {
             FrameWait::Frame(frame) => frame,
-            FrameWait::TimedOut => continue,
+            FrameWait::TimedOut => {
+                // In the VM, plug-in modules that loaded since are patched (`vm_hooks`).
+                #[cfg(windows)]
+                sp_shared_memory_os::vm_hooks::sweep();
+                continue;
+            }
             // The host closed the channel (it stopped or dropped this worker) or broke framing.
             FrameWait::Closed => return Ok(()),
         };
@@ -197,6 +202,9 @@ fn control_loop(
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let shutdown_after_reply = request.operation() == ControlOperation::Shutdown;
         let response = forward_request(&request, &mut mailbox, timeout, shutdown)?;
+        // A request can load a plug-in: patch it before it processes audio.
+        #[cfg(windows)]
+        sp_shared_memory_os::vm_hooks::sweep();
         response
             .write_to(&mut responses)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;

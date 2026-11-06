@@ -10,18 +10,14 @@
 
 #![allow(unsafe_code, reason = "a TLS callback and Win32 thread affinity")]
 
-use std::{
-    ffi::c_void,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::ffi::c_void;
+
+use sp_shared_memory_os::vm_hooks;
 
 use windows_sys::Win32::System::{
     SystemServices::DLL_THREAD_ATTACH,
     Threading::{GetCurrentThread, SetThreadAffinityMask},
 };
-
-/// The Windows vCPUs, or zero outside the VM.
-static WINDOWS_CPUS: AtomicUsize = AtomicUsize::new(0);
 
 /// Reads `SP_VM_WINDOWS_CPUS` and moves the calling thread to those vCPUs. Call it first in
 /// `main`, before any other thread starts.
@@ -33,7 +29,7 @@ pub fn confine() {
     else {
         return;
     };
-    WINDOWS_CPUS.store(mask, Ordering::Relaxed);
+    vm_hooks::set_windows_cpus(mask);
     // SAFETY: the pseudo-handle of this thread; a plain mask.
     unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) };
 }
@@ -42,7 +38,7 @@ unsafe extern "system" fn on_thread(_module: *mut c_void, reason: u32, _reserved
     if reason != DLL_THREAD_ATTACH {
         return;
     }
-    let mask = WINDOWS_CPUS.load(Ordering::Relaxed);
+    let mask = vm_hooks::windows_cpus();
     if mask != 0 {
         // SAFETY: the pseudo-handle of the new thread; a plain mask.
         unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) };

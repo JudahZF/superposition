@@ -12,6 +12,8 @@ mod audio_thread;
 mod chain;
 mod port;
 mod sys;
+#[cfg(windows)]
+pub mod vm_hooks;
 
 #[cfg(any(target_os = "linux", windows))]
 pub use audio_thread::realtime_priority;
