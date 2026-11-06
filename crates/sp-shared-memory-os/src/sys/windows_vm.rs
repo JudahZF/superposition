@@ -6,7 +6,12 @@
 //! cached (`MmCached`): the BAR is host RAM. The host's doorbell on vector 0 sets an event
 //! that the driver signals from its DPC.
 
-use std::{ffi::c_void, io, mem, ptr, sync::OnceLock};
+use std::{
+    collections::HashMap,
+    ffi::c_void,
+    io, mem, ptr,
+    sync::{Arc, Mutex, OnceLock, PoisonError, Weak},
+};
 
 use windows_sys::{
     Win32::{
@@ -81,6 +86,24 @@ pub(crate) struct PortDevice {
 
 // SAFETY: the handles and the mapping belong to this process, not to a thread.
 unsafe impl Send for PortDevice {}
+// SAFETY: as above; `wait` only waits on the event, which Windows allows from any thread.
+unsafe impl Sync for PortDevice {}
+
+/// Port `port`'s device, shared by every bank of the port that this process opens. The driver
+/// lets one handle map a device, and a worker can open its bank more than once.
+pub(crate) fn shared_port(port: u32) -> io::Result<Arc<PortDevice>> {
+    static PORTS: OnceLock<Mutex<HashMap<u32, Weak<PortDevice>>>> = OnceLock::new();
+    let mut ports = PORTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(device) = ports.get(&port).and_then(Weak::upgrade) {
+        return Ok(device);
+    }
+    let device = Arc::new(PortDevice::open(port)?);
+    ports.insert(port, Arc::downgrade(&device));
+    Ok(device)
+}
 
 impl Drop for PortDevice {
     fn drop(&mut self) {

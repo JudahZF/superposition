@@ -194,7 +194,9 @@ enum Backing {
     /// A VM worker's bank: its port's IVSHMEM device, which owns the mapping and the
     /// doorbell event.
     #[cfg(windows)]
-    VmPort { device: sys::windows_vm::PortDevice },
+    VmPort {
+        device: std::sync::Arc<sys::windows_vm::PortDevice>,
+    },
 }
 
 // SAFETY: the mapping pointer is exclusively owned by this value. Moving the owner to
@@ -286,7 +288,7 @@ impl SharedMemoryRegion {
     /// the host has not written the region, and `InvalidData` for another port or layout.
     #[cfg(windows)]
     fn open_port_bank(name: &str, port: u32, bank: usize) -> io::Result<Self> {
-        let device = sys::windows_vm::PortDevice::open(port)?;
+        let device = sys::windows_vm::shared_port(port)?;
         if device.size() < port_region_bytes() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
