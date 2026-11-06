@@ -385,9 +385,10 @@ impl SharedMemoryRegion {
             Backing::Named { .. } => unsafe { sys::notify(sequence) },
             #[cfg(target_os = "linux")]
             Backing::Port { eventfd, .. } => sys::ring(eventfd),
-            // A VM worker never wakes its host: the host polls for completions.
+            // In the guest only the worker's own audio thread waits: the host polls for
+            // completions.
             #[cfg(windows)]
-            Backing::VmPort { .. } => -38,
+            Backing::VmPort { device } => device.notify(),
         }
     }
 

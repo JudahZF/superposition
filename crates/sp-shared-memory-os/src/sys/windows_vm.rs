@@ -33,8 +33,8 @@ use windows_sys::{
             Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
             Threading::{
                 CreateEventW, GetCurrentProcess, GetCurrentThread, REALTIME_PRIORITY_CLASS,
-                SetPriorityClass, SetThreadAffinityMask, SetThreadPriority, THREAD_PRIORITY_NORMAL,
-                THREAD_PRIORITY_TIME_CRITICAL, WaitForSingleObject,
+                SetEvent, SetPriorityClass, SetThreadAffinityMask, SetThreadPriority,
+                THREAD_PRIORITY_NORMAL, THREAD_PRIORITY_TIME_CRITICAL, WaitForSingleObject,
             },
         },
     },
@@ -211,6 +211,16 @@ impl PortDevice {
     /// This guest's peer ID on the port server, for a check against the host's view.
     pub(crate) fn peer_id(&self) -> u16 {
         self.peer_id
+    }
+
+    /// Wakes this process's waiter as the doorbell would: the worker's control thread wakes
+    /// its audio thread this way. Returns 1, or a negative Windows error code.
+    pub(crate) fn notify(&self) -> i32 {
+        // SAFETY: `event` is a live event handle.
+        if unsafe { SetEvent(self.event) } == 0 {
+            return -last_error();
+        }
+        1
     }
 
     /// Waits for the doorbell up to `timeout_ns`, rounded up to whole milliseconds.
