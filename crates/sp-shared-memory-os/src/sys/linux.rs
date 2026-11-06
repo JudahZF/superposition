@@ -240,3 +240,7 @@ pub(crate) fn wait_eventfd(eventfd: &OwnedFd, timeout_ns: u64) -> c_int {
     }
     0
 }
+
+pub(crate) fn clock_is_host_domain() -> bool {
+    true
+}

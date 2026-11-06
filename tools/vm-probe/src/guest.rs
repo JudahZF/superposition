@@ -11,9 +11,9 @@ const WAIT: Duration = Duration::from_millis(100);
 
 /// Answers requests until the bank fails. Returns the error that stopped it.
 ///
-/// The guest's clock is its own domain. It writes the claim tick as the host's publication
-/// tick and the completion tick as that plus its own processing time, so the ticks stay in
-/// the host's domain and in order. The host measures the round trip on its own clock.
+/// In the VM the guest's clock is its own domain, so the slot ticks are anchored at the
+/// host's publication tick ([`MonotonicClock::slot_tick`]). The host measures the round trip
+/// on its own clock.
 pub(crate) fn serve(region: &mut SharedMemoryRegion, clock: MonotonicClock) -> io::Error {
     loop {
         let observed = region.request_wake_sequence();
@@ -37,9 +37,9 @@ fn answer(region: &mut SharedMemoryRegion, clock: MonotonicClock) -> Result<bool
     let Some(ticket) = requested_ticket(slot) else {
         return Ok(false);
     };
-    let started = clock.now_ticks();
+    let seen = clock.now_ticks();
     let published = slot.metadata.request_published_tick.load(Ordering::Acquire);
-    match slot.claim_ticket_for_processing_at(WORKER_ID, ticket, published.max(1)) {
+    match slot.claim_ticket_for_processing_at(WORKER_ID, ticket, clock.slot_tick(published, seen)) {
         Ok(_) => {}
         // The host abandoned or replaced the request first.
         Err(ProtocolError::UnexpectedState | ProtocolError::Owned | ProtocolError::StaleTicket) => {
@@ -52,13 +52,7 @@ fn answer(region: &mut SharedMemoryRegion, clock: MonotonicClock) -> Result<bool
     for channel in 0..channels {
         slot.output_audio[channel][..frames].copy_from_slice(&slot.input_audio[channel][..frames]);
     }
-    let processing = clock.ticks_to_duration(clock.now_ticks().saturating_sub(started));
-    let processing = u64::try_from(processing.as_nanos()).unwrap_or(u64::MAX);
-    slot.publish_completion_at(
-        WORKER_ID,
-        ticket,
-        published.max(1).saturating_add(processing),
-    )?;
+    slot.publish_completion_at(WORKER_ID, ticket, clock.slot_tick(published, seen))?;
     Ok(true)
 }
 

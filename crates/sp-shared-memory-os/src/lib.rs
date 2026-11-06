@@ -89,6 +89,7 @@ const SHARED_MEMORY_CREATE_ATTEMPTS: usize = 64;
 pub struct MonotonicClock {
     numer: u32,
     denom: u32,
+    host_domain: bool,
 }
 
 impl MonotonicClock {
@@ -104,7 +105,34 @@ impl MonotonicClock {
                 "the platform returned an invalid timebase",
             ));
         }
-        Ok(Self { numer, denom })
+        Ok(Self {
+            numer,
+            denom,
+            host_domain: sys::clock_is_host_domain(),
+        })
+    }
+
+    /// Whether this clock's ticks compare with the host's: false only in Lambda's VM.
+    #[must_use]
+    pub fn is_host_domain(self) -> bool {
+        self.host_domain
+    }
+
+    /// The tick a worker writes into a slot for an event now (a claim or a completion).
+    ///
+    /// In the host's clock domain this is [`Self::now_ticks`]. In Lambda's VM it is the
+    /// request's host `published` tick plus the guest time since `seen`, a guest tick that
+    /// the worker took when it found the request. Such ticks stay ordered and in the host's
+    /// nanoseconds, but they leave out the wake time: they are diagnostics only.
+    #[must_use]
+    pub fn slot_tick(self, published: u64, seen: u64) -> u64 {
+        if self.host_domain {
+            return self.now_ticks();
+        }
+        let elapsed = self.ticks_to_duration(self.now_ticks().saturating_sub(seen));
+        published
+            .max(1)
+            .saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
     }
 
     /// Captures the current raw tick in the system-wide continuous clock domain.
@@ -1296,7 +1324,11 @@ mod tests {
 
     #[test]
     fn clock_conversions_round_up_and_saturate_without_sampling_the_system_clock() {
-        let clock = MonotonicClock { numer: 3, denom: 2 };
+        let clock = MonotonicClock {
+            numer: 3,
+            denom: 2,
+            host_domain: true,
+        };
         assert_eq!(clock.ticks_to_duration(2), Duration::from_nanos(3));
         assert_eq!(clock.duration_to_ticks(Duration::from_nanos(1)), 1);
         assert_eq!(clock.duration_to_ticks(Duration::from_nanos(3)), 2);
@@ -1304,6 +1336,7 @@ mod tests {
         let saturating_clock = MonotonicClock {
             numer: u32::MAX,
             denom: 1,
+            host_domain: true,
         };
         assert_eq!(saturating_clock.ticks_to_duration(u64::MAX), Duration::MAX);
     }

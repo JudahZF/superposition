@@ -477,10 +477,12 @@ fn process_available_request(
     let Some(observed_ticket) = requested_ticket(slot)? else {
         return Ok(false);
     };
+    let seen = clock.now_ticks();
+    let published = slot.metadata.request_published_tick.load(Ordering::Acquire);
     let ticket = match slot.claim_ticket_for_processing_at(
         configuration.worker_id,
         observed_ticket,
-        clock.now_ticks(),
+        clock.slot_tick(published, seen),
     ) {
         Ok(ticket) => ticket,
         Err(ProtocolError::UnexpectedState | ProtocolError::Owned | ProtocolError::StaleTicket) => {
@@ -490,8 +492,12 @@ fn process_available_request(
     };
 
     process_slot_audio(slot, plugin)?;
-    slot.publish_completion_at(configuration.worker_id, ticket, clock.now_ticks())
-        .map_err(|error| format!("could not publish completion: {error}"))?;
+    slot.publish_completion_at(
+        configuration.worker_id,
+        ticket,
+        clock.slot_tick(published, seen),
+    )
+    .map_err(|error| format!("could not publish completion: {error}"))?;
     // A completed block is a useful liveness boundary even when its period is shorter than the
     // ordinary heartbeat interval.
     heartbeat.publish_now(header)?;
@@ -1973,18 +1979,21 @@ fn process_production_request(
     let Some(observed_ticket) = requested_ticket(slot)? else {
         return Ok(RequestProgress::Idle);
     };
-    let ticket =
-        match slot.claim_ticket_for_processing_at(worker_id, observed_ticket, clock.now_ticks()) {
-            Ok(ticket) => ticket,
-            Err(
-                ProtocolError::UnexpectedState | ProtocolError::Owned | ProtocolError::StaleTicket,
-            ) => {
-                // A publication wake is not repeated after transient owner contention.
-                // Rescan instead of sleeping while the observed request may remain pending.
-                return Ok(RequestProgress::Retry);
-            }
-            Err(error) => return Err(format!("invalid shared-memory request: {error}")),
-        };
+    let seen = clock.now_ticks();
+    let published = slot.metadata.request_published_tick.load(Ordering::Acquire);
+    let ticket = match slot.claim_ticket_for_processing_at(
+        worker_id,
+        observed_ticket,
+        clock.slot_tick(published, seen),
+    ) {
+        Ok(ticket) => ticket,
+        Err(ProtocolError::UnexpectedState | ProtocolError::Owned | ProtocolError::StaleTicket) => {
+            // A publication wake is not repeated after transient owner contention.
+            // Rescan instead of sleeping while the observed request may remain pending.
+            return Ok(RequestProgress::Retry);
+        }
+        Err(error) => return Err(format!("invalid shared-memory request: {error}")),
+    };
     let frames = slot.metadata.frame_count;
     audio_policy
         .enter(frames, sample_rate)
@@ -1994,7 +2003,7 @@ fn process_production_request(
     if let Some(chain) = chain {
         chain.process(slot, header, clock, sample_rate);
     }
-    slot.publish_completion_at(worker_id, ticket, clock.now_ticks())
+    slot.publish_completion_at(worker_id, ticket, clock.slot_tick(published, seen))
         .map_err(|error| format!("could not publish completion: {error}"))?;
     heartbeat.publish_now(header)?;
     Ok(RequestProgress::Processed(frames))

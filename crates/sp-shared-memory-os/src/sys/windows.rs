@@ -278,3 +278,8 @@ pub(crate) unsafe fn wait(word: &AtomicU32, observed: u32, timeout_ns: u64) -> c
         None => 38, // ENOSYS
     }
 }
+
+/// Under Wine the clock is the host's; in Lambda's VM it is the guest's own.
+pub(crate) fn clock_is_host_domain() -> bool {
+    bridge().is_some()
+}
