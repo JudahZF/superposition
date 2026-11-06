@@ -253,7 +253,8 @@ impl Agent {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            // The worker's diagnostics go where the agent's go.
+            .stderr(Stdio::inherit());
         if let Some(cpu) = audio_cpu {
             command.env("SP_VM_AUDIO_CPU", cpu.to_string());
         }
