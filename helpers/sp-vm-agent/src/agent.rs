@@ -74,10 +74,7 @@ impl State {
     /// Sends one event. A host that is not listening loses it.
     fn emit(&self, event: &Event) {
         let mut port = lock(&self.events);
-        if let Ok(mut line) = serde_json::to_vec(event) {
-            line.push(b'\n');
-            let _ = port.write_all(&line).and_then(|()| port.flush());
-        }
+        let _ = port.write_all(&event.to_line()).and_then(|()| port.flush());
     }
 
     /// Reports and forgets workers that exited by themselves.
@@ -183,7 +180,7 @@ impl Agent {
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str::<Request>(&line) {
+            match Request::from_line(&line) {
                 Ok(request) => self.handle(request),
                 Err(error) => self.state.emit(&Event::Error {
                     port: None,

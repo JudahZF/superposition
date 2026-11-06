@@ -86,3 +86,45 @@ pub enum Event {
         message: String,
     },
 }
+
+/// One JSON line, with its newline: the wire form of a [`Request`] or an [`Event`].
+fn line(value: &impl Serialize) -> Vec<u8> {
+    // The messages have only strings, integers and lists: serializing cannot fail.
+    let mut line = serde_json::to_vec(value).unwrap_or_default();
+    line.push(b'\n');
+    line
+}
+
+impl Request {
+    /// The request as one line for the agent port.
+    #[must_use]
+    pub fn to_line(&self) -> Vec<u8> {
+        line(self)
+    }
+
+    /// Parses one line from the agent port.
+    ///
+    /// # Errors
+    ///
+    /// Returns the parse error as text.
+    pub fn from_line(line: &str) -> Result<Self, String> {
+        serde_json::from_str(line).map_err(|error| error.to_string())
+    }
+}
+
+impl Event {
+    /// The event as one line for the agent port.
+    #[must_use]
+    pub fn to_line(&self) -> Vec<u8> {
+        line(self)
+    }
+
+    /// Parses one line from the agent port.
+    ///
+    /// # Errors
+    ///
+    /// Returns the parse error as text.
+    pub fn from_line(line: &str) -> Result<Self, String> {
+        serde_json::from_str(line).map_err(|error| error.to_string())
+    }
+}
