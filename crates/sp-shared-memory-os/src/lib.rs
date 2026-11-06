@@ -1,12 +1,16 @@
-//! Shared-memory mappings for a fixed [`SharedBank`] layout on macOS, Linux, and Wine.
+//! Shared-memory mappings for a fixed [`SharedBank`] layout on macOS, Linux, Wine, and in
+//! Lambda's Windows VM.
 //!
 //! This crate maps initialized `SharedBank` bytes. Fixed-bank heap initialization has its
 //! own narrow unsafe boundary in `sp-shared-memory`; protocol state changes remain safe APIs.
 //! The host creates banks on macOS and Linux. A Windows worker running under Wine opens a
-//! Linux host's bank; see the `sys` module.
+//! Linux host's bank. A Linux host also writes the two banks of a VM port
+//! ([`create_port_banks`]), which a Windows worker in the VM opens by their
+//! [`port_bank_name`]; see the `sys` and `port` modules.
 
 mod audio_thread;
 mod chain;
+mod port;
 mod sys;
 
 #[cfg(any(target_os = "linux", windows))]
@@ -19,6 +23,13 @@ pub use audio_thread::{
     current_thread_id, promote_thread, realtime_priority_limit, rtkit_max_priority,
 };
 pub use chain::{ChainLink, Forwarded, Hop, MIN_HOP_MARGIN};
+#[cfg(target_os = "linux")]
+pub use port::create_port_banks;
+pub use port::{
+    MAX_VM_PORTS, PORT_HEADER_BYTES, PORT_LAYOUT_VERSION, PORT_MAGIC, PortHeader,
+    VM_PORT_FIRST_PCI_DEVICE, parse_port_bank_name, port_bank_name, port_bank_offset,
+    port_region_bytes,
+};
 
 use std::{
     ffi::CString,
@@ -68,7 +79,9 @@ const SHARED_MEMORY_CREATE_ATTEMPTS: usize = 64;
 /// Conversion and sampling for the process-independent clock shared by host and workers.
 ///
 /// macOS uses the continuous Mach clock. Linux and Wine workers use `CLOCK_MONOTONIC`
-/// nanoseconds, so a Wine worker's ticks compare directly with its Linux host's.
+/// nanoseconds, so a Wine worker's ticks compare directly with its Linux host's. A worker in
+/// Lambda's VM uses the guest's performance counter: its own clock domain, which no code may
+/// compare with a host tick.
 ///
 /// Construct this value off the real-time thread. Calling [`Self::now_ticks`] performs
 /// one system clock read and does not allocate or lock.
@@ -125,17 +138,34 @@ impl MonotonicClock {
     }
 }
 
-/// A named mapping containing exactly one initialized [`SharedBank`].
+/// A mapping containing exactly one initialized [`SharedBank`].
 ///
-/// The creator unlinks the POSIX name when this value is dropped. Existing mappings
-/// remain valid until their owners close them, which lets the worker outlive the
-/// launch handshake without leaking a named shared-memory object.
+/// A bank is either a named POSIX object of its own or one of the two banks in a VM port's
+/// region ([`create_port_banks`]). The creator of a named bank unlinks the name when this
+/// value is dropped. Existing mappings remain valid until their owners close them, which
+/// lets the worker outlive the launch handshake without leaking a named shared-memory object.
 pub struct SharedMemoryRegion {
     name: CString,
-    /// Dropped after `Drop::drop` unmaps the bank.
-    _object: sys::RawObject,
+    backing: Backing,
     bank: NonNull<SharedBank>,
-    unlink_on_drop: bool,
+}
+
+enum Backing {
+    /// A POSIX object that holds only this bank. Dropped after `Drop::drop` unmaps the bank.
+    Named {
+        _object: sys::RawObject,
+        unlink_on_drop: bool,
+    },
+    /// One bank in a VM port's region. The request wake rings the guest's eventfd doorbell.
+    #[cfg(target_os = "linux")]
+    Port {
+        _mapping: std::sync::Arc<port::PortMapping>,
+        doorbell: std::os::fd::OwnedFd,
+    },
+    /// A VM worker's bank: its port's IVSHMEM device, which owns the mapping and the
+    /// doorbell event.
+    #[cfg(windows)]
+    VmPort { device: sys::windows_vm::PortDevice },
 }
 
 // SAFETY: the mapping pointer is exclusively owned by this value. Moving the owner to
@@ -186,6 +216,10 @@ impl SharedMemoryRegion {
     /// Returns an operating-system error if the named object cannot be opened or
     /// mapped, or `InvalidData` if its header or slot contents do not match this build.
     pub fn open(name: &str) -> io::Result<Self> {
+        #[cfg(windows)]
+        if let Some((port, bank)) = parse_port_bank_name(name) {
+            return Self::open_port_bank(name, port, bank);
+        }
         let name = CString::new(name).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -209,13 +243,62 @@ impl SharedMemoryRegion {
 
         Ok(Self {
             name,
-            _object: object,
+            backing: Backing::Named {
+                _object: object,
+                unlink_on_drop: false,
+            },
             bank,
-            unlink_on_drop: false,
         })
     }
 
-    /// Returns the POSIX name a worker uses to open this mapping.
+    /// Opens bank `bank` of VM port `port` in Lambda's VM.
+    ///
+    /// Fails with `ResourceBusy` while an old worker still maps the port, `WouldBlock` while
+    /// the host has not written the region, and `InvalidData` for another port or layout.
+    #[cfg(windows)]
+    fn open_port_bank(name: &str, port: u32, bank: usize) -> io::Result<Self> {
+        let device = sys::windows_vm::PortDevice::open(port)?;
+        if device.size() < port_region_bytes() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the VM port device is smaller than a port region",
+            ));
+        }
+        // SAFETY: the mapping is at least a port region and starts with the header, which has
+        // only atomics.
+        unsafe { device.address().cast::<PortHeader>().as_ref() }.check(port)?;
+        // SAFETY: the bank's page-aligned offset and size lie within the checked region.
+        let bank_pointer: NonNull<SharedBank> =
+            unsafe { device.address().byte_add(port_bank_offset(bank)).cast() };
+        // SAFETY: the host wrote an initialized bank before the header's magic (checked).
+        let bank_ref = unsafe { bank_pointer.as_ref() };
+        if !bank_ref.is_compatible() || bank_ref.validate_mapped_contents().is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the VM port bank is not compatible with this build",
+            ));
+        }
+        Ok(Self {
+            name: CString::new(name).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "bank name contains NUL")
+            })?,
+            backing: Backing::VmPort { device },
+            bank: bank_pointer,
+        })
+    }
+
+    /// This VM worker's peer ID on its port server, for a check against the host's view.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn vm_peer_id(&self) -> Option<u16> {
+        match &self.backing {
+            Backing::VmPort { device } => Some(device.peer_id()),
+            Backing::Named { .. } => None,
+        }
+    }
+
+    /// Returns the name a worker uses to open this mapping: a POSIX name, or for a VM port's
+    /// bank the [`port_bank_name`].
     ///
     /// # Panics
     ///
@@ -266,8 +349,15 @@ impl SharedMemoryRegion {
     fn notify_request_status(&self) -> c_int {
         let sequence = &self.bank().header.request_wake_sequence;
         sequence.fetch_add(1, Ordering::Release);
-        // SAFETY: `sequence` is a four-byte aligned atomic in this live shared bank.
-        unsafe { sys::notify(sequence) }
+        match &self.backing {
+            // SAFETY: `sequence` is a four-byte aligned atomic in this live shared bank.
+            Backing::Named { .. } => unsafe { sys::notify(sequence) },
+            #[cfg(target_os = "linux")]
+            Backing::Port { doorbell, .. } => sys::ring(doorbell),
+            // A VM worker never wakes its host: the host polls for completions.
+            #[cfg(windows)]
+            Backing::VmPort { .. } => -38,
+        }
     }
 
     /// Waits until the wake sequence differs from `observed`, a signal arrives, or time expires.
@@ -287,8 +377,19 @@ impl SharedMemoryRegion {
         }
         let timeout_ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
         let sequence = &self.bank().header.request_wake_sequence;
-        // SAFETY: `sequence` is a four-byte aligned atomic in this live shared bank.
-        let status = unsafe { sys::wait(sequence, observed, timeout_ns) };
+        let status = match &self.backing {
+            // The doorbell event stays set after a ring that came before this wait.
+            #[cfg(windows)]
+            Backing::VmPort { device } => {
+                if sequence.load(Ordering::Acquire) == observed {
+                    device.wait(timeout_ns)
+                } else {
+                    0
+                }
+            }
+            // SAFETY: `sequence` is a four-byte aligned atomic in this live shared bank.
+            _ => unsafe { sys::wait(sequence, observed, timeout_ns) },
+        };
         if status == 0 {
             Ok(())
         } else {
@@ -346,11 +447,21 @@ impl SharedMemoryRegion {
 
 impl Drop for SharedMemoryRegion {
     fn drop(&mut self) {
-        // SAFETY: this value owns the mapping exactly once and no borrow outlives `self`.
-        unsafe { sys::unmap(self.bank.cast(), size_of::<SharedBank>()) };
-        // POSIX permits unlinking before other mapping owners close their descriptors.
-        if self.unlink_on_drop {
-            sys::unlink(&self.name);
+        match &self.backing {
+            Backing::Named { unlink_on_drop, .. } => {
+                // SAFETY: this value owns the mapping exactly once and no borrow outlives `self`.
+                unsafe { sys::unmap(self.bank.cast(), size_of::<SharedBank>()) };
+                // POSIX permits unlinking before other mapping owners close their descriptors.
+                if *unlink_on_drop {
+                    sys::unlink(&self.name);
+                }
+            }
+            // The port mapping unmaps when its last bank drops.
+            #[cfg(target_os = "linux")]
+            Backing::Port { .. } => {}
+            // Closing the device releases the mapping.
+            #[cfg(windows)]
+            Backing::VmPort { .. } => {}
         }
     }
 }
@@ -910,9 +1021,11 @@ fn initialize_created_region(
     match result {
         Ok(bank) => Ok(SharedMemoryRegion {
             name: name.clone(),
-            _object: object,
+            backing: Backing::Named {
+                _object: object,
+                unlink_on_drop: true,
+            },
             bank,
-            unlink_on_drop: true,
         }),
         Err(error) => {
             // This process created the object under O_EXCL, so this cleanup cannot unlink an

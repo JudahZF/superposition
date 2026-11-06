@@ -7,7 +7,10 @@
 use std::{
     ffi::CStr,
     io,
-    os::raw::{c_int, c_void},
+    os::{
+        fd::{AsRawFd, IntoRawFd, OwnedFd},
+        raw::{c_int, c_void},
+    },
     ptr::{self, NonNull},
     sync::atomic::AtomicU32,
 };
@@ -21,6 +24,12 @@ impl Drop for RawObject {
     fn drop(&mut self) {
         // SAFETY: this value is the descriptor's only owner.
         unsafe { libc::close(self.0) };
+    }
+}
+
+impl From<OwnedFd> for RawObject {
+    fn from(descriptor: OwnedFd) -> Self {
+        Self(descriptor.into_raw_fd())
     }
 }
 
@@ -185,5 +194,19 @@ pub(crate) unsafe fn wait(word: &AtomicU32, observed: u32, timeout_ns: u64) -> c
         Some(libc::EAGAIN | libc::ETIMEDOUT | libc::EINTR) => 0,
         Some(code) => code,
         None => libc::EIO,
+    }
+}
+
+/// Rings an eventfd doorbell: one non-blocking write. Returns 1, or a negative errno.
+pub(crate) fn ring(doorbell: &OwnedFd) -> c_int {
+    let one = 1_u64.to_ne_bytes();
+    // SAFETY: the descriptor is open and `one` is 8 readable bytes.
+    let written = unsafe { libc::write(doorbell.as_raw_fd(), one.as_ptr().cast(), one.len()) };
+    if written == 8 {
+        1
+    } else {
+        -io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
     }
 }

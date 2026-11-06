@@ -1,4 +1,5 @@
-//! A Windows plug-in worker under Wine, attached to a Linux host's shared bank.
+//! A Windows plug-in worker under Wine, attached to a Linux host's shared bank, and the clock
+//! of a worker in Lambda's VM (`windows_vm` maps its banks).
 //!
 //! The worker never creates a bank. It opens the host's `/dev/shm` object through Wine's `Z:`
 //! drive; Wine backs the view with a `MAP_SHARED` mapping of the same pages. Windows has no
@@ -20,7 +21,7 @@ use windows_sys::Win32::{
         OPEN_EXISTING,
     },
     System::{
-        LibraryLoader::{GetProcAddress, LoadLibraryW},
+        LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
         Memory::{
             CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
             PAGE_READWRITE, UnmapViewOfFile,
@@ -71,6 +72,19 @@ fn load_bridge() -> Option<Bridge> {
             )?),
         })
     }
+}
+
+/// Whether this process runs under Wine: Wine's `ntdll` exports `wine_get_version`.
+fn under_wine() -> bool {
+    static UNDER_WINE: OnceLock<bool> = OnceLock::new();
+    *UNDER_WINE.get_or_init(|| {
+        let name = wide("ntdll.dll");
+        // SAFETY: `name` is NUL-terminated; ntdll is always loaded.
+        let module = unsafe { GetModuleHandleW(name.as_ptr()) };
+        // SAFETY: `module` is loaded; the name is NUL-terminated.
+        !module.is_null()
+            && unsafe { GetProcAddress(module, c"wine_get_version".as_ptr().cast()) }.is_some()
+    })
 }
 
 fn wide(value: &str) -> Vec<u16> {
@@ -184,24 +198,57 @@ pub(crate) fn page_size() -> i64 {
     i64::from(unsafe { info.assume_init() }.dwPageSize)
 }
 
+/// Under Wine, the host's `CLOCK_MONOTONIC` nanoseconds. In the VM, the guest's performance
+/// counter, which no code compares with a host tick.
 pub(crate) fn clock_now() -> u64 {
-    // Without the bridge no bank can be opened, so this clock is never compared with a host.
-    // SAFETY: the bridge export takes no arguments.
-    bridge().map_or(0, |bridge| unsafe { (bridge.clock_ns)() })
+    match bridge() {
+        // SAFETY: the bridge export takes no arguments.
+        Some(bridge) => unsafe { (bridge.clock_ns)() },
+        // Under Wine without the bridge, `clock_timebase` fails, so no clock exists.
+        None => super::windows_vm::qpc_now(),
+    }
 }
 
 pub(crate) fn clock_timebase() -> io::Result<(u32, u32)> {
-    if bridge().is_none() {
+    if bridge().is_some() {
+        return Ok((1, 1));
+    }
+    if under_wine() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "sp_wine_bridge.dll is not available; Windows workers run only under Wine",
+            "sp_wine_bridge.dll is not available; a Windows worker under Wine needs it",
         ));
     }
-    Ok((1, 1))
+    let frequency = super::windows_vm::qpc_frequency().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows has no performance counter",
+        )
+    })?;
+    let divisor = gcd(NANOS_PER_SECOND, frequency);
+    match (
+        u32::try_from(NANOS_PER_SECOND / divisor),
+        u32::try_from(frequency / divisor),
+    ) {
+        (Ok(numer), Ok(denom)) => Ok((numer, denom)),
+        _ => Err(io::Error::other(
+            "the performance counter frequency does not reduce to u32",
+        )),
+    }
 }
 
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// Under Wine, only with the bridge. In the VM, a port's doorbell event is the wait.
 pub(crate) fn wake_supported() -> bool {
-    bridge().is_some()
+    bridge().is_some() || !under_wine()
 }
 
 /// Wakes one waiter on a shared four-byte word. Returns a negative errno on failure.

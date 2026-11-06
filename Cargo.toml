@@ -10,6 +10,7 @@ members = [
     "crates/sp-shared-memory",
     "crates/sp-shared-memory-os",
     "crates/sp-rack-lane",
+    "crates/sp-ivshmem",
     "crates/sp-engine",
     "crates/sp-audio-io",
     "crates/sp-audio-io-macos",
