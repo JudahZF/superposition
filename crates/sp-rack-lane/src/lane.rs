@@ -246,6 +246,39 @@ impl RackLane {
         Ok(Self::new(clock, banks, Some(recovery)))
     }
 
+    /// Writes fresh banks into a VM port's region and makes a lane over them: bank 0 active
+    /// with `generation`, bank 1 inactive. Requests wake the guest through `doorbell`, the
+    /// eventfd of the guest's vector on the port ([`sp_shared_memory_os::create_port_banks`]).
+    ///
+    /// The control plane calls it only after the guest agent has confirmed that no worker
+    /// runs on the port (the one-owner rule of the VM plan), and holds one lane per port.
+    ///
+    /// # Errors
+    /// Returns an error for a port region that is too small, a zero or largest generation,
+    /// or a failed mapping.
+    #[cfg(target_os = "linux")]
+    pub fn over_vm_port(
+        clock: MonotonicClock,
+        memory: std::os::fd::OwnedFd,
+        port: u32,
+        generation: u64,
+        doorbell: std::os::fd::BorrowedFd<'_>,
+        recovery: Arc<RackRecoverySignal>,
+    ) -> io::Result<Self> {
+        if recovery.state() != RackRecoveryState::Idle {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "finish the rack bank handoff before adding it to live audio",
+            ));
+        }
+        // SAFETY: the control plane calls this only when no guest worker maps the port and no
+        // other lane holds it (documented above).
+        #[allow(unsafe_code, reason = "documented VM port ownership contract")]
+        let banks =
+            unsafe { sp_shared_memory_os::create_port_banks(memory, port, generation, doorbell) }?;
+        Ok(Self::new(clock, banks, Some(recovery)))
+    }
+
     /// The worker recovery signal, when the lane has one.
     #[must_use]
     pub fn recovery(&self) -> Option<&Arc<RackRecoverySignal>> {
