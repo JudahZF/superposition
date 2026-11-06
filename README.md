@@ -56,7 +56,7 @@ The app finds its helper executables beside its own executable, the Windows ones
 
 ## Using the app
 
-The show screen has one column per rack, left to right ([UI design](docs/ui-design.md)). Each column shows the rack's route, a picture of each plug-in's editor, gain, meters, and a state token. Click a picture to open that plug-in's native editor, and right-click it for the slot menu. **Setup** (⌘,) holds audio devices, MIDI, the plug-in catalog, and diagnostics. Use **Rescan plug-ins** there to fill the plug-in browser.
+The app has two views of the racks ([UI design](docs/ui-design.md)). **Overview** shows every rack as a narrow strip: its route, its eight plug-in slots with a picture of each editor, meters, a gain fader, mute, bypass, and its state. **Rack** shows the selected rack in detail: input, the chain, the plug-in's editor in a large centre pane, output, and a rail of up to 12 hot plug-ins pinned from any rack. Click a plug-in anywhere to open it in the rack view, and right-click it for the slot menu. On Linux the editor docks in the pane (**Pop out** floats it); on macOS it opens as a native window. **Setup** (⌘,) holds audio devices, MIDI, the plug-in catalog, and diagnostics. Use **Rescan plug-ins** there to fill the plug-in browser.
 
 | Key | Action |
 | --- | --- |
@@ -66,6 +66,7 @@ The show screen has one column per rack, left to right ([UI design](docs/ui-desi
 | ⌘⇧C | Capture a scene |
 | 1–8 | Recall scenes 1–8 |
 | ⌘0–⌘9 | Show all racks, or a page |
+| ↩ | Open the selected plug-in in the rack view |
 | Esc | Close the topmost overlay |
 
 Audio keeps running while you:
@@ -121,7 +122,7 @@ cargo xtask lane-soak --frames 32 --racks mixed --duration 60s   # rack lanes on
 
 The hardware verification commands (`host-checker`, `compatibility`, `loopback`, `click-test`, `midi-timing`, `soak`, `bundle`) check captured evidence from real devices. See [testing](docs/testing.md).
 
-To render the show screen to PNGs for visual review:
+To render the UI to PNGs for visual review:
 
 ```sh
 SUPERPOSITION_UI_SNAPSHOT=<dir> cargo test -p superposition --bin superposition render_show_screen_snapshots -- --ignored

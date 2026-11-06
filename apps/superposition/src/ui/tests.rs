@@ -85,8 +85,8 @@ fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
     }
 }
 
-/// Software-renders the show screen in its main states to PNGs for visual review. Opt-in: set
-/// `SUPERPOSITION_UI_SNAPSHOT` to an output directory. No window or GPU is used.
+/// Software-renders the overview, the rack view, and their overlays to PNGs for visual review.
+/// Opt-in: set `SUPERPOSITION_UI_SNAPSHOT` to an output directory. No window or GPU is used.
 #[cfg(audio_backend)]
 #[test]
 #[ignore = "writes PNGs; set SUPERPOSITION_UI_SNAPSHOT to an output directory"]
@@ -104,7 +104,48 @@ fn render_show_screen_snapshots() {
     let mut snapshot = |app: &mut LiveRackApp, size, path: &std::path::Path| {
         snapshot(&ctx, app, &mut textures, size, path);
     };
-    snapshot(&mut app, (1920.0, 1080.0), &directory.join("show-1920.png"));
+    snapshot(
+        &mut app,
+        (1920.0, 1080.0),
+        &directory.join("overview-1920.png"),
+    );
+    // The window's default size: the top bar drops its readouts rather than overlap the tabs.
+    snapshot(
+        &mut app,
+        (1180.0, 720.0),
+        &directory.join("overview-default.png"),
+    );
+    app.view = super::View::Rack;
+    snapshot(&mut app, (1920.0, 1080.0), &directory.join("rack-1920.png"));
+    snapshot(
+        &mut app,
+        (1512.0, 982.0),
+        &directory.join("rack-laptop.png"),
+    );
+    // Twelve pins on the default window: tiles shrink so every pin stays reachable.
+    let fixture_pins = app.controller.document().model.hot_plugins.clone();
+    let pins: Vec<(usize, usize)> = (0..8)
+        .map(|slot| (6, slot))
+        .chain([(1, 0), (1, 1), (2, 0), (2, 1)])
+        .filter(|&(rack, slot)| !app.is_hot(rack, slot))
+        .collect();
+    for &(rack, slot) in &pins {
+        app.toggle_hot_plugin(rack, slot);
+    }
+    snapshot(
+        &mut app,
+        (1180.0, 720.0),
+        &directory.join("rack-twelve-pins.png"),
+    );
+    app.controller.document_mut().model.hot_plugins = fixture_pins;
+    app.selected_slot = None;
+    snapshot(
+        &mut app,
+        (1920.0, 1080.0),
+        &directory.join("rack-no-slot.png"),
+    );
+    app.selected_slot = Some(1);
+    app.view = super::View::Overview;
     app.overlay = Overlay::Route {
         rack: 1,
         at: egui::pos2(215.0, 110.0),
@@ -190,6 +231,19 @@ fn render_show_screen_snapshots() {
     );
     app.show_page(Some(0));
     snapshot(&mut app, (1920.0, 1080.0), &directory.join("page.png"));
+    // Sixteen pages on the default window: the page rail scrolls.
+    let fixture_pages = app.controller.document().model.pages.clone();
+    while app.controller.document().model.pages.len() < sp_model::MAX_PAGES {
+        app.new_page(None);
+    }
+    app.show_page(Some(0));
+    snapshot(
+        &mut app,
+        (1180.0, 720.0),
+        &directory.join("pages-sixteen.png"),
+    );
+    app.controller.document_mut().model.pages = fixture_pages;
+    app.show_page(Some(0));
     app.overlay = Overlay::RackPages {
         rack: 0,
         at: egui::pos2(20.0, 140.0),
@@ -296,6 +350,9 @@ fn snapshot_fixture() -> (LiveRackApp, egui::Context) {
     app.current_scene = Some(2);
     app.selected_rack = 0;
     app.selected_slot = Some(1);
+    for (rack, slot) in [(0, 0), (2, 2), (4, 0), (6, 4)] {
+        app.toggle_hot_plugin(rack, slot);
+    }
     app.system.state = SystemStatusState::Online;
     app.test_workers_running = true;
     app.status_line = "Session loaded".to_owned();
@@ -681,7 +738,7 @@ fn show_controls_guard_audio_and_recall_scenes_by_number() {
     );
 }
 
-/// Escape closes overlays in the brief's order: popover, then fault line, then setup page.
+/// Escape closes overlays in order: popover, then fault banner, then setup page.
 #[test]
 fn escape_closes_the_topmost_overlay_first() {
     let mut app = empty_app("escape");
@@ -701,6 +758,107 @@ fn escape_closes_the_topmost_overlay_first() {
     assert!(app.close_topmost());
     assert_eq!(app.screen, super::Screen::Show);
     assert!(!app.close_topmost());
+}
+
+/// Enter on the selected slot opens it in the rack view, as clicking it in the overview does.
+#[test]
+fn enter_opens_the_selected_plugin_in_the_rack_view() {
+    let ctx = egui::Context::default();
+    super::install_style(&ctx);
+    let mut app = empty_app("open-plugin");
+    app.add_rack();
+    let slots = &mut app.controller.document_mut().model.racks[0].slots;
+    slots.push(plugin_slot("first", "test", 1));
+    slots.push(plugin_slot("second", "test", 1));
+    app.selected_slot = Some(1);
+    assert_eq!(app.view, super::View::Overview);
+    run_frame(
+        &ctx,
+        &mut app,
+        vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+    );
+    assert_eq!(app.view, super::View::Rack);
+    assert_eq!((app.selected_rack, app.selected_slot), (0, Some(1)));
+}
+
+/// Hot plug-ins name a rack and a slot (slot IDs repeat across racks): pinning toggles, and
+/// removing a slot or its rack unpins it so the session stays valid.
+#[test]
+fn hot_plugins_follow_slot_and_rack_removal() {
+    let mut app = empty_app("hot-plugins");
+    app.add_rack();
+    app.add_rack();
+    for rack in 0..2 {
+        for slot in 0..2 {
+            app.controller.document_mut().model.racks[rack]
+                .slots
+                .push(plugin_slot(&format!("slot{slot}"), "test", 1));
+        }
+    }
+    app.toggle_hot_plugin(0, 1);
+    app.toggle_hot_plugin(1, 0);
+    app.toggle_hot_plugin(0, 0);
+    assert_eq!(app.hot_plugin_slots(), [(0, 1), (1, 0), (0, 0)]);
+    app.toggle_hot_plugin(0, 1);
+    assert_eq!(app.hot_plugin_slots(), [(1, 0), (0, 0)]);
+
+    app.select_rack(0);
+    app.remove_slot(0);
+    assert_eq!(app.hot_plugin_slots(), [(1, 0)]);
+    app.select_rack(1);
+    app.remove_selected_rack();
+    assert!(app.controller.document().model.hot_plugins.is_empty());
+    app.controller
+        .document()
+        .model
+        .validate()
+        .expect("hot plug-ins stay valid");
+}
+
+/// The docked editor follows its rack and slot when racks or slots move or are removed, so
+/// leaving it never closes another plug-in's editor.
+#[cfg(target_os = "linux")]
+#[test]
+fn docked_editor_follows_rack_and_slot_edits() {
+    let mut app = empty_app("dock-remap");
+    for _ in 0..3 {
+        app.add_rack();
+    }
+    app.select_rack(0);
+    app.docked = Some((0, 1));
+    app.move_selected_rack(1);
+    assert_eq!((app.selected_rack, app.docked), (1, Some((1, 1))));
+    app.move_selected_rack(1);
+    assert_eq!((app.selected_rack, app.docked), (2, Some((2, 1))));
+
+    app.select_rack(0);
+    app.remove_selected_rack();
+    assert_eq!(
+        app.docked,
+        Some((1, 1)),
+        "racks after the removed one shift down"
+    );
+    app.select_rack(1);
+    app.remove_selected_rack();
+    assert_eq!(app.docked, None, "the removed rack's editor goes with it");
+
+    app.select_rack(0);
+    for slot in 0..3 {
+        app.controller.document_mut().model.racks[0]
+            .slots
+            .push(plugin_slot(&format!("slot{slot}"), "test", 1));
+    }
+    app.docked = Some((0, 1));
+    app.move_slot(1, 2);
+    assert_eq!(app.docked, Some((0, 2)), "a moved slot keeps its editor");
+    app.remove_slot(0);
+    assert_eq!(
+        app.docked,
+        Some((0, 1)),
+        "slots after a removed one shift up"
+    );
+    app.remove_slot(1);
+    assert_eq!(app.docked, None, "the removed slot's editor goes with it");
 }
 
 #[test]
@@ -724,7 +882,7 @@ fn added_racks_get_a_valid_route_with_an_input() {
     session.validate().expect("rack routes are valid");
 }
 
-/// Pages filter the columns in session order; moves step past hidden racks, new racks join
+/// Pages filter the overview's strips in session order; moves step past hidden racks, new racks join
 /// the shown page, and removed racks leave every page.
 #[test]
 fn pages_filter_racks_and_follow_rack_edits() {

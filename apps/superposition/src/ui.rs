@@ -5,7 +5,9 @@
 //! parameter editing happens in each plug-in's own editor window; there is no master bus.
 
 mod overlays;
+mod overview;
 mod previews;
+mod rack_view;
 mod scenes;
 mod setup;
 mod show;
@@ -59,7 +61,7 @@ const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 const FADE_STEP_MS: u32 = 50;
 const FADE_MAX_MS: u32 = 10_000;
 const DEFAULT_FADE_MS: u32 = 250;
-/// Recent callback-load bars in the foot and how often one is added.
+/// Recent callback-load bars in the scene bar and how often one is added.
 const LOAD_BARS: usize = 12;
 const LOAD_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 /// ⌘0 shows all racks; ⌘1–⌘9 show pages 1–9.
@@ -75,8 +77,6 @@ const PAGE_KEYS: [egui::Key; 10] = [
     egui::Key::Num8,
     egui::Key::Num9,
 ];
-/// More racks than fit across 1920 px bring up the page line even before any page exists.
-const PAGE_LINE_RACKS: usize = 8;
 /// Reduced motion holds meters still, refreshing them this rarely.
 const REDUCED_MOTION_METER_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -93,11 +93,20 @@ fn mirror_update_matches(model: &sp_model::Session, update: &MirroredParameterUp
         })
 }
 
-/// The column area shows racks or the setup page; head and foot stay.
+/// The area between the top bar and the scene bar shows racks or the setup page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Screen {
     Show,
     Setup,
+}
+
+/// How the show screen presents racks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum View {
+    /// One narrow strip per rack, with the page rail.
+    Overview,
+    /// The selected rack in detail, with its plug-in's editor in the pane.
+    Rack,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,7 +185,7 @@ enum SlotAction {
     Remove(usize),
 }
 
-/// Root egui application state for the film-strip show screen.
+/// Root egui application state for the rack UI.
 pub struct LiveRackApp {
     controller: SessionController,
     product: Result<ProductRuntime, String>,
@@ -190,11 +199,12 @@ pub struct LiveRackApp {
     /// When the last explicit save succeeded, for "Session saved, 4 s ago".
     saved_at: Option<Instant>,
     screen: Screen,
+    view: View,
     setup_tab: SetupTab,
     overlay: Overlay,
     /// The page shown, or `None` for all racks.
     page: Option<usize>,
-    /// Scroll the selected rack's column into view on the next frame.
+    /// Scroll the selected rack's strip into view on the next frame.
     scroll_to_selected: bool,
     /// Rack being renamed inline, with its draft name.
     rename: Option<(usize, String)>,
@@ -257,6 +267,15 @@ pub struct LiveRackApp {
     /// workers' streamed editor windows while remote clients watch (macOS `--serve`).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     streamed: Option<streamed::StreamedWindows>,
+    /// Linux: the slot whose editor the rack view docks in its pane.
+    #[cfg(target_os = "linux")]
+    docked: Option<(usize, usize)>,
+    /// Linux: editors just closed, hidden until their windows go away, with when each closed.
+    #[cfg(target_os = "linux")]
+    undocked: Vec<((usize, usize), Instant)>,
+    /// Linux: editors the rack view let go of while still opening. Each closes once it opens.
+    #[cfg(target_os = "linux")]
+    pending_close: Vec<(usize, usize)>,
     /// Linux: the Tunnel device settings being edited.
     #[cfg(target_os = "linux")]
     tunnel_settings: tunnel::TunnelSettings,
@@ -341,6 +360,7 @@ impl LiveRackApp {
             status_line,
             saved_at: None,
             screen: Screen::Show,
+            view: View::Overview,
             setup_tab: SetupTab::Audio,
             overlay: if recovery_offered {
                 Overlay::Modal(Modal::Recovery)
@@ -403,6 +423,12 @@ impl LiveRackApp {
             telemetry: None,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             streamed,
+            #[cfg(target_os = "linux")]
+            docked: None,
+            #[cfg(target_os = "linux")]
+            undocked: Vec::new(),
+            #[cfg(target_os = "linux")]
+            pending_close: Vec::new(),
             #[cfg(target_os = "linux")]
             tunnel_settings: tunnel::TunnelSettings::load(),
             #[cfg(test)]
@@ -1278,6 +1304,23 @@ impl LiveRackApp {
         let racks = &mut self.controller.document_mut().model.racks;
         let moved = racks.remove(self.selected_rack);
         racks.insert(neighbour, moved);
+        #[cfg(target_os = "linux")]
+        {
+            let from = self.selected_rack;
+            self.remap_editors(|(rack, slot)| {
+                let rack = if rack == from {
+                    neighbour
+                } else {
+                    let shifted = if rack > from { rack - 1 } else { rack };
+                    if shifted >= neighbour {
+                        shifted + 1
+                    } else {
+                        shifted
+                    }
+                };
+                Some((rack, slot))
+            });
+        }
         self.selected_rack = neighbour;
         self.scroll_to_selected = true;
         self.apply_rack_edit(&before, &[]);
@@ -1323,7 +1366,19 @@ impl LiveRackApp {
         for page in &mut model.pages {
             page.racks.retain(|id| *id != rack.id);
         }
+        model.hot_plugins.retain(|pin| pin.rack_id != rack.id);
         // Slots keyed by the removed rack lose their sidechain; their racks reload.
+        #[cfg(target_os = "linux")]
+        {
+            // The removed rack's worker and editors stop with it.
+            let removed = self.selected_rack;
+            self.remap_editors(|(rack, slot)| match rack.cmp(&removed) {
+                std::cmp::Ordering::Less => Some((rack, slot)),
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some((rack - 1, slot)),
+            });
+        }
+        let model = &mut self.controller.document_mut().model;
         let removed_source = Some(sp_model::SlotSidechain::RackOutput(rack.id.clone()));
         let mut rebuilt = Vec::new();
         for other in &mut model.racks {
@@ -1826,6 +1881,21 @@ impl LiveRackApp {
             return;
         }
         rack.slots.swap(from, to);
+        #[cfg(target_os = "linux")]
+        {
+            let swapped = self.selected_rack;
+            self.remap_editors(|(rack, slot)| {
+                Some((
+                    rack,
+                    match slot {
+                        _ if rack != swapped => slot,
+                        moved if moved == from => to,
+                        moved if moved == to => from,
+                        _ => slot,
+                    },
+                ))
+            });
+        }
         self.selected_slot = Some(to);
         self.reload_selected_rack_after_edit(SlotEdit::Swap(from, to));
     }
@@ -1851,6 +1921,23 @@ impl LiveRackApp {
         model.midi_mappings.retain(|mapping| {
             mapping.target.rack_id != rack_id || mapping.target.slot_id != removed.id
         });
+        model
+            .hot_plugins
+            .retain(|pin| pin.rack_id != rack_id || pin.slot_id != removed.id);
+        #[cfg(target_os = "linux")]
+        {
+            let removed_from = self.selected_rack;
+            self.remap_editors(|(rack, other)| {
+                if rack != removed_from {
+                    return Some((rack, other));
+                }
+                match other.cmp(&slot) {
+                    std::cmp::Ordering::Less => Some((rack, other)),
+                    std::cmp::Ordering::Equal => None,
+                    std::cmp::Ordering::Greater => Some((rack, other - 1)),
+                }
+            });
+        }
         self.selected_slot = None;
         self.reload_selected_rack_after_edit(SlotEdit::Remove(slot));
     }
@@ -1998,10 +2085,12 @@ impl LiveRackApp {
         }
     }
 
-    /// Opens a slot's native editor beside its column, or brings an open one to front.
+    /// Shows a slot in the rack view and opens its editor. On Linux the editor docks in the
+    /// rack view's pane; on macOS it opens as a native window, or an open one comes to front.
     fn open_editor(&mut self, ctx: &egui::Context, rack: usize, slot: usize) {
         self.select_rack(rack);
         self.selected_slot = Some(slot);
+        self.show_view(View::Rack);
         if self.slot_token(rack, slot) == StateToken::Missing {
             let name = self.controller.document().model.racks[rack].slots[slot]
                 .plugin
@@ -2013,6 +2102,34 @@ impl LiveRackApp {
             ));
             return;
         }
+        // An editor the rack view just closed still reads as open until the worker's next
+        // picture poll, so reopening it must not trust that flag.
+        #[cfg(target_os = "linux")]
+        let just_closed = {
+            let closing = self.undocked.len();
+            self.undocked.retain(|(closed, _)| *closed != (rack, slot));
+            self.pending_close
+                .retain(|pending| *pending != (rack, slot));
+            self.undocked.len() != closing
+        };
+        #[cfg(not(target_os = "linux"))]
+        let just_closed = false;
+        #[cfg(target_os = "linux")]
+        {
+            // One docked editor at a time: the one shown before closes, not floats.
+            if let Some(previous) = self.docked.filter(|docked| *docked != (rack, slot)) {
+                self.close_docked(previous);
+            }
+            self.docked = Some((rack, slot));
+        }
+        let open = !just_closed
+            && self
+                .product
+                .as_ref()
+                .is_ok_and(|product| product.editor_open(rack, slot));
+        if open && cfg!(target_os = "linux") {
+            return;
+        }
         let placement = editor_placement(ctx, rack, slot);
         let running = self.online();
         match self
@@ -2022,6 +2139,159 @@ impl LiveRackApp {
             Ok(()) => self.set_status("Opening the plug-in editor"),
             Err(error) => self.show_fault(error),
         }
+    }
+
+    /// Linux: lets the docked editor float in its own window. It stays open.
+    #[cfg(target_os = "linux")]
+    fn pop_out_editor(&mut self) {
+        self.docked = None;
+    }
+
+    /// Linux: closes the docked editor once the rack view no longer shows its slot, so one
+    /// docked editor is open at a time.
+    #[cfg(target_os = "linux")]
+    fn sync_docked_editor(&mut self) {
+        const HIDE_CLOSING: Duration = Duration::from_secs(1);
+        let ready = {
+            let product = self.product.as_ref().ok();
+            let open = |(rack, slot): (usize, usize)| {
+                product.is_some_and(|product| product.editor_open(rack, slot))
+            };
+            // A closed editor stays hidden, and reopenable, until its window has had time to go
+            // and the worker has reported it closed.
+            self.undocked
+                .retain(|(editor, at)| at.elapsed() < HIDE_CLOSING || open(*editor));
+            // An editor let go of while opening closes once it opens, or is forgotten when its
+            // open failed.
+            let opening = product.is_some_and(ProductRuntime::native_editor_pending);
+            let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_close)
+                .into_iter()
+                .partition(|editor| open(*editor));
+            if opening {
+                self.pending_close = waiting;
+            }
+            ready
+        };
+        for editor in ready {
+            self.close_docked(editor);
+        }
+        let Some((rack, slot)) = self.docked else {
+            return;
+        };
+        let shown = self.screen == Screen::Show
+            && self.view == View::Rack
+            && self.selected_rack == rack
+            && self.selected_slot == Some(slot);
+        if shown {
+            return;
+        }
+        self.docked = None;
+        self.close_docked((rack, slot));
+    }
+
+    /// Linux: closes an editor the rack view docked, hiding its window until it goes away.
+    #[cfg(target_os = "linux")]
+    fn close_docked(&mut self, (rack, slot): (usize, usize)) {
+        let running = self.online();
+        let Ok(product) = self.product.as_mut() else {
+            return;
+        };
+        if product.editor_open(rack, slot) {
+            let closed = product.set_native_editor_open(rack, slot, false, running);
+            self.undocked.retain(|(editor, _)| *editor != (rack, slot));
+            match closed {
+                Ok(()) => self.undocked.push(((rack, slot), Instant::now())),
+                // Still open: let it float rather than hide it.
+                Err(error) => self.show_fault(error),
+            }
+        } else if product.native_editor_pending() && !self.pending_close.contains(&(rack, slot)) {
+            self.pending_close.push((rack, slot));
+        }
+    }
+
+    /// Linux: follows a rack or slot edit in the docked, closing, and pending-close editors.
+    /// `map` gives an editor's new rack and slot, or `None` when its slot is gone.
+    #[cfg(target_os = "linux")]
+    fn remap_editors(&mut self, map: impl Fn((usize, usize)) -> Option<(usize, usize)>) {
+        self.docked = self.docked.and_then(&map);
+        self.undocked = std::mem::take(&mut self.undocked)
+            .into_iter()
+            .filter_map(|(editor, at)| Some((map(editor)?, at)))
+            .collect();
+        self.pending_close = std::mem::take(&mut self.pending_close)
+            .into_iter()
+            .filter_map(&map)
+            .collect();
+    }
+
+    /// Whether a slot's editor is open. On Linux an editor the app just closed counts as closed,
+    /// although the worker reports it open until its next picture poll.
+    fn editor_open(&self, rack: usize, slot: usize) -> bool {
+        #[cfg(target_os = "linux")]
+        if self
+            .undocked
+            .iter()
+            .any(|(closed, _)| *closed == (rack, slot))
+        {
+            return false;
+        }
+        self.product
+            .as_ref()
+            .is_ok_and(|product| product.editor_open(rack, slot))
+    }
+
+    /// Whether `rack` and `slot` is a hot plug-in.
+    fn is_hot(&self, rack: usize, slot: usize) -> bool {
+        let model = &self.controller.document().model;
+        model
+            .racks
+            .get(rack)
+            .and_then(|rack| Some((rack, rack.slots.get(slot)?)))
+            .is_some_and(|(rack, slot)| {
+                model
+                    .hot_plugins
+                    .iter()
+                    .any(|pin| pin.rack_id == rack.id && pin.slot_id == slot.id)
+            })
+    }
+
+    /// Pins a slot to the hot plug-ins rail, or unpins it.
+    fn toggle_hot_plugin(&mut self, rack: usize, slot: usize) {
+        let model = &mut self.controller.document_mut().model;
+        let Some(pin) = model.racks.get(rack).and_then(|rack| {
+            Some(sp_model::HotPlugin {
+                rack_id: rack.id.clone(),
+                slot_id: rack.slots.get(slot)?.id.clone(),
+            })
+        }) else {
+            return;
+        };
+        if let Some(position) = model.hot_plugins.iter().position(|pinned| *pinned == pin) {
+            model.hot_plugins.remove(position);
+            self.set_status("Plug-in unpinned");
+        } else if model.hot_plugins.len() < sp_model::MAX_HOT_PLUGINS {
+            model.hot_plugins.push(pin);
+            self.set_status("Plug-in pinned to hot plug-ins");
+        } else {
+            self.set_status("Hot plug-ins are full (12). Unpin one first.");
+        }
+    }
+
+    /// Rack and slot of each hot plug-in, in display order.
+    fn hot_plugin_slots(&self) -> Vec<(usize, usize)> {
+        let model = &self.controller.document().model;
+        model
+            .hot_plugins
+            .iter()
+            .filter_map(|pin| {
+                let rack = model.racks.iter().position(|rack| rack.id == pin.rack_id)?;
+                let slot = model.racks[rack]
+                    .slots
+                    .iter()
+                    .position(|slot| slot.id == pin.slot_id)?;
+                Some((rack, slot))
+            })
+            .collect()
     }
 
     fn slot_action(&mut self, ctx: &egui::Context, action: SlotAction) {
@@ -2392,8 +2662,8 @@ impl LiveRackApp {
         }
     }
 
-    /// Closes the topmost overlay in the brief's order: menus and popovers, modals, an editor
-    /// window, the fault line, then the setup page. Returns false when nothing was open.
+    /// Closes the topmost overlay, in order: menus, popovers, and modals, the scene editor, an
+    /// editor window, the fault banner, then the setup page. Returns false when nothing was open.
     fn close_topmost(&mut self) -> bool {
         if self.overlay != Overlay::None {
             if self.overlay == Overlay::Modal(Modal::Recovery) {
@@ -2413,14 +2683,29 @@ impl LiveRackApp {
         true
     }
 
-    /// Draws streamed windows and closes editors the user closed there.
+    /// Draws the floating streamed windows and closes editors the user closed there. The rack
+    /// view drew the docked one already.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn show_streamed_windows(&mut self, ctx: &egui::Context) {
+    fn finish_streamed_windows(&mut self, ctx: &egui::Context) {
         let running = self.online();
+        #[cfg(target_os = "linux")]
+        let hidden: Vec<(u32, usize)> = self.product.as_ref().map_or_else(
+            |_| Vec::new(),
+            |product| {
+                self.docked
+                    .into_iter()
+                    .chain(self.undocked.iter().map(|(editor, _)| *editor))
+                    .chain(self.pending_close.iter().copied())
+                    .filter_map(|(rack, slot)| product.editor_window_owner(rack, slot))
+                    .collect()
+            },
+        );
+        #[cfg(target_os = "macos")]
+        let hidden: Vec<(u32, usize)> = Vec::new();
         let Some(streamed) = self.streamed.as_mut() else {
             return;
         };
-        let events = streamed.show(ctx);
+        let events = streamed.finish_frame(ctx, &hidden);
         for event in events {
             match event {
                 streamed::StreamedWindowEvent::CloseEditor { rack, slot } => {
@@ -2446,19 +2731,29 @@ impl LiveRackApp {
     fn close_open_editor(&mut self) -> bool {
         let racks = self.controller.document().model.racks.len();
         let running = self.online();
+        // Linux: editors closed a moment ago still read as open until the next picture poll.
+        #[cfg(target_os = "linux")]
+        let closing: Vec<(usize, usize)> =
+            self.undocked.iter().map(|(editor, _)| *editor).collect();
+        #[cfg(not(target_os = "linux"))]
+        let closing: Vec<(usize, usize)> = Vec::new();
         let Ok(product) = self.product.as_mut() else {
             return false;
         };
         let open = (0..racks).find_map(|rack| {
             (0..MAX_SLOTS_PER_RACK)
-                .find(|&slot| product.editor_open(rack, slot))
+                .find(|&slot| product.editor_open(rack, slot) && !closing.contains(&(rack, slot)))
                 .map(|slot| (rack, slot))
         });
         let Some((rack, slot)) = open else {
             return false;
         };
-        if let Err(error) = product.set_native_editor_open(rack, slot, false, running) {
-            self.show_fault(error);
+        match product.set_native_editor_open(rack, slot, false, running) {
+            #[cfg(target_os = "linux")]
+            Ok(()) => self.undocked.push(((rack, slot), Instant::now())),
+            #[cfg(not(target_os = "linux"))]
+            Ok(()) => {}
+            Err(error) => self.show_fault(error),
         }
         true
     }
@@ -2729,7 +3024,9 @@ impl LiveRackApp {
         }
         self.poll_previews(ctx);
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        self.show_streamed_windows(ctx);
+        if let Some(streamed) = self.streamed.as_mut() {
+            streamed.begin_frame(ctx);
+        }
         self.autosave_if_due(Instant::now());
         ctx.request_repaint_after(
             self.next_autosave_at
@@ -2745,28 +3042,25 @@ impl LiveRackApp {
         }
         self.clamp_selection();
         self.handle_keys(ctx);
+        #[cfg(target_os = "linux")]
+        self.sync_docked_editor();
         if ctx.input(|input| input.viewport().close_requested()) && self.online() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.overlay = Overlay::Modal(Modal::Quit);
         }
 
-        self.draw_head(ctx);
-        if self.fault.is_some() {
-            self.draw_fault_line(ctx);
-        }
-        let model = &self.controller.document().model;
-        if self.screen == Screen::Show
-            && (!model.pages.is_empty() || model.racks.len() > PAGE_LINE_RACKS)
-        {
-            self.draw_page_line(ctx);
-        }
-        self.draw_foot(ctx);
-        match self.screen {
-            Screen::Show => self.draw_columns(ctx),
-            Screen::Setup => self.draw_setup(ctx),
+        self.draw_top_bar(ctx);
+        self.draw_fault_banner(ctx);
+        self.draw_scene_bar(ctx);
+        match (self.screen, self.view) {
+            (Screen::Show, View::Overview) => self.draw_overview(ctx),
+            (Screen::Show, View::Rack) => self.draw_rack_view(ctx),
+            (Screen::Setup, _) => self.draw_setup(ctx),
         }
         self.draw_overlay(ctx);
         self.draw_scene_editor(ctx);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        self.finish_streamed_windows(ctx);
     }
 }
 
@@ -2779,7 +3073,7 @@ fn reduced_motion_preference() -> MotionPreference {
     MotionPreference::Full
 }
 
-/// Screen position for a new editor window: beside its column, stepping down per slot.
+/// Screen position for a new native editor window, stepping right per rack and down per slot.
 fn editor_placement(
     ctx: &egui::Context,
     rack: usize,

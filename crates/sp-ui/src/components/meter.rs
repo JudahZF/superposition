@@ -7,9 +7,10 @@ pub const METER_REPAINT_HZ: u32 = 30;
 /// Interval derived from [`METER_REPAINT_HZ`].
 pub const METER_REPAINT_INTERVAL: Duration =
     Duration::from_nanos(1_000_000_000 / METER_REPAINT_HZ as u64);
-/// Segments in one LED meter column.
+/// Reference segment count of one LED meter column. Taller meters draw more, finer segments.
 pub const LED_SEGMENTS: usize = 16;
-/// Topmost segments that light in the fault colour.
+/// Topmost segments of a [`LED_SEGMENTS`]-tall meter that light in the fault colour; taller
+/// meters keep the same top fraction.
 pub const LED_FAULT_SEGMENTS: usize = 2;
 
 const METER_FLOOR_DBFS: f32 = -60.0;
@@ -112,20 +113,21 @@ pub enum Segment {
     Hot,
 }
 
-/// Returns segment `index` (0 is the bottom) of a [`LED_SEGMENTS`]-tall meter showing `level`
-/// with the peak hold at `held`, both as fill fractions.
+/// Returns segment `index` (0 is the bottom) of a `segments`-tall meter showing `level` with the
+/// peak hold at `held`, both as fill fractions.
 #[must_use]
-pub fn led_segment(level: f32, held: f32, index: usize) -> Segment {
+pub fn led_segment(level: f32, held: f32, index: usize, segments: usize) -> Segment {
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss,
-        reason = "fractions are clamped to 0..=1 and the meter has 16 segments"
+        reason = "fractions are clamped to 0..=1 and a meter has a few hundred segments at most"
     )]
-    let lit = |fraction: f32| (fraction.clamp(0.0, 1.0) * LED_SEGMENTS as f32).round() as usize;
+    let lit = |fraction: f32| (fraction.clamp(0.0, 1.0) * segments as f32).round() as usize;
+    let hot = (segments * LED_FAULT_SEGMENTS).div_ceil(LED_SEGMENTS);
     let held_index = lit(held).checked_sub(1);
     if index < lit(level) || Some(index) == held_index {
-        if index >= LED_SEGMENTS - LED_FAULT_SEGMENTS {
+        if index >= segments.saturating_sub(hot) {
             Segment::Hot
         } else {
             Segment::Lit
@@ -161,7 +163,7 @@ mod tests {
     fn led_meter_lights_from_the_bottom_with_a_hot_top_and_a_held_peak() {
         let lit = |level, held| {
             (0..LED_SEGMENTS)
-                .map(|index| led_segment(level, held, index))
+                .map(|index| led_segment(level, held, index, LED_SEGMENTS))
                 .collect::<Vec<_>>()
         };
         assert!(lit(0.0, 0.0).iter().all(|segment| *segment == Segment::Off));
@@ -173,5 +175,14 @@ mod tests {
         assert_eq!(full[LED_SEGMENTS - 3], Segment::Lit);
         assert_eq!(full[LED_SEGMENTS - 2], Segment::Hot);
         assert_eq!(full[LED_SEGMENTS - 1], Segment::Hot);
+        let tall = (0..64)
+            .map(|index| led_segment(1.0, 1.0, index, 64))
+            .collect::<Vec<_>>();
+        assert_eq!(tall[55], Segment::Lit);
+        assert_eq!(
+            tall[56],
+            Segment::Hot,
+            "taller meters keep the hot top fraction"
+        );
     }
 }

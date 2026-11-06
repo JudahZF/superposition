@@ -9,9 +9,14 @@
 //! so an unwatched Mac pictures nothing; local users keep using the native windows.
 //!
 //! Either way the pixels arrive as lossless tiles. This module keeps one texture per window, draws
-//! each top-level window as an egui window (popups float over their parent), and sends pointer,
-//! wheel, key, and text input back to the connection that owns the window. Because the windows are
-//! egui content, a remote client sees and drives them like the rest of the UI.
+//! the rack view's docked editor inside its pane and every other top-level window as an egui
+//! window (popups float over their parent), and sends pointer, wheel, key, and text input back to
+//! the connection that owns the window. Because the windows are egui content, a remote client sees
+//! and drives them like the rest of the UI.
+//!
+//! A frame runs in three steps: [`StreamedWindows::begin_frame`] syncs textures,
+//! [`StreamedWindows::draw_docked`] draws the docked editor while the panels lay out, and
+//! [`StreamedWindows::finish_frame`] draws the floating windows and forwards input.
 
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -133,6 +138,45 @@ struct Shown {
     connection: usize,
 }
 
+impl Shown {
+    /// The editor's owner: its worker's process ID and the slot's number in that worker.
+    fn owner(&self) -> Option<(u32, usize)> {
+        Some((self.info.pid?, usize::try_from(self.info.slot?).ok()?))
+    }
+
+    /// The plug-in slot whose editor this is, if any.
+    fn slot(&self) -> Option<(usize, usize)> {
+        Some((
+            usize::try_from(self.info.rack?).ok()?,
+            usize::try_from(self.info.slot?).ok()?,
+        ))
+    }
+}
+
+/// Where a window's picture was drawn this frame.
+#[derive(Clone, Copy)]
+struct Placed {
+    rect: egui::Rect,
+    /// The egui layer it was drawn in: the rack view's panel for the docked editor, its own
+    /// window or popup area otherwise.
+    layer: egui::LayerId,
+    /// The window's size in pixels.
+    pixels: [usize; 2],
+}
+
+impl Placed {
+    /// Window pixels per egui point: the device scale for floating windows, more when a docked
+    /// editor is shrunk to fit.
+    fn pixels_per_point(&self) -> f32 {
+        let width = f32::from(u16::try_from(self.pixels[0]).unwrap_or(u16::MAX));
+        if self.rect.width() > 0.0 {
+            width / self.rect.width()
+        } else {
+            1.0
+        }
+    }
+}
+
 /// The streamed windows of the engine's private display or of its workers.
 pub(crate) struct StreamedWindows {
     source: Source,
@@ -145,6 +189,10 @@ pub(crate) struct StreamedWindows {
     keyboard: Option<WindowId>,
     /// Modifiers held in the keyboard window.
     modifiers: Modifiers,
+    /// Windows with pixels this frame, from [`Self::begin_frame`].
+    shown: Vec<Shown>,
+    /// Where each window was drawn this frame.
+    placed: HashMap<WindowId, Placed>,
 }
 
 impl StreamedWindows {
@@ -157,6 +205,8 @@ impl StreamedWindows {
             pointer_capture: None,
             keyboard: None,
             modifiers: Modifiers::NONE,
+            shown: Vec::new(),
+            placed: HashMap::new(),
         }
     }
 
@@ -242,13 +292,10 @@ impl StreamedWindows {
         }
     }
 
-    /// Draws every streamed window and forwards input. Returns editor close requests.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one pass: sync textures, draw windows, then popups over their parents"
-    )]
-    pub(crate) fn show(&mut self, ctx: &Context) -> Vec<StreamedWindowEvent> {
+    /// Connects, syncs window textures, and starts a frame. Call before the panels.
+    pub(crate) fn begin_frame(&mut self, ctx: &Context) {
         self.connect(ctx);
+        self.placed.clear();
         let mut windows = Vec::new();
         for (index, connection) in self.connections.iter().enumerate() {
             let mut state = connection
@@ -284,17 +331,81 @@ impl StreamedWindows {
         }
         self.scroll
             .retain(|id, _| windows.iter().any(|window| window.info.id == *id));
+        self.shown = windows;
+    }
+
+    /// Draws the editor `owner` (see [`Shown::owner`]) docked in `area`: top-centred, shrunk to
+    /// fit but never enlarged. Returns false when that editor has no window yet. Linux only:
+    /// macOS editors stay native windows.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn draw_docked(
+        &mut self,
+        ui: &mut egui::Ui,
+        area: egui::Rect,
+        owner: (u32, usize),
+    ) -> bool {
+        let Some(window) = self
+            .shown
+            .iter()
+            .find(|window| window.info.kind == WindowKind::Normal && window.owner() == Some(owner))
+        else {
+            return false;
+        };
+        let Some(texture) = self.textures.get(&window.info.id) else {
+            return false;
+        };
+        let natural = points(window.size, ui.ctx().pixels_per_point());
+        let scale = (area.width() / natural.x)
+            .min(area.height() / natural.y)
+            .min(1.0);
+        let size = natural * scale;
+        let rect =
+            egui::Rect::from_min_size(egui::pos2(area.center().x - size.x / 2.0, area.top()), size);
+        egui::Image::new((texture.id(), size)).paint_at(ui, rect);
+        ui.interact(
+            rect,
+            egui::Id::new(("streamed-docked", window.info.id)),
+            Sense::click_and_drag(),
+        );
+        self.placed.insert(
+            window.info.id,
+            Placed {
+                rect,
+                layer: ui.layer_id(),
+                pixels: window.size,
+            },
+        );
+        true
+    }
+
+    /// Draws the windows not docked this frame, except the editors whose owners (see
+    /// [`Shown::owner`]) `hidden` lists, then forwards input. Returns editor close requests.
+    /// Call after the panels.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one pass: draw windows, then popups over their parents, then input"
+    )]
+    pub(crate) fn finish_frame(
+        &mut self,
+        ctx: &Context,
+        hidden: &[(u32, usize)],
+    ) -> Vec<StreamedWindowEvent> {
+        let windows = std::mem::take(&mut self.shown);
         if windows.is_empty() {
             return Vec::new();
         }
-
         let pixels_per_point = ctx.pixels_per_point();
         let mut events = Vec::new();
-        let mut image_rects: HashMap<WindowId, egui::Rect> = HashMap::new();
-        for window in windows
+        let floating: Vec<&Shown> = windows
             .iter()
-            .filter(|window| window.info.kind == WindowKind::Normal && !is_decoration(&window.info))
-        {
+            .filter(|window| {
+                window.info.kind == WindowKind::Normal
+                    && !is_decoration(&window.info)
+                    && !self.placed.contains_key(&window.info.id)
+                    && !window.owner().is_some_and(|owner| hidden.contains(&owner))
+            })
+            .collect();
+        for window in floating {
             let Some(texture) = self.textures.get(&window.info.id) else {
                 continue;
             };
@@ -313,22 +424,31 @@ impl StreamedWindows {
                     let size = points(window.size, pixels_per_point);
                     ui.add(egui::Image::new((texture.id(), size)).sense(Sense::click_and_drag()))
                 });
-            if let Some(inner) = shown.and_then(|shown| shown.inner) {
-                image_rects.insert(window.info.id, inner.rect);
+            if let Some(shown) = shown
+                && let Some(inner) = shown.inner
+            {
+                self.placed.insert(
+                    window.info.id,
+                    Placed {
+                        rect: inner.rect,
+                        layer: shown.response.layer_id,
+                        pixels: window.size,
+                    },
+                );
             }
             if !open {
-                match (window.info.rack, window.info.slot) {
-                    (Some(rack), Some(slot)) => events.push(StreamedWindowEvent::CloseEditor {
-                        rack: rack as usize,
-                        slot: slot as usize,
-                    }),
-                    _ => self.connections[window.connection].send(InputEvent::Close {
+                match window.slot() {
+                    Some((rack, slot)) => {
+                        events.push(StreamedWindowEvent::CloseEditor { rack, slot });
+                    }
+                    None => self.connections[window.connection].send(InputEvent::Close {
                         window: window.info.id,
                     }),
                 }
             }
         }
-        // Popups (menus, drop-downs) keep their position relative to their parent window.
+        // Popups (menus, drop-downs) keep their position relative to their parent window, at
+        // the parent's scale.
         for window in windows
             .iter()
             .filter(|window| window.info.kind == WindowKind::Popup)
@@ -340,27 +460,35 @@ impl StreamedWindows {
             let (Some(parent), Some(texture)) = (parent, self.textures.get(&window.info.id)) else {
                 continue;
             };
-            let Some(parent_rect) = image_rects.get(&parent.info.id) else {
+            let Some(parent_placed) = self.placed.get(&parent.info.id).copied() else {
                 continue;
             };
+            let scale = parent_placed.pixels_per_point();
             let offset = egui::vec2(
                 f32::from(window.info.x - parent.info.x),
                 f32::from(window.info.y - parent.info.y),
-            ) / pixels_per_point;
-            let size = points(window.size, pixels_per_point);
+            ) / scale;
+            let size = points(window.size, scale);
             let shown = egui::Area::new(egui::Id::new(("streamed-popup", window.info.id)))
                 .order(egui::Order::Foreground)
-                .fixed_pos(parent_rect.min + offset)
+                .fixed_pos(parent_placed.rect.min + offset)
                 .show(ctx, |ui| {
                     ui.add(egui::Image::new((texture.id(), size)).sense(Sense::click_and_drag()))
                 });
-            image_rects.insert(window.info.id, shown.inner.rect);
+            self.placed.insert(
+                window.info.id,
+                Placed {
+                    rect: shown.inner.rect,
+                    layer: shown.response.layer_id,
+                    pixels: window.size,
+                },
+            );
         }
         let owners = windows
             .iter()
             .map(|window| (window.info.id, window.connection))
             .collect();
-        self.forward_input(ctx, &image_rects, &owners, pixels_per_point);
+        self.forward_input(ctx, &owners);
         events
     }
 
@@ -368,13 +496,8 @@ impl StreamedWindows {
         clippy::too_many_lines,
         reason = "one dispatch over egui's input events"
     )]
-    fn forward_input(
-        &mut self,
-        ctx: &Context,
-        image_rects: &HashMap<WindowId, egui::Rect>,
-        owners: &HashMap<WindowId, usize>,
-        pixels_per_point: f32,
-    ) {
+    fn forward_input(&mut self, ctx: &Context, owners: &HashMap<WindowId, usize>) {
+        let placed = &self.placed;
         let connections = &mut self.connections;
         let mut send = |event: InputEvent| {
             if let Some(connection) = owners
@@ -384,22 +507,17 @@ impl StreamedWindows {
                 connection.send(event);
             }
         };
-        // Popups draw last, so test them first.
+        // A window takes input only where nothing else is drawn over it: the egui layer under
+        // the pointer must be the one it was drawn in.
         let target_at = |position: egui::Pos2| {
             let layer = ctx.layer_id_at(position);
-            image_rects
+            placed
                 .iter()
-                .filter(|(_, rect)| rect.contains(position))
-                .map(|(id, rect)| (*id, *rect))
-                .max_by_key(|(id, _)| {
-                    layer.is_some_and(|layer| {
-                        layer.id == egui::Id::new(("streamed-popup", *id))
-                            || layer.id == egui::Id::new(("streamed-window", *id))
-                    })
-                })
+                .find(|(_, placed)| placed.rect.contains(position) && Some(placed.layer) == layer)
+                .map(|(id, placed)| (*id, *placed))
         };
-        let local = |rect: egui::Rect, position: egui::Pos2| {
-            let offset = (position - rect.min) * pixels_per_point;
+        let local = |placed: Placed, position: egui::Pos2| {
+            let offset = (position - placed.rect.min) * placed.pixels_per_point();
             (clamp_i16(offset.x), clamp_i16(offset.y))
         };
         let events = ctx.input(|input| input.events.clone());
@@ -408,10 +526,10 @@ impl StreamedWindows {
                 Event::PointerMoved(position) => {
                     let target = self
                         .pointer_capture
-                        .and_then(|id| image_rects.get(&id).map(|rect| (id, *rect)))
+                        .and_then(|id| placed.get(&id).map(|placed| (id, *placed)))
                         .or_else(|| target_at(position));
-                    if let Some((window, rect)) = target {
-                        let (x, y) = local(rect, position);
+                    if let Some((window, at)) = target {
+                        let (x, y) = local(at, position);
                         send(InputEvent::PointerMove { window, x, y });
                     }
                 }
@@ -425,9 +543,9 @@ impl StreamedWindows {
                         target_at(pos)
                     } else {
                         self.pointer_capture
-                            .and_then(|id| image_rects.get(&id).map(|rect| (id, *rect)))
+                            .and_then(|id| placed.get(&id).map(|placed| (id, *placed)))
                     };
-                    let Some((window, rect)) = target else {
+                    let Some((window, at)) = target else {
                         // A click in the app's own UI takes the keyboard back.
                         if pressed && let Some(previous) = self.keyboard.take() {
                             sync_modifiers(
@@ -456,7 +574,7 @@ impl StreamedWindows {
                     } else {
                         self.pointer_capture = None;
                     }
-                    let (x, y) = local(rect, pos);
+                    let (x, y) = local(at, pos);
                     send(InputEvent::PointerButton {
                         window,
                         x,
@@ -469,7 +587,7 @@ impl StreamedWindows {
                     let Some(position) = ctx.input(|input| input.pointer.hover_pos()) else {
                         continue;
                     };
-                    let Some((window, rect)) = target_at(position) else {
+                    let Some((window, at)) = target_at(position) else {
                         continue;
                     };
                     let scale = match unit {
@@ -484,7 +602,7 @@ impl StreamedWindows {
                         .or_insert_with(|| ScrollAccumulator::new(POINTS_PER_NOTCH))
                         .push(-delta.x * scale, -delta.y * scale);
                     if let Some((dx, dy)) = notches {
-                        let (x, y) = local(rect, position);
+                        let (x, y) = local(at, position);
                         send(InputEvent::Scroll {
                             window,
                             x,
@@ -500,8 +618,7 @@ impl StreamedWindows {
                     modifiers,
                     ..
                 } => {
-                    let Some(window) = self.keyboard.filter(|id| image_rects.contains_key(id))
-                    else {
+                    let Some(window) = self.keyboard.filter(|id| placed.contains_key(id)) else {
                         continue;
                     };
                     sync_modifiers(&mut send, window, &mut self.modifiers, modifiers);
@@ -516,8 +633,7 @@ impl StreamedWindows {
                     }
                 }
                 Event::Text(text) => {
-                    let Some(window) = self.keyboard.filter(|id| image_rects.contains_key(id))
-                    else {
+                    let Some(window) = self.keyboard.filter(|id| placed.contains_key(id)) else {
                         continue;
                     };
                     if !text.is_empty() {
@@ -699,5 +815,222 @@ mod tests {
         assert_eq!(keysym(Key::A, true), Some(u32::from('a')));
         assert_eq!(keysym(Key::Enter, false), Some(0xff0d));
         assert_eq!(keysym(Key::ArrowLeft, true), Some(0xff51));
+    }
+
+    /// The rack view's docked editor: found by its worker whatever its rack tag says, drawn in
+    /// its pane at the pane's scale rather than as a floating window, clicks land at the editor's
+    /// own pixel coordinates, and nothing reaches it through a popover drawn over it.
+    #[cfg(target_os = "linux")]
+    mod docking {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        use egui::{Context, Event, Modifiers, PointerButton, Pos2, RawInput, Rect, Vec2};
+        use sp_window_stream::{
+            ClientId, ClientMessage, FrameUpdate, InputEvent, PROTOCOL_VERSION,
+            PointerButton as StreamButton, ServerMessage, TileEncoder, WindowId, WindowInfo,
+            WindowKind, WireMessage, tile_grid,
+        };
+
+        use super::super::{Connection, StreamedWindows};
+
+        const EDITOR: WindowId = WindowId(7);
+        /// The worker process that owns the editor.
+        const WORKER: u32 = 4242;
+        const WIDTH: u16 = 800;
+        const HEIGHT: u16 = 600;
+
+        /// Half the editor's size, so it docks at half scale.
+        fn pane() -> Rect {
+            Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::new(400.0, 300.0))
+        }
+
+        /// A window source on the far end of a socket that streams one editor: worker `WORKER`,
+        /// slot 1.
+        fn streamed_editor(ctx: &Context) -> (StreamedWindows, UnixStream) {
+            let (client, mut server) = UnixStream::pair().expect("socket pair");
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("timeout");
+            let mut windows = StreamedWindows::from_streamer("/nonexistent".into());
+            windows
+                .connections
+                .push(Connection::start(client, ctx).expect("connection"));
+            let mut buffer = Vec::new();
+            assert!(matches!(
+                ClientMessage::read_from(&mut server, &mut buffer),
+                Ok(ClientMessage::Hello { .. })
+            ));
+            let info = WindowInfo {
+                id: EDITOR,
+                kind: WindowKind::Normal,
+                title: "Editor".into(),
+                x: 0,
+                y: 0,
+                width: WIDTH,
+                height: HEIGHT,
+                // A stale tag, as after a live rack move: docking goes by the worker instead.
+                rack: Some(5),
+                slot: Some(1),
+                pid: Some(WORKER),
+                transient_for: None,
+            };
+            let image = vec![0x80; usize::from(WIDTH) * usize::from(HEIGHT) * 4];
+            let mut encoder = TileEncoder::new().expect("encoder");
+            let tiles = tile_grid(WIDTH, HEIGHT)
+                .map(|rect| {
+                    encoder
+                        .encode(&image, usize::from(WIDTH) * 4, rect)
+                        .expect("tile")
+                })
+                .collect();
+            for message in [
+                ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                    client: ClientId(1),
+                },
+                ServerMessage::WindowList(vec![info]),
+                ServerMessage::Frame(FrameUpdate {
+                    window: EDITOR,
+                    sequence: 1,
+                    width: WIDTH,
+                    height: HEIGHT,
+                    keyframe: true,
+                    complete: true,
+                    tiles,
+                }),
+            ] {
+                message.write_to(&mut server).expect("send");
+            }
+            (windows, server)
+        }
+
+        /// One frame: the pane docks the worker's slot 1 editor, an optional popover covers `cover`, and
+        /// `events` arrive. Returns whether the editor was docked.
+        fn frame(
+            ctx: &Context,
+            windows: &mut StreamedWindows,
+            cover: Option<Rect>,
+            events: Vec<Event>,
+        ) -> bool {
+            let mut docked = false;
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 800.0))),
+                events,
+                ..RawInput::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                windows.begin_frame(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    docked = windows.draw_docked(ui, pane(), (WORKER, 1));
+                });
+                if let Some(cover) = cover {
+                    egui::Area::new(egui::Id::new("popover"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(cover.min)
+                        .show(ctx, |ui| {
+                            ui.allocate_exact_size(cover.size(), egui::Sense::click())
+                        });
+                }
+                let _ = windows.finish_frame(ctx, &[]);
+            });
+            docked
+        }
+
+        fn press(at: Pos2) -> Event {
+            Event::PointerButton {
+                pos: at,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            }
+        }
+
+        fn next_input(server: &mut UnixStream) -> InputEvent {
+            let mut buffer = Vec::new();
+            match ClientMessage::read_from(server, &mut buffer).expect("client message") {
+                ClientMessage::Input(event) => event,
+                other => panic!("expected input, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn docked_editor_scales_into_its_pane_and_takes_only_uncovered_input() {
+            let ctx = Context::default();
+            let (mut windows, mut server) = streamed_editor(&ctx);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !frame(&ctx, &mut windows, None, Vec::new()) {
+                assert!(Instant::now() < deadline, "editor pixels never arrived");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let placed = windows.placed[&EDITOR];
+            assert_eq!(placed.rect, pane(), "the editor shrinks to fit the pane");
+            assert_eq!(
+                placed.layer.order,
+                egui::Order::Background,
+                "a docked editor is part of the pane, not a floating window"
+            );
+
+            frame(
+                &ctx,
+                &mut windows,
+                None,
+                vec![press(Pos2::new(150.0, 130.0))],
+            );
+            assert!(matches!(
+                next_input(&mut server),
+                InputEvent::Focus { window: EDITOR }
+            ));
+            assert_eq!(
+                next_input(&mut server),
+                InputEvent::PointerButton {
+                    window: EDITOR,
+                    x: 100,
+                    y: 60,
+                    button: StreamButton::Left,
+                    pressed: true,
+                },
+                "pane points map to editor pixels at the docked scale"
+            );
+
+            let cover = Rect::from_min_size(Pos2::new(140.0, 120.0), Vec2::splat(60.0));
+            for _ in 0..2 {
+                frame(&ctx, &mut windows, Some(cover), Vec::new());
+            }
+            frame(
+                &ctx,
+                &mut windows,
+                Some(cover),
+                vec![press(Pos2::new(150.0, 130.0))],
+            );
+            frame(
+                &ctx,
+                &mut windows,
+                Some(cover),
+                vec![press(Pos2::new(300.0, 300.0))],
+            );
+            // The press on the popover took the keyboard back to the app, so the editor is
+            // focused again before its next press.
+            assert!(matches!(
+                next_input(&mut server),
+                InputEvent::Focus { window: EDITOR }
+            ));
+            assert_eq!(
+                next_input(&mut server),
+                InputEvent::PointerButton {
+                    window: EDITOR,
+                    x: 400,
+                    y: 400,
+                    button: StreamButton::Left,
+                    pressed: true,
+                },
+                "the press under the popover never reached the editor"
+            );
+            server
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("timeout");
+            assert!(server.read(&mut [0; 1]).is_err(), "nothing else was sent");
+        }
     }
 }
