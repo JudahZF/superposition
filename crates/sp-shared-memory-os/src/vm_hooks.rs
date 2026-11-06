@@ -11,8 +11,9 @@
 //!   nothing and succeed: the agent owns the process mask;
 //! - `GetProcAddress` gives these hooks for those names, so a dynamic lookup gets them too.
 //!
-//! A worker calls [`sweep`] after each control request (plug-ins load in requests) and when
-//! it is idle. Its thread-attach callback puts new threads on the Windows vCPUs, also those
+//! A worker calls [`sweep`] after each control request: plug-ins load in requests. A sweep
+//! walks only modules that it has not patched yet; it does not run while the worker is idle,
+//! because it holds the loader lock. The worker's thread-attach callback puts new threads on the Windows vCPUs, also those
 //! that a plug-in's `DllMain` starts before the next sweep. This lowers the risk; it does not
 //! contain a plug-in that writes its own code.
 
@@ -70,8 +71,9 @@ struct Hooks {
 }
 
 static HOOKS: OnceLock<Option<Hooks>> = OnceLock::new();
-/// One patcher at a time: two would race on a page's protection.
-static PATCHING: Mutex<()> = Mutex::new(());
+/// The modules patched so far, by base address. One patcher at a time: two would race on a
+/// page's protection.
+static PATCHED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 fn hooks() -> Option<&'static Hooks> {
     HOOKS.get_or_init(load).as_ref()
@@ -225,7 +227,7 @@ pub fn sweep() {
     let Some(hooks) = hooks() else {
         return;
     };
-    let _patching = PATCHING.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut patched = PATCHED.lock().unwrap_or_else(PoisonError::into_inner);
     let mut modules = vec![ptr::null_mut::<c_void>(); 512];
     let mut needed = 0_u32;
     let bytes = u32::try_from(modules.len() * mem::size_of::<HMODULE>()).unwrap_or(u32::MAX);
@@ -245,8 +247,14 @@ pub fn sweep() {
     // SAFETY: a null name gives the executable's module.
     let worker = unsafe { GetModuleHandleW(ptr::null()) };
     for &module in &modules[..count] {
+        if patched.contains(&(module as usize)) {
+            continue;
+        }
+        patched.push(module as usize);
         if module != worker && !is_system(module, &hooks.windows_dir) {
-            // SAFETY: a module of this process, loaded while the loader lists it.
+            // SAFETY: a module of this process, loaded while the loader lists it. A sweep
+            // runs after a control request, when its loads have ended and their imports
+            // are resolved.
             unsafe { patch(module.cast::<u8>(), &hooks.table) };
         }
     }
