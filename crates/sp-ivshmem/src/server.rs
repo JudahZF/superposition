@@ -13,15 +13,21 @@ use std::{
 
 /// The server of one VM port: the shared memory and the eventfds of every peer.
 ///
-/// The memory is a sealed memfd: no peer can shrink or grow it. Peers get the lowest free
-/// ID. A peer that sends data or fails a send is disconnected; one bad peer never stops
-/// the server.
+/// The memory is a sealed memfd: no peer can shrink or grow it. A peer that sends data or
+/// fails a send is disconnected; one bad peer never stops the server.
+///
+/// Peer IDs count up and are not reused until they wrap at 65 536, as in QEMU's own server.
+/// QEMU's `ivshmem` device frees a departed peer's eventfd array without clearing it, and
+/// writes into that freed memory if a new peer arrives with the same ID (QEMU 10.2,
+/// `close_peer_eventfds` and `resize_peers`): a host that connects again must get a new ID.
 pub struct PortServer {
     listener: UnixListener,
     memory: OwnedFd,
     size: u64,
     vectors: u16,
     peers: Vec<ServerPeer>,
+    /// The next ID to try.
+    next_id: u16,
 }
 
 struct ServerPeer {
@@ -67,6 +73,7 @@ impl PortServer {
             size,
             vectors,
             peers: Vec::new(),
+            next_id: 0,
         })
     }
 
@@ -142,11 +149,14 @@ impl PortServer {
     }
 
     fn add_peer(&mut self, stream: UnixStream) -> io::Result<()> {
-        let Some(id) = (0..=u16::MAX).find(|id| self.peers.iter().all(|peer| peer.id != *id))
+        let Some(id) = (0..=u16::MAX)
+            .map(|offset| self.next_id.wrapping_add(offset))
+            .find(|id| self.peers.iter().all(|peer| peer.id != *id))
         else {
             // 65 536 peers: refuse this one. The stream closes on drop.
             return Ok(());
         };
+        self.next_id = id.wrapping_add(1);
         let eventfds = (0..self.vectors)
             .map(|_| eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK))
             .collect::<Result<Vec<_>, _>>()?;

@@ -112,7 +112,7 @@ fn peers_share_memory_and_ring_each_other_by_vector() {
 }
 
 #[test]
-fn a_disconnect_is_announced_and_its_id_is_reused() {
+fn a_disconnect_is_announced_and_a_returning_peer_gets_a_new_id() {
     let served = Served::start("leave", 4096, 1);
     let mut host = PortPeer::connect(served.path(), 1).expect("host");
     let guest = PortPeer::connect(served.path(), 1).expect("guest");
@@ -126,9 +126,10 @@ fn a_disconnect_is_announced_and_its_id_is_reused() {
     assert_eq!(host.only_other_peer(), None);
     assert!(kept.ring());
 
+    // QEMU writes into freed memory if a departed peer's ID comes back (see PortServer).
     let again = PortPeer::connect(served.path(), 1).expect("guest again");
-    assert_eq!(again.id(), guest_id);
-    assert_eq!(next_event(&mut host), PeerEvent::Joined(guest_id));
+    assert_ne!(again.id(), guest_id);
+    assert_eq!(next_event(&mut host), PeerEvent::Joined(again.id()));
 }
 
 #[test]
