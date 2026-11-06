@@ -85,6 +85,9 @@ pub enum Event {
     Scanned {
         /// The bundle's guest path.
         bundle: String,
+        /// SHA-256 (hex) over each file's relative path, size and modification time: it
+        /// changes when the bundle is installed again.
+        fingerprint: String,
         /// The scanner's exit code, or `None` if it timed out or had none.
         code: Option<i32>,
         /// True if the scanner ran past [`SCAN_TIMEOUT`] and was ended.

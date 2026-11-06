@@ -350,6 +350,7 @@ fn scan(state: &State, scanner: &Path, vst3: &Path, reports: &Path) {
         let (code, timed_out) = run_scanner(scanner, bundle, &report_path);
         state.emit(&Event::Scanned {
             bundle: bundle.display().to_string(),
+            fingerprint: fingerprint(bundle),
             code,
             timed_out,
             report: std::fs::read_to_string(&report_path).ok(),
@@ -358,6 +359,46 @@ fn scan(state: &State, scanner: &Path, vst3: &Path, reports: &Path) {
     state.emit(&Event::ScanDone {
         bundles: u32::try_from(bundles.len()).unwrap_or(u32::MAX),
     });
+}
+
+/// SHA-256 (hex) over each file's path relative to `bundle`, size and modification time.
+fn fingerprint(bundle: &Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    fn files(path: &Path, found: &mut Vec<PathBuf>) {
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+                files(&entry.path(), found);
+            }
+        } else {
+            found.push(path.to_owned());
+        }
+    }
+    let mut found = Vec::new();
+    files(bundle, &mut found);
+    found.sort();
+    let mut hasher = Sha256::new();
+    for file in found {
+        let relative = file.strip_prefix(bundle).unwrap_or(&file);
+        hasher.update(relative.to_string_lossy().as_bytes());
+        if let Ok(metadata) = std::fs::metadata(&file) {
+            hasher.update(metadata.len().to_le_bytes());
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .unwrap_or_default();
+            hasher.update(modified.as_nanos().to_le_bytes());
+        }
+    }
+    hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
 }
 
 /// Every `.vst3` bundle (file or folder) under `folder`, without looking inside bundles.

@@ -185,11 +185,13 @@ fn a_scan_reports_every_bundle_under_the_vst3_folder() {
         match host.event() {
             Event::Scanned {
                 bundle,
+                fingerprint,
                 code,
                 timed_out,
                 report,
             } => {
                 assert_eq!(code, Some(0));
+                assert_eq!(fingerprint.len(), 64);
                 assert!(!timed_out);
                 assert!(report.unwrap().contains(&bundle));
                 bundles.push(bundle);

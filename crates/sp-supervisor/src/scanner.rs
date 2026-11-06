@@ -617,6 +617,32 @@ fn update_modified_time(hasher: &mut Sha256, metadata: &fs::Metadata) {
     }
 }
 
+/// A Windows scan that another process ran: in Lambda's Windows VM the guest agent runs the
+/// scanner on each guest bundle and returns its exit (`code`, or a timeout) and its report.
+/// `bundle` is the guest path, as the scanner received it. The fingerprint is the agent's:
+/// the host cannot read the guest's files.
+pub fn remote_windows_scan(
+    bundle: PathBuf,
+    fingerprint: BundleFingerprint,
+    code: Option<i32>,
+    timed_out: bool,
+    report: Option<&[u8]>,
+) -> CachedScan {
+    let result = if timed_out {
+        TimedHelperResult::TimedOut { process_id: 0 }
+    } else {
+        TimedHelperResult::Exited {
+            process_id: 0,
+            code: code.unwrap_or(-1),
+        }
+    };
+    let report = report.map(|bytes| Ok(bytes.to_vec()));
+    let reported = bundle.clone();
+    let mut scan = map_scan(bundle, &reported, fingerprint, &result, report);
+    scan.platform = PluginPlatform::Windows;
+    scan
+}
+
 /// `reported_bundle` is the bundle path as the helper received it.
 fn map_scan(
     bundle: PathBuf,
