@@ -105,7 +105,7 @@ pub fn parse_port_bank_name(name: &str) -> Option<(u32, usize)> {
 #[cfg(target_os = "linux")]
 pub(crate) use host::PortMapping;
 #[cfg(target_os = "linux")]
-pub use host::create_port_banks;
+pub use host::{attach_port_bank, create_port_banks};
 
 #[cfg(target_os = "linux")]
 mod host {
@@ -189,21 +189,8 @@ mod host {
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
-        let object = sys::RawObject::from(memory);
-        let length = usize::try_from(port_region_bytes())
-            .map_err(|_| io::Error::other("the VM port region exceeds the address space"))?;
-        if sys::len(&object)? < i64::try_from(length).unwrap_or(i64::MAX) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "the port server's memory is smaller than a VM port region",
-            ));
-        }
-        let address = sys::map(&object, length)?;
-        let mapping = Arc::new(PortMapping {
-            _object: object,
-            address,
-            length,
-        });
+        let mapping = map_region(memory)?;
+        let address = mapping.address;
 
         // SAFETY: the region is at least `length` bytes, page aligned, and starts with the
         // header. The header has only atomics, so a shared reference is sound even while a
@@ -239,7 +226,7 @@ mod host {
                     .map_err(|_| io::Error::other("generated invalid bank name"))?,
                 backing: Backing::Port {
                     _mapping: Arc::clone(&mapping),
-                    doorbell: doorbell.try_clone_to_owned()?,
+                    eventfd: doorbell.try_clone_to_owned()?,
                 },
                 bank,
             });
@@ -250,16 +237,87 @@ mod host {
         // SAFETY: no worker uses either bank (this function's contract).
         unsafe { MappedRackBanks::from_regions(active, inactive) }
     }
+
+    /// Attaches to bank `bank` of a port region that a host has written, as a guest worker
+    /// would: for a Linux process that plays the guest in tests and in the V0 probe.
+    ///
+    /// [`SharedMemoryRegion::wait_for_request`] waits on `interrupt`, the guest's own eventfd
+    /// for the port's vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WouldBlock` while the host has not written the region, `InvalidData` for a
+    /// region of another port or layout or an incompatible bank, `InvalidInput` for a bank
+    /// other than 0 or 1, and the operating-system error if the mapping fails.
+    pub fn attach_port_bank(
+        memory: OwnedFd,
+        port: u32,
+        bank: usize,
+        interrupt: OwnedFd,
+    ) -> io::Result<SharedMemoryRegion> {
+        if bank >= BANK_COUNT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a VM port has banks 0 and 1",
+            ));
+        }
+        let mapping = map_region(memory)?;
+        // SAFETY: the region starts with the header, which has only atomics.
+        unsafe { mapping.address.cast::<PortHeader>().as_ref() }.check(port)?;
+        // SAFETY: the bank's page-aligned offset and size lie within the region.
+        let pointer: NonNull<SharedBank> =
+            unsafe { mapping.address.byte_add(port_bank_offset(bank)).cast() };
+        // SAFETY: the host wrote an initialized bank before the header's magic (checked).
+        let shared = unsafe { pointer.as_ref() };
+        if !shared.is_compatible() || shared.validate_mapped_contents().is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the VM port bank is not compatible with this build",
+            ));
+        }
+        Ok(SharedMemoryRegion {
+            name: CString::new(port_bank_name(port, bank))
+                .map_err(|_| io::Error::other("generated invalid bank name"))?,
+            backing: Backing::Port {
+                _mapping: mapping,
+                eventfd: interrupt,
+            },
+            bank: pointer,
+        })
+    }
+
+    /// Maps a whole port region from a port server's memory.
+    fn map_region(memory: OwnedFd) -> io::Result<Arc<PortMapping>> {
+        let object = sys::RawObject::from(memory);
+        let length = usize::try_from(port_region_bytes())
+            .map_err(|_| io::Error::other("the VM port region exceeds the address space"))?;
+        if sys::len(&object)? < i64::try_from(length).unwrap_or(i64::MAX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the port server's memory is smaller than a VM port region",
+            ));
+        }
+        let address = sys::map(&object, length)?;
+        Ok(Arc::new(PortMapping {
+            _object: object,
+            address,
+            length,
+        }))
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{PORT_MAGIC, PortHeader, create_port_banks, port_bank_offset, port_region_bytes};
+    use super::{
+        PORT_MAGIC, PortHeader, attach_port_bank, create_port_banks, parse_port_bank_name,
+        port_bank_name, port_bank_offset, port_region_bytes,
+    };
     use crate::SharedBank;
     use std::{
         io,
         os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
         sync::atomic::Ordering,
+        time::{Duration, Instant},
     };
 
     fn memfd(length: u64) -> OwnedFd {
@@ -394,6 +452,39 @@ mod tests {
     }
 
     #[test]
+    fn an_attached_guest_waits_for_the_host_request_wake() {
+        let memory = memfd(port_region_bytes());
+        let interrupt = eventfd();
+        let unwritten = attach_port_bank(memory.try_clone().unwrap(), 2, 0, eventfd());
+        assert_eq!(unwritten.err().unwrap().kind(), io::ErrorKind::WouldBlock);
+
+        // SAFETY: no worker uses this test region yet.
+        let banks =
+            unsafe { create_port_banks(memory.try_clone().unwrap(), 2, 5, interrupt.as_fd()) }
+                .expect("port banks");
+        let wrong_port = attach_port_bank(memory.try_clone().unwrap(), 3, 0, eventfd());
+        assert_eq!(wrong_port.err().unwrap().kind(), io::ErrorKind::InvalidData);
+        let guest = attach_port_bank(memory, 2, 0, interrupt).expect("guest bank");
+        assert_eq!(guest.generation(), 5);
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            let observed = guest.request_wake_sequence();
+            ready_tx.send(()).unwrap();
+            let started = Instant::now();
+            guest
+                .wait_for_request(observed, Duration::from_secs(3))
+                .unwrap();
+            (guest.request_wake_sequence() != observed, started.elapsed())
+        });
+        ready_rx.recv().unwrap();
+        assert!(banks.active_bank().notify_request());
+        let (woken, elapsed) = waiter.join().unwrap();
+        assert!(woken);
+        assert!(elapsed < Duration::from_secs(2));
+    }
+
+    #[test]
     fn a_server_region_smaller_than_the_layout_is_refused() {
         let memory = memfd(port_region_bytes() / 2);
         // SAFETY: no worker uses this test region.
@@ -407,5 +498,18 @@ mod tests {
     fn the_region_holds_both_banks_in_a_power_of_two() {
         assert!(port_bank_offset(1) >= port_bank_offset(0) + size_of::<SharedBank>());
         assert!(port_region_bytes().is_power_of_two());
+    }
+
+    #[test]
+    fn bank_names_round_trip_and_reject_other_spellings() {
+        assert_eq!(parse_port_bank_name(&port_bank_name(7, 1)), Some((7, 1)));
+        for name in [
+            "vmport-8-bank-0",
+            "vmport-1-bank-2",
+            "vmport-01-bank-0",
+            "/sp-1-2-3",
+        ] {
+            assert_eq!(parse_port_bank_name(name), None, "{name}");
+        }
     }
 }

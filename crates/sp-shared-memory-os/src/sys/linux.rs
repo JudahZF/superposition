@@ -210,3 +210,33 @@ pub(crate) fn ring(doorbell: &OwnedFd) -> c_int {
             .unwrap_or(libc::EIO)
     }
 }
+
+/// Waits up to `timeout_ns` for an eventfd to be rung, and clears it. Returns zero on a ring,
+/// a timeout or an interruption, else an errno.
+pub(crate) fn wait_eventfd(eventfd: &OwnedFd, timeout_ns: u64) -> c_int {
+    let mut poll = libc::pollfd {
+        fd: eventfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout = libc::timespec {
+        tv_sec: libc::time_t::try_from(timeout_ns / 1_000_000_000).unwrap_or(libc::time_t::MAX),
+        tv_nsec: libc::c_long::try_from(timeout_ns % 1_000_000_000).unwrap_or_default(),
+    };
+    // SAFETY: one valid pollfd and a valid timeout; no signal mask change.
+    let ready = unsafe { libc::ppoll(&raw mut poll, 1, &raw const timeout, ptr::null()) };
+    if ready < 0 {
+        return match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => 0,
+            Some(code) => code,
+            None => libc::EIO,
+        };
+    }
+    if ready > 0 {
+        let mut count = [0_u8; 8];
+        // SAFETY: `count` is 8 writable bytes. A non-blocking eventfd that another reader
+        // cleared first returns EAGAIN, which is not an error here.
+        unsafe { libc::read(eventfd.as_raw_fd(), count.as_mut_ptr().cast(), count.len()) };
+    }
+    0
+}

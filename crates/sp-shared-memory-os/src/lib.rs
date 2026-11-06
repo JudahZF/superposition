@@ -23,13 +23,13 @@ pub use audio_thread::{
     current_thread_id, promote_thread, realtime_priority_limit, rtkit_max_priority,
 };
 pub use chain::{ChainLink, Forwarded, Hop, MIN_HOP_MARGIN};
-#[cfg(target_os = "linux")]
-pub use port::create_port_banks;
 pub use port::{
     MAX_VM_PORTS, PORT_HEADER_BYTES, PORT_LAYOUT_VERSION, PORT_MAGIC, PortHeader,
     VM_PORT_FIRST_PCI_DEVICE, parse_port_bank_name, port_bank_name, port_bank_offset,
     port_region_bytes,
 };
+#[cfg(target_os = "linux")]
+pub use port::{attach_port_bank, create_port_banks};
 
 use std::{
     ffi::CString,
@@ -156,11 +156,12 @@ enum Backing {
         _object: sys::RawObject,
         unlink_on_drop: bool,
     },
-    /// One bank in a VM port's region. The request wake rings the guest's eventfd doorbell.
+    /// One bank in a VM port's region and the guest's eventfd for the port's vector: the host
+    /// rings it, and a Linux process that plays the guest waits on it.
     #[cfg(target_os = "linux")]
     Port {
         _mapping: std::sync::Arc<port::PortMapping>,
-        doorbell: std::os::fd::OwnedFd,
+        eventfd: std::os::fd::OwnedFd,
     },
     /// A VM worker's bank: its port's IVSHMEM device, which owns the mapping and the
     /// doorbell event.
@@ -353,7 +354,7 @@ impl SharedMemoryRegion {
             // SAFETY: `sequence` is a four-byte aligned atomic in this live shared bank.
             Backing::Named { .. } => unsafe { sys::notify(sequence) },
             #[cfg(target_os = "linux")]
-            Backing::Port { doorbell, .. } => sys::ring(doorbell),
+            Backing::Port { eventfd, .. } => sys::ring(eventfd),
             // A VM worker never wakes its host: the host polls for completions.
             #[cfg(windows)]
             Backing::VmPort { .. } => -38,
@@ -378,11 +379,19 @@ impl SharedMemoryRegion {
         let timeout_ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
         let sequence = &self.bank().header.request_wake_sequence;
         let status = match &self.backing {
-            // The doorbell event stays set after a ring that came before this wait.
+            // A ring that came before this wait leaves the event or eventfd set.
             #[cfg(windows)]
             Backing::VmPort { device } => {
                 if sequence.load(Ordering::Acquire) == observed {
                     device.wait(timeout_ns)
+                } else {
+                    0
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Backing::Port { eventfd, .. } => {
+                if sequence.load(Ordering::Acquire) == observed {
+                    sys::wait_eventfd(eventfd, timeout_ns)
                 } else {
                     0
                 }
