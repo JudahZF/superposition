@@ -35,6 +35,9 @@ pub enum Request {
         port: u32,
         /// The worker's arguments.
         args: Vec<String>,
+        /// The port's real-time vCPU, for the worker's audio thread (`SP_VM_AUDIO_CPU`).
+        #[serde(default)]
+        audio_cpu: Option<u32>,
     },
     /// Ends the worker on `port`.
     Stop {

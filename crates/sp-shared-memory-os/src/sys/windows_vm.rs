@@ -26,7 +26,11 @@ use windows_sys::{
         System::{
             IO::DeviceIoControl,
             Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
-            Threading::{CreateEventW, WaitForSingleObject},
+            Threading::{
+                CreateEventW, GetCurrentProcess, GetCurrentThread, REALTIME_PRIORITY_CLASS,
+                SetPriorityClass, SetThreadAffinityMask, SetThreadPriority, THREAD_PRIORITY_NORMAL,
+                THREAD_PRIORITY_TIME_CRITICAL, WaitForSingleObject,
+            },
         },
     },
     core::GUID,
@@ -366,6 +370,46 @@ fn property(set: HDEVINFO, info: &SP_DEVINFO_DATA, property: u32) -> Option<u32>
         )
     };
     (ok != 0).then_some(value)
+}
+
+/// The audio thread's vCPU in the VM: the VM port's real-time vCPU, which the agent gives a
+/// worker in this variable.
+pub const AUDIO_CPU_VARIABLE: &str = "SP_VM_AUDIO_CPU";
+
+/// Makes the calling thread the VM worker's audio thread: the real-time priority class for
+/// the process (Windows gives the high class without the privilege), time-critical priority,
+/// and the real-time vCPU of [`AUDIO_CPU_VARIABLE`]. Returns 0 or a Windows error code.
+pub(crate) fn enter_realtime() -> i32 {
+    let cpu = std::env::var(AUDIO_CPU_VARIABLE)
+        .ok()
+        .and_then(|cpu| cpu.parse::<u32>().ok())
+        .and_then(|cpu| 1_usize.checked_shl(cpu));
+    // SAFETY: pseudo-handles of this process and thread; plain flag arguments.
+    unsafe {
+        SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
+        if SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) == 0 {
+            return last_error();
+        }
+        if let Some(mask) = cpu
+            && SetThreadAffinityMask(GetCurrentThread(), mask) == 0
+        {
+            return last_error();
+        }
+    }
+    0
+}
+
+/// Gives the calling thread normal priority again. Returns 0 or a Windows error code.
+pub(crate) fn leave_realtime() -> i32 {
+    // SAFETY: the pseudo-handle of this thread; a plain priority.
+    if unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) } == 0 {
+        return last_error();
+    }
+    0
+}
+
+fn last_error() -> i32 {
+    io::Error::last_os_error().raw_os_error().unwrap_or(-1)
 }
 
 /// The performance counter's frequency, or `None` if Windows has none (never on Windows 10+).

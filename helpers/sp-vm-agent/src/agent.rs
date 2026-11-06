@@ -223,7 +223,11 @@ impl Agent {
                 let exited = self.state.stop(port);
                 self.state.emit(&Event::Stopped { port, exited });
             }
-            Request::Start { port, args } => {
+            Request::Start {
+                port,
+                args,
+                audio_cpu,
+            } => {
                 if !self.state.stop(port) {
                     self.state.emit(&Event::Stopped {
                         port,
@@ -231,7 +235,7 @@ impl Agent {
                     });
                     return;
                 }
-                match self.start(port, &args) {
+                match self.start(port, &args, audio_cpu) {
                     Ok(pid) => self.state.emit(&Event::Started { port, pid }),
                     Err(error) => self.state.emit(&Event::Error {
                         port: Some(port),
@@ -242,7 +246,7 @@ impl Agent {
         }
     }
 
-    fn start(&self, port: u32, args: &[String]) -> io::Result<u32> {
+    fn start(&self, port: u32, args: &[String], audio_cpu: Option<u32>) -> io::Result<u32> {
         let (input, output) = self.worker_port(port)?;
         let mut command = Command::new(&self.config.worker);
         command
@@ -250,6 +254,9 @@ impl Agent {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        if let Some(cpu) = audio_cpu {
+            command.env("SP_VM_AUDIO_CPU", cpu.to_string());
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;

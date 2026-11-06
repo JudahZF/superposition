@@ -107,6 +107,7 @@ fn a_started_worker_relays_control_bytes_and_stops_within_the_timeout() {
     host.send(&Request::Start {
         port: 1,
         args: vec![],
+        audio_cpu: None,
     });
     assert!(matches!(host.event(), Event::Started { port: 1, .. }));
     assert_eq!(echo(&mut host, 1, b"frame one"), b"frame one");
@@ -129,6 +130,7 @@ fn a_new_worker_on_a_port_replaces_the_old_one_and_gets_the_relay() {
     host.send(&Request::Start {
         port: 0,
         args: vec![],
+        audio_cpu: Some(2),
     });
     let Event::Started { pid: first, .. } = host.event() else {
         panic!("no first worker");
@@ -136,6 +138,7 @@ fn a_new_worker_on_a_port_replaces_the_old_one_and_gets_the_relay() {
     host.send(&Request::Start {
         port: 0,
         args: vec![],
+        audio_cpu: Some(2),
     });
     let Event::Started { pid: second, .. } = host.event() else {
         panic!("no second worker");

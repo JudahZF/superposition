@@ -75,7 +75,7 @@ fn load_bridge() -> Option<Bridge> {
 }
 
 /// Whether this process runs under Wine: Wine's `ntdll` exports `wine_get_version`.
-fn under_wine() -> bool {
+pub(crate) fn under_wine() -> bool {
     static UNDER_WINE: OnceLock<bool> = OnceLock::new();
     *UNDER_WINE.get_or_init(|| {
         let name = wide("ntdll.dll");
