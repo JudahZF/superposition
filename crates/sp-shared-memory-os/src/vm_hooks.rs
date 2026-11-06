@@ -9,6 +9,9 @@
 //!   them if no Windows vCPU is left);
 //! - `SetProcessAffinityMask`, `SetThreadSelectedCpuSets` and `SetProcessDefaultCpuSets` do
 //!   nothing and succeed: the agent owns the process mask;
+//! - `CreateProcessW` and `CreateProcessA` start the child suspended, give it the Windows
+//!   vCPUs (it would inherit the real-time vCPU in the worker's mask), then resume it unless
+//!   the caller asked for a suspended start;
 //! - `GetProcAddress` gives these hooks for those names, so a dynamic lookup gets them too.
 //!
 //! A worker calls [`sweep`] after each control request: plug-ins load in requests. A sweep
@@ -36,7 +39,7 @@ use windows_sys::{
             ProcessStatus::K32EnumProcessModules,
             SystemInformation::{GROUP_AFFINITY, GetSystemWindowsDirectoryW},
             SystemServices::{IMAGE_DOS_HEADER, IMAGE_IMPORT_DESCRIPTOR},
-            Threading::GetCurrentProcess,
+            Threading::{CREATE_SUSPENDED, GetCurrentProcess, PROCESS_INFORMATION, ResumeThread},
         },
     },
     core::{BOOL, PCSTR},
@@ -59,12 +62,30 @@ type SetThreadAffinityMask = unsafe extern "system" fn(HANDLE, usize) -> usize;
 type SetThreadGroupAffinity =
     unsafe extern "system" fn(HANDLE, *const GROUP_AFFINITY, *mut GROUP_AFFINITY) -> BOOL;
 type GetProcAddressFn = unsafe extern "system" fn(HMODULE, PCSTR) -> FARPROC;
+type SetProcessAffinityMaskFn = unsafe extern "system" fn(HANDLE, usize) -> BOOL;
+/// `CreateProcessW` and `CreateProcessA`: their string and start-up records are pointers.
+type CreateProcessFn = unsafe extern "system" fn(
+    *const c_void,
+    *mut c_void,
+    *const c_void,
+    *const c_void,
+    BOOL,
+    u32,
+    *const c_void,
+    *const c_void,
+    *const c_void,
+    *mut PROCESS_INFORMATION,
+) -> BOOL;
 
 /// The real functions, and each real address with its hook.
 struct Hooks {
     set_thread_affinity_mask: SetThreadAffinityMask,
     set_thread_group_affinity: SetThreadGroupAffinity,
     get_proc_address: GetProcAddressFn,
+    create_process_w: CreateProcessFn,
+    create_process_a: CreateProcessFn,
+    /// The real one: a hook's own call must not reach the hook.
+    set_process_affinity_mask: SetProcessAffinityMaskFn,
     /// `(real address, hook address)`, for kernel32's and kernelbase's exports.
     table: Vec<(usize, usize)>,
     windows_dir: Vec<u16>,
@@ -84,10 +105,17 @@ fn wide(text: &str) -> Vec<u16> {
 }
 
 fn load() -> Option<Hooks> {
-    type AffinityFlag = unsafe extern "system" fn(HANDLE, usize) -> BOOL;
     type CpuSets = unsafe extern "system" fn(HANDLE, *const u32, u32) -> BOOL;
     let cpu_sets = ignore_cpu_sets as CpuSets as usize;
-    let hooked: [(&str, usize); 6] = [
+    let hooked: [(&str, usize); 8] = [
+        (
+            "CreateProcessW",
+            create_process_w as CreateProcessFn as usize,
+        ),
+        (
+            "CreateProcessA",
+            create_process_a as CreateProcessFn as usize,
+        ),
         (
             "SetThreadAffinityMask",
             set_thread_affinity_mask as SetThreadAffinityMask as usize,
@@ -98,7 +126,7 @@ fn load() -> Option<Hooks> {
         ),
         (
             "SetProcessAffinityMask",
-            set_process_affinity_mask as AffinityFlag as usize,
+            set_process_affinity_mask as SetProcessAffinityMaskFn as usize,
         ),
         ("SetThreadSelectedCpuSets", cpu_sets),
         ("SetProcessDefaultCpuSets", cpu_sets),
@@ -150,6 +178,11 @@ fn load() -> Option<Hooks> {
                 "SetThreadGroupAffinity",
             )?),
             get_proc_address: mem::transmute::<usize, GetProcAddressFn>(find("GetProcAddress")?),
+            create_process_w: mem::transmute::<usize, CreateProcessFn>(find("CreateProcessW")?),
+            create_process_a: mem::transmute::<usize, CreateProcessFn>(find("CreateProcessA")?),
+            set_process_affinity_mask: mem::transmute::<usize, SetProcessAffinityMaskFn>(find(
+                "SetProcessAffinityMask",
+            )?),
             table,
             windows_dir,
         })
@@ -200,6 +233,59 @@ unsafe extern "system" fn set_process_affinity_mask(_process: HANDLE, _mask: usi
 unsafe extern "system" fn ignore_cpu_sets(_handle: HANDLE, _ids: *const u32, _count: u32) -> BOOL {
     1
 }
+
+macro_rules! create_process_hook {
+    ($name:ident, $real:ident) => {
+        #[allow(clippy::too_many_arguments, reason = "the Win32 signature")]
+        unsafe extern "system" fn $name(
+            application: *const c_void,
+            command_line: *mut c_void,
+            process_attributes: *const c_void,
+            thread_attributes: *const c_void,
+            inherit: BOOL,
+            flags: u32,
+            environment: *const c_void,
+            directory: *const c_void,
+            startup: *const c_void,
+            information: *mut PROCESS_INFORMATION,
+        ) -> BOOL {
+            let Some(hooks) = hooks() else {
+                return 0;
+            };
+            // SAFETY: the real function with the caller's arguments, started suspended.
+            let created = unsafe {
+                (hooks.$real)(
+                    application,
+                    command_line,
+                    process_attributes,
+                    thread_attributes,
+                    inherit,
+                    flags | CREATE_SUSPENDED,
+                    environment,
+                    directory,
+                    startup,
+                    information,
+                )
+            };
+            if created != 0 && !information.is_null() {
+                // SAFETY: the real function filled `information` with the child's handles.
+                unsafe {
+                    let windows = windows_cpus();
+                    if windows != 0 {
+                        (hooks.set_process_affinity_mask)((*information).hProcess, windows);
+                    }
+                    if flags & CREATE_SUSPENDED == 0 {
+                        ResumeThread((*information).hThread);
+                    }
+                }
+            }
+            created
+        }
+    };
+}
+
+create_process_hook!(create_process_w, create_process_w);
+create_process_hook!(create_process_a, create_process_a);
 
 unsafe extern "system" fn get_proc_address(module: HMODULE, name: PCSTR) -> FARPROC {
     let hooks = hooks()?;
@@ -363,6 +449,61 @@ mod tests {
             // The real function returns the mask that the hooked call set.
             let previous = (hooks.set_thread_affinity_mask)(GetCurrentThread(), 0b01);
             assert_eq!(previous, 0b01);
+        }
+    }
+
+    /// A child process would inherit the worker's mask, with its real-time vCPU. Wine does
+    /// not apply a mask to another process, so this runs on Windows only (in the VM).
+    #[test]
+    #[ignore = "needs Windows: Wine ignores another process's mask"]
+    fn a_child_process_of_a_patched_module_gets_only_the_windows_vcpus() {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, WAIT_OBJECT_0},
+            System::Threading::{
+                CreateProcessW, GetProcessAffinityMask, INFINITE, PROCESS_INFORMATION,
+                STARTUPINFOW, WaitForSingleObject,
+            },
+        };
+
+        set_windows_cpus(0b01);
+        let hooks = hooks().expect("kernel32 exports");
+        // SAFETY: the test executable's module is loaded.
+        unsafe { patch(GetModuleHandleW(std::ptr::null()).cast(), &hooks.table) };
+        let mut command: Vec<u16> = "cmd.exe /c exit 0\0".encode_utf16().collect();
+        // SAFETY: plain records, zero is their documented initial state.
+        let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        startup.cb = u32::try_from(std::mem::size_of::<STARTUPINFOW>()).unwrap();
+        // SAFETY: as above.
+        let mut information: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a writable command line and valid records; the handles are closed below.
+        unsafe {
+            let created = CreateProcessW(
+                std::ptr::null(),
+                command.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                &raw const startup,
+                &raw mut information,
+            );
+            assert_ne!(created, 0, "cmd.exe did not start");
+            let (mut process_mask, mut system_mask) = (0_usize, 0_usize);
+            GetProcessAffinityMask(
+                information.hProcess,
+                &raw mut process_mask,
+                &raw mut system_mask,
+            );
+            assert_eq!(process_mask, 0b01, "the child keeps only the Windows vCPUs");
+            assert_eq!(
+                WaitForSingleObject(information.hProcess, INFINITE),
+                WAIT_OBJECT_0,
+                "the child was resumed"
+            );
+            CloseHandle(information.hThread);
+            CloseHandle(information.hProcess);
         }
     }
 }
