@@ -227,6 +227,7 @@ impl Agent {
                 port,
                 args,
                 audio_cpu,
+                windows_cpus,
             } => {
                 if !self.state.stop(port) {
                     self.state.emit(&Event::Stopped {
@@ -235,7 +236,7 @@ impl Agent {
                     });
                     return;
                 }
-                match self.start(port, &args, audio_cpu) {
+                match self.start(port, &args, audio_cpu, windows_cpus) {
                     Ok(pid) => self.state.emit(&Event::Started { port, pid }),
                     Err(error) => self.state.emit(&Event::Error {
                         port: Some(port),
@@ -246,7 +247,13 @@ impl Agent {
         }
     }
 
-    fn start(&self, port: u32, args: &[String], audio_cpu: Option<u32>) -> io::Result<u32> {
+    fn start(
+        &self,
+        port: u32,
+        args: &[String],
+        audio_cpu: Option<u32>,
+        windows_cpus: Option<u64>,
+    ) -> io::Result<u32> {
         let (input, output) = self.worker_port(port)?;
         let mut command = Command::new(&self.config.worker);
         command
@@ -258,6 +265,9 @@ impl Agent {
         if let Some(cpu) = audio_cpu {
             command.env("SP_VM_AUDIO_CPU", cpu.to_string());
         }
+        if let Some(mask) = windows_cpus {
+            command.env("SP_VM_WINDOWS_CPUS", mask.to_string());
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -267,6 +277,13 @@ impl Agent {
         }
         let mut child = command.spawn()?;
         let pid = child.id();
+        #[cfg(windows)]
+        if let Some(windows) = windows_cpus {
+            let audio = audio_cpu
+                .and_then(|cpu| 1_u64.checked_shl(cpu))
+                .unwrap_or(0);
+            crate::port_windows::set_process_mask(&child, windows | audio)?;
+        }
         *lock(&input) = child.stdin.take();
         if let Some(stdout) = child.stdout.take() {
             thread::spawn(move || relay_output(stdout, output));

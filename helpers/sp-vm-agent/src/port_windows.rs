@@ -1,4 +1,4 @@
-//! A virtio-serial port on Windows, opened for overlapped I/O.
+//! A virtio-serial port on Windows, opened for overlapped I/O, and a worker's process mask.
 //!
 //! On a handle opened without `FILE_FLAG_OVERLAPPED`, Windows runs one I/O at a time per file
 //! object: a read that waits for the host blocks every write on the port. The agent reads and
@@ -18,7 +18,11 @@ use windows_sys::Win32::{
         CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     },
     Storage::FileSystem::{CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, ReadFile, WriteFile},
-    System::{IO::GetOverlappedResult, IO::OVERLAPPED, Threading::CreateEventW},
+    System::{
+        IO::GetOverlappedResult,
+        IO::OVERLAPPED,
+        Threading::{CreateEventW, SetProcessAffinityMask},
+    },
 };
 
 use crate::PortIo;
@@ -126,4 +130,17 @@ impl PortIo for OverlappedPort {
     fn try_clone_port(&self) -> io::Result<Box<dyn PortIo>> {
         Ok(Box::new(Self(Arc::clone(&self.0))))
     }
+}
+
+/// Limits `child` to the vCPUs in `mask`: the Windows vCPUs and its port's real-time vCPU.
+pub(crate) fn set_process_mask(child: &std::process::Child, mask: u64) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    let mask = usize::try_from(mask)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "vCPU mask is too wide"))?;
+    // SAFETY: the child's process handle is open while `child` lives; a plain mask.
+    if unsafe { SetProcessAffinityMask(child.as_raw_handle(), mask) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }

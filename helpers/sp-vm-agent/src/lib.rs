@@ -42,6 +42,10 @@ pub enum Request {
         /// The port's real-time vCPU, for the worker's audio thread (`SP_VM_AUDIO_CPU`).
         #[serde(default)]
         audio_cpu: Option<u32>,
+        /// The Windows vCPUs as a mask, for every other thread (`SP_VM_WINDOWS_CPUS`). The
+        /// agent sets the worker's process mask to these and `audio_cpu`.
+        #[serde(default)]
+        windows_cpus: Option<u64>,
     },
     /// Ends the worker on `port`.
     Stop {

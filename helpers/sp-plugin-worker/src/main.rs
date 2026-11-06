@@ -10,6 +10,8 @@ mod remote_input;
 mod segment_chain;
 #[cfg(feature = "sdk")]
 mod state_transfer;
+#[cfg(windows)]
+mod vm_threads;
 mod worker_runtime;
 
 use std::{
@@ -166,6 +168,8 @@ impl HeartbeatPublisher {
 }
 
 fn main() {
+    #[cfg(windows)]
+    vm_threads::confine();
     let startup = match parse_worker_startup(std::env::args().skip(1)) {
         Ok(startup) => startup,
         Err(error) => exit_with_error(&error),
