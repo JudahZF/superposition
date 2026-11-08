@@ -1397,8 +1397,9 @@ impl ProductRenderer {
             u32::try_from(frames).unwrap_or(u32::MAX),
             &mut self.scene_block,
         );
-        let scene_block = self.scene_block.clone();
-        for (index, &target) in scene_block.targets().iter().enumerate() {
+        // Index rather than clone: the block holds 256 targets and is rendered every callback.
+        for index in 0..self.scene_block.targets().len() {
+            let target = self.scene_block.targets()[index];
             let accepted = self.push_parameter(target, 0);
             if self.pending_scene_parameters[index].is_some() {
                 self.pending_scene_parameter_count -= 1;
@@ -1562,7 +1563,8 @@ impl ProductRenderer {
     }
 
     fn publish_telemetry(&mut self) {
-        for rack in 0..MAX_RACKS {
+        // Only graph racks are metered; positions past the rack count hold no rack.
+        for rack in 0..self.mixer.prepared_graph().rack_count() {
             if let Some(snapshot) = self.mixer.rack_meter_snapshot(rack) {
                 self.telemetry.racks[rack].publish(snapshot);
                 self.ui_rack_meters[rack].publish(&self.telemetry.ui_racks[rack], snapshot);
@@ -1573,50 +1575,47 @@ impl ProductRenderer {
         self.ui_output_meter
             .publish(&self.telemetry.ui_output, output_snapshot);
         if let Some(dispatcher) = &self.dispatcher {
-            for rack in 0..MAX_RACKS {
-                if let Some(snapshot) = dispatcher.telemetry(rack) {
-                    self.telemetry.completed[rack].store(snapshot.completed, Ordering::Release);
-                    self.telemetry.wake_failures[rack]
-                        .store(snapshot.wake_failures, Ordering::Release);
-                    self.telemetry.max_wake_ticks[rack]
-                        .store(snapshot.max_wake_ticks, Ordering::Release);
-                    if snapshot.deadline_misses
-                        != self.telemetry.deadline_misses[rack].load(Ordering::Relaxed)
-                    {
-                        self.telemetry.missed_unclaimed[rack]
-                            .store(snapshot.missed_unclaimed, Ordering::Relaxed);
-                        self.telemetry.missed_in_progress[rack]
-                            .store(snapshot.missed_in_progress, Ordering::Relaxed);
-                        self.telemetry.missed_completed_late[rack]
-                            .store(snapshot.missed_completed_late, Ordering::Relaxed);
-                        self.telemetry.last_miss_block_index[rack]
-                            .store(snapshot.last_miss_block_index, Ordering::Relaxed);
-                        self.telemetry.last_miss_sequence[rack]
-                            .store(snapshot.last_miss_sequence, Ordering::Relaxed);
-                        self.telemetry.last_miss_request_tick[rack]
-                            .store(snapshot.last_miss_request_tick, Ordering::Relaxed);
-                        self.telemetry.last_miss_claimed_tick[rack]
-                            .store(snapshot.last_miss_claimed_tick, Ordering::Relaxed);
-                        self.telemetry.last_miss_observed_tick[rack]
-                            .store(snapshot.last_miss_observed_tick, Ordering::Relaxed);
-                        self.telemetry.last_miss_worker_phase[rack]
-                            .store(snapshot.last_miss_worker_phase, Ordering::Relaxed);
-                        self.telemetry.last_miss_worker_wait_sequence[rack]
-                            .store(snapshot.last_miss_worker_wait_sequence, Ordering::Relaxed);
-                        self.telemetry.last_miss_wake_sequence[rack]
-                            .store(snapshot.last_miss_wake_sequence, Ordering::Relaxed);
-                        self.telemetry.last_miss_worker_loop_tick[rack]
-                            .store(snapshot.last_miss_worker_loop_tick, Ordering::Relaxed);
-                        self.telemetry.deadline_misses[rack]
-                            .store(snapshot.deadline_misses, Ordering::Release);
-                    }
-                    self.telemetry.protocol_rejections[rack]
-                        .store(snapshot.protocol_rejections, Ordering::Release);
-                    self.telemetry.fallback_activations[rack]
-                        .store(snapshot.fallback_activations, Ordering::Release);
-                    self.telemetry.gate_closed_blocks[rack]
-                        .store(snapshot.gate_closed_blocks, Ordering::Release);
+            for (rack, snapshot) in dispatcher.lane_telemetry() {
+                self.telemetry.completed[rack].store(snapshot.completed, Ordering::Release);
+                self.telemetry.wake_failures[rack].store(snapshot.wake_failures, Ordering::Release);
+                self.telemetry.max_wake_ticks[rack]
+                    .store(snapshot.max_wake_ticks, Ordering::Release);
+                if snapshot.deadline_misses
+                    != self.telemetry.deadline_misses[rack].load(Ordering::Relaxed)
+                {
+                    self.telemetry.missed_unclaimed[rack]
+                        .store(snapshot.missed_unclaimed, Ordering::Relaxed);
+                    self.telemetry.missed_in_progress[rack]
+                        .store(snapshot.missed_in_progress, Ordering::Relaxed);
+                    self.telemetry.missed_completed_late[rack]
+                        .store(snapshot.missed_completed_late, Ordering::Relaxed);
+                    self.telemetry.last_miss_block_index[rack]
+                        .store(snapshot.last_miss_block_index, Ordering::Relaxed);
+                    self.telemetry.last_miss_sequence[rack]
+                        .store(snapshot.last_miss_sequence, Ordering::Relaxed);
+                    self.telemetry.last_miss_request_tick[rack]
+                        .store(snapshot.last_miss_request_tick, Ordering::Relaxed);
+                    self.telemetry.last_miss_claimed_tick[rack]
+                        .store(snapshot.last_miss_claimed_tick, Ordering::Relaxed);
+                    self.telemetry.last_miss_observed_tick[rack]
+                        .store(snapshot.last_miss_observed_tick, Ordering::Relaxed);
+                    self.telemetry.last_miss_worker_phase[rack]
+                        .store(snapshot.last_miss_worker_phase, Ordering::Relaxed);
+                    self.telemetry.last_miss_worker_wait_sequence[rack]
+                        .store(snapshot.last_miss_worker_wait_sequence, Ordering::Relaxed);
+                    self.telemetry.last_miss_wake_sequence[rack]
+                        .store(snapshot.last_miss_wake_sequence, Ordering::Relaxed);
+                    self.telemetry.last_miss_worker_loop_tick[rack]
+                        .store(snapshot.last_miss_worker_loop_tick, Ordering::Relaxed);
+                    self.telemetry.deadline_misses[rack]
+                        .store(snapshot.deadline_misses, Ordering::Release);
                 }
+                self.telemetry.protocol_rejections[rack]
+                    .store(snapshot.protocol_rejections, Ordering::Release);
+                self.telemetry.fallback_activations[rack]
+                    .store(snapshot.fallback_activations, Ordering::Release);
+                self.telemetry.gate_closed_blocks[rack]
+                    .store(snapshot.gate_closed_blocks, Ordering::Release);
             }
         }
     }
@@ -1632,8 +1631,9 @@ impl ProductRenderer {
             output.fill(0.0);
             return RenderDisposition::Silence;
         }
+        // Every rack hears the same stereo input here, so it is metered once.
+        let snapshot = input_meter(input, frames);
         for rack in 0..self.mixer.prepared_graph().rack_count() {
-            let snapshot = input_meter(input, frames);
             self.telemetry.input_racks[rack].publish(snapshot);
             self.ui_input_meters[rack].publish(&self.telemetry.ui_input_racks[rack], snapshot);
         }
@@ -1703,28 +1703,35 @@ impl ProductRenderer {
             output.fill(0.0);
             return RenderDisposition::Silence;
         }
-        let graph = *self.mixer.prepared_graph();
+        // Borrowed, not copied: the graph is about 15 KB and this runs every callback.
+        let graph = self.mixer.prepared_graph();
         for rack in 0..graph.rack_count() {
             let destination = &mut self.rack_inputs[rack][..frames * 2];
-            destination.fill(0.0);
+            // A routed channel exists (`validate_routes`), so `input_channels` is non-zero there.
             match graph
                 .rack(rack)
                 .and_then(sp_engine::PreparedRack::input_channels)
             {
                 Some(PhysicalChannels::Mono { channel }) => {
-                    for (frame, stereo) in destination.chunks_exact_mut(2).enumerate() {
-                        let sample = input[frame * input_channels + usize::from(channel)];
-                        stereo.copy_from_slice(&[sample, sample]);
+                    let channel = usize::from(channel);
+                    for (stereo, frame) in destination
+                        .chunks_exact_mut(2)
+                        .zip(input.chunks_exact(input_channels))
+                    {
+                        stereo.fill(frame[channel]);
                     }
                 }
                 Some(PhysicalChannels::Stereo { left, right }) => {
-                    for (frame, stereo) in destination.chunks_exact_mut(2).enumerate() {
-                        let offset = frame * input_channels;
-                        stereo[0] = input[offset + usize::from(left)];
-                        stereo[1] = input[offset + usize::from(right)];
+                    let (left, right) = (usize::from(left), usize::from(right));
+                    for (stereo, frame) in destination
+                        .chunks_exact_mut(2)
+                        .zip(input.chunks_exact(input_channels))
+                    {
+                        stereo[0] = frame[left];
+                        stereo[1] = frame[right];
                     }
                 }
-                None => {}
+                None => destination.fill(0.0),
             }
             let snapshot = input_meter(destination, frames);
             self.telemetry.input_racks[rack].publish(snapshot);

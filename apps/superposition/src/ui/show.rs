@@ -275,14 +275,7 @@ impl LiveRackApp {
             Pos2::new(previous.right(), rect.top()),
             Pos2::new(next.left(), rect.bottom()),
         );
-        let Some(rack) = self
-            .controller
-            .document()
-            .model
-            .racks
-            .get(self.selected_rack)
-            .cloned()
-        else {
+        let Some(rack) = self.rack_fields(self.selected_rack) else {
             paint_text(
                 ui,
                 middle.center(),
@@ -670,10 +663,10 @@ impl LiveRackApp {
     /// A vertical gain fader filling `rect`: a rounded track, a 0 dB tick, and the thumb. Click
     /// or drag sets the gain, Shift drags finely, arrows step it, and double-click resets it.
     pub(super) fn draw_gain_fader(&mut self, ui: &mut Ui, id: egui::Id, rect: Rect, rack: usize) {
-        let Some(model_rack) = self.controller.document().model.racks.get(rack).cloned() else {
+        let Some(model_rack) = self.rack_fields(rack) else {
             return;
         };
-        let gain_db = model_rack.gain_db.get();
+        let gain_db = model_rack.gain_db;
         let track = Rect::from_center_size(
             rect.center(),
             Vec2::new(
@@ -730,10 +723,13 @@ impl LiveRackApp {
         rack: usize,
         which: RouteChips,
     ) -> f32 {
-        let Some(model_rack) = self.controller.document().model.racks.get(rack).cloned() else {
-            return pos.y;
+        let route = {
+            let model = &self.controller.document().model;
+            let Some(model_rack) = model.racks.get(rack) else {
+                return pos.y;
+            };
+            super::rack_route(model, model_rack)
         };
-        let route = super::rack_route(&self.controller.document().model, &model_rack);
         let tone = if self.route_fits(route) {
             ChipTone::Neutral
         } else {

@@ -379,6 +379,13 @@ impl RackSharedMemoryDispatcher {
             .is_some()
     }
 
+    /// Returns each lane's rack index and lock-free telemetry snapshot, in one pass.
+    pub fn lane_telemetry(&self) -> impl Iterator<Item = (usize, RackDispatchTelemetry)> + '_ {
+        self.racks
+            .iter()
+            .map(|rack| (rack.rack_index, rack.lane.telemetry()))
+    }
+
     /// Returns a lock-free telemetry snapshot for one rack.
     #[must_use]
     pub fn telemetry(&self, rack_index: usize) -> Option<RackDispatchTelemetry> {

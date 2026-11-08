@@ -1,7 +1,7 @@
 //! Capacity-bounded, platform-neutral prepared graph contracts.
 //!
 //! Graph preparation happens before an audio block. `AudioThread::activate_block`
-//! only swaps fixed-size values and acknowledges the swap; it performs neither
+//! only moves a staged fixed-size graph into place and acknowledges the swap; it performs neither
 //! allocation nor locking. The product mix path lives in [`realtime`]. The rack gate and each
 //! rack's dry delay and fades come from `sp-rack-lane`, which Lambda shares.
 
@@ -487,41 +487,37 @@ pub struct AudioThread<'arena> {
 }
 
 impl AudioThread<'_> {
-    /// Activates the latest staged graph at a block boundary and reports it.
+    /// Activates the latest staged graph at a block boundary and reports it. The activated
+    /// graph is then [`GraphArena::active_graph`].
     ///
-    /// This method only reads, writes, and moves `Copy` fixed-size graph data.
-    /// It therefore performs no heap allocation and acquires no lock.
+    /// This method only moves a staged graph into the active position. It performs no heap
+    /// allocation, acquires no lock, and copies no graph when nothing was staged.
     #[must_use]
     pub fn activate_block(&mut self) -> BlockActivation {
-        let acknowledgement = self.arena.staged.take().map(|staged| {
-            self.arena.active = staged;
-            GraphSwapAcknowledgement {
-                generation: staged.generation,
-            }
-        });
+        let acknowledgement = if let Some(staged) = &self.arena.staged {
+            let generation = staged.generation;
+            self.arena.active = *staged;
+            self.arena.staged = None;
+            Some(GraphSwapAcknowledgement { generation })
+        } else {
+            None
+        };
         BlockActivation {
-            graph: self.arena.active.graph,
             active_generation: self.arena.active.generation,
             acknowledgement,
         }
     }
 }
 
-/// Graph information available to the audio thread for one block.
+/// The outcome of one block-boundary graph activation. It does not hold the graph (about
+/// 15 KB), so the audio thread never copies the graph to report it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockActivation {
-    graph: PreparedGraph,
     active_generation: GraphGeneration,
     acknowledgement: Option<GraphSwapAcknowledgement>,
 }
 
 impl BlockActivation {
-    /// Returns the graph activated for this block.
-    #[must_use]
-    pub const fn graph(&self) -> &PreparedGraph {
-        &self.graph
-    }
-
     /// Returns the active generation for this block.
     #[must_use]
     pub const fn active_generation(&self) -> GraphGeneration {

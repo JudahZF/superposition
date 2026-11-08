@@ -174,12 +174,17 @@ impl ProductCallback {
             return BlockOutcome::InvalidChannels;
         }
         let input_channels = usize::from(self.input_channels);
+        // Strided iterators: no index arithmetic or bounds check per sample.
         for channel in 0..input_channels {
             let Some(samples) = block.input(channel) else {
                 return BlockOutcome::InvalidBuffers;
             };
-            for (frame, sample) in samples.iter().enumerate() {
-                self.input[frame * input_channels + channel] = *sample;
+            for (interleaved, sample) in self.input[channel..]
+                .iter_mut()
+                .step_by(input_channels)
+                .zip(samples)
+            {
+                *interleaved = *sample;
             }
         }
         let Some(renderer) = self.renderer.as_deref_mut() else {
@@ -210,8 +215,11 @@ impl ProductCallback {
             let Some(samples) = block.output(channel) else {
                 return BlockOutcome::InvalidBuffers;
             };
-            for (frame, sample) in samples.iter_mut().enumerate() {
-                *sample = self.output[frame * output_channels + channel];
+            for (sample, interleaved) in samples
+                .iter_mut()
+                .zip(self.output[channel..].iter().step_by(output_channels))
+            {
+                *sample = *interleaved;
             }
         }
         BlockOutcome::Rendered

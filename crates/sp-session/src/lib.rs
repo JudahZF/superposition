@@ -509,7 +509,7 @@ impl AtomicFileSessionStore {
         let stage = self.layout.staging_dir().join(revision_id());
         let result = (|| {
             fs::create_dir_all(&stage)?;
-            copy_dir_if_exists(&self.layout.plugin_state_dir(), &stage.join("plugin-state"))?;
+            link_dir_if_exists(&self.layout.plugin_state_dir(), &stage.join("plugin-state"))?;
             let mut manifest = package.manifest.clone();
             // Document-only callers (including autosave) retain the last successful opaque
             // capture and its activation metadata instead of silently dropping that reference.
@@ -618,7 +618,7 @@ impl AtomicFileSessionStore {
             &self.layout.session_json(),
             &rollback_tmp.join("session.json"),
         )?;
-        copy_dir_if_exists(
+        link_dir_if_exists(
             &self.layout.plugin_state_dir(),
             &rollback_tmp.join("plugin-state"),
         )?;
@@ -995,9 +995,9 @@ impl SessionController {
     /// # Errors
     /// Returns [`SessionError`] when validation or the atomic publish fails.
     pub fn autosave(&mut self) -> Result<(), SessionError> {
+        // Publishing already marks the shutdown unclean, so an autosave offers recovery.
         self.store
             .save_atomic(&SessionPackage::new(self.document.clone()))?;
-        self.store.mark_clean_shutdown(false)?;
         self.dirty = false;
         Ok(())
     }
@@ -1230,6 +1230,11 @@ fn read_limited(path: &Path, maximum: u64, limit: &'static str) -> Result<Vec<u8
 fn read_opaque(path: &Path) -> Result<Vec<u8>, SessionError> {
     read_limited(path, MAX_OPAQUE_STATE_BYTES, "opaque state bytes")
 }
+fn opaque_length(path: &Path) -> Result<u64, SessionError> {
+    let length = fs::metadata(path)?.len();
+    validate_opaque(length)?;
+    Ok(length)
+}
 fn is_editor_preview(png: &[u8]) -> bool {
     png.len() as u64 <= MAX_EDITOR_PREVIEW_BYTES && png.starts_with(PNG_SIGNATURE)
 }
@@ -1252,9 +1257,15 @@ fn validate_opaque(length: u64) -> Result<(), SessionError> {
         Ok(())
     }
 }
+/// Writes a new file. An existing file is unlinked first, never truncated: state files are
+/// hard links shared by the live package, its stage, and the rollback (`link_dir_if_exists`).
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+    }
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
     }
     let mut file = File::create(path)?;
     file.write_all(bytes)?;
@@ -1270,33 +1281,41 @@ fn copy_file_if_exists(from: &Path, to: &Path) -> Result<(), SessionError> {
     }
     Ok(())
 }
-fn copy_dir_if_exists(from: &Path, to: &Path) -> Result<(), SessionError> {
+/// Hard-links a tree of files, copying a file only where the file system cannot link it.
+/// Unchanged plug-in state then costs a directory entry per save instead of a full copy and
+/// its fsync. Every write replaces a file through `write_file`, so a link is never modified.
+fn link_dir_if_exists(from: &Path, to: &Path) -> Result<(), SessionError> {
     if !from.exists() {
         return Ok(());
     }
+    fs::create_dir_all(to)?;
     for entry in fs::read_dir(from)? {
         let entry = entry?;
         let path = entry.path();
         let target = to.join(entry.file_name());
         if entry.file_type()?.is_dir() {
-            copy_dir_if_exists(&path, &target)?;
-        } else {
-            copy_file_if_exists(&path, &target)?;
+            link_dir_if_exists(&path, &target)?;
+        } else if fs::hard_link(&path, &target).is_err() {
+            fs::copy(&path, &target)?;
         }
     }
     Ok(())
 }
+/// Moves a synced staged file into place. Both are inside the session root.
 fn replace_file(from: &Path, to: &Path) -> Result<(), SessionError> {
-    let tmp = to.with_extension("next");
-    copy_file_if_exists(from, &tmp)?;
-    fs::rename(tmp, to)?;
+    fs::rename(from, to)?;
     Ok(())
 }
+/// Moves a synced staged tree into place through `<to>.next`. A missing `from` publishes an
+/// empty tree.
 fn replace_dir(from: &Path, to: &Path) -> Result<(), SessionError> {
     let tmp = to.with_extension("next");
     let _ = fs::remove_dir_all(&tmp);
-    fs::create_dir_all(&tmp)?;
-    copy_dir_if_exists(from, &tmp)?;
+    if from.exists() {
+        fs::rename(from, &tmp)?;
+    } else {
+        fs::create_dir_all(&tmp)?;
+    }
     let _ = fs::remove_dir_all(to);
     fs::rename(tmp, to)?;
     Ok(())
@@ -1316,11 +1335,10 @@ fn sync_tree(root: &Path) -> Result<(), SessionError> {
 fn validate_state_files(root: &Path, manifest: &PackageManifest) -> Result<(), SessionError> {
     for (id, expected) in &manifest.plugin_state {
         let base = root.join("plugin-state").join(id);
-        let component = read_opaque(&base.join("component.bin"))?;
-        let controller = read_opaque(&base.join("controller.bin"))?;
-        if component.len() as u64 != expected.component_bytes
-            || controller.len() as u64 != expected.controller_bytes
-        {
+        // Only the lengths are checked here; the streams are read when they are restored.
+        let component = opaque_length(&base.join("component.bin"))?;
+        let controller = opaque_length(&base.join("controller.bin"))?;
+        if component != expected.component_bytes || controller != expected.controller_bytes {
             return Err(SessionError::InvalidMetadata(format!(
                 "opaque state size mismatch for {id}"
             )));
@@ -1581,6 +1599,36 @@ mod tests {
         assert_eq!(
             store.load().expect("rollback").session_json,
             SessionDocument::empty()
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+    /// Saves share unchanged state files by hard link, so a replaced stream must be a new
+    /// file: the rollback keeps the previous bytes, and other instances stay intact.
+    #[test]
+    fn replacing_state_keeps_the_rollback_and_other_instances() {
+        let root = root();
+        let store = AtomicFileSessionStore::new(&root);
+        store
+            .save_atomic(&SessionPackage::new(SessionDocument::empty()))
+            .expect("save");
+        store.save_plugin_state("a", &[1], &[2]).expect("a");
+        store.save_plugin_state("b", &[3], &[4]).expect("b");
+        store
+            .save_plugin_state("a", &[5, 6], &[7])
+            .expect("a again");
+        assert_eq!(
+            store.load_plugin_state("a").expect("a"),
+            (vec![5, 6], vec![7])
+        );
+        assert_eq!(store.load_plugin_state("b").expect("b"), (vec![3], vec![4]));
+        let previous = store.layout().rollback_dir().join("plugin-state");
+        assert_eq!(
+            fs::read(previous.join("a/component.bin")).expect("rollback"),
+            [1]
+        );
+        assert_eq!(
+            fs::read(previous.join("b/component.bin")).expect("rollback"),
+            [3]
         );
         fs::remove_dir_all(root).expect("cleanup");
     }

@@ -20,7 +20,7 @@ mod tunnel;
 pub use style::install_style;
 
 #[cfg(audio_backend)]
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(audio_backend)]
@@ -157,6 +157,25 @@ enum Overlay {
     Modal(Modal),
 }
 
+/// What a show screen draws of a rack: see [`LiveRackApp::rack_fields`].
+struct RackFields {
+    name: String,
+    gain_db: f32,
+    muted: bool,
+    bypassed: bool,
+    slots: usize,
+}
+
+/// What a show screen draws of a slot: see [`LiveRackApp::slot_fields`].
+struct SlotFields {
+    id: String,
+    name: String,
+    vendor: String,
+    bypassed: bool,
+    /// The sidechain chip's label, when the slot has a sidechain.
+    sidechain: Option<String>,
+}
+
 /// The plug-in picker for one rack: a search query and the keyboard cursor.
 #[derive(Debug, PartialEq)]
 struct Picker {
@@ -189,7 +208,10 @@ enum SlotAction {
 pub struct LiveRackApp {
     controller: SessionController,
     product: Result<ProductRuntime, String>,
+    /// Change only through [`LiveRackApp::set_catalog`], which keeps `installed_plugins`.
     catalog_plugins: Vec<CatalogPlugin>,
+    /// Unique IDs of `catalog_plugins`: every slot's state token checks it each frame.
+    installed_plugins: HashSet<String>,
     selected_rack: usize,
     /// Keyboard slot selection within the selected rack.
     selected_slot: Option<usize>,
@@ -352,6 +374,7 @@ impl LiveRackApp {
         Self {
             controller,
             product,
+            installed_plugins: installed_plugin_ids(&catalog_plugins),
             catalog_plugins,
             selected_rack: 0,
             selected_slot: None,
@@ -818,11 +841,50 @@ impl LiveRackApp {
         self.set_status("Page removed. Its racks stay in the session.");
     }
 
+    /// The fields of a rack that the show screens draw every frame. Cloning the `Rack` would
+    /// also copy each slot's parameter map, which can hold thousands of entries.
+    fn rack_fields(&self, rack: usize) -> Option<RackFields> {
+        self.controller
+            .document()
+            .model
+            .racks
+            .get(rack)
+            .map(|rack| RackFields {
+                name: rack.name.clone(),
+                gain_db: rack.gain_db.get(),
+                muted: rack.muted,
+                bypassed: rack.bypassed,
+                slots: rack.slots.len(),
+            })
+    }
+
+    /// The fields of a slot that the show screens draw every frame, without its parameters.
+    fn slot_fields(&self, rack: usize, slot: usize) -> Option<SlotFields> {
+        self.controller
+            .document()
+            .model
+            .racks
+            .get(rack)
+            .and_then(|rack| rack.slots.get(slot))
+            .map(|slot| SlotFields {
+                id: slot.id.0.clone(),
+                name: slot.plugin.identity.name.clone(),
+                vendor: slot.plugin.identity.vendor.clone(),
+                bypassed: slot.bypassed,
+                sidechain: self.sidechain_marker(slot),
+            })
+    }
+
+    /// Replaces the catalog and the installed-plug-in index built from it.
+    fn set_catalog(&mut self, plugins: Vec<CatalogPlugin>) {
+        self.installed_plugins = installed_plugin_ids(&plugins);
+        self.catalog_plugins = plugins;
+    }
+
     /// Whether the catalog on this machine has the plug-in a slot names.
     fn plugin_installed(&self, slot: &PluginSlot) -> bool {
-        self.catalog_plugins
-            .iter()
-            .any(|plugin| plugin.descriptor.identity.unique_id == slot.plugin.identity.unique_id)
+        self.installed_plugins
+            .contains(&slot.plugin.identity.unique_id)
     }
 
     fn worker_running(&self, rack: usize) -> bool {
@@ -1816,10 +1878,11 @@ impl LiveRackApp {
             .and_then(|product| product.scan_standard_locations(true));
         match result {
             Ok(count) => {
-                self.catalog_plugins = self
+                let catalog = self
                     .product
                     .as_ref()
                     .map_or_else(|_| Vec::new(), ProductRuntime::catalog_plugins);
+                self.set_catalog(catalog);
                 self.last_scan = Some(SystemTime::now());
                 self.set_status(&format!("Scan complete, {count} bundles cataloged"));
             }
@@ -3118,6 +3181,13 @@ fn new_rack_route(position: usize, inputs: u16, outputs: u16) -> RackChannelRout
 }
 
 /// A rack's hardware route, falling back to its source and endpoint layouts.
+fn installed_plugin_ids(plugins: &[CatalogPlugin]) -> HashSet<String> {
+    plugins
+        .iter()
+        .map(|plugin| plugin.descriptor.identity.unique_id.clone())
+        .collect()
+}
+
 fn rack_route(model: &sp_model::Session, rack: &sp_model::Rack) -> RackChannelRoute {
     model.rack_routes.get(&rack.id).copied().unwrap_or_else(|| {
         let layout =

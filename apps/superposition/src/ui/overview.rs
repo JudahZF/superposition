@@ -367,7 +367,7 @@ impl LiveRackApp {
 
     /// One rack strip.
     fn draw_strip(&mut self, ui: &mut Ui, rect: Rect, rack: usize) {
-        let Some(model_rack) = self.controller.document().model.racks.get(rack).cloned() else {
+        let Some(model_rack) = self.rack_fields(rack) else {
             return;
         };
         let selected = rack == self.selected_rack;
@@ -447,7 +447,7 @@ impl LiveRackApp {
                 Vec2::new(inner.width(), slot_height),
             );
             y += slot_height + sp(Spacing::S4);
-            match slot.cmp(&model_rack.slots.len()) {
+            match slot.cmp(&model_rack.slots) {
                 Ordering::Less => {
                     self.draw_strip_slot(ui, row, id.with(("slot", slot)), rack, slot);
                 }
@@ -473,7 +473,7 @@ impl LiveRackApp {
     /// A strip's foot, from the bottom up: state, mute and bypass, then meters and the fader
     /// filling the room between the chain (ending at `top`) and the toggles.
     fn draw_strip_foot(&mut self, ui: &mut Ui, inner: Rect, top: f32, rack: usize, id: egui::Id) {
-        let Some(model_rack) = self.controller.document().model.racks.get(rack).cloned() else {
+        let Some(model_rack) = self.rack_fields(rack) else {
             return;
         };
         let status = Rect::from_min_max(
@@ -494,7 +494,7 @@ impl LiveRackApp {
             Pos2::new(toggles.right() - half, toggles.top()),
             Vec2::new(half, toggles.height()),
         );
-        let gain_db = model_rack.gain_db.get();
+        let gain_db = model_rack.gain_db;
         if toggle_at(
             ui,
             mute,
@@ -553,15 +553,7 @@ impl LiveRackApp {
     /// One slot row in a strip: picture thumbnail, name, and state dot. Click opens the plug-in
     /// in the rack view; right-click opens the slot menu.
     fn draw_strip_slot(&mut self, ui: &mut Ui, row: Rect, id: egui::Id, rack: usize, slot: usize) {
-        let Some(model_slot) = self
-            .controller
-            .document()
-            .model
-            .racks
-            .get(rack)
-            .and_then(|rack| rack.slots.get(slot))
-            .cloned()
-        else {
+        let Some(model_slot) = self.slot_fields(rack, slot) else {
             return;
         };
         let token = self.slot_token(rack, slot);
@@ -579,7 +571,7 @@ impl LiveRackApp {
                 egui::StrokeKind::Inside,
             );
         }
-        let picture = self.previews.get(&model_slot.id.0);
+        let picture = self.previews.get(&model_slot.id);
         let thumb_height = row.height() - sp(Spacing::S6) * 2.0;
         let thumb = Rect::from_min_size(
             Pos2::new(
@@ -591,7 +583,7 @@ impl LiveRackApp {
         thumbnail(ui, thumb, picture, token, Radius::Small);
         let dot_x = row.right() - sp(Spacing::S8);
         dot(ui, Pos2::new(dot_x, row.center().y), token.color());
-        let name = &model_slot.plugin.identity.name;
+        let name = &model_slot.name;
         let name_token = match token {
             StateToken::Missing | StateToken::Faulted => ColorToken::Fault,
             StateToken::Bypassed | StateToken::Unloaded => ColorToken::Dim,

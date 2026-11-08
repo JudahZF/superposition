@@ -29,6 +29,12 @@ members = [
 default-members = ["apps/superposition"]
 exclude = ["third-party/vst3-host"]
 
+# Release builds (bundles, timing checks) optimize across crates: the callback path runs
+# through sp-audio-io, sp-engine, sp-rack-lane, and sp-shared-memory.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [patch.crates-io]
 vst3-host = { path = "third-party/vst3-host" }
 

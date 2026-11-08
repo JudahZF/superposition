@@ -116,15 +116,14 @@ fn audio_thread_acknowledges_only_block_boundary_swaps() {
     let mut arena = GraphArena::new(initial);
     let request = arena.stage(PreparedGraph::empty());
 
-    let mut audio_thread = arena.activate_audio_thread();
-    let first_block = audio_thread.activate_block();
+    let first_block = arena.activate_audio_thread().activate_block();
     assert_eq!(
         first_block.acknowledgement().unwrap().generation,
         request.generation
     );
-    assert_eq!(first_block.graph().rack_count(), 0);
+    assert_eq!(arena.active_graph().rack_count(), 0);
 
-    let second_block = audio_thread.activate_block();
+    let second_block = arena.activate_audio_thread().activate_block();
     assert!(second_block.acknowledgement().is_none());
     assert_eq!(second_block.active_generation(), request.generation);
 }

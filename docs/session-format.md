@@ -134,8 +134,8 @@ empty session.
 
 Before JSON decoding, each JSON file is limited to 8 MiB, nesting to 64 levels, an individual JSON string to 64 KiB, and JSON collection separators to 16,384. Opaque component and controller files are each limited to 32 MiB. File size is checked from metadata before reading; JSON shape is checked before serde constructs application objects. Size, metadata, ID, or model validation failures are reported without launching a plug-in.
 
-Worker control protocol version 6 transfers each state stream in chunks of at
-most 256 KiB, up to the same 32 MiB per-stream package limit. One transfer is
+Worker control protocol version 8 transfers each state stream in chunks of at
+most 1,000 KiB, up to the same 32 MiB per-stream package limit. One transfer is
 active per worker and is bound to its slot, generation, and transfer ID. Capture
 reads one immutable snapshot. Restore stages both complete streams before
 calling the plug-in; an incomplete or rejected transfer does not change its
