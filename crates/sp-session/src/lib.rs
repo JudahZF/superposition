@@ -1295,7 +1295,11 @@ fn link_dir_if_exists(from: &Path, to: &Path) -> Result<(), SessionError> {
         let target = to.join(entry.file_name());
         if entry.file_type()?.is_dir() {
             link_dir_if_exists(&path, &target)?;
-        } else if fs::hard_link(&path, &target).is_err() {
+        } else if let Err(error) = fs::hard_link(&path, &target) {
+            // An existing target may be a link to `path` itself, which a copy would truncate.
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                return Err(error.into());
+            }
             fs::copy(&path, &target)?;
         }
     }
