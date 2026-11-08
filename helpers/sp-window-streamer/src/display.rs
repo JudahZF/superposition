@@ -528,12 +528,19 @@ impl Display {
                 .copied()
                 .reduce(Rect::union)
                 .expect("a run holds at least one tile");
-            let pixels = grabber.grab(
+            let pixels = match grabber.grab(
                 conn,
                 window.pixmap,
                 (area.x + border, area.y + border),
                 (area.width, area.height),
-            )?;
+            ) {
+                Ok(pixels) => pixels,
+                Err(error) => {
+                    // Earlier runs already changed the cache: start again from a keyframe.
+                    window.reset_frame();
+                    return Err(error);
+                }
+            };
             let area_stride = usize::from(area.width) * 4;
             for index in run {
                 let tile = window.grid[index];
