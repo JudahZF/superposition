@@ -9,8 +9,8 @@
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc, time::Instant};
 
 use sp_window_stream::{
-    MAX_TITLE_BYTES, MAX_WINDOW_DIMENSION, MAX_WINDOWS, Rect, Tile, TileEncoder, WindowId,
-    WindowInfo, WindowKind, tile_grid,
+    MAX_TITLE_BYTES, MAX_WINDOW_DIMENSION, MAX_WINDOWS, Rect, TILE_SIZE, Tile, TileEncoder,
+    WindowId, WindowInfo, WindowKind, tile_grid,
 };
 use x11rb::{
     connection::{Connection, RequestConnection},
@@ -496,50 +496,78 @@ impl Display {
                 damage = conn.xfixes_fetch_region(*region)?.reply()?.rectangles;
             }
         }
-        let dirty: Vec<usize> = (0..window.grid.len())
-            .filter(|&i| keyframe || damage.iter().any(|&r| intersects(window.grid[i], r)))
-            .collect();
+        let columns = usize::from(window.info.width).div_ceil(usize::from(TILE_SIZE));
+        let dirty = dirty_tiles(
+            keyframe,
+            &damage,
+            (window.info.width, window.info.height),
+            window.grid.len(),
+        );
         window.damaged = false;
         window.last_capture = Some(Instant::now());
-        let Some(area) = dirty.iter().map(|&i| window.grid[i]).reduce(Rect::union) else {
-            return Ok(None);
-        };
 
+        // Each run of adjacent dirty tiles in a tile row is grabbed on its own, so damage at
+        // two edges of a window (meters, say) does not read the whole window between them.
         let border = window.border;
-        let pixels = grabber.grab(
-            conn,
-            window.pixmap,
-            (area.x + border, area.y + border),
-            (area.width, area.height),
-        )?;
         let frame_stride = usize::from(window.info.width) * 4;
-        let area_stride = usize::from(area.width) * 4;
         let mut changed = Vec::new();
-        for index in dirty {
-            let tile = window.grid[index];
-            let row_bytes = usize::from(tile.width) * 4;
-            let mut differs = keyframe;
-            for row in 0..usize::from(tile.height) {
-                let src = (usize::from(tile.y - area.y) + row) * area_stride
-                    + usize::from(tile.x - area.x) * 4;
-                let dst = (usize::from(tile.y) + row) * frame_stride + usize::from(tile.x) * 4;
-                let (src, dst) = (
-                    &pixels[src..src + row_bytes],
-                    &mut window.frame[dst..dst + row_bytes],
-                );
-                if src != dst {
-                    dst.copy_from_slice(src);
-                    differs = true;
-                }
+        let mut index = 0;
+        while index < dirty.len() {
+            if !dirty[index] {
+                index += 1;
+                continue;
             }
-            if differs {
-                let fresh = encoder.encode(&window.frame, frame_stride, tile)?;
-                if keyframe {
-                    window.tiles.push(fresh.clone());
-                } else {
-                    window.tiles[index] = fresh.clone();
+            let row_end = (index / columns + 1) * columns;
+            let run_end = (index..row_end.min(dirty.len()))
+                .find(|&next| !dirty[next])
+                .unwrap_or(row_end.min(dirty.len()));
+            let run = index..run_end;
+            index = run_end;
+            let area = window.grid[run.clone()]
+                .iter()
+                .copied()
+                .reduce(Rect::union)
+                .expect("a run holds at least one tile");
+            let pixels = match grabber.grab(
+                conn,
+                window.pixmap,
+                (area.x + border, area.y + border),
+                (area.width, area.height),
+            ) {
+                Ok(pixels) => pixels,
+                Err(error) => {
+                    // Earlier runs already changed the cache: start again from a keyframe.
+                    window.reset_frame();
+                    return Err(error);
                 }
-                changed.push(fresh);
+            };
+            let area_stride = usize::from(area.width) * 4;
+            for index in run {
+                let tile = window.grid[index];
+                let row_bytes = usize::from(tile.width) * 4;
+                let mut differs = keyframe;
+                for row in 0..usize::from(tile.height) {
+                    let src = (usize::from(tile.y - area.y) + row) * area_stride
+                        + usize::from(tile.x - area.x) * 4;
+                    let dst = (usize::from(tile.y) + row) * frame_stride + usize::from(tile.x) * 4;
+                    let (src, dst) = (
+                        &pixels[src..src + row_bytes],
+                        &mut window.frame[dst..dst + row_bytes],
+                    );
+                    if src != dst {
+                        dst.copy_from_slice(src);
+                        differs = true;
+                    }
+                }
+                if differs {
+                    let fresh = encoder.encode(&window.frame, frame_stride, tile)?;
+                    if keyframe {
+                        window.tiles.push(fresh.clone());
+                    } else {
+                        window.tiles[index] = fresh.clone();
+                    }
+                    changed.push(fresh);
+                }
             }
         }
         window.full = false;
@@ -563,11 +591,90 @@ fn window_size_ok(width: u16, height: u16) -> bool {
     (1..=MAX_WINDOW_DIMENSION).contains(&width) && (1..=MAX_WINDOW_DIMENSION).contains(&height)
 }
 
-fn intersects(tile: Rect, r: x11rb::protocol::xproto::Rectangle) -> bool {
-    let (rx, ry) = (i32::from(r.x), i32::from(r.y));
-    let (tx, ty) = (i32::from(tile.x), i32::from(tile.y));
-    rx < tx + i32::from(tile.width)
-        && tx < rx + i32::from(r.width)
-        && ry < ty + i32::from(tile.height)
-        && ty < ry + i32::from(r.height)
+/// Marks the [`tile_grid`] tiles (row-major, `tiles` of them) that a damage rectangle
+/// touches, or every tile for a keyframe. Each rectangle marks its own tile range, so the
+/// cost follows the damaged area, not tiles times rectangles.
+fn dirty_tiles(
+    keyframe: bool,
+    damage: &[x11rb::protocol::xproto::Rectangle],
+    (width, height): (u16, u16),
+    tiles: usize,
+) -> Vec<bool> {
+    let mut dirty = vec![keyframe; tiles];
+    if keyframe {
+        return dirty;
+    }
+    let tile = usize::from(TILE_SIZE);
+    let columns = usize::from(width).div_ceil(tile);
+    // Clamped to the window, so each edge is a non-negative pixel position.
+    let clamp =
+        |value: i32, limit: u16| usize::try_from(value.clamp(0, i32::from(limit))).unwrap_or(0);
+    for r in damage {
+        let left = clamp(i32::from(r.x), width);
+        let top = clamp(i32::from(r.y), height);
+        let right = clamp(i32::from(r.x) + i32::from(r.width), width);
+        let bottom = clamp(i32::from(r.y) + i32::from(r.height), height);
+        if left >= right || top >= bottom {
+            continue;
+        }
+        for row in top / tile..=(bottom - 1) / tile {
+            for column in left / tile..=(right - 1) / tile {
+                if let Some(cell) = dirty.get_mut(row * columns + column) {
+                    *cell = true;
+                }
+            }
+        }
+    }
+    dirty
+}
+
+#[cfg(test)]
+mod tests {
+    use x11rb::protocol::xproto::Rectangle;
+
+    use super::dirty_tiles;
+
+    #[test]
+    fn damage_marks_only_the_tiles_it_touches_clamped_to_the_window() {
+        // A 130 x 70 window has 3 x 2 tiles.
+        let damage = [
+            // Straddles the first two columns of the top row.
+            Rectangle {
+                x: 60,
+                y: 10,
+                width: 8,
+                height: 4,
+            },
+            // Starts off the window's left and top edges: only tile 0.
+            Rectangle {
+                x: -20,
+                y: -20,
+                width: 25,
+                height: 25,
+            },
+            // Its last pixel is the window's last pixel: only the bottom-right tile.
+            Rectangle {
+                x: 129,
+                y: 69,
+                width: 50,
+                height: 50,
+            },
+            // Entirely outside.
+            Rectangle {
+                x: 200,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+        ];
+        assert_eq!(
+            dirty_tiles(false, &damage, (130, 70), 6),
+            [true, true, false, false, false, true]
+        );
+        assert!(
+            dirty_tiles(true, &[], (130, 70), 6)
+                .iter()
+                .all(|&dirty| dirty)
+        );
+    }
 }

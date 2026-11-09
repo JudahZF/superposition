@@ -31,7 +31,7 @@ impl Engine {
         });
         let presses = &mut self.presses;
         let button = &mut self.button;
-        let output = self.ctx.run(input, |ctx| {
+        let mut output = self.ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let response = ui.button(format!("Pressed {presses}"));
                 *button = response.rect;
@@ -40,7 +40,7 @@ impl Engine {
                 }
             });
         });
-        self.server.publish(&self.ctx, &output);
+        self.server.publish(&self.ctx, &mut output);
     }
 }
 

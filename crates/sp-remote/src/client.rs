@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use crate::{
     Identity, RemoteError, Role, TrustStore,
     protocol::{
-        ClientMessage, Frame, PROTOCOL_VERSION, ServerMessage, pairing, read_control, read_frame,
+        ClientMessage, Frame, FrameReader, PROTOCOL_VERSION, ServerMessage, pairing, read_control,
         write_control,
     },
     server::spawn_reader,
@@ -295,7 +295,10 @@ async fn run(
 
 /// Receives frames on their own task (stream reads are not cancel-safe).
 async fn read_frames(mut frames: quinn::RecvStream, shared: Arc<Shared>) {
-    while let Ok(Some(mut frame)) = read_frame(&mut frames).await {
+    let Ok(mut reader) = FrameReader::new() else {
+        return;
+    };
+    while let Ok(Some(mut frame)) = reader.read(&mut frames).await {
         {
             let mut received = shared.received();
             received.textures.append(&mut frame.textures);

@@ -10,7 +10,6 @@ use super::style::{
     popover_title, px, scrim, sp, text, text_field, title,
 };
 use super::{LiveRackApp, Modal, Overlay, SlotAction, channels_label, show::latency_label};
-use crate::CatalogPlugin;
 
 /// One menu row: label, key hint, enabled, and what it does.
 type MenuItem<A> = Option<(&'static str, &'static str, bool, A)>;
@@ -44,7 +43,29 @@ struct PickerRow {
     name: String,
     /// A note beside the name: why it cannot be added, or that it runs under Wine.
     reason: Option<&'static str>,
-    plugin: Option<CatalogPlugin>,
+    /// Index into the catalog, for a plug-in that can be added. The picker rebuilds its rows
+    /// every frame, so rows never copy catalog entries and their parameter maps.
+    plugin: Option<usize>,
+    /// Lowercase vendor and name: the sort key, and what the search matches.
+    key: (String, String),
+}
+
+impl PickerRow {
+    fn new(
+        vendor: String,
+        name: String,
+        reason: Option<&'static str>,
+        plugin: Option<usize>,
+    ) -> Self {
+        let key = (vendor.to_lowercase(), name.to_lowercase());
+        Self {
+            vendor,
+            name,
+            reason,
+            plugin,
+            key,
+        }
+    }
 }
 
 impl LiveRackApp {
@@ -645,42 +666,30 @@ impl LiveRackApp {
         let mut rows: Vec<PickerRow> = self
             .catalog_plugins
             .iter()
-            .map(|plugin| PickerRow {
-                vendor: plugin.descriptor.identity.vendor.clone(),
-                name: plugin.descriptor.identity.name.clone(),
-                // Windows plug-ins run under Wine, and their rack is heard one buffer late.
-                reason: plugin.windows.then_some("Windows, +1 buffer"),
-                plugin: Some(plugin.clone()),
+            .enumerate()
+            .map(|(index, plugin)| {
+                PickerRow::new(
+                    plugin.descriptor.identity.vendor.clone(),
+                    plugin.descriptor.identity.name.clone(),
+                    // Windows plug-ins run under Wine, and their rack is heard one buffer late.
+                    plugin.windows.then_some("Windows, +1 buffer"),
+                    Some(index),
+                )
             })
             .collect();
         if let Ok(product) = self.product.as_ref() {
             rows.extend(
-                product
-                    .quarantined_plugins()
-                    .into_iter()
-                    .map(|entry| PickerRow {
-                        vendor: String::new(),
-                        name: entry.name,
-                        reason: Some("quarantined"),
-                        plugin: None,
-                    }),
+                product.quarantined_plugins().into_iter().map(|entry| {
+                    PickerRow::new(String::new(), entry.name, Some("quarantined"), None)
+                }),
             );
             rows.extend(
-                product
-                    .unavailable_plugins()
-                    .into_iter()
-                    .map(|entry| PickerRow {
-                        vendor: entry.vendor,
-                        name: entry.name,
-                        reason: Some(entry.reason),
-                        plugin: None,
-                    }),
+                product.unavailable_plugins().into_iter().map(|entry| {
+                    PickerRow::new(entry.vendor, entry.name, Some(entry.reason), None)
+                }),
             );
         }
-        rows.sort_by(|a, b| {
-            (a.vendor.to_lowercase(), a.name.to_lowercase())
-                .cmp(&(b.vendor.to_lowercase(), b.name.to_lowercase()))
-        });
+        rows.sort_by(|a, b| a.key.cmp(&b.key));
         rows
     }
 
@@ -708,9 +717,7 @@ impl LiveRackApp {
         let matches: Vec<&PickerRow> = rows
             .iter()
             .filter(|row| {
-                query.is_empty()
-                    || row.name.to_lowercase().contains(&query)
-                    || row.vendor.to_lowercase().contains(&query)
+                query.is_empty() || row.key.1.contains(&query) || row.key.0.contains(&query)
             })
             .collect();
         let choosable: Vec<usize> = matches
@@ -744,11 +751,7 @@ impl LiveRackApp {
             picker.cursor = choosable.first().copied().unwrap_or(0);
         }
         let mut chosen = enter
-            .then(|| {
-                matches
-                    .get(picker.cursor)
-                    .and_then(|row| row.plugin.clone())
-            })
+            .then(|| matches.get(picker.cursor).and_then(|row| row.plugin))
             .flatten();
         let center = ctx.screen_rect().center();
         let catalog_empty = rows.is_empty();
@@ -807,7 +810,7 @@ impl LiveRackApp {
                                 response.scroll_to_me(None);
                             }
                             if response.clicked() {
-                                chosen.clone_from(&row.plugin);
+                                chosen = row.plugin;
                             }
                         }
                         if matches.is_empty() {
@@ -834,7 +837,7 @@ impl LiveRackApp {
                 });
             },
         );
-        if let Some(plugin) = chosen {
+        if let Some(plugin) = chosen.and_then(|index| self.catalog_plugins.get(index).cloned()) {
             self.overlay = Overlay::None;
             self.select_rack(rack_index);
             self.add_plugin(plugin);

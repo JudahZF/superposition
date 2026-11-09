@@ -372,7 +372,7 @@ impl WorkerControlClient {
                     .map_or(String::new(), |record| record.message().to_owned()),
             });
         }
-        Ok(response.payload().to_vec())
+        Ok(response.into_payload())
     }
 
     /// Captures both VST3 state streams through bounded control frames.

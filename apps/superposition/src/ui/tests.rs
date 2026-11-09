@@ -317,7 +317,7 @@ fn snapshot_fixture() -> (LiveRackApp, egui::Context) {
     model.racks[6].slots[2].sidechain = Some(sp_model::SlotSidechain::PhysicalInput(
         sp_model::PhysicalChannels::Stereo { left: 6, right: 7 },
     ));
-    app.catalog_plugins = model
+    let mut catalog: Vec<_> = model
         .racks
         .iter()
         .flat_map(|rack| &rack.slots)
@@ -329,10 +329,9 @@ fn snapshot_fixture() -> (LiveRackApp, egui::Context) {
             windows: false,
         })
         .collect();
-    app.catalog_plugins
-        .sort_by(|a, b| a.descriptor.identity.name.cmp(&b.descriptor.identity.name));
-    app.catalog_plugins
-        .dedup_by(|a, b| a.descriptor.identity.name == b.descriptor.identity.name);
+    catalog.sort_by(|a, b| a.descriptor.identity.name.cmp(&b.descriptor.identity.name));
+    catalog.dedup_by(|a, b| a.descriptor.identity.name == b.descriptor.identity.name);
+    app.set_catalog(catalog);
     for (index, name) in ["Intro", "Verse", "Chorus", "Bridge", "Outro"]
         .into_iter()
         .enumerate()

@@ -418,45 +418,49 @@ impl RealtimeRackMixer {
             return Err(MixError::BufferLength);
         }
         let activation = self.arena.activate_audio_thread().activate_block();
-        let graph = activation.graph();
-        for rack_index in 0..graph.rack_count() {
-            let rack = graph.rack(rack_index).expect("prepared rack");
+        let rack_count = self.arena.active_graph().rack_count();
+        for rack_index in 0..rack_count {
+            let rack = self
+                .arena
+                .active_graph()
+                .rack(rack_index)
+                .expect("prepared rack");
             check_physical_channels(rack.output_channels(), output_channels, rack_index, false)?;
         }
         output[..samples].fill(0.0);
-        for (rack_index, rack_input) in inputs.iter().enumerate().take(graph.rack_count()) {
-            let rack = graph.rack(rack_index).expect("prepared rack");
+        for (rack_index, rack_input) in inputs.iter().enumerate().take(rack_count) {
+            // One rack (not the whole graph) is copied, so `render_lane` may borrow `self`.
+            let rack = *self
+                .arena
+                .active_graph()
+                .rack(rack_index)
+                .expect("prepared rack");
             let input = if rack.input_channels().is_some() {
                 rack_input
             } else {
                 &SILENT_RACK_INPUT
             };
-            self.render_lane(rack_index, rack, input, sources, frames);
-            let gain = if self.settings[rack_index].muted {
-                0.0
-            } else {
-                self.settings[rack_index].gain
-            };
-            self.capture_rack_output(rack_index, gain, frames);
-            for frame in 0..frames {
-                let scratch = frame * MIX_CHANNELS;
-                let output_frame = frame * output_channels;
-                match rack.output_channels() {
-                    PhysicalChannels::Mono { channel } => {
-                        output[output_frame + usize::from(channel)] += self.scratch[scratch] * gain;
+            self.render_lane(rack_index, &rack, input, sources, frames);
+            let post_fader = self.capture_rack_output(rack_index, frames);
+            let frames_out = output[..samples].chunks_exact_mut(output_channels);
+            let frames_in = post_fader.chunks_exact(MIX_CHANNELS);
+            match rack.output_channels() {
+                PhysicalChannels::Mono { channel } => {
+                    let channel = usize::from(channel);
+                    for (out, lane) in frames_out.zip(frames_in) {
+                        out[channel] += lane[0];
                     }
-                    PhysicalChannels::Stereo { left, right } => {
-                        output[output_frame + usize::from(left)] += self.scratch[scratch] * gain;
-                        output[output_frame + usize::from(right)] +=
-                            self.scratch[scratch + 1] * gain;
+                }
+                PhysicalChannels::Stereo { left, right } => {
+                    let (left, right) = (usize::from(left), usize::from(right));
+                    for (out, lane) in frames_out.zip(frames_in) {
+                        out[left] += lane[0];
+                        out[right] += lane[1];
                     }
                 }
             }
-            self.rack_meters[rack_index].publish(meter(
-                &self.scratch[..frames * MIX_CHANNELS],
-                frames,
-                gain,
-            ));
+            let snapshot = meter(post_fader, frames);
+            self.rack_meters[rack_index].publish(snapshot);
         }
         self.output_meter.publish(physical_output_meter(
             &output[..samples],
@@ -492,38 +496,38 @@ impl RealtimeRackMixer {
             return Err(MixError::BufferLength);
         }
         let activation = self.arena.activate_audio_thread().activate_block();
-        let rack_count = activation.graph().rack_count();
+        let rack_count = self.arena.active_graph().rack_count();
         output[..samples].fill(0.0);
         for rack_index in 0..rack_count {
-            let rack = activation
-                .graph()
+            let rack = *self
+                .arena
+                .active_graph()
                 .rack(rack_index)
                 .expect("prepared active rack");
-            self.render_lane(rack_index, rack, input, sources, frames);
-            let gain = if self.settings[rack_index].muted {
-                0.0
-            } else {
-                self.settings[rack_index].gain
-            };
-            self.capture_rack_output(rack_index, gain, frames);
-            mix_scaled(&self.scratch[..samples], output, gain);
-            self.rack_meters[rack_index].publish(meter(&self.scratch[..samples], frames, gain));
+            self.render_lane(rack_index, &rack, input, sources, frames);
+            let post_fader = self.capture_rack_output(rack_index, frames);
+            for (out, sample) in output[..samples].iter_mut().zip(post_fader) {
+                *out += *sample;
+            }
+            let snapshot = meter(post_fader, frames);
+            self.rack_meters[rack_index].publish(snapshot);
         }
-        self.output_meter
-            .publish(meter(&output[..samples], frames, 1.0));
+        self.output_meter.publish(meter(&output[..samples], frames));
         Ok(activation)
     }
 
-    /// Keeps the rack's post-fader output for rack-output sidechains in the next block.
-    fn capture_rack_output(&mut self, rack_index: usize, gain: f32, frames: usize) {
+    /// Applies the rack's gain (zero when muted) to its rendered lane, once per sample, and
+    /// keeps the result for the mix, the rack meter, and next block's rack-output sidechains.
+    fn capture_rack_output(&mut self, rack_index: usize, frames: usize) -> &[f32] {
+        let settings = self.settings[rack_index];
+        let gain = if settings.muted { 0.0 } else { settings.gain };
         let samples = frames * MIX_CHANNELS;
-        for (output, sample) in self.rack_outputs[rack_index][..samples]
-            .iter_mut()
-            .zip(&self.scratch[..samples])
-        {
+        let post_fader = &mut self.rack_outputs[rack_index][..samples];
+        for (output, sample) in post_fader.iter_mut().zip(&self.scratch[..samples]) {
             *output = sample * gain;
         }
         self.rack_output_frames[rack_index] = frames;
+        post_fader
     }
 
     /// Renders one rack's dry/wet lane into the scratch buffer, before gain.
@@ -719,22 +723,17 @@ fn check_physical_channels(
     }
 }
 
-fn mix_scaled(source: &[f32], output: &mut [f32], gain: f32) {
-    for (out, sample) in output.iter_mut().zip(source) {
-        *out += *sample * gain;
-    }
-}
 #[allow(
     clippy::cast_precision_loss,
     reason = "frame counts are bounded far below f32 precision limits"
 )]
-fn meter(samples: &[f32], frames: usize, gain: f32) -> RackMeterSnapshot {
+fn meter(samples: &[f32], frames: usize) -> RackMeterSnapshot {
     let mut peak = [0.0_f32; 2];
     let mut sum = [0.0_f32; 2];
     let mut clipped = false;
-    for frame in 0..frames {
+    for frame in samples[..frames * 2].chunks_exact(2) {
         for channel in 0..2 {
-            let sample = samples[frame * 2 + channel] * gain;
+            let sample = frame[channel];
             let abs = sample.abs();
             peak[channel] = peak[channel].max(abs);
             sum[channel] += sample * sample;

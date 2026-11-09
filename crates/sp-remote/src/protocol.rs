@@ -59,7 +59,7 @@ pub(crate) enum ServerMessage {
 }
 
 /// A mesh and its clip rectangle, in points.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct WireMesh {
     /// The clip rectangle.
     pub clip_rect: egui::Rect,
@@ -80,6 +80,17 @@ pub struct Frame {
     pub cursor: egui::CursorIcon,
     /// Text the engine's UI copied to the clipboard in this frame.
     pub copied_text: String,
+}
+
+/// A frame as the server sends it: [`Frame`]'s fields in the same order, borrowed, so it
+/// serializes to the same bytes without copying the meshes.
+#[derive(Serialize)]
+pub(crate) struct FrameRef<'a> {
+    pub(crate) sequence: u64,
+    pub(crate) textures: &'a [egui::TexturesDelta],
+    pub(crate) meshes: &'a [WireMesh],
+    pub(crate) cursor: egui::CursorIcon,
+    pub(crate) copied_text: &'a str,
 }
 
 async fn write_body(send: &mut quinn::SendStream, body: &[u8]) -> Result<(), RemoteError> {
@@ -108,6 +119,28 @@ async fn read_body(
     Ok(Some(body))
 }
 
+/// Reads one length-prefixed body into `body`, reusing its allocation. `false` at a clean end
+/// of stream.
+async fn read_body_into(
+    receive: &mut quinn::RecvStream,
+    limit: u32,
+    body: &mut Vec<u8>,
+) -> Result<bool, RemoteError> {
+    let mut length = [0; 4];
+    match receive.read_exact(&mut length).await {
+        Ok(()) => {}
+        Err(quinn::ReadExactError::FinishedEarly(0)) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+    let length = u32::from_le_bytes(length);
+    if length > limit {
+        return Err(RemoteError::TooLarge);
+    }
+    body.resize(length as usize, 0);
+    receive.read_exact(body).await?;
+    Ok(true)
+}
+
 pub(crate) async fn write_control<T: Serialize>(
     send: &mut quinn::SendStream,
     message: &T,
@@ -125,23 +158,80 @@ pub(crate) async fn read_control<T: DeserializeOwned>(
     }
 }
 
-pub(crate) async fn write_frame(
-    send: &mut quinn::SendStream,
-    frame: &Frame,
-) -> Result<(), RemoteError> {
-    let body = postcard::to_stdvec(frame)?;
-    // Level 1: meshes and glyph atlases compress well even at the fastest level.
-    write_body(send, &zstd::bulk::compress(&body, 1)?).await
+/// Largest decompressed frame body a client accepts.
+const MAX_DECOMPRESSED_FRAME_BYTES: u64 = MAX_FRAME_BYTES as u64 * 4;
+
+/// Encodes a connection's frames. It keeps one zstd context and its buffers, so a frame
+/// allocates only when it is larger than every frame before it.
+pub(crate) struct FrameWriter {
+    compressor: zstd::bulk::Compressor<'static>,
+    body: Vec<u8>,
+    compressed: Vec<u8>,
 }
 
-pub(crate) async fn read_frame(
-    receive: &mut quinn::RecvStream,
-) -> Result<Option<Frame>, RemoteError> {
-    let Some(body) = read_body(receive, MAX_FRAME_BYTES).await? else {
-        return Ok(None);
-    };
-    let body = zstd::bulk::decompress(&body, MAX_FRAME_BYTES as usize * 4)?;
-    Ok(Some(postcard::from_bytes(&body)?))
+impl FrameWriter {
+    pub(crate) fn new() -> Result<Self, RemoteError> {
+        Ok(Self {
+            // Level 1: meshes and glyph atlases compress well even at the fastest level.
+            compressor: zstd::bulk::Compressor::new(1)?,
+            body: Vec::new(),
+            compressed: Vec::new(),
+        })
+    }
+
+    pub(crate) async fn write(
+        &mut self,
+        send: &mut quinn::SendStream,
+        frame: &FrameRef<'_>,
+    ) -> Result<(), RemoteError> {
+        self.body.clear();
+        self.body = postcard::to_extend(frame, std::mem::take(&mut self.body))?;
+        self.compressed.clear();
+        self.compressed
+            .reserve(zstd::zstd_safe::compress_bound(self.body.len()));
+        self.compressor
+            .compress_to_buffer(&self.body, &mut self.compressed)?;
+        write_body(send, &self.compressed).await
+    }
+}
+
+/// Decodes a connection's frames with one zstd context and reused buffers. The output is
+/// sized from the content size that the server's one-shot compression writes in each frame.
+pub(crate) struct FrameReader {
+    decompressor: zstd::bulk::Decompressor<'static>,
+    compressed: Vec<u8>,
+    body: Vec<u8>,
+}
+
+impl FrameReader {
+    pub(crate) fn new() -> Result<Self, RemoteError> {
+        Ok(Self {
+            decompressor: zstd::bulk::Decompressor::new()?,
+            compressed: Vec::new(),
+            body: Vec::new(),
+        })
+    }
+
+    /// Reads one frame; `None` at a clean end of stream.
+    pub(crate) async fn read(
+        &mut self,
+        receive: &mut quinn::RecvStream,
+    ) -> Result<Option<Frame>, RemoteError> {
+        if !read_body_into(receive, MAX_FRAME_BYTES, &mut self.compressed).await? {
+            return Ok(None);
+        }
+        let size = zstd::zstd_safe::get_frame_content_size(&self.compressed)
+            .ok()
+            .flatten()
+            .filter(|&size| size <= MAX_DECOMPRESSED_FRAME_BYTES)
+            .ok_or(RemoteError::TooLarge)?;
+        self.body.clear();
+        self.body
+            .reserve(usize::try_from(size).map_err(|_| RemoteError::TooLarge)?);
+        self.decompressor
+            .decompress_to_buffer(&self.compressed, &mut self.body)?;
+        Ok(Some(postcard::from_bytes(&self.body)?))
+    }
 }
 
 /// SPAKE2 pairing bound to both certificate fingerprints.
@@ -229,5 +319,39 @@ pub(crate) mod pairing {
                 assert!(!verify(&server_key, true, server_fp, client_fp, &tag));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Frame, FrameRef, WireMesh};
+
+    /// The server sends `FrameRef` and the client reads `Frame`: their bytes must stay equal.
+    #[test]
+    fn borrowed_frame_encodes_as_an_owned_frame() {
+        let mut mesh = egui::epaint::Mesh::default();
+        mesh.colored_vertex(egui::pos2(1.0, 2.0), egui::Color32::RED);
+        mesh.add_triangle(0, 0, 0);
+        let frame = Frame {
+            sequence: 7,
+            textures: vec![egui::TexturesDelta::default()],
+            meshes: vec![WireMesh {
+                clip_rect: egui::Rect::EVERYTHING,
+                mesh,
+            }],
+            cursor: egui::CursorIcon::Text,
+            copied_text: "copied".into(),
+        };
+        let borrowed = FrameRef {
+            sequence: frame.sequence,
+            textures: &frame.textures,
+            meshes: &frame.meshes,
+            cursor: frame.cursor,
+            copied_text: &frame.copied_text,
+        };
+        assert_eq!(
+            postcard::to_stdvec(&borrowed).unwrap(),
+            postcard::to_stdvec(&frame).unwrap()
+        );
     }
 }

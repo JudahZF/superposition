@@ -102,6 +102,15 @@ struct AtomicLaneTelemetry {
     abandoned_requests: AtomicU64,
 }
 
+/// Increments a lane counter. Only the lane's owner writes its counters, so a load and a store
+/// replace a locked read-modify-write; [`RackLane::poll`] counts inside the completion spin.
+fn bump(counter: &AtomicU64) {
+    counter.store(
+        counter.load(Ordering::Relaxed).wrapping_add(1),
+        Ordering::Relaxed,
+    );
+}
+
 impl AtomicLaneTelemetry {
     fn snapshot(&self) -> LaneTelemetry {
         let deadline_misses = self.deadline_misses.load(Ordering::Relaxed);
@@ -333,9 +342,7 @@ impl RackLane {
     /// Ends a host block: counts it when the gate is closed. Real-time safe.
     pub fn end_block(&self) {
         if matches!(self.gate.state(), RackGateState::Closed { .. }) {
-            self.telemetry
-                .gate_closed_blocks
-                .fetch_add(1, Ordering::Relaxed);
+            bump(&self.telemetry.gate_closed_blocks);
         }
     }
 
@@ -390,7 +397,7 @@ impl RackLane {
             slot_index,
             request,
         });
-        self.telemetry.published.fetch_add(1, Ordering::Relaxed);
+        bump(&self.telemetry.published);
         true
     }
 
@@ -403,11 +410,13 @@ impl RackLane {
         let started = self.clock.now_ticks();
         let notified = self.banks.active_bank().notify_request();
         let wake_ticks = self.clock.now_ticks().saturating_sub(started);
-        self.telemetry
-            .max_wake_ticks
-            .fetch_max(wake_ticks, Ordering::Relaxed);
+        let max_wake_ticks = &self.telemetry.max_wake_ticks;
+        max_wake_ticks.store(
+            max_wake_ticks.load(Ordering::Relaxed).max(wake_ticks),
+            Ordering::Relaxed,
+        );
         if !notified {
-            self.telemetry.wake_failures.fetch_add(1, Ordering::Relaxed);
+            bump(&self.telemetry.wake_failures);
         }
     }
 
@@ -420,9 +429,7 @@ impl RackLane {
         let Some(live) = self.live else {
             return self.outcome;
         };
-        self.telemetry
-            .completion_observation_passes
-            .fetch_add(1, Ordering::Relaxed);
+        bump(&self.telemetry.completion_observation_passes);
         let slot = self
             .banks
             .bank(live.bank_index)
@@ -459,19 +466,15 @@ impl RackLane {
             GateOutcome::WorkerResultAccepted => {
                 self.live = None;
                 self.wet_valid = true;
-                self.telemetry.completed.fetch_add(1, Ordering::Relaxed);
+                bump(&self.telemetry.completed);
             }
             GateOutcome::Awaiting => {}
             GateOutcome::UseFallback(_) => {
                 if matches!(observation, WorkerObservation::ProtocolFault(_)) {
-                    self.telemetry
-                        .protocol_rejections
-                        .fetch_add(1, Ordering::Relaxed);
+                    bump(&self.telemetry.protocol_rejections);
                 }
                 if matches!(observation, WorkerObservation::Completed(_)) {
-                    self.telemetry
-                        .stale_completions
-                        .fetch_add(1, Ordering::Relaxed);
+                    bump(&self.telemetry.stale_completions);
                 }
                 self.release_live_request();
                 self.record_outcome(prior);
@@ -488,9 +491,7 @@ impl RackLane {
         if !matches!(self.gate.state(), RackGateState::Awaiting { .. }) {
             return;
         }
-        self.telemetry
-            .completion_observation_deadline_stops
-            .fetch_add(1, Ordering::Relaxed);
+        bump(&self.telemetry.completion_observation_deadline_stops);
         self.record_deadline_diagnostics(block_index, self.clock.now_ticks());
         self.release_live_request();
         let prior = self.gate.state();
@@ -532,19 +533,29 @@ impl RackLane {
         if slot.metadata.state() == Ok(SlotState::Requested)
             && slot.abandon_request(live.ticket).is_ok()
         {
-            self.telemetry
-                .abandoned_requests
-                .fetch_add(1, Ordering::Relaxed);
+            bump(&self.telemetry.abandoned_requests);
         }
     }
 
     /// Advances the control plane's bank handoff by one step. Real-time safe. The host calls it
     /// once per block ([`Self::begin_block`]), or while stopped, as the handoff's only driver.
     pub fn service_recovery(&mut self, block_index: u64) {
+        let Some(state) = self.recovery.as_ref().map(|recovery| recovery.state()) else {
+            return;
+        };
+        if matches!(
+            state,
+            RackRecoveryState::Idle
+                | RackRecoveryState::ReplacementActive { .. }
+                | RackRecoveryState::Quiescent
+        ) {
+            return;
+        }
+        // Cloned only while a handoff step is due, so a steady block touches no reference count.
         let Some(recovery) = self.recovery.clone() else {
             return;
         };
-        match recovery.state() {
+        match state {
             RackRecoveryState::Idle
             | RackRecoveryState::ReplacementActive { .. }
             | RackRecoveryState::Quiescent => {}
@@ -678,13 +689,9 @@ impl RackLane {
         if !matches!(prior, RackGateState::Closed { .. })
             && let GateOutcome::UseFallback(reason) = self.outcome
         {
-            self.telemetry
-                .fallback_activations
-                .fetch_add(1, Ordering::Relaxed);
+            bump(&self.telemetry.fallback_activations);
             if reason == FallbackReason::DeadlineMiss {
-                self.telemetry
-                    .deadline_misses
-                    .fetch_add(1, Ordering::Relaxed);
+                bump(&self.telemetry.deadline_misses);
             }
             // A hard deadline miss abandons the live slot and closes this gate. The stable
             // bank must be retired before any further request can reach this lane.
@@ -728,7 +735,7 @@ impl RackLane {
             Ok(SlotState::Complete) => &telemetry.missed_completed_late,
             _ => &telemetry.missed_in_progress,
         };
-        counter.fetch_add(1, Ordering::Relaxed);
+        bump(counter);
         telemetry
             .last_miss_block_index
             .store(block_index, Ordering::Relaxed);

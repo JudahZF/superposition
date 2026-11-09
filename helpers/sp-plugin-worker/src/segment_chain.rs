@@ -201,12 +201,15 @@ impl SegmentChain {
             // Once heard, the next segment gets no more grace.
             self.warmup_misses = MAX_WARMUP_MISSES;
         }
-        let bypass_latency = self.skipped_latency as usize + self.downstream_latency as usize;
-        self.history.read(&mut self.delayed, bypass_latency, frames);
         if heard != self.audible {
             self.audible = heard;
             // Joining fades in; a lost segment has no output to fade from.
             self.fade_position = if heard { 0 } else { SLOT_FADE_FRAMES };
+        }
+        // The delayed output is read only when this block plays or fades from it.
+        if !heard || self.fade_position < SLOT_FADE_FRAMES {
+            let bypass_latency = self.skipped_latency as usize + self.downstream_latency as usize;
+            self.history.read(&mut self.delayed, bypass_latency, frames);
         }
         if !heard {
             self.delayed.copy_to_slot(slot, channels, frames);
