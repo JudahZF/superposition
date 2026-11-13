@@ -191,8 +191,8 @@ fn serve(arguments: &[String]) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         app.set_remote_watched(!server.clients().is_empty());
         last_frame = Instant::now();
-        let output = ctx.run(input, |ctx| app.frame(ctx));
-        server.publish(&ctx, &output);
+        let mut output = ctx.run(input, |ctx| app.frame(ctx));
+        server.publish(&ctx, &mut output);
         let repaint = output
             .viewport_output
             .get(&egui::ViewportId::ROOT)

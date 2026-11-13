@@ -135,11 +135,11 @@ impl LiveRackApp {
             ColorToken::Info,
         )
         .clicked()
-            && let Some(model_rack) = self.controller.document().model.racks.get(rack).cloned()
+            && let Some(model_rack) = self.rack_fields(rack)
         {
             self.set_rack_controls(
                 rack,
-                model_rack.gain_db.get(),
+                model_rack.gain_db,
                 model_rack.muted,
                 !model_rack.bypassed,
             );
@@ -160,7 +160,7 @@ impl LiveRackApp {
 
     /// The output strip: route, output meters beside the gain fader, gain, and mute.
     fn draw_output_strip(&mut self, ui: &mut Ui, rect: Rect, rack: usize) {
-        let Some(model_rack) = self.controller.document().model.racks.get(rack).cloned() else {
+        let Some(model_rack) = self.rack_fields(rack) else {
             return;
         };
         card(ui, rect, false);
@@ -179,7 +179,7 @@ impl LiveRackApp {
             Pos2::new(inner.left(), inner.bottom() - px(Layout::Control)),
             inner.right_bottom(),
         );
-        let gain_db = model_rack.gain_db.get();
+        let gain_db = model_rack.gain_db;
         if toggle_at(
             ui,
             mute,
@@ -284,15 +284,7 @@ impl LiveRackApp {
         reason = "one row reads left to right: picture, name, sidechain, state"
     )]
     fn draw_chain_row(&mut self, ui: &mut Ui, row: Rect, id: egui::Id, rack: usize, slot: usize) {
-        let Some(model_slot) = self
-            .controller
-            .document()
-            .model
-            .racks
-            .get(rack)
-            .and_then(|rack| rack.slots.get(slot))
-            .cloned()
-        else {
+        let Some(model_slot) = self.slot_fields(rack, slot) else {
             return;
         };
         let token = self.slot_token(rack, slot);
@@ -311,7 +303,7 @@ impl LiveRackApp {
                 egui::StrokeKind::Inside,
             );
         }
-        let picture = self.previews.get(&model_slot.id.0);
+        let picture = self.previews.get(&model_slot.id);
         let thumb_height = row.height() - sp(Spacing::S6) * 2.0;
         let thumb = Rect::from_min_size(
             Pos2::new(
@@ -325,7 +317,7 @@ impl LiveRackApp {
         let right = row.right() - sp(Spacing::S8);
         let name_y = row.center().y - line() / 2.0;
         let mut name_right = right;
-        if let Some(marker) = self.sidechain_marker(&model_slot) {
+        if let Some(marker) = model_slot.sidechain.clone() {
             let mut chip_ui = ui.new_child(
                 UiBuilder::new()
                     .max_rect(Rect::from_min_max(
@@ -339,7 +331,7 @@ impl LiveRackApp {
                 .left()
                 - sp(Spacing::S6);
         }
-        let name = &model_slot.plugin.identity.name;
+        let name = &model_slot.name;
         paint_text(
             ui,
             Pos2::new(left, name_y),
@@ -503,15 +495,7 @@ impl LiveRackApp {
     /// Name and `Slot n · Vendor` at the left; sidechain, bypass, and pop out or dock at the
     /// right.
     fn draw_pane_header(&mut self, ui: &mut Ui, rect: Rect, rack: usize, slot: usize) {
-        let Some(model_slot) = self
-            .controller
-            .document()
-            .model
-            .racks
-            .get(rack)
-            .and_then(|rack| rack.slots.get(slot))
-            .cloned()
-        else {
+        let Some(model_slot) = self.slot_fields(rack, slot) else {
             return;
         };
         let mut row = ui.new_child(
@@ -522,13 +506,13 @@ impl LiveRackApp {
         row.spacing_mut().item_spacing.x = sp(Spacing::S8);
         text(
             &mut row,
-            &model_slot.plugin.identity.name,
+            &model_slot.name,
             TypographyRole::Title,
             ColorToken::Text,
         );
         text(
             &mut row,
-            format!("Slot {} · {}", slot + 1, model_slot.plugin.identity.vendor),
+            format!("Slot {} · {}", slot + 1, model_slot.vendor),
             TypographyRole::Label,
             ColorToken::Dim,
         );
@@ -563,16 +547,22 @@ impl LiveRackApp {
                 let ctx = ui.ctx().clone();
                 self.slot_action(&ctx, SlotAction::Bypass(slot));
             }
-            if self.accepts_sidechain(&model_slot) {
-                let marker = self
-                    .sidechain_marker(&model_slot)
-                    .unwrap_or_else(|| "Sidechain…".to_owned());
+            let accepts_sidechain = self
+                .controller
+                .document()
+                .model
+                .racks
+                .get(rack)
+                .and_then(|rack| rack.slots.get(slot))
+                .is_some_and(|slot| self.accepts_sidechain(slot));
+            if accepts_sidechain {
                 let tone = if model_slot.sidechain.is_some() {
                     ChipTone::Info
                 } else {
                     ChipTone::Neutral
                 };
-                let response = chip(ui, &marker, tone, true);
+                let marker = model_slot.sidechain.as_deref().unwrap_or("Sidechain…");
+                let response = chip(ui, marker, tone, true);
                 if response.clicked() {
                     self.overlay = Overlay::Sidechain {
                         rack,
@@ -586,19 +576,11 @@ impl LiveRackApp {
 
     /// The slot's last picture, fitted to the pane, with a card that says what to do next.
     fn draw_pane_picture(&mut self, ui: &mut Ui, body: Rect, rack: usize, slot: usize) {
-        let Some(model_slot) = self
-            .controller
-            .document()
-            .model
-            .racks
-            .get(rack)
-            .and_then(|rack| rack.slots.get(slot))
-            .cloned()
-        else {
+        let Some(model_slot) = self.slot_fields(rack, slot) else {
             return;
         };
         let token = self.slot_token(rack, slot);
-        if let Some(picture) = self.previews.get(&model_slot.id.0) {
+        if let Some(picture) = self.previews.get(&model_slot.id) {
             fitted(ui, body, picture, token);
         } else {
             dashed_rect(ui, body, ColorToken::Hairline, Radius::Card);
@@ -625,7 +607,7 @@ impl LiveRackApp {
             PaneState::Missing => (
                 format!(
                     "{} is not installed on this machine. The slot keeps its saved state until you replace it.",
-                    model_slot.plugin.identity.name
+                    model_slot.name
                 ),
                 None,
             ),

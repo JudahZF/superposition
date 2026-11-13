@@ -225,23 +225,14 @@ impl LaneFader {
         let Some(samples) = wet else {
             return;
         };
-        for frame in 0..frames {
-            let destination = frame * LANE_CHANNELS;
-            match endpoint {
-                LaneLayout::Mono => {
-                    let sample = samples.get(destination).copied().unwrap_or(0.0);
-                    self.last_wet[destination] = sample;
-                    self.last_wet[destination + 1] = sample;
-                }
-                LaneLayout::Stereo => {
-                    self.last_wet[destination] = samples.get(destination).copied().unwrap_or(0.0);
-                    self.last_wet[destination + 1] =
-                        samples.get(destination + 1).copied().unwrap_or(0.0);
-                }
-            }
-        }
+        copy_wet(
+            samples,
+            endpoint == LaneLayout::Mono,
+            &mut self.last_wet[..frames * LANE_CHANNELS],
+        );
     }
 
+    /// Renders a block: each source is written whole, and only a fade blends per frame.
     fn render_frames(
         &mut self,
         block: FaderBlock<'_>,
@@ -250,29 +241,29 @@ impl LaneFader {
         out: &mut [f32],
     ) {
         let transition = self.transition;
-        for frame in 0..block.frames {
-            let (from_l, from_r) = self.source_frame(block, settings, transition.from, frame);
-            let (to_l, to_r) = self.source_frame(block, settings, target, frame);
-            let (left, right) = if transition.active() {
+        let out = &mut out[..block.frames * LANE_CHANNELS];
+        self.fill_source(block, settings, target, out);
+        if transition.active() {
+            let mut from = [0.0; LANE_SAMPLES];
+            let from = &mut from[..out.len()];
+            self.fill_source(block, settings, transition.from, from);
+            for (frame, (to, from)) in out
+                .chunks_exact_mut(LANE_CHANNELS)
+                .zip(from.chunks_exact(LANE_CHANNELS))
+                .enumerate()
+            {
                 #[allow(
                     clippy::cast_precision_loss,
                     reason = "transition positions are bounded well below f32 precision limits"
                 )]
                 let amount = (transition.position + frame).min(transition.frames) as f32
                     / transition.frames as f32;
-                (
-                    from_l + (to_l - from_l) * amount,
-                    from_r + (to_r - from_r) * amount,
-                )
-            } else {
-                (to_l, to_r)
-            };
-            out[frame * 2] = left;
-            out[frame * 2 + 1] = right;
+                to[0] = from[0] + (to[0] - from[0]) * amount;
+                to[1] = from[1] + (to[1] - from[1]) * amount;
+            }
         }
-        if block.frames > 0 {
-            let last = (block.frames - 1) * 2;
-            self.last_frame = [out[last], out[last + 1]];
+        if let [.., left, right] = *out {
+            self.last_frame = [left, right];
         }
         if transition.active() {
             let updated = transition.position.saturating_add(block.frames);
@@ -290,57 +281,88 @@ impl LaneFader {
         }
     }
 
-    fn source_frame(
+    /// Writes one whole block of `source` into `out` (`frames * 2` samples).
+    fn fill_source(
         &self,
         block: FaderBlock<'_>,
         settings: &FaderSettings,
         source: RenderSource,
-        frame: usize,
-    ) -> (f32, f32) {
+        out: &mut [f32],
+    ) {
         match source {
-            RenderSource::Silence => (0.0, 0.0),
-            RenderSource::Held => (self.last_frame[0], self.last_frame[1]),
-            RenderSource::Dry => self.dry_frame(settings, frame, block.frames),
-            RenderSource::Wet => {
-                let index = frame * LANE_CHANNELS;
-                // Without this block's output, a fade from wet reads the last one.
-                let samples = block.wet.unwrap_or(&self.last_wet);
-                let sample = |index: usize| samples.get(index).copied().unwrap_or(0.0);
-                match (block.wet, settings.endpoint) {
-                    (Some(_), LaneLayout::Mono) => (sample(index), sample(index)),
-                    _ => (sample(index), sample(index + 1)),
+            RenderSource::Silence => out.fill(0.0),
+            RenderSource::Held => {
+                for frame in out.chunks_exact_mut(LANE_CHANNELS) {
+                    frame.copy_from_slice(&self.last_frame);
+                }
+            }
+            RenderSource::Dry => self.fill_dry(settings, block.frames, out),
+            // Without this block's output, a fade from wet reads the last one, which
+            // `capture_wet` already stored in stereo.
+            RenderSource::Wet => match block.wet {
+                Some(samples) => copy_wet(samples, settings.endpoint == LaneLayout::Mono, out),
+                None => copy_wet(&self.last_wet, false, out),
+            },
+        }
+    }
+
+    /// Writes the block's input into the dry ring, in at most two contiguous copies.
+    fn advance_dry(&mut self, input: &[f32], frames: usize) {
+        let input = &input[..frames * LANE_CHANNELS];
+        let write = self.dry_write_frame;
+        let (head, tail) = input.split_at(frames.min(DRY_DELAY_CAPACITY_FRAMES - write) * 2);
+        self.dry[write * 2..write * 2 + head.len()].copy_from_slice(head);
+        self.dry[..tail.len()].copy_from_slice(tail);
+        self.dry_write_frame = (write + frames) % DRY_DELAY_CAPACITY_FRAMES;
+    }
+
+    /// Reads the block written last, delayed by the lane's latency, in at most two segments.
+    fn fill_dry(&self, settings: &FaderSettings, frames: usize, out: &mut [f32]) {
+        if settings.latency_frames > MAX_DRY_DELAY_FRAMES {
+            out.fill(0.0);
+            return;
+        }
+        let read = (self.dry_write_frame + 2 * DRY_DELAY_CAPACITY_FRAMES
+            - frames
+            - settings.latency_frames)
+            % DRY_DELAY_CAPACITY_FRAMES;
+        let head_frames = frames.min(DRY_DELAY_CAPACITY_FRAMES - read);
+        let (out_head, out_tail) = out.split_at_mut(head_frames * 2);
+        let head = &self.dry[read * 2..read * 2 + out_head.len()];
+        let tail = &self.dry[..out_tail.len()];
+        match settings.source {
+            LaneLayout::Stereo => {
+                out_head.copy_from_slice(head);
+                out_tail.copy_from_slice(tail);
+            }
+            LaneLayout::Mono => {
+                for (out, ring) in [(out_head, head), (out_tail, tail)] {
+                    for (frame, stored) in out
+                        .chunks_exact_mut(LANE_CHANNELS)
+                        .zip(ring.chunks_exact(LANE_CHANNELS))
+                    {
+                        frame.fill(stored[0]);
+                    }
                 }
             }
         }
     }
+}
 
-    fn advance_dry(&mut self, input: &[f32], frames: usize) {
-        let mut write = self.dry_write_frame;
-        for frame in 0..frames {
-            let index = frame * 2;
-            let write_index = write * 2;
-            self.dry[write_index] = input[index];
-            self.dry[write_index + 1] = input[index + 1];
-            write = (write + 1) % DRY_DELAY_CAPACITY_FRAMES;
+/// Copies interleaved wet output into `out`, reading samples past the end of `samples` as
+/// silence. A mono endpoint plays its left lane on both channels.
+fn copy_wet(samples: &[f32], mono: bool, out: &mut [f32]) {
+    if mono {
+        let mut frames = out.chunks_exact_mut(LANE_CHANNELS);
+        // The source goes first: `zip` must not take a frame once the source has run out.
+        for (source, frame) in samples.chunks(LANE_CHANNELS).zip(frames.by_ref()) {
+            frame.fill(source[0]);
         }
-        self.dry_write_frame = write;
-    }
-
-    fn dry_frame(&self, settings: &FaderSettings, frame: usize, frames: usize) -> (f32, f32) {
-        if settings.latency_frames > MAX_DRY_DELAY_FRAMES {
-            return (0.0, 0.0);
-        }
-        let written = (self.dry_write_frame + DRY_DELAY_CAPACITY_FRAMES - frames + frame)
-            % DRY_DELAY_CAPACITY_FRAMES;
-        let read = (written + DRY_DELAY_CAPACITY_FRAMES - settings.latency_frames)
-            % DRY_DELAY_CAPACITY_FRAMES;
-        let base = read * 2;
-        let left = self.dry[base];
-        let right = self.dry[base + 1];
-        match settings.source {
-            LaneLayout::Stereo => (left, right),
-            LaneLayout::Mono => (left, left),
-        }
+        frames.for_each(|frame| frame.fill(0.0));
+    } else {
+        let available = samples.len().min(out.len());
+        out[..available].copy_from_slice(&samples[..available]);
+        out[available..].fill(0.0);
     }
 }
 

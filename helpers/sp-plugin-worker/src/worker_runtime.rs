@@ -124,26 +124,32 @@ impl BypassDelay {
         }
     }
 
+    /// Appends one block, in at most two contiguous copies per channel.
     pub(crate) fn write(&mut self, input: &PlanarBlock, frame_count: usize) {
+        let head = frame_count.min(BYPASS_DELAY_CAPACITY_FRAMES - self.write);
         for (history, input) in self.channels.iter_mut().zip(input.channels()) {
-            for (frame, sample) in input[..frame_count].iter().enumerate() {
-                history[(self.write + frame) % BYPASS_DELAY_CAPACITY_FRAMES] = *sample;
-            }
+            let (first, wrapped) = input[..frame_count].split_at(head);
+            history[self.write..self.write + head].copy_from_slice(first);
+            history[..wrapped.len()].copy_from_slice(wrapped);
         }
         self.write = (self.write + frame_count) % BYPASS_DELAY_CAPACITY_FRAMES;
     }
 
-    /// Reads the block just written, `latency` frames late.
+    /// Reads the block just written, `latency` frames late, in at most two copies per channel.
     pub(crate) fn read(&self, output: &mut PlanarBlock, latency: usize, frame_count: usize) {
-        for (history, output) in self.channels.iter().zip(output.channels_mut()) {
-            if latency > MAX_BYPASS_DELAY_FRAMES {
+        if latency > MAX_BYPASS_DELAY_FRAMES {
+            for output in output.channels_mut() {
                 output[..frame_count].fill(0.0);
-                continue;
             }
-            let start = self.write + BYPASS_DELAY_CAPACITY_FRAMES - frame_count - latency;
-            for (frame, sample) in output[..frame_count].iter_mut().enumerate() {
-                *sample = history[(start + frame) % BYPASS_DELAY_CAPACITY_FRAMES];
-            }
+            return;
+        }
+        let start = (self.write + 2 * BYPASS_DELAY_CAPACITY_FRAMES - frame_count - latency)
+            % BYPASS_DELAY_CAPACITY_FRAMES;
+        let head = frame_count.min(BYPASS_DELAY_CAPACITY_FRAMES - start);
+        for (history, output) in self.channels.iter().zip(output.channels_mut()) {
+            let (first, wrapped) = output[..frame_count].split_at_mut(head);
+            first.copy_from_slice(&history[start..start + head]);
+            wrapped.copy_from_slice(&history[..wrapped.len()]);
         }
     }
 }
@@ -781,14 +787,10 @@ impl<P: PluginFacade> RackProcessor<P> {
             return Ok(carried_channels);
         }
         // Record every slot's input so bypass can engage at any block with full history.
-        let delay = &mut self.delays[slot_index];
-        delay.write(&self.ping_a, frame_count);
+        self.delays[slot_index].write(&self.ping_a, frame_count);
         let heard = plugin_slot.heard();
-        delay.read(
-            &mut self.passthrough,
-            plugin_slot.plugin.latency_samples() as usize,
-            frame_count,
-        );
+        // The delayed input is read below only if this block plays or fades from it.
+        let latency = plugin_slot.plugin.latency_samples() as usize;
 
         let topology = plugin_slot.configuration.topology;
         let input_channels = usize::try_from(topology.input_channels)
@@ -839,7 +841,11 @@ impl<P: PluginFacade> RackProcessor<P> {
             // A failed block has no output to fade from.
             plugin_slot.fade_position = if usable { 0 } else { SLOT_FADE_FRAMES };
         }
-        if plugin_slot.fade_position < SLOT_FADE_FRAMES {
+        let fading = plugin_slot.fade_position < SLOT_FADE_FRAMES;
+        if fading || !heard {
+            self.delays[slot_index].read(&mut self.passthrough, latency, frame_count);
+        }
+        if fading {
             adapt_channels(
                 &mut self.passthrough,
                 carried_channels,

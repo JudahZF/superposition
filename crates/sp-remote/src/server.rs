@@ -18,8 +18,8 @@ use tokio::sync::{Notify, mpsc};
 use crate::{
     Fingerprint, Identity, RemoteError, Role, TrustStore, WireMesh,
     protocol::{
-        ClientMessage, Frame, PROTOCOL_VERSION, ServerMessage, pairing, read_control,
-        write_control, write_frame,
+        ClientMessage, FrameRef, FrameWriter, PROTOCOL_VERSION, ServerMessage, pairing,
+        read_control, write_control,
     },
     textures::TextureMirror,
     tls,
@@ -254,10 +254,23 @@ impl RemoteServer {
         Some(merged)
     }
 
-    /// Tessellates one frame and queues it for every client.
-    pub fn publish(&self, ctx: &egui::Context, output: &egui::FullOutput) {
+    /// Tessellates one frame and queues it for every client. It takes the output's shapes.
+    ///
+    /// With no client connected, it only records texture changes: a client that joins gets
+    /// the next frame. A frame identical to the last one, with no texture change or copied
+    /// text, is not sent again.
+    pub fn publish(&self, ctx: &egui::Context, output: &mut egui::FullOutput) {
+        let previous = {
+            let mut state = self.shared.state();
+            if state.clients.is_empty() {
+                state.textures.apply(&output.textures_delta);
+                state.latest = None;
+                return;
+            }
+            state.latest.clone()
+        };
         let meshes: Vec<WireMesh> = ctx
-            .tessellate(output.shapes.clone(), output.pixels_per_point)
+            .tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point)
             .into_iter()
             .filter_map(|primitive| match primitive.primitive {
                 egui::epaint::Primitive::Mesh(mesh) => Some(WireMesh {
@@ -268,7 +281,6 @@ impl RemoteServer {
                 egui::epaint::Primitive::Callback(_) => None,
             })
             .collect();
-        let meshes = Arc::new(meshes);
         let cursor = output.platform_output.cursor_icon;
         let copied: String = output
             .platform_output
@@ -280,6 +292,14 @@ impl RemoteServer {
             })
             .collect();
         let has_textures = !output.textures_delta.is_empty();
+        if !has_textures
+            && copied.is_empty()
+            && previous
+                .is_some_and(|(latest, latest_cursor)| latest_cursor == cursor && *latest == meshes)
+        {
+            return;
+        }
+        let meshes = Arc::new(meshes);
         let mut state = self.shared.state();
         state.textures.apply(&output.textures_delta);
         state.sequence += 1;
@@ -373,6 +393,9 @@ async fn serve_client(incoming: quinn::Incoming, shared: Arc<Shared>) -> Result<
                 cursor: *cursor,
             });
         }
+        // Send the latest frame now: an unchanged UI publishes nothing new, and the client
+        // waits for the frame stream's first data before it reads control messages.
+        outbox.ready.notify_one();
         state.clients.insert(
             id,
             Client {
@@ -489,8 +512,12 @@ pub(crate) fn spawn_reader<T: serde::de::DeserializeOwned + Send + 'static>(
     (messages, task)
 }
 
-/// Sends each newest frame, with every texture change since the last one sent.
+/// Sends each newest frame, with every texture change since the last one sent. The meshes
+/// are shared with the other clients and serialized in place.
 async fn write_frames(mut frames: quinn::SendStream, outbox: Arc<Outbox>) {
+    let Ok(mut writer) = FrameWriter::new() else {
+        return;
+    };
     loop {
         outbox.ready.notified().await;
         let frame = {
@@ -499,17 +526,25 @@ async fn write_frames(mut frames: quinn::SendStream, outbox: Arc<Outbox>) {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             // Textures wait for a frame to carry them, so none is lost before the first.
-            pending.frame.take().map(|body| Frame {
-                sequence: body.sequence,
-                textures: std::mem::take(&mut pending.textures),
-                meshes: body.meshes.as_ref().clone(),
-                cursor: body.cursor,
-                copied_text: std::mem::take(&mut pending.copied_text),
+            pending.frame.take().map(|body| {
+                (
+                    body,
+                    std::mem::take(&mut pending.textures),
+                    std::mem::take(&mut pending.copied_text),
+                )
             })
         };
-        if let Some(frame) = frame
-            && write_frame(&mut frames, &frame).await.is_err()
-        {
+        let Some((body, textures, copied_text)) = frame else {
+            continue;
+        };
+        let frame = FrameRef {
+            sequence: body.sequence,
+            textures: &textures,
+            meshes: &body.meshes,
+            cursor: body.cursor,
+            copied_text: &copied_text,
+        };
+        if writer.write(&mut frames, &frame).await.is_err() {
             return;
         }
     }

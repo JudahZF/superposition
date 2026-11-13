@@ -17,7 +17,7 @@ use std::{
 };
 
 pub const CONTROL_PROTOCOL_MAGIC: u32 = u32::from_le_bytes(*b"SPC1");
-pub const CONTROL_PROTOCOL_VERSION: u16 = 7;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 8;
 pub const CONTROL_REQUEST_HEADER_BYTES: usize = 48;
 pub const CONTROL_RESPONSE_HEADER_BYTES: usize = 52;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 1_048_576;
@@ -674,6 +674,11 @@ impl ControlResponse {
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.payload
+    }
+    /// Takes the payload without copying it.
+    #[must_use]
+    pub fn into_payload(self) -> Vec<u8> {
+        self.payload
     }
     #[must_use]
     pub const fn error_record(&self) -> Option<&ControlErrorRecord> {

@@ -21,7 +21,11 @@ use crate::control::{
 };
 
 pub const MAX_STATE_CHUNK_BYTES: usize = (MAX_CONTROL_STATE_BYTES - 8) / 2;
-pub const MAX_STATE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
+/// The largest state chunk: one control frame each way, so a 32 MiB stream takes 33 round
+/// trips through the worker's loading thread rather than 128.
+pub const MAX_STATE_TRANSFER_CHUNK_BYTES: usize = 1_000 * 1024;
+// A `WriteStateChunk` carries 16 bytes of header with its data; a read reply carries the data.
+const _: () = assert!(16 + MAX_STATE_TRANSFER_CHUNK_BYTES <= MAX_CONTROL_STATE_BYTES);
 pub const MAX_STATE_STREAM_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_PARAMETER_BATCH_SIZE: usize = 128;
 
