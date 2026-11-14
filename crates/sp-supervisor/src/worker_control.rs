@@ -707,6 +707,9 @@ pub struct WorkerControlSession {
     process_id: u64,
     client: WorkerControlClient,
     initial_health: ControlResponse,
+    /// True for a worker that another machine's agent started: its process ID is not one
+    /// of this machine.
+    remote: bool,
 }
 
 impl WorkerControlSession {
@@ -788,7 +791,9 @@ impl WorkerControlSession {
             ));
         }
         let client = WorkerControlClient::from_streams(requests, responses, target, timeout)?;
-        Self::with_initial_health(process_id, client, timeout)
+        let mut session = Self::with_initial_health(process_id, client, timeout)?;
+        session.remote = true;
+        Ok(session)
     }
 
     /// Sends the first health request; the worker answers once its first plug-in has loaded.
@@ -813,6 +818,7 @@ impl WorkerControlSession {
             process_id,
             client,
             initial_health,
+            remote: false,
         })
     }
 
@@ -833,7 +839,9 @@ impl WorkerControlSession {
         &mut self.client
     }
 
-    /// Requests protocol shutdown, then ensures the child process has terminated.
+    /// Requests protocol shutdown, then ensures the child process has terminated. A worker
+    /// from [`Self::attach_remote`] gets the request only: its process ID is the guest's,
+    /// and `supervisor` could have a child of this machine with the same number.
     ///
     /// # Errors
     ///
@@ -845,11 +853,15 @@ impl WorkerControlSession {
     ) -> Result<ControlResponse, WorkerControlError> {
         match self.client.request(ControlOperation::Shutdown, None, &[]) {
             Ok(response) => {
-                supervisor.stop(self.process_id)?;
+                if !self.remote {
+                    supervisor.stop(self.process_id)?;
+                }
                 Ok(response)
             }
             Err(error) => {
-                let _ = supervisor.stop(self.process_id);
+                if !self.remote {
+                    let _ = supervisor.stop(self.process_id);
+                }
                 Err(error)
             }
         }
