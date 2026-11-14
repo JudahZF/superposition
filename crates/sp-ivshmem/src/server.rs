@@ -52,9 +52,9 @@ impl PortServer {
                 "ivshmem vector count is out of range",
             ));
         }
-        let size = size
-            .checked_next_power_of_two()
+        let size = Some(size)
             .filter(|&size| size > 0)
+            .and_then(u64::checked_next_power_of_two)
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "ivshmem size is out of range")
             })?;

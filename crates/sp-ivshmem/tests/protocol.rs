@@ -150,3 +150,14 @@ fn a_peer_with_fewer_vectors_closes_the_extra_ones() {
         1
     );
 }
+
+#[test]
+fn a_server_refuses_a_zero_size() {
+    let socket = std::env::temp_dir().join(format!("sp-ivshmem-zero-{}.sock", std::process::id()));
+    let error = sp_ivshmem::PortServer::bind(&socket, 0, 1).err().unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        !socket.exists(),
+        "no socket for a server that did not start"
+    );
+}

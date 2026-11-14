@@ -109,7 +109,9 @@ pub use host::{attach_port_bank, create_port_banks};
 
 #[cfg(target_os = "linux")]
 mod host {
-    use super::{PORT_LAYOUT_VERSION, PORT_MAGIC, PortHeader, port_bank_name, port_bank_offset};
+    use super::{
+        MAX_VM_PORTS, PORT_LAYOUT_VERSION, PORT_MAGIC, PortHeader, port_bank_name, port_bank_offset,
+    };
     use crate::{
         BANK_COUNT, Backing, MappedRackBanks, SharedBank, SharedMemoryRegion, port_region_bytes,
         sys,
@@ -161,14 +163,22 @@ mod host {
     /// # Errors
     ///
     /// Returns `InvalidData` if `memory` is smaller than [`port_region_bytes`], `InvalidInput`
-    /// for a generation that is zero or the largest value, and the operating-system error if
-    /// the mapping or a descriptor copy fails.
+    /// for a port that is not below [`MAX_VM_PORTS`] or a generation that is zero or the
+    /// largest value, and the operating-system error if the mapping or a descriptor copy
+    /// fails.
     pub unsafe fn create_port_banks(
         memory: OwnedFd,
         port: u32,
         active_generation: u64,
         doorbell: BorrowedFd<'_>,
     ) -> io::Result<MappedRackBanks> {
+        // The guest opens a bank by its name, and it knows no port from this one on.
+        if port >= MAX_VM_PORTS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "VM port is out of range",
+            ));
+        }
         let generations = [
             active_generation,
             active_generation.checked_add(1).ok_or_else(|| {
@@ -312,7 +322,7 @@ mod tests {
         PORT_MAGIC, PortHeader, attach_port_bank, create_port_banks, parse_port_bank_name,
         port_bank_name, port_bank_offset, port_region_bytes,
     };
-    use crate::SharedBank;
+    use crate::{MAX_VM_PORTS, SharedBank};
     use std::{
         io,
         os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
@@ -485,13 +495,20 @@ mod tests {
     }
 
     #[test]
-    fn a_server_region_smaller_than_the_layout_is_refused() {
+    fn a_region_smaller_than_the_layout_and_a_port_out_of_range_are_refused() {
         let memory = memfd(port_region_bytes() / 2);
         // SAFETY: no worker uses this test region.
         let error = unsafe { create_port_banks(memory, 0, 1, eventfd().as_fd()) }
             .err()
             .unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        // The guest could not open a bank of this port by its name.
+        let memory = memfd(port_region_bytes());
+        // SAFETY: no worker uses this test region.
+        let error = unsafe { create_port_banks(memory, MAX_VM_PORTS, 1, eventfd().as_fd()) }
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
