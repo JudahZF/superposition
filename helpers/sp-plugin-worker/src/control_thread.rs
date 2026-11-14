@@ -197,6 +197,9 @@ fn control_loop(
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let shutdown_after_reply = request.operation() == ControlOperation::Shutdown;
         let response = forward_request(&request, &mut mailbox, timeout, shutdown)?;
+        // A request can load a plug-in: patch it before it processes audio.
+        #[cfg(windows)]
+        sp_shared_memory_os::vm_hooks::sweep();
         response
             .write_to(&mut responses)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;

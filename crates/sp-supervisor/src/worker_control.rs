@@ -707,6 +707,9 @@ pub struct WorkerControlSession {
     process_id: u64,
     client: WorkerControlClient,
     initial_health: ControlResponse,
+    /// True for a worker that another machine's agent started: its process ID is not one
+    /// of this machine.
+    remote: bool,
 }
 
 impl WorkerControlSession {
@@ -754,13 +757,56 @@ impl WorkerControlSession {
                 "worker process ID must be nonzero".to_owned(),
             ));
         }
-        let mut client =
-            WorkerControlClient::new(pipes, configuration.target, configuration.timeout)?;
+        let client = WorkerControlClient::new(pipes, configuration.target, configuration.timeout)?;
+        let session = Self::with_initial_health(process_id, client, configuration.timeout)?;
+        #[cfg(target_os = "linux")]
+        if configuration.launch.wine.is_some() {
+            promote_wine_processing_thread(process_id);
+        }
+        Ok(session)
+    }
+
+    /// Attaches to a worker that another process started, over its relayed control streams:
+    /// in Lambda's Windows VM the guest agent starts the worker and relays its stdin and
+    /// stdout over a virtio-serial port. `arguments` are the worker's arguments, checked as
+    /// for a launch. `process_id` is the guest's process ID, for reports only: stop such a
+    /// worker through its agent, not through a `ProcessSupervisor`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid arguments, a zero process ID or timeout, or a missing or
+    /// rejected correlated health response.
+    pub fn attach_remote(
+        process_id: u64,
+        requests: impl Write + Send + 'static,
+        responses: impl Read + Send + 'static,
+        arguments: &[String],
+        target: ControlTarget,
+        timeout: Duration,
+    ) -> Result<Self, WorkerControlError> {
+        validate_production_worker_arguments(arguments, target)?;
+        if process_id == 0 {
+            return Err(WorkerControlError::InvalidLaunchArguments(
+                "worker process ID must be nonzero".to_owned(),
+            ));
+        }
+        let client = WorkerControlClient::from_streams(requests, responses, target, timeout)?;
+        let mut session = Self::with_initial_health(process_id, client, timeout)?;
+        session.remote = true;
+        Ok(session)
+    }
+
+    /// Sends the first health request; the worker answers once its first plug-in has loaded.
+    fn with_initial_health(
+        process_id: u64,
+        mut client: WorkerControlClient,
+        timeout: Duration,
+    ) -> Result<Self, WorkerControlError> {
         let initial_health = match client.request_within(
             ControlOperation::QueryHealth,
             None,
             &[],
-            LONG_CONTROL_TIMEOUT.max(configuration.timeout),
+            LONG_CONTROL_TIMEOUT.max(timeout),
         ) {
             Ok(response) if response.status() == ControlResponseStatus::Ok => response,
             Ok(response) => {
@@ -768,14 +814,11 @@ impl WorkerControlSession {
             }
             Err(error) => return Err(error),
         };
-        #[cfg(target_os = "linux")]
-        if configuration.launch.wine.is_some() {
-            promote_wine_processing_thread(process_id);
-        }
         Ok(Self {
             process_id,
             client,
             initial_health,
+            remote: false,
         })
     }
 
@@ -796,7 +839,9 @@ impl WorkerControlSession {
         &mut self.client
     }
 
-    /// Requests protocol shutdown, then ensures the child process has terminated.
+    /// Requests protocol shutdown, then ensures the child process has terminated. A worker
+    /// from [`Self::attach_remote`] gets the request only: its process ID is the guest's,
+    /// and `supervisor` could have a child of this machine with the same number.
     ///
     /// # Errors
     ///
@@ -808,11 +853,15 @@ impl WorkerControlSession {
     ) -> Result<ControlResponse, WorkerControlError> {
         match self.client.request(ControlOperation::Shutdown, None, &[]) {
             Ok(response) => {
-                supervisor.stop(self.process_id)?;
+                if !self.remote {
+                    supervisor.stop(self.process_id)?;
+                }
                 Ok(response)
             }
             Err(error) => {
-                let _ = supervisor.stop(self.process_id);
+                if !self.remote {
+                    let _ = supervisor.stop(self.process_id);
+                }
                 Err(error)
             }
         }
