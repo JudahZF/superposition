@@ -304,7 +304,12 @@ impl Agent {
             let audio = audio_cpu
                 .and_then(|cpu| 1_u64.checked_shl(cpu))
                 .unwrap_or(0);
-            crate::port_windows::set_process_mask(&child, windows | audio)?;
+            if let Err(error) = crate::port_windows::set_process_mask(&child, windows | audio) {
+                // No record holds this worker yet, so no stop would find it.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
         }
         *lock(&input) = child.stdin.take();
         if let Some(stdout) = child.stdout.take() {
@@ -398,14 +403,28 @@ fn relay_output(mut stdout: impl Read, mut to_host: Box<dyn PortIo>) {
     }
 }
 
+/// The largest scanner report that the agent sends: the host reads no larger one.
+const MAX_REPORT_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The report at `path`, if it is text of at most [`MAX_REPORT_BYTES`].
+fn read_report(path: &Path) -> Option<String> {
+    let mut report = String::new();
+    let file = std::fs::File::open(path).ok()?;
+    let read = file.take(MAX_REPORT_BYTES + 1).read_to_string(&mut report);
+    (read.ok()? as u64 <= MAX_REPORT_BYTES).then_some(report)
+}
+
 /// Scans every bundle under `vst3`, one scanner process each, and reports each one.
 fn scan(state: &State, scanner: &Path, vst3: &Path, reports: &Path) {
+    // Two scans at a time keep their reports apart.
+    static SCANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let scan = SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut bundles = Vec::new();
     find_bundles(vst3, &mut bundles);
     bundles.sort();
     let _ = std::fs::create_dir_all(reports);
     for (index, bundle) in bundles.iter().enumerate() {
-        let report_path = reports.join(format!("scan-{index}.json"));
+        let report_path = reports.join(format!("scan-{scan}-{index}.json"));
         let _ = std::fs::remove_file(&report_path);
         let (code, timed_out) = run_scanner(scanner, bundle, &report_path);
         state.emit(&Event::Scanned {
@@ -413,8 +432,9 @@ fn scan(state: &State, scanner: &Path, vst3: &Path, reports: &Path) {
             fingerprint: fingerprint(bundle),
             code,
             timed_out,
-            report: std::fs::read_to_string(&report_path).ok(),
+            report: read_report(&report_path),
         });
+        let _ = std::fs::remove_file(&report_path);
     }
     state.emit(&Event::ScanDone {
         bundles: u32::try_from(bundles.len()).unwrap_or(u32::MAX),

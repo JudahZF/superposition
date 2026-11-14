@@ -2607,6 +2607,12 @@ impl ProductionRuntime {
             self.chain = None;
             return Ok(());
         }
+        // The deadline of a hop is a host tick, and a worker in the VM reads the guest's
+        // clock. A VM rack is one segment.
+        #[cfg(windows)]
+        if target.bank.is_some() && sp_shared_memory_os::vm_hooks::windows_cpus() != 0 {
+            return Err("a worker in the VM cannot forward to another segment".to_owned());
+        }
         self.chain
             .get_or_insert_with(|| Box::new(SegmentChain::new()))
             .retarget(target)

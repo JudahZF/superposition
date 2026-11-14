@@ -35,7 +35,9 @@ impl Histogram {
         self.total
     }
 
-    /// The smallest whole microsecond at or above `fraction` of the round trips.
+    /// The smallest whole microsecond at or above `fraction` of the round trips. The last
+    /// bucket holds every longer round trip, so 10 000 means "10 ms or more"; the maximum
+    /// has the true worst value.
     pub(crate) fn percentile_us(&self, fraction: f64) -> u64 {
         if self.total == 0 {
             return 0;

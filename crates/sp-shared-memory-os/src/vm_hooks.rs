@@ -93,7 +93,9 @@ struct Hooks {
 
 static HOOKS: OnceLock<Option<Hooks>> = OnceLock::new();
 /// The modules patched so far, by base address. One patcher at a time: two would race on a
-/// page's protection.
+/// page's protection. A module that loads at the base address of one that unloaded is not
+/// patched again, so its affinity calls are not hooked. Its threads still start on the
+/// Windows vCPUs (the thread-attach callback).
 static PATCHED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 fn hooks() -> Option<&'static Hooks> {
@@ -315,21 +317,29 @@ pub fn sweep() {
     };
     let mut patched = PATCHED.lock().unwrap_or_else(PoisonError::into_inner);
     let mut modules = vec![ptr::null_mut::<c_void>(); 512];
-    let mut needed = 0_u32;
-    let bytes = u32::try_from(modules.len() * mem::size_of::<HMODULE>()).unwrap_or(u32::MAX);
-    // SAFETY: the buffer holds `bytes` bytes of module handles.
-    if unsafe {
-        K32EnumProcessModules(
-            GetCurrentProcess(),
-            modules.as_mut_ptr(),
-            bytes,
-            &raw mut needed,
-        )
-    } == 0
-    {
-        return;
-    }
-    let count = (needed as usize / mem::size_of::<HMODULE>()).min(modules.len());
+    let count = loop {
+        let mut needed = 0_u32;
+        let bytes = u32::try_from(modules.len() * mem::size_of::<HMODULE>()).unwrap_or(u32::MAX);
+        // SAFETY: the buffer holds `bytes` bytes of module handles.
+        if unsafe {
+            K32EnumProcessModules(
+                GetCurrentProcess(),
+                modules.as_mut_ptr(),
+                bytes,
+                &raw mut needed,
+            )
+        } == 0
+        {
+            return;
+        }
+        let count = needed as usize / mem::size_of::<HMODULE>();
+        if count <= modules.len() {
+            break count;
+        }
+        // The process has more modules than the buffer holds: ask again with room for
+        // them, and for some that load meanwhile.
+        modules.resize(count + 64, ptr::null_mut());
+    };
     // SAFETY: a null name gives the executable's module.
     let worker = unsafe { GetModuleHandleW(ptr::null()) };
     for &module in &modules[..count] {
