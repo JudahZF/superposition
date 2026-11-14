@@ -9,7 +9,9 @@
 //! ```
 //!
 //! `host` prints progress on stderr and the JSON report on stdout. A port server
-//! (`sp-ivshmem-server`) must already serve the socket.
+//! (`sp-ivshmem-server`) must already serve the socket. In the report and the progress
+//! lines, a percentile of 10000 µs means "10 ms or more": the histogram ends there.
+//! `max_us` is the true worst round trip.
 
 // The probe runs on a Linux host and in a Windows guest. Elsewhere it prints its usage.
 #[cfg(any(target_os = "linux", windows))]

@@ -446,7 +446,7 @@ fn fingerprint(bundle: &Path) -> String {
     use sha2::{Digest, Sha256};
 
     fn files(path: &Path, found: &mut Vec<PathBuf>) {
-        if path.is_dir() {
+        if is_folder(path) {
             for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
                 files(&entry.path(), found);
             }
@@ -492,10 +492,16 @@ fn find_bundles(folder: &Path, bundles: &mut Vec<PathBuf>) {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("vst3"))
         {
             bundles.push(path);
-        } else if path.is_dir() {
+        } else if is_folder(&path) {
             find_bundles(&path, bundles);
         }
     }
+}
+
+/// True for a real folder. A link to a folder (a symlink or a junction) is not one: it can
+/// point back to a parent, and then a walk does not end.
+fn is_folder(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
 }
 
 /// Runs the scanner on one bundle. Returns its exit code and whether it timed out.

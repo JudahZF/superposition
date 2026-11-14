@@ -173,6 +173,9 @@ fn a_scan_reports_every_bundle_under_the_vst3_folder() {
     std::fs::create_dir_all(vst3.join("Vendor/Folder.vst3/Contents")).unwrap();
     std::fs::write(vst3.join("Single.vst3"), b"").unwrap();
     std::fs::write(vst3.join("readme.txt"), b"").unwrap();
+    // Links back to the root, beside the bundles and in one: no walk follows them.
+    std::os::unix::fs::symlink(&vst3, vst3.join("Vendor/back")).unwrap();
+    std::os::unix::fs::symlink(&vst3, vst3.join("Vendor/Folder.vst3/Contents/back")).unwrap();
     // The scanner's stand-in writes a report naming its bundle (arguments 2 and 5).
     let scanner = root.join("scanner.sh");
     std::fs::write(
