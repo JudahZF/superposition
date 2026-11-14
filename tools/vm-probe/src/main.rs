@@ -11,6 +11,8 @@
 //! `host` prints progress on stderr and the JSON report on stdout. A port server
 //! (`sp-ivshmem-server`) must already serve the socket.
 
+// The probe runs on a Linux host and in a Windows guest. Elsewhere it prints its usage.
+#[cfg(any(target_os = "linux", windows))]
 mod guest;
 #[cfg(target_os = "linux")]
 mod host;
@@ -115,7 +117,7 @@ fn run(mode: &str, flags: &HashMap<String, String>) -> Result<ExitCode, String> 
         #[cfg(windows)]
         "guest" => windows_guest(port, cpu),
         _ => {
-            let _ = cpu;
+            let _ = (port, cpu);
             Ok(usage())
         }
     }
