@@ -5,11 +5,13 @@ members = [
     "helpers/sp-plugin-worker",
     "helpers/sp-plugin-scanner",
     "helpers/sp-window-streamer",
+    "helpers/sp-vm-agent",
     "crates/sp-model",
     "crates/sp-protocol",
     "crates/sp-shared-memory",
     "crates/sp-shared-memory-os",
     "crates/sp-rack-lane",
+    "crates/sp-ivshmem",
     "crates/sp-engine",
     "crates/sp-audio-io",
     "crates/sp-audio-io-macos",
@@ -24,6 +26,7 @@ members = [
     "crates/sp-remote",
     "crates/sp-window-stream",
     "tools/lane-adapter",
+    "tools/vm-probe",
     "tools/xtask",
 ]
 default-members = ["apps/superposition"]

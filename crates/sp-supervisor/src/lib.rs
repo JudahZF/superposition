@@ -15,7 +15,7 @@ pub use quarantine::{
 };
 pub use scanner::{
     BundleFingerprint, CachedScan, PluginPlatform, ScanCache, ScanDescriptor, ScanStatus, Scanner,
-    discover_vst3_bundles, discover_windows_vst3_bundles, fingerprint_bundle,
+    discover_vst3_bundles, discover_windows_vst3_bundles, fingerprint_bundle, remote_windows_scan,
 };
 pub use sp_wine::WineLauncher;
 pub use worker_control::{

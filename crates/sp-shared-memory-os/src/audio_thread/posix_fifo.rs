@@ -1,4 +1,6 @@
 //! `SCHED_FIFO` for the processing thread on Linux, or under Wine through `sp_wine_bridge`.
+//! In Lambda's Windows VM: the real-time priority class and a time-critical thread on the VM
+//! port's real-time vCPU.
 //! On Linux, rtkit is the fallback when `RLIMIT_RTPRIO` denies it. rtkit answers over D-Bus,
 //! too slowly for a block, so the policy asks it once, when it is created before audio starts,
 //! and the thread keeps rtkit's `SCHED_RR` until it exits.
@@ -41,7 +43,7 @@ impl AudioThreadPolicy {
     /// Under Wine, returns `Unsupported` when `sp_wine_bridge.dll` is not loaded.
     pub fn new() -> io::Result<Self> {
         #[cfg(windows)]
-        if crate::sys::bridge().is_none() {
+        if crate::sys::bridge().is_none() && crate::sys::under_wine() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "sp_wine_bridge.dll is required for worker scheduling",
@@ -215,14 +217,19 @@ fn set_other() -> i32 {
 
 #[cfg(windows)]
 fn set_fifo(priority: i32) -> i32 {
-    let bridge = crate::sys::bridge().expect("checked in AudioThreadPolicy::new");
-    // SAFETY: the bridge applies the policy to the calling Linux thread.
-    unsafe { (bridge.set_scheduler)(1, priority) }
+    match crate::sys::bridge() {
+        // SAFETY: the bridge applies the policy to the calling Linux thread.
+        Some(bridge) => unsafe { (bridge.set_scheduler)(1, priority) },
+        // Lambda's VM (`AudioThreadPolicy::new` refused Wine without the bridge).
+        None => crate::sys::windows_vm::enter_realtime(),
+    }
 }
 
 #[cfg(windows)]
 fn set_other() -> i32 {
-    let bridge = crate::sys::bridge().expect("checked in AudioThreadPolicy::new");
-    // SAFETY: the bridge applies the policy to the calling Linux thread.
-    unsafe { (bridge.set_scheduler)(0, 0) }
+    match crate::sys::bridge() {
+        // SAFETY: the bridge applies the policy to the calling Linux thread.
+        Some(bridge) => unsafe { (bridge.set_scheduler)(0, 0) },
+        None => crate::sys::windows_vm::leave_realtime(),
+    }
 }

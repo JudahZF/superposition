@@ -186,3 +186,7 @@ pub(crate) unsafe fn wait(word: &AtomicU32, observed: u32, timeout_ns: u64) -> c
         superposition_wait_for_request(ptr::from_ref(word).cast_mut().cast(), observed, timeout_ns)
     }
 }
+
+pub(crate) fn clock_is_host_domain() -> bool {
+    true
+}

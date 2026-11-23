@@ -64,6 +64,15 @@ This is one targeted check, not a compatibility certification: no licence
 manager, iLok, or GPU-heavy editor has been tried, and no Linux timing is
 claimed for real audio hardware.
 
+## Windows plug-ins in Lambda's VM
+
+Lambda can run a Windows worker in a Windows guest (ADR 0011): for plug-ins that Wine cannot
+run, first those protected by iLok. The worker, the scanner and the plug-in are the same as
+under Wine; the bank comes from a VM port, and the guest agent starts the worker and relays
+its control. Tested in the phase V0 VM on 6 November 2026: the scanner reports the Lambda test
+fixture and ZamComp (Windows builds) as supported, and the fixture runs as a pass-through at
+32 frames and 96 kHz through a VM port. No iLok plug-in is tested yet.
+
 ## Compatibility tiers
 
 The 23 September 2026 fresh scan of 33 local bundles returned 26 supported

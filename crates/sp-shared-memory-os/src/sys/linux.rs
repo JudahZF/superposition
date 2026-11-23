@@ -7,7 +7,10 @@
 use std::{
     ffi::CStr,
     io,
-    os::raw::{c_int, c_void},
+    os::{
+        fd::{AsRawFd, IntoRawFd, OwnedFd},
+        raw::{c_int, c_void},
+    },
     ptr::{self, NonNull},
     sync::atomic::AtomicU32,
 };
@@ -21,6 +24,12 @@ impl Drop for RawObject {
     fn drop(&mut self) {
         // SAFETY: this value is the descriptor's only owner.
         unsafe { libc::close(self.0) };
+    }
+}
+
+impl From<OwnedFd> for RawObject {
+    fn from(descriptor: OwnedFd) -> Self {
+        Self(descriptor.into_raw_fd())
     }
 }
 
@@ -186,4 +195,52 @@ pub(crate) unsafe fn wait(word: &AtomicU32, observed: u32, timeout_ns: u64) -> c
         Some(code) => code,
         None => libc::EIO,
     }
+}
+
+/// Rings an eventfd doorbell: one non-blocking write. Returns 1, or a negative errno.
+pub(crate) fn ring(doorbell: &OwnedFd) -> c_int {
+    let one = 1_u64.to_ne_bytes();
+    // SAFETY: the descriptor is open and `one` is 8 readable bytes.
+    let written = unsafe { libc::write(doorbell.as_raw_fd(), one.as_ptr().cast(), one.len()) };
+    if written == 8 {
+        1
+    } else {
+        -io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
+    }
+}
+
+/// Waits up to `timeout_ns` for an eventfd to be rung, and clears it. Returns zero on a ring,
+/// a timeout or an interruption, else an errno.
+pub(crate) fn wait_eventfd(eventfd: &OwnedFd, timeout_ns: u64) -> c_int {
+    let mut poll = libc::pollfd {
+        fd: eventfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout = libc::timespec {
+        tv_sec: libc::time_t::try_from(timeout_ns / 1_000_000_000).unwrap_or(libc::time_t::MAX),
+        tv_nsec: libc::c_long::try_from(timeout_ns % 1_000_000_000).unwrap_or_default(),
+    };
+    // SAFETY: one valid pollfd and a valid timeout; no signal mask change.
+    let ready = unsafe { libc::ppoll(&raw mut poll, 1, &raw const timeout, ptr::null()) };
+    if ready < 0 {
+        return match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => 0,
+            Some(code) => code,
+            None => libc::EIO,
+        };
+    }
+    if ready > 0 {
+        let mut count = [0_u8; 8];
+        // SAFETY: `count` is 8 writable bytes. A non-blocking eventfd that another reader
+        // cleared first returns EAGAIN, which is not an error here.
+        unsafe { libc::read(eventfd.as_raw_fd(), count.as_mut_ptr().cast(), count.len()) };
+    }
+    0
+}
+
+pub(crate) fn clock_is_host_domain() -> bool {
+    true
 }
