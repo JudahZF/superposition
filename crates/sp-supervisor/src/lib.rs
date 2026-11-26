@@ -538,6 +538,9 @@ pub struct ProcessSupervisor {
     /// macOS: the socket workers stream their editor windows to, while remote clients watch.
     #[cfg(target_os = "macos")]
     editor_stream: Option<std::path::PathBuf>,
+    /// macOS: with a stream, editor windows stay off the desktop.
+    #[cfg(target_os = "macos")]
+    editors_hidden: bool,
 }
 
 impl ProcessSupervisor {
@@ -555,6 +558,8 @@ impl ProcessSupervisor {
             display: None,
             #[cfg(target_os = "macos")]
             editor_stream: None,
+            #[cfg(target_os = "macos")]
+            editors_hidden: false,
         }
     }
 
@@ -573,6 +578,14 @@ impl ProcessSupervisor {
     #[cfg(target_os = "macos")]
     pub fn set_editor_stream(&mut self, socket: Option<std::path::PathBuf>) {
         self.editor_stream = socket;
+    }
+
+    /// macOS: whether children launched from now on keep their editor windows off the desktop
+    /// (`sp_window_stream::EDITOR_HIDDEN_ENV`), so the stream is the only view of them. It applies
+    /// only with an editor stream. Default: windows show on the desktop.
+    #[cfg(target_os = "macos")]
+    pub fn set_editors_hidden(&mut self, hidden: bool) {
+        self.editors_hidden = hidden;
     }
 
     /// Creates a command for `launch` with this supervisor's child environment.
@@ -596,6 +609,12 @@ impl ProcessSupervisor {
             Some(socket) => command.env(sp_window_stream::EDITOR_STREAM_ENV, socket),
             None => command.env_remove(sp_window_stream::EDITOR_STREAM_ENV),
         };
+        #[cfg(target_os = "macos")]
+        if self.editor_stream.is_some() && self.editors_hidden {
+            command.env(sp_window_stream::EDITOR_HIDDEN_ENV, "1");
+        } else {
+            command.env_remove(sp_window_stream::EDITOR_HIDDEN_ENV);
+        }
         command
     }
 

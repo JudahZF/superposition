@@ -746,6 +746,9 @@ struct EditorHost {
     /// Streams the editors to the app while remote clients watch.
     #[cfg(target_os = "macos")]
     stream: Option<editor_stream::EditorStream>,
+    /// The app shows editors only through the stream: no window goes on the desktop.
+    #[cfg(target_os = "macos")]
+    hidden: bool,
 }
 
 /// An open editor window and when it is next pictured.
@@ -798,6 +801,19 @@ impl EditorHost {
         )
     )]
     fn new(rack_index: u8, sample_rate: u32) -> Self {
+        #[cfg(target_os = "macos")]
+        let stream = std::env::var_os(sp_window_stream::EDITOR_STREAM_ENV).and_then(|socket| {
+            editor_stream::EditorStream::spawn(socket.into())
+                .map_err(|error| {
+                    eprintln!("sp-plugin-worker: editor stream unavailable: {error}");
+                })
+                .ok()
+        });
+        // Hidden only with a stream: a hidden editor without one would have no view at all.
+        #[cfg(target_os = "macos")]
+        let hidden = stream.is_some()
+            && std::env::var_os(sp_window_stream::EDITOR_HIDDEN_ENV)
+                .is_some_and(|value| value == "1");
         Self {
             state_transfers: StateTransfers::starting_at(LIVE_CAPTURE_TRANSFER_BASE),
             services: BTreeMap::new(),
@@ -816,13 +832,9 @@ impl EditorHost {
             #[cfg(target_os = "macos")]
             pump_until: None,
             #[cfg(target_os = "macos")]
-            stream: std::env::var_os(sp_window_stream::EDITOR_STREAM_ENV).and_then(|socket| {
-                editor_stream::EditorStream::spawn(socket.into())
-                    .map_err(|error| {
-                        eprintln!("sp-plugin-worker: editor stream unavailable: {error}");
-                    })
-                    .ok()
-            }),
+            stream,
+            #[cfg(target_os = "macos")]
+            hidden,
         }
     }
 
@@ -879,6 +891,8 @@ impl EditorHost {
                         self.close_editor(slot)?;
                         Ok(Vec::new())
                     }),
+                // The app's explicit request: it shows the window also when editors are
+                // hidden, for one that the stream cannot picture.
                 ControlOperation::FocusNativeEditor => ProductionRuntime::slot_index(request)
                     .and_then(|slot| {
                         self.windows
@@ -918,12 +932,31 @@ impl EditorHost {
         }
     }
 
+    /// Shows and focuses an editor window, unless the app shows editors only through the stream
+    /// (macOS, [`sp_window_stream::EDITOR_HIDDEN_ENV`]): then the window stays ordered out and the
+    /// worker takes no focus.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(
+            clippy::unused_self,
+            reason = "only macOS keeps editors off the desktop"
+        )
+    )]
+    fn present(&self, window: &EditorWindow) {
+        #[cfg(target_os = "macos")]
+        if self.hidden {
+            return;
+        }
+        window.focus();
+    }
+
     /// Opens `slot`'s editor in a new worker-owned window at the requested position, or
     /// focuses the window that is already open.
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn open_editor(&mut self, slot: usize, payload: &[u8]) -> Result<Vec<u8>, String> {
         if let Some(open) = self.windows.get(&slot) {
-            open.window.focus();
+            self.present(&open.window);
             return Ok(Vec::new());
         }
         let position = (!payload.is_empty())
@@ -955,7 +988,7 @@ impl EditorHost {
         if let Some(position) = position {
             window.set_top_left(f64::from(position.left), f64::from(position.top));
         }
-        window.focus();
+        self.present(&window);
         self.windows.insert(
             slot,
             OpenEditor {
@@ -1207,6 +1240,10 @@ impl EditorHost {
             return;
         };
         for (window, input) in stream.take_input() {
+            // A focus would put a hidden window on the desktop.
+            if self.hidden && matches!(input, sp_vst3::editor_input::EditorInput::Focus) {
+                continue;
+            }
             if let Some(open) = self
                 .windows
                 .values()

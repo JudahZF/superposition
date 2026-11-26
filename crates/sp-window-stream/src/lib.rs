@@ -43,6 +43,13 @@ mod wire;
 /// worker connects to it and serves its own editor windows; the app speaks first, as a client.
 pub const EDITOR_STREAM_ENV: &str = "SUPERPOSITION_EDITOR_STREAM";
 
+/// macOS: set to `1` beside [`EDITOR_STREAM_ENV`] when the app shows editors only through the
+/// stream. The worker then never puts an editor window on the desktop by itself and never takes
+/// focus: an open stays ordered out, and the stream still pictures the window and injects input
+/// into it. Only the app's `FocusNativeEditor` shows one, for an editor that the stream cannot
+/// picture (a view that draws with OpenGL or Metal gives `cacheDisplayInRect` no pixels).
+pub const EDITOR_HIDDEN_ENV: &str = "SUPERPOSITION_EDITOR_HIDDEN";
+
 pub use client::{
     ApplyError, ScrollAccumulator, StreamedWindow, WindowStreamClient, keysym_for_char,
 };
