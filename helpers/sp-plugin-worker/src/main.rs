@@ -969,6 +969,12 @@ impl EditorHost {
             .ok_or("native editor slot is not loaded")?;
         #[cfg(target_os = "macos")]
         let window = EditorWindow::new("Superposition Plug-in Editor")?;
+        // Before the plug-in attaches: some editors order their host window in or make it
+        // visible themselves (DPF does), and a streamed editor stays off the desktop.
+        #[cfg(target_os = "macos")]
+        if self.hidden {
+            window.keep_off_desktop();
+        }
         #[cfg(any(target_os = "linux", windows))]
         let window = EditorWindow::new(&EditorWindowIdentity {
             title: &format!(
@@ -1117,6 +1123,44 @@ impl EditorHost {
                 self.state_transfers.release(slot, transfer.id)?;
                 Ok(Vec::new())
             }
+            // One parameter's metadata, or its value, without the audio thread: the processing
+            // thread hands nothing over and keeps answering blocks while an editor is busy.
+            ControlOperation::ParameterMetadata => {
+                let id =
+                    ParameterId::decode(request.payload()).map_err(|error| error.to_string())?;
+                let parameter_id = u32::try_from(id.value)
+                    .map_err(|_| "parameter ID exceeds VST3 u32 range".to_owned())?;
+                let parameter = editor
+                    .parameter_metadata(parameter_id)
+                    .map_err(|error| error.to_string())?;
+                let formatted = editor
+                    .format_parameter(parameter.id, parameter.normalized)
+                    .unwrap_or_else(|_| format!("{:.3}", parameter.normalized));
+                ParameterMetadata {
+                    id,
+                    normalized: parameter.normalized,
+                    default_normalized: parameter.default_normalized,
+                    step_count: parameter.step_count,
+                    flags: parameter.flags,
+                    name: parameter.name,
+                    unit: parameter.unit,
+                    formatted,
+                }
+                .encode()
+                .map_err(|error| error.to_string())
+            }
+            ControlOperation::ReadParameter => {
+                let id =
+                    ParameterId::decode(request.payload()).map_err(|error| error.to_string())?;
+                let parameter_id = u32::try_from(id.value)
+                    .map_err(|_| "parameter ID exceeds VST3 u32 range".to_owned())?;
+                let normalized = editor
+                    .read_parameter(parameter_id)
+                    .map_err(|error| error.to_string())?;
+                ParameterWrite { id, normalized }
+                    .encode()
+                    .map_err(|error| error.to_string())
+            }
             ControlOperation::ReadParameters => {
                 let ids =
                     ParameterIds::decode(request.payload()).map_err(|error| error.to_string())?;
@@ -1255,45 +1299,57 @@ impl EditorHost {
         if !stream.capture_due(Instant::now()) {
             return;
         }
-        let captures = self
-            .windows
-            .iter()
-            .filter_map(|(&slot, open)| {
-                let id = open.window.window_number()?;
-                let mut bgrx = Vec::new();
-                let (width, height) = open
-                    .window
-                    .capture_bgrx(&mut bgrx)
-                    .map_err(|error| {
-                        eprintln!("sp-plugin-worker: could not stream editor: {error}");
-                    })
-                    .ok()?;
-                let plugin = self
-                    .editors
-                    .get(&slot)
-                    .map_or("Plug-in", |editor| editor.plugin_name());
-                Some(editor_stream::Capture {
-                    info: sp_window_stream::WindowInfo {
-                        id: sp_window_stream::WindowId(id),
-                        kind: sp_window_stream::WindowKind::Normal,
-                        title: format!(
-                            "{plugin} – Rack {}, Slot {}",
-                            u32::from(self.rack_index) + 1,
-                            slot + 1
-                        ),
-                        x: 0,
-                        y: 0,
-                        width,
-                        height,
-                        rack: Some(u32::from(self.rack_index)),
-                        slot: u32::try_from(slot).ok(),
-                        pid: Some(std::process::id()),
-                        transient_for: None,
-                    },
-                    bgrx,
-                })
-            })
-            .collect();
+        // Each window asks the window server for its next picture; its latest one goes out now.
+        // Until every window has its first picture, nothing goes out: a window missing from a
+        // publication would close for the app.
+        for open in self.windows.values() {
+            open.window.request_capture();
+        }
+        let mut captures = Vec::new();
+        for (&slot, open) in &self.windows {
+            let Some(id) = open.window.window_number() else {
+                continue;
+            };
+            let mut bgrx = Vec::new();
+            // The window server's picture has what OpenGL and Metal views draw. When it gives
+            // none (before macOS 14.4), the view draws itself into a bitmap instead.
+            let size = match open.window.latest_capture(&mut bgrx) {
+                None => return,
+                Some(Ok(size)) => size,
+                Some(Err(error)) => match open.window.capture_bgrx(&mut bgrx) {
+                    Ok(size) => size,
+                    Err(fallback) => {
+                        eprintln!("sp-plugin-worker: could not stream editor: {error}; {fallback}");
+                        continue;
+                    }
+                },
+            };
+            let (width, height) = size;
+            let plugin = self
+                .editors
+                .get(&slot)
+                .map_or("Plug-in", |editor| editor.plugin_name());
+            captures.push(editor_stream::Capture {
+                info: sp_window_stream::WindowInfo {
+                    id: sp_window_stream::WindowId(id),
+                    kind: sp_window_stream::WindowKind::Normal,
+                    title: format!(
+                        "{plugin} – Rack {}, Slot {}",
+                        u32::from(self.rack_index) + 1,
+                        slot + 1
+                    ),
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                    rack: Some(u32::from(self.rack_index)),
+                    slot: u32::try_from(slot).ok(),
+                    pid: Some(std::process::id()),
+                    transient_for: None,
+                },
+                bgrx,
+            });
+        }
         stream.publish(captures);
     }
 
@@ -1876,6 +1932,28 @@ fn drain_production_commands(
         }
         return Ok(());
     }
+    // A request that needs the main thread takes the runtime from this thread until the main
+    // thread answers. A main thread that an editor holds (a hung or busy plug-in view) would stop
+    // the rack's blocks for that long: refuse instead, and let the host ask again.
+    if is_main_thread_operation(request.operation())
+        && request.operation() != ControlOperation::Shutdown
+        && clock.now_ticks().saturating_sub(
+            runtime
+                .as_ref()
+                .expect("runtime has one owner")
+                .loading_pass
+                .load(Ordering::Acquire),
+        ) > clock.duration_to_ticks(EDITOR_THREAD_STALL)
+    {
+        let response = ProductionRuntime::response(
+            &request,
+            Err("worker main thread is busy with an editor; ask again later".to_owned()),
+        );
+        endpoint
+            .try_reply(response)
+            .map_err(|_| "worker control reply mailbox is full".to_owned())?;
+        return Ok(());
+    }
     audio_policy.leave().map_err(|error| error.to_string())?;
     let response = if is_main_thread_operation(request.operation()) {
         if let Err(error) = main_request.send(MainThreadRequest {
@@ -1921,6 +1999,8 @@ const fn is_live_read_operation(operation: ControlOperation) -> bool {
             | ControlOperation::ReadStateChunk
             | ControlOperation::ReleaseStateTransfer
             | ControlOperation::ReadParameters
+            | ControlOperation::ParameterMetadata
+            | ControlOperation::ReadParameter
     )
 }
 
@@ -1982,8 +2062,6 @@ const fn is_main_thread_operation(operation: ControlOperation) -> bool {
         ControlOperation::RebuildRack
             | ControlOperation::ActivateSlot
             | ControlOperation::DeactivateSlot
-            | ControlOperation::ParameterMetadata
-            | ControlOperation::ReadParameter
             | ControlOperation::CaptureState
             | ControlOperation::RestoreState
             | ControlOperation::BeginStateRestore
@@ -3008,7 +3086,14 @@ mod tests {
             ControlOperation::OpenNativeEditor
         ));
         assert!(!is_editor_operation(ControlOperation::ReadParameter));
-        assert!(is_main_thread_operation(ControlOperation::ReadParameter));
+        // A metadata or value read never takes the runtime from the processing thread: an
+        // editor that keeps the main thread busy must not cost the rack a block.
+        assert!(!is_main_thread_operation(ControlOperation::ReadParameter));
+        assert!(!is_main_thread_operation(
+            ControlOperation::ParameterMetadata
+        ));
+        assert!(is_live_read_operation(ControlOperation::ReadParameter));
+        assert!(is_live_read_operation(ControlOperation::ParameterMetadata));
         assert!(!is_main_thread_operation(ControlOperation::ReadParameters));
         assert!(is_live_read_operation(ControlOperation::ReadParameters));
         assert!(is_live_read_operation(ControlOperation::BeginStateCapture));

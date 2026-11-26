@@ -4,25 +4,27 @@
 #![allow(unsafe_code)] // AppKit initialization is this crate's isolated Objective-C boundary.
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ffi::{c_char, c_void},
     marker::PhantomData,
     ptr::{self, NonNull},
     rc::Rc,
-    sync::OnceLock,
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Duration,
 };
+
+use block2::RcBlock;
 
 use objc2::{
     AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::{Retained, autoreleasepool},
-    runtime::{AnyObject, ProtocolObject},
+    runtime::{AnyObject, Bool, ProtocolObject},
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBitmapImageFileType,
     NSBitmapImageRep, NSBitmapImageRepPropertyKey, NSEvent, NSEventMask, NSEventModifierFlags,
-    NSEventType, NSScreen, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
-    NSWindowTabbingMode,
+    NSEventType, NSResponder, NSScreen, NSView, NSWindow, NSWindowDelegate, NSWindowOrderingMode,
+    NSWindowStyleMask, NSWindowTabbingMode,
 };
 use objc2_core_foundation::{CFRetained, CGFloat};
 use objc2_core_graphics::{
@@ -32,8 +34,11 @@ use objc2_core_graphics::{
     kCGColorSpaceSRGB,
 };
 use objc2_foundation::{
-    NSDate, NSDefaultRunLoopMode, NSDictionary, NSObject, NSObjectProtocol, NSPoint, NSProcessInfo,
-    NSRect, NSSize, NSString,
+    NSDate, NSDefaultRunLoopMode, NSDictionary, NSError, NSInteger, NSObject, NSObjectProtocol,
+    NSPoint, NSProcessInfo, NSRect, NSSize, NSString,
+};
+use objc2_screen_capture_kit::{
+    SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
 };
 
 use crate::editor_input::{EditorInput, Modifiers, MouseButton};
@@ -62,6 +67,68 @@ define_class!(
     }
 );
 
+define_class!(
+    // SAFETY: NSWindow allows subclassing; the overrides below call the same selectors on super
+    // with the arguments they got, or return without doing anything. No Drop implementation.
+    #[unsafe(super(NSWindow, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = Cell<bool>]
+    struct EditorNSWindow;
+
+    /// While the ivar is set, the window stays off the desktop: a plug-in that orders its host
+    /// window in or makes it visible (DPF's `puglShow` sets `isVisible`) changes nothing, and
+    /// the window says it is visible.
+    impl EditorNSWindow {
+        #[unsafe(method(orderWindow:relativeTo:))]
+        fn order_window(&self, place: NSWindowOrderingMode, other: NSInteger) {
+            if self.ivars().get() && place != NSWindowOrderingMode::Out {
+                return;
+            }
+            // SAFETY: The same selector and arguments on NSWindow.
+            unsafe { msg_send![super(self), orderWindow: place, relativeTo: other] }
+        }
+
+        #[unsafe(method(setIsVisible:))]
+        fn set_is_visible(&self, visible: bool) {
+            if self.ivars().get() && visible {
+                return;
+            }
+            // SAFETY: The same selector and argument on NSWindow.
+            unsafe { msg_send![super(self), setIsVisible: visible] }
+        }
+
+        /// A window kept off the desktop tells the plug-in it shows: pugl (DPF) draws only
+        /// while its window is visible (`-[PuglWrapperView dispatchExpose:]`), and the window
+        /// server pictures what the plug-in draws.
+        #[unsafe(method(isVisible))]
+        fn is_visible(&self) -> Bool {
+            if self.ivars().get() {
+                return Bool::YES;
+            }
+            // SAFETY: The same selector on NSWindow.
+            unsafe { msg_send![super(self), isVisible] }
+        }
+
+        #[unsafe(method(orderFrontRegardless))]
+        fn order_front_regardless(&self) {
+            if self.ivars().get() {
+                return;
+            }
+            // SAFETY: The same selector on NSWindow.
+            unsafe { msg_send![super(self), orderFrontRegardless] }
+        }
+
+        #[unsafe(method(makeKeyAndOrderFront:))]
+        fn make_key_and_order_front(&self, sender: Option<&AnyObject>) {
+            if self.ivars().get() {
+                return;
+            }
+            // SAFETY: The same selector and argument on NSWindow.
+            unsafe { msg_send![super(self), makeKeyAndOrderFront: sender] }
+        }
+    }
+);
+
 impl EditorWindowDelegate {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(Cell::new(false));
@@ -72,9 +139,160 @@ impl EditorWindowDelegate {
 
 /// Top-level editor window that may only be created and operated on the worker main thread.
 pub struct MacOsEditorWindow {
-    window: Retained<NSWindow>,
+    window: Retained<EditorNSWindow>,
     delegate: Retained<EditorWindowDelegate>,
     closed: Cell<bool>,
+    /// The view that took the last mouse press while the window is off the desktop
+    /// ([`Self::inject`]).
+    pressed: RefCell<Option<Retained<NSView>>>,
+    /// The window server's pictures of this window ([`Self::request_capture`]).
+    capture: Arc<Mutex<WindowCapture>>,
+}
+
+/// A picture of the editor's content as BGRX pixels and its size, or why there is none.
+type Picture = Result<(u16, u16, Vec<u8>), String>;
+
+/// The window server's pictures of one editor window. `ScreenCaptureKit`'s completion handlers
+/// run on its own queues: they leave each picture here for the worker main thread to take.
+#[derive(Default)]
+struct WindowCapture {
+    /// The window's content filter, once the process's shareable content listed the window.
+    filter: Option<SendFilter>,
+    /// A listing or a picture is on its way.
+    busy: bool,
+    /// The newest picture.
+    picture: Option<Picture>,
+    /// The pictures and failures that came.
+    count: u64,
+}
+
+/// A content filter that crosses to `ScreenCaptureKit`'s queues.
+struct SendFilter(Retained<SCContentFilter>);
+
+// SAFETY: A content filter is not changed after it is made, and ScreenCaptureKit takes filters
+// on any queue: the capture calls only read it.
+unsafe impl Send for SendFilter {}
+
+/// The sizes of one capture: the whole window, title bar included, and its content, in points.
+#[derive(Clone, Copy)]
+struct CaptureSize {
+    window: (u16, u16),
+    content: (u16, u16),
+}
+
+fn lock(capture: &Mutex<WindowCapture>) -> std::sync::MutexGuard<'_, WindowCapture> {
+    capture.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Ends the capture that ran with `picture`. A failure forgets the filter, so the next capture
+/// lists the window again (a window that the window server recreated has a new filter).
+fn finish(capture: &Mutex<WindowCapture>, picture: Picture) {
+    let mut state = lock(capture);
+    state.busy = false;
+    if picture.is_err() {
+        state.filter = None;
+    }
+    state.picture = Some(picture);
+    state.count += 1;
+}
+
+/// The words of a `ScreenCaptureKit` error, or `fallback`.
+fn describe(error: *mut NSError, fallback: &str) -> String {
+    // SAFETY: ScreenCaptureKit passes a valid error or null.
+    unsafe { error.as_ref() }.map_or_else(
+        || fallback.to_owned(),
+        |error| error.localizedDescription().to_string(),
+    )
+}
+
+/// Asks the window server for one picture of the window of `filter`, at one pixel per point.
+fn capture_window(
+    capture: &Arc<Mutex<WindowCapture>>,
+    filter: &SCContentFilter,
+    size: CaptureSize,
+) {
+    // SAFETY: A new configuration is a plain value object; the setters take plain numbers.
+    let config = unsafe { SCStreamConfiguration::new() };
+    unsafe {
+        config.setWidth(usize::from(size.window.0));
+        config.setHeight(usize::from(size.window.1));
+        config.setShowsCursor(false);
+        config.setIgnoreShadowsSingleWindow(true);
+    }
+    let shared = Arc::clone(capture);
+    let done = RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
+        // SAFETY: ScreenCaptureKit passes a valid image or null.
+        let picture = match unsafe { image.as_ref() } {
+            Some(image) => content_bgrx(image, size),
+            None => Err(describe(error, "the window server gave no picture")),
+        };
+        finish(&shared, picture);
+    });
+    // SAFETY: The filter, the configuration and the handler outlive the call; the handler only
+    // touches the shared state.
+    unsafe {
+        SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
+            filter,
+            &config,
+            Some(&done),
+        );
+    }
+}
+
+/// The content of a window-server picture of the whole window, as BGRX: the bottom
+/// `size.content` part, below the title bar.
+fn content_bgrx(image: &CGImage, size: CaptureSize) -> Picture {
+    let mut pixels = Vec::new();
+    let (width, height) = draw_bgrx(
+        image,
+        size.content,
+        (f64::from(size.window.0), f64::from(size.window.1)),
+        &mut pixels,
+    )?;
+    Ok((width, height, pixels))
+}
+
+/// Draws `image` at `drawn` points from the bottom-left corner into BGRX `pixels` of `size`,
+/// rows top to bottom: the window-stream tile format. Whatever lies above `size` is cut off.
+fn draw_bgrx(
+    image: &CGImage,
+    size: (u16, u16),
+    drawn: (f64, f64),
+    pixels: &mut Vec<u8>,
+) -> Result<(u16, u16), String> {
+    let (width, height) = size;
+    if width == 0 || height == 0 {
+        return Err("native editor window has no content".to_owned());
+    }
+    // SAFETY: `kCGColorSpaceSRGB` is an immutable CoreGraphics constant.
+    let space = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }))
+        .ok_or("sRGB color space is unavailable")?;
+    let (columns, rows) = (usize::from(width), usize::from(height));
+    pixels.clear();
+    pixels.resize(columns * rows * 4, 0);
+    // Little-endian 32-bit pixels with the alpha byte skipped first are B, G, R, X in memory.
+    // The context's first row in memory is the top of the drawn image.
+    // SAFETY: `pixels` holds `rows` rows of `columns * 4` bytes. The context writes only inside
+    // them and is released at the end of this function, before `pixels` is read.
+    let context = unsafe {
+        CGBitmapContextCreate(
+            pixels.as_mut_ptr().cast(),
+            columns,
+            rows,
+            8,
+            columns * 4,
+            Some(&space),
+            CGImageAlphaInfo::NoneSkipFirst.0 | CGImageByteOrderInfo::Order32Little.0,
+        )
+    }
+    .ok_or("native editor capture context could not be made")?;
+    CGContext::draw_image(
+        Some(&context),
+        NSRect::new(NSPoint::ZERO, NSSize::new(drawn.0, drawn.1)),
+        Some(image),
+    );
+    drop(context);
+    Ok((width, height))
 }
 
 /// A retained `AppKit` parent view. It cannot cross threads or outlive its owned `NSView`.
@@ -86,6 +304,12 @@ pub struct EditorParentView {
 impl EditorParentView {
     pub(crate) fn as_ptr(&self) -> *mut c_void {
         Retained::as_ptr(&self.view).cast_mut().cast()
+    }
+
+    /// The window's content view, where the plug-in's view goes.
+    #[must_use]
+    pub fn view(&self) -> &NSView {
+        &self.view
     }
 }
 
@@ -100,17 +324,20 @@ impl MacOsEditorWindow {
         app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
         app.finishLaunching();
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(640.0, 480.0));
-        let window = unsafe {
-            NSWindow::initWithContentRect_styleMask_backing_defer(
-                NSWindow::alloc(mtm),
-                frame,
-                NSWindowStyleMask::Titled
-                    | NSWindowStyleMask::Closable
-                    | NSWindowStyleMask::Resizable
-                    | NSWindowStyleMask::Miniaturizable,
-                NSBackingStoreType::Buffered,
-                false,
-            )
+        let this = EditorNSWindow::alloc(mtm).set_ivars(Cell::new(false));
+        let style = NSWindowStyleMask::Titled
+            | NSWindowStyleMask::Closable
+            | NSWindowStyleMask::Resizable
+            | NSWindowStyleMask::Miniaturizable;
+        // SAFETY: NSWindow's designated initializer with a valid frame, style and backing.
+        let window: Retained<EditorNSWindow> = unsafe {
+            msg_send![
+                super(this),
+                initWithContentRect: frame,
+                styleMask: style,
+                backing: NSBackingStoreType::Buffered,
+                defer: false
+            ]
         };
         unsafe { window.setReleasedWhenClosed(false) };
         // Each editor is its own window; macOS would otherwise tab same-titled windows together.
@@ -122,6 +349,8 @@ impl MacOsEditorWindow {
             window,
             delegate,
             closed: Cell::new(false),
+            pressed: RefCell::default(),
+            capture: Arc::default(),
         })
     }
 
@@ -145,16 +374,25 @@ impl MacOsEditorWindow {
             .setContentSize(NSSize::new(f64::from(width), f64::from(height)));
     }
 
-    /// Shows and focuses the window.
+    /// Shows and focuses the window, also one that was kept off the desktop.
     ///
     /// # Panics
     /// Panics when called off the worker main thread, which violates the window's contract.
     pub fn focus(&self) {
+        self.window.ivars().set(false);
         NSApplication::sharedApplication(
             MainThreadMarker::new().expect("editor window remains on main thread"),
         )
         .activate();
         self.window.makeKeyAndOrderFront(None);
+    }
+
+    /// Keeps the window off the desktop until [`Self::focus`]: the plug-in's own calls that
+    /// order its host window in or make it visible do nothing, and the window tells it that it
+    /// is visible, so that it draws. The window stays ordered out, and
+    /// [`Self::request_capture`] and [`Self::inject`] still work on it.
+    pub fn keep_off_desktop(&self) {
+        self.window.ivars().set(true);
     }
 
     /// Takes a user close request without closing the window or detaching its plug-in view.
@@ -254,44 +492,112 @@ impl MacOsEditorWindow {
             let image = bitmap
                 .CGImage()
                 .ok_or("native editor cache bitmap has no image")?;
-            // SAFETY: `kCGColorSpaceSRGB` is an immutable CoreGraphics constant.
-            let space = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }))
-                .ok_or("sRGB color space is unavailable")?;
-            let (columns, rows) = (usize::from(width), usize::from(height));
-            pixels.clear();
-            pixels.resize(columns * rows * 4, 0);
-            // Little-endian 32-bit pixels with the alpha byte skipped first are B, G, R, X in
-            // memory. The context's first row in memory is the top of the drawn image.
-            // SAFETY: `pixels` holds `rows` rows of `columns * 4` bytes. The context writes only
-            // inside them and is released at the end of this block, before `pixels` is read.
-            let context = unsafe {
-                CGBitmapContextCreate(
-                    pixels.as_mut_ptr().cast(),
-                    columns,
-                    rows,
-                    8,
-                    columns * 4,
-                    Some(&space),
-                    CGImageAlphaInfo::NoneSkipFirst.0 | CGImageByteOrderInfo::Order32Little.0,
-                )
-            }
-            .ok_or("native editor capture context could not be made")?;
-            CGContext::draw_image(
-                Some(&context),
-                NSRect::new(
-                    NSPoint::ZERO,
-                    NSSize::new(f64::from(width), f64::from(height)),
-                ),
-                Some(&image),
-            );
-            drop(context);
-            Ok((width, height))
+            draw_bgrx(
+                &image,
+                (width, height),
+                (f64::from(width), f64::from(height)),
+                pixels,
+            )
         })
     }
 
+    /// Starts a picture of this window from the window server, unless one is on its way:
+    /// what the server composes for the window, so a view that draws with OpenGL or Metal is in
+    /// it too, also while the window is ordered out. [`Self::latest_capture`] gives it once it
+    /// came.
+    ///
+    /// The worker pictures its own window. `ScreenCaptureKit` lists that window in the current
+    /// process's shareable content, which (macOS 14.4) holds what "is available to capture by
+    /// current process without user consent via TCC": no Screen Recording permission, no prompt.
+    pub fn request_capture(&self) {
+        let Some(number) = self.window_number() else {
+            return;
+        };
+        let Some(view) = self.window.contentView() else {
+            return;
+        };
+        let (frame, bounds) = (self.window.frame(), view.bounds());
+        let size = CaptureSize {
+            window: (
+                whole_pixels(frame.size.width),
+                whole_pixels(frame.size.height),
+            ),
+            content: (
+                whole_pixels(bounds.size.width),
+                whole_pixels(bounds.size.height),
+            ),
+        };
+        let mut state = lock(&self.capture);
+        if state.busy {
+            return;
+        }
+        state.busy = true;
+        if let Some(filter) = state.filter.as_ref().map(|filter| filter.0.clone()) {
+            drop(state);
+            capture_window(&self.capture, &filter, size);
+            return;
+        }
+        drop(state);
+        let shared = Arc::clone(&self.capture);
+        let listed = RcBlock::new(
+            move |content: *mut SCShareableContent, error: *mut NSError| {
+                // SAFETY: ScreenCaptureKit passes valid content or null; its windows are SCWindows.
+                let window = unsafe { content.as_ref() }.and_then(|content| {
+                    unsafe { content.windows() }
+                        .iter()
+                        .find(|window| unsafe { window.windowID() } == number)
+                });
+                let Some(window) = window else {
+                    finish(
+                        &shared,
+                        Err(describe(
+                            error,
+                            "the window server does not list this window",
+                        )),
+                    );
+                    return;
+                };
+                // SAFETY: A desktop-independent window filter takes any listed window.
+                let filter = unsafe {
+                    SCContentFilter::initWithDesktopIndependentWindow(
+                        SCContentFilter::alloc(),
+                        &window,
+                    )
+                };
+                lock(&shared).filter = Some(SendFilter(filter.clone()));
+                capture_window(&shared, &filter, size);
+            },
+        );
+        // SAFETY: The handler outlives the call and only touches the shared state.
+        unsafe {
+            SCShareableContent::getCurrentProcessShareableContentWithCompletionHandler(&listed);
+        }
+    }
+
+    /// The newest window-server picture of [`Self::request_capture`], `None` before the first
+    /// came: its BGRX pixels go into `pixels`, rows top to bottom, and its width and height in
+    /// pixels are returned. An error says why the window server gave none.
+    pub fn latest_capture(&self, pixels: &mut Vec<u8>) -> Option<Result<(u16, u16), String>> {
+        let state = lock(&self.capture);
+        Some(match state.picture.as_ref()? {
+            Ok((width, height, latest)) => {
+                pixels.clone_from(latest);
+                Ok((*width, *height))
+            }
+            Err(error) => Err(error.clone()),
+        })
+    }
+
+    /// How many answers to [`Self::request_capture`] came: pictures and failures.
+    #[must_use]
+    pub fn captures(&self) -> u64 {
+        lock(&self.capture).count
+    }
+
     /// Delivers synthesized input to this window as if the user gave it. The events go through
-    /// `-[NSWindow sendEvent:]`, so only this window sees them: the system pointer does not move
-    /// and no Accessibility permission is needed.
+    /// `-[NSWindow sendEvent:]`, or straight to the views while the window is kept off the
+    /// desktop, so only this window sees them: the system pointer does not move and no
+    /// Accessibility permission is needed.
     ///
     /// # Panics
     /// Panics when called off the worker main thread, which violates the window's contract.
@@ -366,9 +672,110 @@ impl MacOsEditorWindow {
                 }
             };
             if let Some(event) = event {
-                self.window.sendEvent(&event);
+                if self.window.ivars().get() {
+                    self.deliver_off_desktop(mtm, &event);
+                } else {
+                    self.window.sendEvent(&event);
+                }
             }
         });
+    }
+
+    /// `-[NSWindow sendEvent:]` drops mouse events for a window that is not ordered in, so a
+    /// window kept off the desktop gets them as `AppKit` would route them: a press goes to the
+    /// view under it, which also takes the drags and the release; moves and wheels go to the
+    /// view under the pointer; keys go to the first responder. A control that runs its own
+    /// tracking loop (`NSTextView`, `NSSlider`) takes a press as a click and does not follow
+    /// drags; plug-in views draw their own controls and follow them.
+    fn deliver_off_desktop(&self, mtm: MainThreadMarker, event: &NSEvent) {
+        let hit = || {
+            let content = self.window.contentView()?;
+            // The content view's superview, the frame view, uses window coordinates.
+            content.hitTest(event.locationInWindow())
+        };
+        match event.r#type() {
+            NSEventType::LeftMouseDown
+            | NSEventType::RightMouseDown
+            | NSEventType::OtherMouseDown => {
+                let Some(view) = hit() else { return };
+                if view.acceptsFirstResponder() {
+                    self.window.makeFirstResponder(Some(&view));
+                }
+                let (release, press): (_, fn(&NSView, &NSEvent)) = match event.r#type() {
+                    NSEventType::LeftMouseDown => (NSEventType::LeftMouseUp, |view, event| {
+                        view.mouseDown(event);
+                    }),
+                    NSEventType::RightMouseDown => (NSEventType::RightMouseUp, |view, event| {
+                        view.rightMouseDown(event);
+                    }),
+                    _ => (NSEventType::OtherMouseUp, |view, event| {
+                        view.otherMouseDown(event);
+                    }),
+                };
+                // A control with a tracking loop (`NSTextView`, `NSSlider`) waits in its
+                // press for a release from the event queue and would hold the main thread
+                // until one came. This release ends such a loop at once; a view without one
+                // never sees it, as the window drops queued mouse events.
+                if let Some(up) = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                    release,
+                    event.locationInWindow(),
+                    event.modifierFlags(),
+                    event.timestamp(),
+                    event.windowNumber(),
+                    None,
+                    0,
+                    event.clickCount(),
+                    0.0,
+                ) {
+                    NSApplication::sharedApplication(mtm).postEvent_atStart(&up, false);
+                }
+                press(&view, event);
+                self.pressed.replace(Some(view));
+            }
+            NSEventType::LeftMouseDragged
+            | NSEventType::RightMouseDragged
+            | NSEventType::OtherMouseDragged => {
+                let Some(view) = self.pressed.borrow().clone().or_else(hit) else {
+                    return;
+                };
+                match event.r#type() {
+                    NSEventType::LeftMouseDragged => view.mouseDragged(event),
+                    NSEventType::RightMouseDragged => view.rightMouseDragged(event),
+                    _ => view.otherMouseDragged(event),
+                }
+            }
+            NSEventType::LeftMouseUp | NSEventType::RightMouseUp | NSEventType::OtherMouseUp => {
+                let Some(view) = self.pressed.take().or_else(hit) else {
+                    return;
+                };
+                match event.r#type() {
+                    NSEventType::LeftMouseUp => view.mouseUp(event),
+                    NSEventType::RightMouseUp => view.rightMouseUp(event),
+                    _ => view.otherMouseUp(event),
+                }
+            }
+            NSEventType::MouseMoved => {
+                if let Some(view) = hit() {
+                    view.mouseMoved(event);
+                }
+            }
+            NSEventType::ScrollWheel => {
+                if let Some(view) = hit() {
+                    view.scrollWheel(event);
+                }
+            }
+            NSEventType::KeyDown | NSEventType::KeyUp | NSEventType::FlagsChanged => {
+                let Some(responder) = self.window.firstResponder() else {
+                    return;
+                };
+                match event.r#type() {
+                    NSEventType::KeyDown => responder.keyDown(event),
+                    NSEventType::KeyUp => responder.keyUp(event),
+                    _ => responder.flagsChanged(event),
+                }
+            }
+            _ => {}
+        }
     }
 
     /// A content-view position, in points from its top-left corner, in window coordinates, which

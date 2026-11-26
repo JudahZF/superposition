@@ -161,6 +161,36 @@ impl SdkEditorHandle {
         }
         Ok(self.inner.get_parameter(parameter_id)?)
     }
+
+    /// One controller parameter's metadata and current value, while the processor keeps
+    /// running: the audio thread never waits for it.
+    ///
+    /// # Errors
+    /// Returns an error if the plug-in has unloaded, has no controller, or has no parameter
+    /// with this ID.
+    pub fn parameter_metadata(&self, parameter_id: u32) -> Result<SdkParameterInfo, SdkError> {
+        let parameter = self.inner.parameter(parameter_id)?;
+        Ok(SdkParameterInfo {
+            id: parameter.id,
+            name: parameter.name,
+            normalized: parameter.value,
+            default_normalized: parameter.default,
+            unit: parameter.unit,
+            step_count: parameter.step_count,
+            flags: parameter.flags,
+            can_automate: parameter.can_automate,
+            is_read_only: parameter.is_read_only,
+            is_bypass: parameter.is_bypass,
+        })
+    }
+
+    /// The controller's text for a normalized value, while the processor keeps running.
+    ///
+    /// # Errors
+    /// Returns an error if the plug-in has unloaded or cannot format the value.
+    pub fn format_parameter(&self, parameter_id: u32, normalized: f64) -> Result<String, SdkError> {
+        Ok(self.inner.format_parameter(parameter_id, normalized)?)
+    }
 }
 
 /// Placeholder editor parent on platforms or builds without native editor hosting.

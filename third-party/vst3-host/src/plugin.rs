@@ -154,6 +154,18 @@ impl MainThreadEditorHandle {
     pub fn parameter_ids(&self) -> Result<Vec<u32>> {
         self.editor()?.parameter_ids()
     }
+
+    /// One controller parameter's metadata and current value, read on the plugin's loading
+    /// thread while audio processing continues.
+    pub fn parameter(&self, id: u32) -> Result<crate::parameters::Parameter> {
+        self.editor()?.parameter(id)
+    }
+
+    /// The controller's text for a normalized value, on the plugin's loading thread while audio
+    /// processing continues.
+    pub fn format_parameter(&self, id: u32, normalized: f64) -> Result<String> {
+        self.editor()?.format_parameter(id, normalized)
+    }
 }
 
 impl MainThreadService {

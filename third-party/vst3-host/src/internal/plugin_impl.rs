@@ -567,6 +567,14 @@ impl EditorCore {
         self.with_fields(|fields| fields.parameter_ids())?
     }
 
+    pub(crate) fn parameter(&self, id: u32) -> Result<Parameter> {
+        self.with_fields(|fields| fields.parameter(id))?
+    }
+
+    pub(crate) fn format_parameter(&self, id: u32, normalized: f64) -> Result<String> {
+        self.with_fields(|fields| fields.format_parameter(id, normalized))?
+    }
+
     pub(crate) fn take_editor_resize_request(&self) -> Option<(i32, i32)> {
         self.with_fields(|fields| fields.editor_resize.lock().ok().and_then(|mut s| s.take()))
             .ok()
@@ -2886,6 +2894,56 @@ impl EditorFields {
                 })
                 .collect())
         }
+    }
+
+    /// One controller parameter with its current value, as `get_all_parameters` gives it.
+    fn parameter(&self, id: u32) -> Result<Parameter> {
+        let controller = self
+            .controller
+            .as_ref()
+            .ok_or_else(|| Error::InterfaceError("No controller available".to_string()))?;
+        unsafe {
+            for index in 0..controller.getParameterCount() {
+                let mut info: ParameterInfo = std::mem::zeroed();
+                if controller.getParameterInfo(index, &mut info) != kResultOk || info.id != id {
+                    continue;
+                }
+                return Ok(Parameter {
+                    id: info.id,
+                    name: crate::internal::utils::vst_string_to_string(&info.title),
+                    value: controller.getParamNormalized(info.id),
+                    min: 0.0,
+                    max: 1.0,
+                    default: info.defaultNormalizedValue,
+                    unit: crate::internal::utils::vst_string_to_string(&info.units),
+                    step_count: info.stepCount,
+                    can_automate: (info.flags & ParameterInfo_::ParameterFlags_::kCanAutomate)
+                        != 0,
+                    is_read_only: (info.flags & ParameterInfo_::ParameterFlags_::kIsReadOnly)
+                        != 0,
+                    is_bypass: (info.flags & ParameterInfo_::ParameterFlags_::kIsBypass) != 0,
+                    flags: info.flags as u32,
+                });
+            }
+        }
+        Err(Error::InvalidParameter(format!("unknown parameter {id}")))
+    }
+
+    /// The controller's text for `normalized` of parameter `id`.
+    fn format_parameter(&self, id: u32, normalized: f64) -> Result<String> {
+        let controller = self
+            .controller
+            .as_ref()
+            .ok_or_else(|| Error::InterfaceError("No controller available".to_string()))?;
+        unsafe {
+            let mut buf: String128 = std::mem::zeroed();
+            if controller.getParamStringByValue(id, normalized, &mut buf) == kResultOk {
+                return Ok(crate::internal::utils::vst_string_to_string(&buf));
+            }
+        }
+        Err(Error::InvalidParameter(format!(
+            "Plugin could not format parameter {id}"
+        )))
     }
 
     fn has_editor(&self) -> bool {

@@ -24,6 +24,8 @@ editor-window = [
     "dep:objc2-core-foundation",
     "dep:objc2-core-graphics",
     "dep:objc2-foundation",
+    "dep:objc2-screen-capture-kit",
+    "dep:block2",
 ]
 
 [dependencies]
@@ -35,7 +37,11 @@ objc2 = { version = "0.6.4", optional = true }
 objc2-app-kit = { version = "0.3.2", optional = true, features = ["NSApplication", "NSBitmapImageRep", "NSEvent", "NSGraphics", "NSGraphicsContext", "NSImageRep", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "objc2-core-graphics"] }
 objc2-core-foundation = { version = "0.3.2", optional = true, features = ["CFCGTypes"] }
 objc2-core-graphics = { version = "0.3.2", optional = true, features = ["CGBitmapContext", "CGColorSpace", "CGContext", "CGEvent", "CGEventTypes", "CGImage", "CGWindow"] }
-objc2-foundation = { version = "0.3.2", optional = true, features = ["NSArray", "NSData", "NSDate", "NSDictionary", "NSGeometry", "NSProcessInfo", "NSRunLoop", "NSString"] }
+objc2-foundation = { version = "0.3.2", optional = true, features = ["NSArray", "NSData", "NSDate", "NSDictionary", "NSError", "NSGeometry", "NSProcessInfo", "NSRunLoop", "NSString"] }
+# The streamed editor's picture from the window server: the worker's own window, with no
+# permission (macOS 14.4: the current process's shareable content).
+objc2-screen-capture-kit = { version = "0.3.2", optional = true, default-features = false, features = ["std", "block2", "objc2-core-graphics", "SCShareableContent", "SCScreenshotManager", "SCStream"] }
+block2 = { version = "0.6", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 png = { version = "0.18.1", optional = true }
@@ -54,6 +60,18 @@ windows-sys = { version = "0.61.2", optional = true, features = [
 
 [build-dependencies]
 cc = "1.2.47"
+
+# Self-drawn OpenGL and Metal views for the window-server capture test.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-app-kit = { version = "0.3.2", features = ["NSOpenGL", "NSOpenGLView"] }
+objc2-metal = "0.3.2"
+objc2-quartz-core = "0.3.2"
+
+# Runs on the main thread, as AppKit needs, so it has its own main; it runs only with `--ignored`.
+[[test]]
+name = "editor_capture_macos"
+harness = false
+required-features = ["editor-window"]
 
 [lints.rust]
 # The native-sdk feature's sole FFI boundary is intentionally contained in native.rs.
