@@ -10,13 +10,14 @@ use std::{
     ptr::{self, NonNull},
     rc::Rc,
     sync::{Arc, Mutex, OnceLock, PoisonError},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use block2::RcBlock;
 
 use objc2::{
-    AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    AllocAnyThread, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class,
+    msg_send,
     rc::{Retained, autoreleasepool},
     runtime::{AnyObject, Bool, ProtocolObject},
 };
@@ -152,15 +153,26 @@ pub struct MacOsEditorWindow {
 /// A picture of the editor's content as BGRX pixels and its size, or why there is none.
 type Picture = Result<(u16, u16, Vec<u8>), String>;
 
+/// The most captures of one window on their way at a time. One capture takes about 20 ms
+/// (1200 × 750 points, M4 Pro), so one at a time gives fewer than 30 a second.
+const MAX_IN_FLIGHT: u8 = 2;
+
 /// The window server's pictures of one editor window. `ScreenCaptureKit`'s completion handlers
 /// run on its own queues: they leave each picture here for the worker main thread to take.
 #[derive(Default)]
 struct WindowCapture {
     /// The window's content filter, once the process's shareable content listed the window.
     filter: Option<SendFilter>,
-    /// A listing or a picture is on its way.
-    busy: bool,
-    /// The newest picture.
+    /// The process's shareable content is being listed for the filter.
+    listing: bool,
+    /// The captures on their way.
+    in_flight: u8,
+    /// When the last capture started.
+    started: Option<Instant>,
+    /// The number of the last capture that started, and of the newest answer that came.
+    started_number: u64,
+    answered_number: u64,
+    /// The newest answer: a picture until it is taken, a failure until a newer answer comes.
     picture: Option<Picture>,
     /// The pictures and failures that came.
     count: u64,
@@ -184,15 +196,19 @@ fn lock(capture: &Mutex<WindowCapture>) -> std::sync::MutexGuard<'_, WindowCaptu
     capture.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Ends the capture that ran with `picture`. A failure forgets the filter, so the next capture
-/// lists the window again (a window that the window server recreated has a new filter).
-fn finish(capture: &Mutex<WindowCapture>, picture: Picture) {
+/// Ends capture `number`, which gave `picture`; an answer older than the newest one is dropped.
+/// A failure forgets the filter, so the next capture lists the window again (a window that the
+/// window server recreated has a new filter).
+fn finish(capture: &Mutex<WindowCapture>, number: u64, picture: Picture) {
     let mut state = lock(capture);
-    state.busy = false;
+    state.in_flight = state.in_flight.saturating_sub(1);
     if picture.is_err() {
         state.filter = None;
     }
-    state.picture = Some(picture);
+    if number > state.answered_number {
+        state.answered_number = number;
+        state.picture = Some(picture);
+    }
     state.count += 1;
 }
 
@@ -205,51 +221,110 @@ fn describe(error: *mut NSError, fallback: &str) -> String {
     )
 }
 
-/// Asks the window server for one picture of the window of `filter`, at one pixel per point.
+/// `kCVPixelFormatType_32BGRA`: B, G, R, A bytes, the window-stream tile layout.
+const PIXEL_FORMAT_BGRA: u32 = u32::from_be_bytes(*b"BGRA");
+
+/// `kCVPixelBufferLock_ReadOnly`.
+const LOCK_READ_ONLY: u64 = 1;
+
+#[link(name = "CoreMedia", kind = "framework")]
+unsafe extern "C" {
+    fn CMSampleBufferGetImageBuffer(buffer: *mut c_void) -> *mut c_void;
+}
+
+#[link(name = "CoreVideo", kind = "framework")]
+unsafe extern "C" {
+    fn CVPixelBufferLockBaseAddress(buffer: *mut c_void, flags: u64) -> i32;
+    fn CVPixelBufferUnlockBaseAddress(buffer: *mut c_void, flags: u64) -> i32;
+    fn CVPixelBufferGetBaseAddress(buffer: *mut c_void) -> *mut c_void;
+    fn CVPixelBufferGetBytesPerRow(buffer: *mut c_void) -> usize;
+    fn CVPixelBufferGetWidth(buffer: *mut c_void) -> usize;
+    fn CVPixelBufferGetHeight(buffer: *mut c_void) -> usize;
+    fn CVPixelBufferGetPixelFormatType(buffer: *mut c_void) -> u32;
+}
+
+/// Asks the window server for one picture of the window of `filter`, at one pixel per point,
+/// as BGRA in sRGB.
 fn capture_window(
     capture: &Arc<Mutex<WindowCapture>>,
     filter: &SCContentFilter,
     size: CaptureSize,
+    number: u64,
 ) {
-    // SAFETY: A new configuration is a plain value object; the setters take plain numbers.
+    // SAFETY: A new configuration is a plain value object; the setters take plain values.
     let config = unsafe { SCStreamConfiguration::new() };
     unsafe {
         config.setWidth(usize::from(size.window.0));
         config.setHeight(usize::from(size.window.1));
+        config.setPixelFormat(PIXEL_FORMAT_BGRA);
+        config.setColorSpaceName(kCGColorSpaceSRGB);
         config.setShowsCursor(false);
         config.setIgnoreShadowsSingleWindow(true);
     }
     let shared = Arc::clone(capture);
-    let done = RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
-        // SAFETY: ScreenCaptureKit passes a valid image or null.
-        let picture = match unsafe { image.as_ref() } {
-            Some(image) => content_bgrx(image, size),
-            None => Err(describe(error, "the window server gave no picture")),
+    let done = RcBlock::new(move |sample: *mut c_void, error: *mut NSError| {
+        let picture = if sample.is_null() {
+            Err(describe(error, "the window server gave no picture"))
+        } else {
+            // SAFETY: ScreenCaptureKit passes a valid sample buffer for the call.
+            unsafe { content_bgrx(sample, size) }
         };
-        finish(&shared, picture);
+        finish(&shared, number, picture);
     });
-    // SAFETY: The filter, the configuration and the handler outlive the call; the handler only
-    // touches the shared state.
+    // SAFETY: `captureSampleBufferWithFilter:configuration:completionHandler:` (macOS 14) takes
+    // a filter, a configuration and a block of a `CMSampleBufferRef` and an `NSError *`. They
+    // outlive the call; the handler only touches the shared state.
     unsafe {
-        SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
-            filter,
-            &config,
-            Some(&done),
-        );
+        let () = msg_send![
+            SCScreenshotManager::class(),
+            captureSampleBufferWithFilter: filter,
+            configuration: &*config,
+            completionHandler: &*done
+        ];
     }
 }
 
 /// The content of a window-server picture of the whole window, as BGRX: the bottom
-/// `size.content` part, below the title bar.
-fn content_bgrx(image: &CGImage, size: CaptureSize) -> Picture {
-    let mut pixels = Vec::new();
-    let (width, height) = draw_bgrx(
-        image,
-        size.content,
-        (f64::from(size.window.0), f64::from(size.window.1)),
-        &mut pixels,
-    )?;
-    Ok((width, height, pixels))
+/// `size.content` rows, below the title bar.
+///
+/// # Safety
+/// `sample` is a valid `CMSampleBufferRef`.
+unsafe fn content_bgrx(sample: *mut c_void, size: CaptureSize) -> Picture {
+    let unusable = || Err("the window server's picture has another format or size".to_owned());
+    // SAFETY: The image buffer of a screenshot is a pixel buffer. Its pixels are read only while
+    // its base address is locked, and only rows inside its height and bytes per row.
+    unsafe {
+        let image = CMSampleBufferGetImageBuffer(sample);
+        if image.is_null()
+            || CVPixelBufferGetPixelFormatType(image) != PIXEL_FORMAT_BGRA
+            || CVPixelBufferLockBaseAddress(image, LOCK_READ_ONLY) != 0
+        {
+            return unusable();
+        }
+        let (width, height) = (CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image));
+        let stride = CVPixelBufferGetBytesPerRow(image);
+        let base = CVPixelBufferGetBaseAddress(image).cast::<u8>();
+        let (columns, rows) = (usize::from(size.content.0), usize::from(size.content.1));
+        let picture = if base.is_null()
+            || columns == 0
+            || rows == 0
+            || (width, height) != (usize::from(size.window.0), usize::from(size.window.1))
+            || columns > width
+            || rows > height
+            || stride < width * 4
+        {
+            unusable()
+        } else {
+            let image = std::slice::from_raw_parts(base, stride * height);
+            let mut pixels = Vec::with_capacity(columns * rows * 4);
+            for row in image.chunks_exact(stride).skip(height - rows) {
+                pixels.extend_from_slice(&row[..columns * 4]);
+            }
+            Ok((size.content.0, size.content.1, pixels))
+        };
+        CVPixelBufferUnlockBaseAddress(image, LOCK_READ_ONLY);
+        picture
+    }
 }
 
 /// Draws `image` at `drawn` points from the bottom-left corner into BGRX `pixels` of `size`,
@@ -515,15 +590,18 @@ impl MacOsEditorWindow {
         })
     }
 
-    /// Starts a picture of this window from the window server, unless one is on its way:
-    /// what the server composes for the window, so a view that draws with OpenGL or Metal is in
-    /// it too, also while the window is ordered out. [`Self::latest_capture`] gives it once it
-    /// came.
+    /// Starts a picture of this window from the window server, unless [`MAX_IN_FLIGHT`] are on
+    /// their way or the last one started less than `interval` ago. It has what the
+    /// server composes for the window, so a view that draws with OpenGL or Metal is in it too,
+    /// also while the window is ordered out. [`Self::take_capture`] gives it once it came.
+    ///
+    /// A capture stream (`SCStream`) gives no pictures of a window that is ordered out: its
+    /// frames say "suspended" and have no image. So each picture is one screenshot.
     ///
     /// The worker pictures its own window. `ScreenCaptureKit` lists that window in the current
     /// process's shareable content, which (macOS 14.4) holds what "is available to capture by
     /// current process without user consent via TCC": no Screen Recording permission, no prompt.
-    pub fn request_capture(&self) {
+    pub fn request_capture(&self, interval: Duration) {
         let Some(number) = self.window_number() else {
             return;
         };
@@ -541,16 +619,26 @@ impl MacOsEditorWindow {
                 whole_pixels(bounds.size.height),
             ),
         };
+        let now = Instant::now();
         let mut state = lock(&self.capture);
-        if state.busy {
+        if state.listing
+            || state.in_flight >= MAX_IN_FLIGHT
+            || state
+                .started
+                .is_some_and(|started| now < started + interval)
+        {
             return;
         }
-        state.busy = true;
+        state.in_flight += 1;
+        state.started = Some(now);
+        state.started_number += 1;
+        let sequence = state.started_number;
         if let Some(filter) = state.filter.as_ref().map(|filter| filter.0.clone()) {
             drop(state);
-            capture_window(&self.capture, &filter, size);
+            capture_window(&self.capture, &filter, size, sequence);
             return;
         }
+        state.listing = true;
         drop(state);
         let shared = Arc::clone(&self.capture);
         let listed = RcBlock::new(
@@ -561,9 +649,11 @@ impl MacOsEditorWindow {
                         .iter()
                         .find(|window| unsafe { window.windowID() } == number)
                 });
+                lock(&shared).listing = false;
                 let Some(window) = window else {
                     finish(
                         &shared,
+                        sequence,
                         Err(describe(
                             error,
                             "the window server does not list this window",
@@ -579,7 +669,7 @@ impl MacOsEditorWindow {
                     )
                 };
                 lock(&shared).filter = Some(SendFilter(filter.clone()));
-                capture_window(&shared, &filter, size);
+                capture_window(&shared, &filter, size, sequence);
             },
         );
         // SAFETY: The handler outlives the call and only touches the shared state.
@@ -588,18 +678,15 @@ impl MacOsEditorWindow {
         }
     }
 
-    /// The newest window-server picture of [`Self::request_capture`], `None` before the first
-    /// came: its BGRX pixels go into `pixels`, rows top to bottom, and its width and height in
-    /// pixels are returned. An error says why the window server gave none.
-    pub fn latest_capture(&self, pixels: &mut Vec<u8>) -> Option<Result<(u16, u16), String>> {
-        let state = lock(&self.capture);
-        Some(match state.picture.as_ref()? {
-            Ok((width, height, latest)) => {
-                pixels.clone_from(latest);
-                Ok((*width, *height))
-            }
-            Err(error) => Err(error.clone()),
-        })
+    /// The newest answer to [`Self::request_capture`]: BGRX pixels, rows top to bottom, and
+    /// their width and height in pixels, once; or why the window server gave none, until a newer
+    /// answer comes.
+    pub fn take_capture(&self) -> Option<Picture> {
+        let mut state = lock(&self.capture);
+        match &state.picture {
+            Some(Err(error)) => Some(Err(error.clone())),
+            _ => state.picture.take(),
+        }
     }
 
     /// How many answers to [`Self::request_capture`] came: pictures and failures.

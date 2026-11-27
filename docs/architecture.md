@@ -196,12 +196,18 @@ protocol and the same UI code as on Linux:
 - **When.** The UI greets the workers only while a remote client is connected. When the last
   client leaves, the UI closes the connections; each worker stops its pictures, connects again,
   and waits. A Mac with no remote client therefore pictures nothing.
-- **Capture.** While greeted, the worker's loading thread pictures each open editor at most 30
-  times a second, and only after the stream thread has written the previous pictures. The
-  content view draws itself into a bitmap inside the worker process
-  (`cacheDisplayInRect:toBitmapImageRep:`) at one pixel per point. This needs no Screen
-  Recording permission. The stream thread compares each picture with the last one and sends only
-  the 64×64 tiles that changed.
+- **Capture.** While greeted, the worker's loading thread asks the window server for screenshots
+  of each open editor window (`SCScreenshotManager`, with a filter of the window from the
+  current process's shareable content, macOS 14.4: no Screen Recording permission, no prompt),
+  at one pixel per point, as BGRA in sRGB. Up to two screenshots of a window are on their way at
+  a time (one takes about 20 ms for 1200 × 750 points), at most one starts each 20 ms while the
+  pictures change or input comes, and one each 100 ms after 1 s without either. Each new picture
+  goes to the stream thread as soon as it has written the previous ones; the window list holds
+  each open window once it has had a picture. A capture stream (`SCStream`) does not serve: for
+  a window that is not ordered in, its frames are "suspended" and have no image. When the window
+  server gives no picture, the content view draws itself into a bitmap inside the worker process
+  (`cacheDisplayInRect:toBitmapImageRep:`), at most 30 times a second. The stream thread
+  compares each picture with the last one and sends only the 64×64 tiles that changed.
 - **Input.** The controller's input comes back on the same connection. The worker turns it into
   `NSEvent`s (scroll events go through `CGEvent`) and gives them to its own window with
   `-[NSWindow sendEvent:]`. This needs no Accessibility permission, and the Mac's pointer does
@@ -212,8 +218,8 @@ protocol and the same UI code as on Linux:
 
 Known limits:
 
-- Views that draw with Metal or OpenGL layers (`CAMetalLayer`) can picture blank, because the
-  view cache does not include those layers.
+- When the window server gives no picture, views that draw with Metal or OpenGL layers
+  (`CAMetalLayer`) can picture blank, because the view cache does not include those layers.
 - Menus and other pop-up windows that a plug-in opens are not streamed. They show only on the
   Mac's display.
 - The stream has one pixel per point, so on a Retina Mac it is half the native resolution.

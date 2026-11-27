@@ -40,7 +40,7 @@ objc2-core-graphics = { version = "0.3.2", optional = true, features = ["CGBitma
 objc2-foundation = { version = "0.3.2", optional = true, features = ["NSArray", "NSData", "NSDate", "NSDictionary", "NSError", "NSGeometry", "NSProcessInfo", "NSRunLoop", "NSString"] }
 # The streamed editor's picture from the window server: the worker's own window, with no
 # permission (macOS 14.4: the current process's shareable content).
-objc2-screen-capture-kit = { version = "0.3.2", optional = true, default-features = false, features = ["std", "block2", "objc2-core-graphics", "SCShareableContent", "SCScreenshotManager", "SCStream"] }
+objc2-screen-capture-kit = { version = "0.3.2", optional = true, default-features = false, features = ["std", "block2", "objc2-core-foundation", "objc2-core-graphics", "SCShareableContent", "SCScreenshotManager", "SCStream"] }
 block2 = { version = "0.6", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

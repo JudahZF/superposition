@@ -1277,13 +1277,16 @@ impl EditorHost {
         detach_result
     }
 
-    /// Injects the app's input into the editors, then pictures them for the stream when due.
+    /// Injects the app's input into the editors and, while the app listens, keeps their window
+    /// server captures going at the stream's pace and hands each new picture to the stream as
+    /// soon as the last ones are written.
     #[cfg(target_os = "macos")]
     fn service_stream(&mut self) {
         let Some(stream) = self.stream.as_mut() else {
             return;
         };
-        for (window, input) in stream.take_input() {
+        let now = Instant::now();
+        for (window, input) in stream.take_input(now) {
             // A focus would put a hidden window on the desktop.
             if self.hidden && matches!(input, sp_vst3::editor_input::EditorInput::Focus) {
                 continue;
@@ -1296,35 +1299,44 @@ impl EditorHost {
                 open.window.inject(&input);
             }
         }
-        if !stream.capture_due(Instant::now()) {
+        // An idle worker pictures nothing.
+        if !stream.streaming() {
             return;
         }
-        // Each window asks the window server for its next picture; its latest one goes out now.
-        // Until every window has its first picture, nothing goes out: a window missing from a
-        // publication would close for the app.
+        let interval = stream.capture_interval(now);
         for open in self.windows.values() {
-            open.window.request_capture();
+            open.window.request_capture(interval);
         }
+        if !stream.ready() {
+            return;
+        }
+        let copy_due = stream.copy_due(now);
+        let mut open_windows = Vec::new();
         let mut captures = Vec::new();
         for (&slot, open) in &self.windows {
             let Some(id) = open.window.window_number() else {
                 continue;
             };
-            let mut bgrx = Vec::new();
+            open_windows.push(sp_window_stream::WindowId(id));
             // The window server's picture has what OpenGL and Metal views draw. When it gives
             // none (before macOS 14.4), the view draws itself into a bitmap instead.
-            let size = match open.window.latest_capture(&mut bgrx) {
-                None => return,
-                Some(Ok(size)) => size,
-                Some(Err(error)) => match open.window.capture_bgrx(&mut bgrx) {
-                    Ok(size) => size,
-                    Err(fallback) => {
-                        eprintln!("sp-plugin-worker: could not stream editor: {error}; {fallback}");
-                        continue;
+            let (width, height, bgrx) = match open.window.take_capture() {
+                None => continue,
+                Some(Ok(picture)) => picture,
+                Some(Err(_)) if !copy_due => continue,
+                Some(Err(error)) => {
+                    let mut bgrx = Vec::new();
+                    match open.window.capture_bgrx(&mut bgrx) {
+                        Ok((width, height)) => (width, height, bgrx),
+                        Err(fallback) => {
+                            eprintln!(
+                                "sp-plugin-worker: could not stream editor: {error}; {fallback}"
+                            );
+                            continue;
+                        }
                     }
-                },
+                }
             };
-            let (width, height) = size;
             let plugin = self
                 .editors
                 .get(&slot)
@@ -1350,7 +1362,7 @@ impl EditorHost {
                 bgrx,
             });
         }
-        stream.publish(captures);
+        stream.publish(&open_windows, captures);
     }
 
     /// Whether `AppKit` events need pumping: an editor is open or one closed recently.
