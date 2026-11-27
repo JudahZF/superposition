@@ -40,7 +40,8 @@ const ACTIVE_HOLD: Duration = Duration::from_secs(1);
 /// The shortest time between two copies of the editors' views, when the window server gives no
 /// picture: 30 per second.
 const COPY_INTERVAL: Duration = Duration::from_millis(33);
-/// The pause before connecting to the app's socket again.
+/// The pause before connecting to the app's socket again, after an attempt that failed or a
+/// connection on which the app never said hello.
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// One open editor's picture: its window, and BGRX pixels of `info.width` x `info.height`.
@@ -215,9 +216,15 @@ impl Server {
                     eprintln!("sp-plugin-worker: editor stream closed: {error}");
                 }
                 let _ = stream.shutdown(std::net::Shutdown::Both);
+                let greeted = self.source.streaming();
                 self.source.disconnect();
                 self.mapper = InputMapper::default();
                 self.shared.streaming.store(false, Ordering::Release);
+                // The app hangs up when no client watches any more: be ready at once for the
+                // next client, which may come within a second.
+                if greeted {
+                    continue;
+                }
             }
             // Wait before the next attempt, keeping the window list current meanwhile.
             let until = Instant::now() + RECONNECT_INTERVAL;

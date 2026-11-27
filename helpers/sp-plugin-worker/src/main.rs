@@ -49,9 +49,7 @@ use sp_vst3::{Vst3BundlePath, adapter::Vst3ClassSelection};
 #[cfg(feature = "sdk")]
 use std::collections::BTreeMap;
 #[cfg(feature = "sdk")]
-use std::sync::mpsc::{
-    Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
-};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 
 #[cfg(feature = "sdk")]
 use crate::{
@@ -701,6 +699,14 @@ enum ChainEdit {
 struct InsertedPlugin {
     configuration: WirePluginSlotConfiguration,
     facade: Vst3Facade,
+}
+
+/// The requests that the loading thread serves without the runtime (editors, live reads, chain
+/// edits), and that thread: a new request, or a main-thread task, wakes it from its idle wait.
+#[cfg(feature = "sdk")]
+struct LoadingQueue {
+    requests: SyncSender<ControlRequest>,
+    thread: thread::Thread,
 }
 
 #[cfg(feature = "sdk")]
@@ -1527,6 +1533,7 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
             .ok_or("could not initialize first parameter feedback slot")?;
         publish_worker_telemetry(region.bank(), &mut runtime);
         let sample_rate = configuration.sample_rate;
+        let loading_thread = thread::current();
         let processing = thread::Builder::new()
             .name(sp_protocol::WORKER_PROCESSING_THREAD.to_owned())
             .spawn(move || {
@@ -1540,7 +1547,10 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
                     processing_endpoint,
                     main_request_tx,
                     main_response_rx,
-                    editor_request_tx,
+                    LoadingQueue {
+                        requests: editor_request_tx,
+                        thread: loading_thread,
+                    },
                     editor_response_rx,
                     &retired_tx,
                     &processing_shutdown,
@@ -1597,10 +1607,15 @@ fn run_production_worker(configuration: ProductionWorkerConfiguration) -> Result
                     Err(TryRecvError::Disconnected) => break,
                 }
             } else {
-                match main_request_rx.recv_timeout(EDITOR_POLL_INTERVAL) {
+                // The processing thread wakes this wait for a main-thread task and for a request
+                // of the loading queue, so neither waits for the timeout.
+                match main_request_rx.try_recv() {
                     Ok(task) => Some(task),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => break,
+                    Err(TryRecvError::Empty) => {
+                        thread::park_timeout(EDITOR_POLL_INTERVAL);
+                        main_request_rx.try_recv().ok()
+                    }
+                    Err(TryRecvError::Disconnected) => break,
                 }
             };
             if let Some(mut task) = next_request {
@@ -1742,7 +1757,7 @@ fn run_production_processing_thread(
     mut processing_endpoint: ProcessingControlEndpoint,
     main_request: SyncSender<MainThreadRequest>,
     main_response: Receiver<MainThreadResponse>,
-    editor_request: SyncSender<ControlRequest>,
+    editor_request: LoadingQueue,
     editor_response: Receiver<LoadingReply>,
     retired: &SyncSender<Vst3Facade>,
     shutdown_requested: &AtomicBool,
@@ -1892,7 +1907,7 @@ fn drain_production_commands(
     runtime: &mut Option<Box<ProductionRuntime>>,
     main_request: &SyncSender<MainThreadRequest>,
     main_response: &Receiver<MainThreadResponse>,
-    editor_request: &SyncSender<ControlRequest>,
+    editor_request: &LoadingQueue,
     audio_policy: &mut sp_shared_memory_os::AudioThreadPolicy,
     clock: MonotonicClock,
 ) -> Result<(), String> {
@@ -1930,7 +1945,7 @@ fn drain_production_commands(
         return Ok(());
     }
     if routes_to_loading_thread(&request) {
-        if let Err(error) = editor_request.try_send(request) {
+        if let Err(error) = editor_request.requests.try_send(request) {
             let request = match error {
                 TrySendError::Full(request) | TrySendError::Disconnected(request) => request,
             };
@@ -1941,6 +1956,8 @@ fn drain_production_commands(
             endpoint
                 .try_reply(response)
                 .map_err(|_| "worker control reply mailbox is full".to_owned())?;
+        } else {
+            editor_request.thread.unpark();
         }
         return Ok(());
     }
@@ -1975,6 +1992,7 @@ fn drain_production_commands(
             *runtime = Some(error.0.runtime);
             return Err("worker main-thread editor owner stopped".to_owned());
         }
+        editor_request.thread.unpark();
         let returned = main_response
             .recv()
             .map_err(|_| "worker main-thread editor owner stopped".to_owned())?;

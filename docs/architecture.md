@@ -194,8 +194,9 @@ protocol and the same UI code as on Linux:
   that owns the window. The window ID is the `AppKit` window number, which is unique across
   processes. The title, rack, and slot are the same as on Linux.
 - **When.** The UI greets the workers only while a remote client is connected. When the last
-  client leaves, the UI closes the connections; each worker stops its pictures, connects again,
-  and waits. A Mac with no remote client therefore pictures nothing.
+  client leaves, the UI closes the connections; each worker stops its pictures, connects again
+  at once, and waits. (After a failed connection, or one on which the app said no hello, it
+  waits 1 s first.) A Mac with no remote client therefore pictures nothing.
 - **Capture.** While greeted, the worker's loading thread asks the window server for screenshots
   of each open editor window (`SCScreenshotManager`, with a filter of the window from the
   current process's shareable content, macOS 14.4: no Screen Recording permission, no prompt),
