@@ -380,10 +380,12 @@ impl MacOsEditorWindow {
     /// Panics when called off the worker main thread, which violates the window's contract.
     pub fn focus(&self) {
         self.window.ivars().set(false);
-        NSApplication::sharedApplication(
+        let app = NSApplication::sharedApplication(
             MainThreadMarker::new().expect("editor window remains on main thread"),
-        )
-        .activate();
+        );
+        // A window that was kept off the desktop left the process unable to activate.
+        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+        app.activate();
         self.window.makeKeyAndOrderFront(None);
     }
 
@@ -391,8 +393,20 @@ impl MacOsEditorWindow {
     /// order its host window in or make it visible do nothing, and the window tells it that it
     /// is visible, so that it draws. The window stays ordered out, and
     /// [`Self::request_capture`] and [`Self::inject`] still work on it.
+    ///
+    /// The process also cannot become the active application until then. `AppKit` asks to
+    /// activate an accessory application when its event loop first runs, and the window server
+    /// grants it when the app that started the worker is in front: that app would lose the
+    /// keyboard to a process with no window on the desktop.
+    ///
+    /// # Panics
+    /// Panics when called off the worker main thread, which violates the window's contract.
     pub fn keep_off_desktop(&self) {
         self.window.ivars().set(true);
+        NSApplication::sharedApplication(
+            MainThreadMarker::new().expect("editor window remains on main thread"),
+        )
+        .setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
     }
 
     /// Takes a user close request without closing the window or detaching its plug-in view.

@@ -31,8 +31,8 @@ mod mac {
     use objc2::runtime::ProtocolObject;
     use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, define_class, msg_send};
     use objc2_app_kit::{
-        NSGraphicsContext, NSOpenGLPixelFormat, NSOpenGLView, NSResponder, NSView, NSWindow,
-        NSWindowNumberListOptions,
+        NSApplication, NSApplicationActivationPolicy, NSGraphicsContext, NSOpenGLPixelFormat,
+        NSOpenGLView, NSResponder, NSView, NSWindow, NSWindowNumberListOptions,
     };
     use objc2_core_foundation::CGSize;
     use objc2_core_graphics::CGContext;
@@ -153,13 +153,21 @@ mod mac {
             .all(|(got, want)| got.abs_diff(want) <= 64)
     }
 
-    /// No window of this process is on the desktop.
+    /// No window of this process is on the desktop, and the process cannot take the keyboard
+    /// from the application in front.
     fn assert_hidden(mtm: MainThreadMarker) {
         let shown = NSWindow::windowNumbersWithOptions(NSWindowNumberListOptions::empty(), mtm);
         assert!(
             shown.is_none_or(|numbers| numbers.is_empty()),
             "a window of this process is on screen"
         );
+        let app = NSApplication::sharedApplication(mtm);
+        assert_eq!(
+            app.activationPolicy(),
+            NSApplicationActivationPolicy::Prohibited,
+            "this process can become the active application"
+        );
+        assert!(!app.isActive(), "this process is the active application");
     }
 
     /// Pictures the window of `view` once it drew: `check` holds for the picture.
